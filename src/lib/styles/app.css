@@ -1,0 +1,250 @@
+:root {
+  font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  color: #202020;
+  background: #f3f3f3;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --app-bg: #f3f3f3;
+  --app-surface: #ffffff;
+  --app-surface-hover: #f7f7f7;
+  --app-border: #d8d8d8;
+  --app-border-strong: #b9b9b9;
+  --app-fg: #202020;
+  --app-muted: #686868;
+  --app-accent: #0067c0;
+  --app-danger: #c42b1c;
+  --app-focus: #005fb8;
+  --shadow-flyout: 0 8px 24px rgb(0 0 0 / 16%), 0 1px 3px rgb(0 0 0 / 12%);
+}
+
+* {
+  box-sizing: border-box;
+  letter-spacing: 0;
+}
+
+html,
+body {
+  width: 100%;
+  min-width: 0;
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background: var(--app-bg);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button,
+input,
+select {
+  letter-spacing: 0;
+}
+
+button {
+  color: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--app-focus);
+  outline-offset: 2px;
+}
+
+.sr-only {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+
+.icon-button {
+  position: relative;
+  display: inline-grid;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  place-items: center;
+  color: inherit;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: default;
+}
+
+.icon-button:hover {
+  background: rgb(0 0 0 / 7%);
+}
+
+.icon-button:active {
+  background: rgb(0 0 0 / 12%);
+}
+
+.icon-button[aria-pressed="true"] {
+  color: var(--app-accent);
+  background: rgb(0 103 192 / 11%);
+}
+
+.icon-button:disabled {
+  color: #8a8a8a;
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+@media (hover: hover) {
+  .icon-button[data-tooltip]::after {
+    position: absolute;
+    z-index: 1000;
+    right: 0;
+    bottom: calc(100% + 7px);
+    width: max-content;
+    max-width: 180px;
+    padding: 5px 8px;
+    color: #ffffff;
+    font-size: 12px;
+    line-height: 1.3;
+    white-space: nowrap;
+    pointer-events: none;
+    content: attr(data-tooltip);
+    background: #252525;
+    border-radius: 4px;
+    box-shadow: 0 2px 8px rgb(0 0 0 / 20%);
+    opacity: 0;
+    transform: translateY(2px);
+    transition: opacity 100ms ease, transform 100ms ease;
+  }
+
+  .icon-button[data-tooltip-placement="bottom"]::after {
+    top: calc(100% + 7px);
+    bottom: auto;
+  }
+
+  /* Buttons at the left edge (for example the note-window new button) should
+     open their tooltip into the viewport instead of to the left of the window. */
+  .icon-button[data-tooltip-align="start"]::after {
+    right: auto;
+    left: 0;
+  }
+
+  .icon-button[data-tooltip]:hover::after,
+  .icon-button[data-tooltip]:focus-visible::after {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+[data-note-color="yellow"] {
+  --note-bg: #fff1a8;
+  --note-bg-strong: #f7df77;
+  --note-border: #e2c755;
+  --note-fg: #302a12;
+  --note-muted: #665b31;
+}
+
+[data-note-color="pink"] {
+  --note-bg: #ffdce5;
+  --note-bg-strong: #f6bfd0;
+  --note-border: #dca5b7;
+  --note-fg: #372229;
+  --note-muted: #75515d;
+}
+
+[data-note-color="blue"] {
+  --note-bg: #d9ecff;
+  --note-bg-strong: #b9daf8;
+  --note-border: #96beda;
+  --note-fg: #172b3a;
+  --note-muted: #486477;
+}
+
+[data-note-color="green"] {
+  --note-bg: #dff3dc;
+  --note-bg-strong: #c1e4bd;
+  --note-border: #9bc898;
+  --note-fg: #1d311f;
+  --note-muted: #4d6c50;
+}
+
+[data-note-color="purple"] {
+  --note-bg: #eadfff;
+  --note-bg-strong: #d6c6f3;
+  --note-border: #b8a2da;
+  --note-fg: #2d2438;
+  --note-muted: #635574;
+}
+
+[data-note-color="gray"] {
+  --note-bg: #e8eaed;
+  --note-bg-strong: #d3d7dc;
+  --note-border: #b3b9c0;
+  --note-fg: #25282c;
+  --note-muted: #5e636a;
+}
+
+[data-note-color="charcoal"] {
+  --note-bg: #666666;
+  --note-bg-strong: #4f4f4f;
+  --note-border: #414141;
+  --note-fg: #ffffff;
+  --note-muted: #e5e5e5;
+  --note-link: #c8efff;
+  --note-selection: rgb(255 255 255 / 24%);
+  --note-focus: #c8efff;
+  --note-danger: #ffddd8;
+  --note-toolbar-opacity: 0.58;
+  --note-toolbar-border: rgb(255 255 255 / 22%);
+  --note-separator: rgb(255 255 255 / 34%);
+  --note-rule: rgb(255 255 255 / 42%);
+  --note-control-hover-bg: rgb(255 255 255 / 12%);
+  --note-control-active-bg: rgb(255 255 255 / 16%);
+  --note-control-active-fg: #c8efff;
+  --note-title-hover-bg: rgb(255 255 255 / 12%);
+  --note-title-input-bg: #3f3f3f;
+  --note-title-input-border: #a6a6a6;
+  --note-code-bg: rgb(0 0 0 / 14%);
+  --note-status-bg: #464646;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #a8a8a8 transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #a8a8a8;
+  background-clip: padding-box;
+  border: 3px solid transparent;
+  border-radius: 5px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

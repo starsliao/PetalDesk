@@ -1,0 +1,59 @@
+name: Deploy product website
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - "artifacts/**"
+      - "static/app-icon.svg"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Prepare static website
+        shell: bash
+        run: |
+          mkdir -p _site/static _site/artifacts
+          sed \
+            -e 's#\.\./static/#./static/#g' \
+            -e 's#\.\./artifacts/#./artifacts/#g' \
+            docs/index.html > _site/index.html
+          cp static/app-icon.svg _site/static/app-icon.svg
+          cp artifacts/*.png _site/artifacts/
+          touch _site/.nojekyll
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,43 @@
+# Dependencies and package-manager caches
+/node_modules/
+/.pnpm-store/
+
+# Frontend build and test output
+/build/
+/_site/
+/.svelte-kit/
+/package/
+/coverage/
+/test-results/
+/playwright-report/
+
+# Rust and Tauri build output
+/src-tauri/target/
+/src-tauri/gen/schemas/
+
+# Local configuration and logs
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+*.bak
+*.dmp
+*.stackdump
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Packaged desktop binaries
+*.exe
+*.msi
+*.msix
+*.dmg
+*.AppImage
+*.deb
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vs/

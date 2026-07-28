@@ -1,0 +1,1318 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="飞花 - PetalDesk 是一款 Windows 本地便签与效率工具，支持 Markdown、纯文本、截图、计时器、提醒和任务甘特图。"
+    />
+    <meta name="theme-color" content="#f7f7f5" />
+    <title>飞花 - PetalDesk｜本地便签与效率工具</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #242426;
+        --muted: #656567;
+        --line: #d9d9d5;
+        --paper: #f7f7f5;
+        --white: #ffffff;
+        --yellow: #fff0a8;
+        --yellow-deep: #d2a500;
+        --pink: #f7d3dc;
+        --green: #d9efd4;
+        --blue: #d6e9f8;
+        --blue-action: #0875c9;
+        --blue-action-hover: #0066ae;
+        --charcoal: #2f3033;
+        --charcoal-soft: #3d3e42;
+        --red: #d95d49;
+        --max-width: 1180px;
+        font-family:
+          "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+        font-synthesis: none;
+      }
+
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+        scroll-padding-top: 78px;
+      }
+
+      body {
+        margin: 0;
+        min-width: 320px;
+        color: var(--ink);
+        background: var(--paper);
+        line-height: 1.65;
+        letter-spacing: 0;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      img {
+        display: block;
+        max-width: 100%;
+      }
+
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+
+      button,
+      a {
+        -webkit-tap-highlight-color: transparent;
+      }
+
+      :focus-visible {
+        outline: 3px solid #e7b900;
+        outline-offset: 3px;
+      }
+
+      .skip-link {
+        position: fixed;
+        top: 10px;
+        left: 10px;
+        z-index: 200;
+        padding: 8px 12px;
+        color: var(--white);
+        background: var(--charcoal);
+        transform: translateY(-180%);
+      }
+
+      .skip-link:focus {
+        transform: translateY(0);
+      }
+
+      .container {
+        width: min(calc(100% - 48px), var(--max-width));
+        margin-inline: auto;
+      }
+
+      .site-header {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        height: 68px;
+        border-bottom: 1px solid rgba(36, 36, 38, 0.12);
+        background: rgba(247, 247, 245, 0.96);
+        backdrop-filter: blur(14px);
+      }
+
+      .nav {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        height: 100%;
+        gap: 24px;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        min-width: max-content;
+        gap: 10px;
+        font-size: 20px;
+        font-weight: 800;
+      }
+
+      .brand img {
+        width: 36px;
+        height: 36px;
+        border-radius: 7px;
+      }
+
+      .nav-links {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 6px;
+        font-size: 14px;
+        font-weight: 650;
+      }
+
+      .nav-link {
+        padding: 8px 11px;
+        color: #555558;
+        border-bottom: 2px solid transparent;
+      }
+
+      .nav-link:hover {
+        color: var(--ink);
+        border-bottom-color: var(--ink);
+      }
+
+      .nav-download,
+      .primary-action,
+      .download-action {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 42px;
+        padding: 9px 17px;
+        color: var(--white);
+        background: var(--blue-action);
+        border: 1px solid var(--blue-action);
+        border-radius: 6px;
+        font-weight: 750;
+        line-height: 1.2;
+        box-shadow: 0 4px 10px rgba(8, 117, 201, 0.2);
+        transition:
+          transform 160ms ease,
+          background-color 160ms ease;
+      }
+
+      .nav-download:hover,
+      .primary-action:hover,
+      .download-action:hover {
+        background: var(--blue-action-hover);
+        transform: translateY(-1px);
+      }
+
+      .hero {
+        height: calc(100vh - 116px);
+        height: calc(100svh - 116px);
+        min-height: 0;
+        max-height: 900px;
+        overflow: hidden;
+        border-bottom: 1px solid var(--line);
+        background: var(--paper);
+      }
+
+      .hero-inner {
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+        height: 100%;
+        padding-top: 28px;
+      }
+
+      .hero-copy {
+        position: relative;
+        z-index: 2;
+        max-width: 860px;
+        margin-inline: auto;
+        text-align: center;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin: 0 0 8px;
+        color: #615126;
+        font-size: 13px;
+        font-weight: 750;
+      }
+
+      .eyebrow::before {
+        width: 22px;
+        height: 4px;
+        content: "";
+        background: var(--yellow-deep);
+      }
+
+      .hero h1 {
+        margin: 0;
+        font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+        font-size: 58px;
+        font-weight: 900;
+        line-height: 1.06;
+        letter-spacing: 0;
+      }
+
+      .hero-lead {
+        max-width: 700px;
+        margin: 10px auto 0;
+        color: #515154;
+        font-size: 18px;
+      }
+
+      .hero-actions {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 10px;
+        margin-top: 17px;
+      }
+
+      .secondary-action {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 42px;
+        padding: 9px 17px;
+        border: 1px solid #a9a9a5;
+        border-radius: 6px;
+        background: rgba(255, 255, 255, 0.62);
+        font-weight: 750;
+        line-height: 1.2;
+        transition:
+          border-color 160ms ease,
+          background-color 160ms ease;
+      }
+
+      .secondary-action:hover {
+        border-color: var(--ink);
+        background: var(--white);
+      }
+
+      .hero-visual {
+        display: flex;
+        align-items: flex-end;
+        justify-content: center;
+        min-height: 0;
+        padding-top: 22px;
+      }
+
+      .product-frame {
+        position: relative;
+        width: min(920px, 88vw);
+        max-height: 100%;
+        margin: 0;
+        overflow: hidden;
+        border: 1px solid #bfc0bc;
+        border-bottom: 0;
+        border-radius: 7px 7px 0 0;
+        background: var(--white);
+        box-shadow: 0 22px 48px rgba(36, 36, 38, 0.18);
+        animation: product-arrive 560ms ease-out both;
+      }
+
+      .product-frame::before {
+        position: absolute;
+        top: 0;
+        left: 0;
+        z-index: 1;
+        width: 100%;
+        height: 4px;
+        content: "";
+        background: #dfbe2e;
+      }
+
+      .product-frame img {
+        width: 100%;
+        height: auto;
+      }
+
+      .section-peek {
+        display: flex;
+        align-items: center;
+        height: 48px;
+        color: var(--white);
+        background: var(--charcoal);
+      }
+
+      .section-peek a {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        width: 100%;
+        font-size: 14px;
+        font-weight: 700;
+      }
+
+      .section-peek .arrow {
+        color: var(--yellow);
+        font-size: 20px;
+        line-height: 1;
+      }
+
+      .section {
+        padding-block: 112px;
+      }
+
+      .section-heading {
+        display: grid;
+        grid-template-columns: minmax(0, 0.9fr) minmax(300px, 1.1fr);
+        align-items: end;
+        gap: 56px;
+        margin-bottom: 60px;
+      }
+
+      .section-index {
+        display: block;
+        margin-bottom: 12px;
+        color: #77777a;
+        font-size: 13px;
+        font-weight: 800;
+      }
+
+      .section h2 {
+        max-width: 620px;
+        margin: 0;
+        font-size: 40px;
+        line-height: 1.24;
+        letter-spacing: 0;
+      }
+
+      .section-intro {
+        max-width: 600px;
+        margin: 0;
+        color: var(--muted);
+        font-size: 17px;
+      }
+
+      .note-features {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 1px;
+        border: 1px solid #cacac6;
+        background: #cacac6;
+      }
+
+      .note-feature {
+        min-height: 245px;
+        padding: 28px 25px;
+        background: var(--white);
+      }
+
+      .note-feature:nth-child(1) {
+        border-top: 6px solid #dfbe2e;
+      }
+
+      .note-feature:nth-child(2) {
+        border-top: 6px solid #cd7188;
+      }
+
+      .note-feature:nth-child(3) {
+        border-top: 6px solid #68a46c;
+      }
+
+      .note-feature:nth-child(4) {
+        border-top: 6px solid #5292be;
+      }
+
+      .feature-label {
+        display: block;
+        margin-bottom: 42px;
+        color: #747477;
+        font-size: 12px;
+        font-weight: 800;
+      }
+
+      .note-feature h3 {
+        margin: 0 0 10px;
+        font-size: 20px;
+        line-height: 1.35;
+      }
+
+      .note-feature p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .mode-band {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        margin-top: 36px;
+        border: 1px solid #c6c6c2;
+      }
+
+      .mode {
+        padding: 28px;
+      }
+
+      .mode + .mode {
+        border-left: 1px solid #c6c6c2;
+      }
+
+      .mode-name {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 8px;
+        font-size: 17px;
+        font-weight: 800;
+      }
+
+      .mode-mark {
+        display: inline-grid;
+        width: 30px;
+        height: 30px;
+        place-items: center;
+        border-radius: 5px;
+        font-family: Consolas, monospace;
+        font-size: 13px;
+      }
+
+      .mode:first-child .mode-mark {
+        background: var(--yellow);
+      }
+
+      .mode:last-child .mode-mark {
+        background: var(--blue);
+      }
+
+      .mode p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .tools-section {
+        color: #f5f5f3;
+        background: var(--charcoal);
+      }
+
+      .tools-section .section-index,
+      .tools-section .section-intro {
+        color: #b9b9bc;
+      }
+
+      .tool-list {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        margin-bottom: 38px;
+        border-top: 1px solid #5b5c60;
+        border-bottom: 1px solid #5b5c60;
+      }
+
+      .tool-item {
+        position: relative;
+        min-height: 180px;
+        padding: 26px 24px 28px;
+      }
+
+      .tool-item + .tool-item {
+        border-left: 1px solid #5b5c60;
+      }
+
+      .tool-number {
+        color: #a9aaad;
+        font-family: Consolas, monospace;
+        font-size: 12px;
+      }
+
+      .tool-item h3 {
+        margin: 42px 0 7px;
+        font-size: 19px;
+      }
+
+      .tool-item p {
+        margin: 0;
+        color: #c3c3c5;
+        font-size: 13px;
+      }
+
+      .tool-item:nth-child(1)::after,
+      .tool-item:nth-child(2)::after,
+      .tool-item:nth-child(3)::after,
+      .tool-item:nth-child(4)::after {
+        position: absolute;
+        top: -1px;
+        right: 20px;
+        width: 44px;
+        height: 5px;
+        content: "";
+      }
+
+      .tool-item:nth-child(1)::after {
+        background: #dfbe2e;
+      }
+
+      .tool-item:nth-child(2)::after {
+        background: #d87e93;
+      }
+
+      .tool-item:nth-child(3)::after {
+        background: #6dae73;
+      }
+
+      .tool-item:nth-child(4)::after {
+        background: #5ba0d0;
+      }
+
+      .screenshot-figure {
+        margin: 0;
+        border: 1px solid #65666a;
+        background: #191a1c;
+      }
+
+      .screenshot-figure + .screenshot-figure {
+        margin-top: 28px;
+      }
+
+      .screenshot-figure img {
+        width: 100%;
+        height: auto;
+        aspect-ratio: 16 / 9;
+        object-fit: cover;
+      }
+
+      .screenshot-figure figcaption {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        min-height: 68px;
+        padding: 14px 20px;
+        border-top: 1px solid #65666a;
+        color: #c7c7c9;
+        font-size: 13px;
+      }
+
+      .caption-title {
+        color: var(--white);
+        font-weight: 800;
+      }
+
+      .data-section {
+        background: #eff0ed;
+      }
+
+      .data-layout {
+        display: grid;
+        grid-template-columns: minmax(0, 0.95fr) minmax(360px, 1.05fr);
+        gap: 72px;
+        align-items: start;
+      }
+
+      .data-points {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        border-top: 1px solid #bcbdb9;
+      }
+
+      .data-points li {
+        display: grid;
+        grid-template-columns: 42px minmax(0, 1fr);
+        gap: 18px;
+        padding-block: 22px;
+        border-bottom: 1px solid #bcbdb9;
+      }
+
+      .data-point-number {
+        color: #707074;
+        font-family: Consolas, monospace;
+        font-size: 13px;
+        font-weight: 800;
+      }
+
+      .data-points strong {
+        display: block;
+        margin-bottom: 4px;
+      }
+
+      .data-points p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .directory-panel {
+        overflow: hidden;
+        border: 1px solid #1e1f21;
+        border-radius: 6px;
+        background: var(--charcoal);
+        box-shadow: 14px 14px 0 var(--yellow);
+      }
+
+      .directory-titlebar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        min-height: 46px;
+        padding: 10px 15px;
+        border-bottom: 1px solid #56575b;
+        color: #c9c9cb;
+        font-size: 12px;
+      }
+
+      .directory-titlebar span:last-child {
+        color: #8f9093;
+      }
+
+      .directory-panel pre {
+        margin: 0;
+        padding: 26px 22px 30px;
+        overflow-x: auto;
+        color: #f3f3f1;
+        font-family: Consolas, "Cascadia Mono", monospace;
+        font-size: 13px;
+        line-height: 1.8;
+        white-space: pre;
+      }
+
+      .directory-note {
+        margin: 28px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .install-section {
+        padding-block: 94px;
+        border-top: 1px solid #d6c25e;
+        border-bottom: 1px solid #d6c25e;
+        background: var(--yellow);
+      }
+
+      .install-layout {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 60px;
+      }
+
+      .install-section h2 {
+        margin: 0;
+        font-size: 38px;
+        line-height: 1.25;
+      }
+
+      .install-section p {
+        max-width: 680px;
+        margin: 14px 0 0;
+        color: #5c5127;
+      }
+
+      .install-actions {
+        width: min(100%, 310px);
+      }
+
+      .download-action {
+        width: 100%;
+        min-height: 52px;
+        background: var(--charcoal);
+        border-color: var(--charcoal);
+        box-shadow: 0 5px 12px rgba(36, 36, 38, 0.18);
+      }
+
+      .download-action:hover {
+        background: #171719;
+      }
+
+      .download-meta {
+        margin-top: 10px;
+        color: #665b32;
+        font-size: 12px;
+        text-align: center;
+      }
+
+      .site-footer {
+        padding-block: 32px;
+        color: #a8a8aa;
+        background: #222225;
+        font-size: 13px;
+      }
+
+      .footer-inner {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 22px;
+      }
+
+      .footer-brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 9px;
+        color: var(--white);
+        font-weight: 800;
+      }
+
+      .footer-brand img {
+        width: 28px;
+        height: 28px;
+        border-radius: 5px;
+      }
+
+      @keyframes product-arrive {
+        from {
+          opacity: 0;
+          transform: translateY(22px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      @media (max-width: 980px) {
+        .section-heading {
+          grid-template-columns: 1fr;
+          gap: 20px;
+        }
+
+        .note-features,
+        .tool-list {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .note-feature:nth-child(3),
+        .note-feature:nth-child(4) {
+          border-top-width: 6px;
+        }
+
+        .tool-item:nth-child(3) {
+          border-left: 0;
+          border-top: 1px solid #5b5c60;
+        }
+
+        .tool-item:nth-child(4) {
+          border-top: 1px solid #5b5c60;
+        }
+
+        .data-layout {
+          grid-template-columns: 1fr;
+          gap: 48px;
+        }
+
+        .directory-panel {
+          box-shadow: 10px 10px 0 var(--yellow);
+        }
+      }
+
+      @media (max-width: 760px) {
+        .container {
+          width: min(calc(100% - 30px), var(--max-width));
+        }
+
+        .site-header {
+          height: 62px;
+        }
+
+        .brand {
+          font-size: 18px;
+        }
+
+        .brand img {
+          width: 32px;
+          height: 32px;
+        }
+
+        .nav-link:nth-child(1),
+        .nav-link:nth-child(3) {
+          display: none;
+        }
+
+        .hero {
+          height: calc(100vh - 110px);
+          height: calc(100svh - 110px);
+        }
+
+        .hero-inner {
+          padding-top: 22px;
+        }
+
+        .hero h1 {
+          font-size: 45px;
+        }
+
+        .hero-lead {
+          max-width: 520px;
+          font-size: 16px;
+          line-height: 1.55;
+        }
+
+        .hero-actions {
+          margin-top: 14px;
+        }
+
+        .hero-visual {
+          padding-top: 18px;
+        }
+
+        .product-frame {
+          width: min(920px, 94vw);
+        }
+
+        .section {
+          padding-block: 78px;
+        }
+
+        .section-heading {
+          margin-bottom: 38px;
+        }
+
+        .section h2,
+        .install-section h2 {
+          font-size: 31px;
+        }
+
+        .section-intro {
+          font-size: 15px;
+        }
+
+        .mode-band {
+          grid-template-columns: 1fr;
+        }
+
+        .mode + .mode {
+          border-top: 1px solid #c6c6c2;
+          border-left: 0;
+        }
+
+        .screenshot-figure figcaption {
+          align-items: flex-start;
+          flex-direction: column;
+          gap: 4px;
+        }
+
+        .install-layout {
+          grid-template-columns: 1fr;
+          gap: 34px;
+        }
+
+        .install-actions {
+          width: 100%;
+        }
+
+        .footer-inner {
+          align-items: flex-start;
+          flex-direction: column;
+        }
+      }
+
+      @media (max-width: 560px) {
+        .nav {
+          gap: 10px;
+        }
+
+        .brand {
+          gap: 8px;
+          font-size: 16px;
+        }
+
+        .brand img {
+          width: 28px;
+          height: 28px;
+        }
+
+        .nav-links {
+          gap: 2px;
+        }
+
+        .nav-link {
+          display: none;
+        }
+
+        .nav-download {
+          min-height: 38px;
+          padding-inline: 10px;
+          font-size: 12px;
+        }
+
+        .hero-inner {
+          padding-top: 17px;
+        }
+
+        .eyebrow {
+          margin-bottom: 5px;
+          font-size: 12px;
+        }
+
+        .hero h1 {
+          font-size: 40px;
+        }
+
+        .hero-lead {
+          margin-top: 7px;
+          font-size: 14px;
+        }
+
+        .hero-actions {
+          gap: 8px;
+          margin-top: 11px;
+        }
+
+        .primary-action,
+        .secondary-action {
+          min-height: 39px;
+          padding: 8px 13px;
+          font-size: 13px;
+        }
+
+        .hero-visual {
+          padding-top: 14px;
+        }
+
+        .section-peek {
+          height: 48px;
+        }
+
+        .section-peek a {
+          font-size: 12px;
+        }
+
+        .section {
+          padding-block: 64px;
+        }
+
+        .section h2,
+        .install-section h2 {
+          font-size: 27px;
+        }
+
+        .note-features,
+        .tool-list {
+          grid-template-columns: 1fr;
+        }
+
+        .note-feature {
+          min-height: 0;
+          padding: 23px 20px;
+        }
+
+        .feature-label {
+          margin-bottom: 24px;
+        }
+
+        .tool-item {
+          min-height: 150px;
+        }
+
+        .tool-item + .tool-item {
+          border-top: 1px solid #5b5c60;
+          border-left: 0;
+        }
+
+        .tool-item h3 {
+          margin-top: 28px;
+        }
+
+        .mode {
+          padding: 22px 20px;
+        }
+
+        .data-layout {
+          gap: 36px;
+        }
+
+        .directory-panel {
+          max-width: calc(100% - 8px);
+          box-shadow: 8px 8px 0 var(--yellow);
+        }
+
+        .directory-titlebar span:last-child {
+          display: none;
+        }
+
+        .directory-panel pre {
+          padding: 20px 16px 24px;
+          font-size: 11px;
+        }
+
+        .install-section {
+          padding-block: 68px;
+        }
+      }
+
+      @media (max-height: 650px) and (min-width: 761px) {
+        .hero-inner {
+          padding-top: 15px;
+        }
+
+        .hero h1 {
+          font-size: 44px;
+        }
+
+        .hero-lead {
+          margin-top: 4px;
+          font-size: 15px;
+        }
+
+        .hero-actions {
+          margin-top: 10px;
+        }
+
+        .hero-visual {
+          padding-top: 12px;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          scroll-behavior: auto !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+          transition-duration: 0.01ms !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">跳到主要内容</a>
+
+    <header class="site-header">
+      <nav class="nav container" aria-label="主导航">
+        <a class="brand" href="#top" aria-label="飞花 - PetalDesk 首页">
+          <img src="../static/app-icon.svg" alt="" width="36" height="36" />
+          <span>飞花 - PetalDesk</span>
+        </a>
+        <div class="nav-links">
+          <a class="nav-link" href="#notes">便签</a>
+          <a class="nav-link" href="#tools">小工具</a>
+          <a class="nav-link" href="#data">本地数据</a>
+          <a
+            class="nav-download"
+            href="https://github.com/starsliao/PetalDesk/releases/download/v0.2.1/PetalDesk_0.2.1_x64-setup.exe"
+            download
+          >下载 0.2.1</a>
+        </div>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero" id="top" aria-labelledby="hero-title">
+        <div class="hero-inner container">
+          <div class="hero-copy">
+            <p class="eyebrow">Windows 本地便签与效率工具</p>
+            <h1 id="hero-title">飞花 - PetalDesk</h1>
+            <p class="hero-lead">
+              让 Markdown 像普通文字一样自然，也让截图、提醒与任务安排留在一个安静的桌面空间里。
+            </p>
+            <div class="hero-actions">
+              <a
+                class="primary-action"
+                href="https://github.com/starsliao/PetalDesk/releases/download/v0.2.1/PetalDesk_0.2.1_x64-setup.exe"
+                download
+              >下载 Windows 版 0.2.1</a>
+              <a class="secondary-action" href="#notes">查看功能</a>
+            </div>
+          </div>
+          <div class="hero-visual">
+            <figure class="product-frame">
+              <img
+                src="../artifacts/main-window-0.2.1.png"
+                alt="飞花 - PetalDesk 0.2.1 主界面，展示黄色、绿色和蓝色本地便签"
+                width="1360"
+                height="820"
+              />
+            </figure>
+          </div>
+        </div>
+      </section>
+
+      <div class="section-peek">
+        <div class="container">
+          <a href="#notes">
+            <span>一张便签，从记下当下开始</span>
+            <span class="arrow" aria-hidden="true">↓</span>
+          </a>
+        </div>
+      </div>
+
+      <section class="section notes-section" id="notes" aria-labelledby="notes-title">
+        <div class="container">
+          <div class="section-heading">
+            <div>
+              <span class="section-index">01 / 便签</span>
+              <h2 id="notes-title">简洁是外表，顺手才是日常。</h2>
+            </div>
+            <p class="section-intro">
+              便签可以独立打开、移动、缩放和置顶。主界面支持拖动手柄手动排列，新建便签追加在末尾，置顶时移到第一位；每一张的颜色、编辑样式与只读状态也都彼此独立。
+            </p>
+          </div>
+
+          <div class="note-features">
+            <article class="note-feature">
+              <span class="feature-label">MARKDOWN</span>
+              <h3>所见即所得</h3>
+              <p>输入 Markdown 即时排版，保留源码切换、快捷格式、高亮、图片与可跳转链接。</p>
+            </article>
+            <article class="note-feature">
+              <span class="feature-label">COLOR</span>
+              <h3>一眼分清内容</h3>
+              <p>黄色、粉色、蓝色、绿色、紫色、灰色与炭笔色，让不同用途自然形成视觉分区。</p>
+            </article>
+            <article class="note-feature">
+              <span class="feature-label">WINDOW</span>
+              <h3>每张都是独立窗口</h3>
+              <p>移动、缩放或从托盘快速召回；列表顺序可手动调整，双击托盘图标直接打开第一张。</p>
+            </article>
+            <article class="note-feature">
+              <span class="feature-label">FOCUS</span>
+              <h3>只读时只看内容</h3>
+              <p>一键隐藏工具栏并锁定正文与标题，查阅资料时不再担心误触修改。</p>
+            </article>
+          </div>
+
+          <div class="mode-band" aria-label="编辑模式">
+            <div class="mode">
+              <div class="mode-name"><span class="mode-mark">M↓</span>Markdown</div>
+              <p>适合结构化记录、清单、代码片段与图片笔记；排版结果直接留在编辑位置。</p>
+            </div>
+            <div class="mode">
+              <div class="mode-name"><span class="mode-mark">TXT</span>纯文本</div>
+              <p>适合快速摘录与临时草稿；不解析语法，只保留稳定的文字输入、查找和撤回重做。</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section tools-section" id="tools" aria-labelledby="tools-title">
+        <div class="container">
+          <div class="section-heading">
+            <div>
+              <span class="section-index">02 / 小工具</span>
+              <h2 id="tools-title">需要时出现，完成后退到一旁。</h2>
+            </div>
+            <p class="section-intro">
+              从托盘或便签窗口随时打开。计时、提醒、任务规划和截图各自专注，不把主界面变成拥挤的控制台。
+            </p>
+          </div>
+
+          <div class="tool-list">
+            <article class="tool-item">
+              <span class="tool-number">01</span>
+              <h3>计时器</h3>
+              <p>透明电子数字、暂停与重置记录，位置、大小和透明度都能记住。</p>
+            </article>
+            <article class="tool-item">
+              <span class="tool-number">02</span>
+              <h3>提醒</h3>
+              <p>支持一次、间隔以及日、周、月、年周期，到点发送 Windows 通知。</p>
+            </article>
+            <article class="tool-item">
+              <span class="tool-number">03</span>
+              <h3>任务甘特图</h3>
+              <p>拖动排序、进度筛选与时间轴缩放，从小时细节看到长期安排。</p>
+            </article>
+            <article class="tool-item">
+              <span class="tool-number">04</span>
+              <h3>截图</h3>
+              <p>快捷键唤起，框选后直接标注、复制、保存或置顶成贴图。</p>
+            </article>
+          </div>
+
+          <figure class="screenshot-figure">
+            <img
+              src="../artifacts/gantt-tool.png"
+              alt="飞花 - PetalDesk 任务甘特图展示七项任务的完成状态、进度和时间安排"
+              width="1280"
+              height="720"
+              loading="lazy"
+            />
+            <figcaption>
+              <span class="caption-title">任务进度与时间范围一览</span>
+              <span>状态筛选、拖动排序、小时级缩放与日期范围调整</span>
+            </figcaption>
+          </figure>
+
+          <figure class="screenshot-figure">
+            <img
+              src="../artifacts/screenshot-tool-final.png"
+              alt="飞花 - PetalDesk 截图工具正在框选产品演示页面，显示标注工具栏、像素尺寸与取色放大镜"
+              width="1920"
+              height="1080"
+              loading="lazy"
+            />
+            <figcaption>
+              <span class="caption-title">完整的截图与标注流程</span>
+              <span>矩形、箭头、画笔、马克笔、文字、马赛克、模糊、橡皮擦、撤销与重做</span>
+            </figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section class="section data-section" id="data" aria-labelledby="data-title">
+        <div class="container">
+          <div class="section-heading">
+            <div>
+              <span class="section-index">03 / 本地数据</span>
+              <h2 id="data-title">你的内容，始终是你能看见的文件。</h2>
+            </div>
+            <p class="section-intro">
+              飞花 - PetalDesk 把便签、附件、设置和小工具数据统一放进“飞花 - PetalDesk 数据存储”。换电脑时复制整个目录，再指定它即可继续使用。
+            </p>
+          </div>
+
+          <div class="data-layout">
+            <ol class="data-points">
+              <li>
+                <span class="data-point-number">01</span>
+                <div>
+                  <strong>标准 Markdown 正文</strong>
+                  <p>每张便签以 note.md 保存，图片放在对应 assets 目录，不依赖专有数据库才能读取。</p>
+                </div>
+              </li>
+              <li>
+                <span class="data-point-number">02</span>
+                <div>
+                  <strong>一个目录完成迁移</strong>
+                  <p>复制完整的飞花 - PetalDesk 数据存储目录，在新电脑安装时或设置中选择该路径。</p>
+                </div>
+              </li>
+              <li>
+                <span class="data-point-number">03</span>
+                <div>
+                  <strong>自动保存与恢复</strong>
+                  <p>临时文件、日志、备份与回收站共同保护内容，搜索索引可以从 Markdown 重新构建。</p>
+                </div>
+              </li>
+            </ol>
+
+            <div>
+              <div class="directory-panel">
+                <div class="directory-titlebar">
+                  <span>文档\PetalDesk</span>
+                  <span>可在安装或设置中修改</span>
+                </div>
+                <pre aria-label="飞花 - PetalDesk 数据存储目录结构">PetalDesk/
+└─ .petaldesk/
+   ├─ notes/
+   │  └─ &lt;note-id&gt;/
+   │     ├─ note.md
+   │     ├─ meta.json
+   │     └─ assets/
+   ├─ tools/
+   ├─ state/
+   │  ├─ note-order.json
+   │  └─ windows.json
+   ├─ backups/
+   ├─ journal/
+   ├─ trash/
+   └─ conflicts/</pre>
+              </div>
+              <p class="directory-note">
+                `%LOCALAPPDATA%\PetalDesk` 只保存当前数据目录指针、可重建索引和调试日志，不属于需要迁移的业务内容。
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="install-section" id="download" aria-labelledby="download-title">
+        <div class="container install-layout">
+          <div>
+            <h2 id="download-title">现在，把飞花 - PetalDesk 放到桌面。</h2>
+            <p>
+              安装器会先检查 WebView2；缺少时从微软官方地址联网下载，显示进度并静默安装，完成后再继续安装飞花 - PetalDesk。
+            </p>
+          </div>
+          <div class="install-actions">
+            <a
+              class="download-action"
+              href="https://github.com/starsliao/PetalDesk/releases/download/v0.2.1/PetalDesk_0.2.1_x64-setup.exe"
+              download
+            >下载飞花 - PetalDesk 0.2.1</a>
+            <div class="download-meta">Windows 10 / 11 · x64 · 联网安装包</div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="container footer-inner">
+        <div class="footer-brand">
+          <img src="../static/app-icon.svg" alt="" width="28" height="28" />
+          <span>飞花 - PetalDesk</span>
+        </div>
+        <span>本地优先 · 数据可见 · Windows 桌面体验</span>
+      </div>
+    </footer>
+  </body>
+</html>

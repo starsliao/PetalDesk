@@ -1,0 +1,60 @@
+[package]
+name = "petaldesk"
+version = "0.2.1"
+description = "飞花 - PetalDesk local Markdown notes and desktop tools"
+authors = ["飞花 - PetalDesk contributors"]
+edition = "2021"
+
+[features]
+# Production builds must serve the bundled frontend through Tauri's custom
+# protocol. `tauri dev` disables default features and keeps using `devUrl`.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "petaldesk_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+serde_json = "1"
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-notification = "=2.3.3"
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
+# Keep the notification stack compatible with the repository's Rust 1.88 toolchain.
+notify-rust = "=4.17.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+infer = "0.19"
+mime_guess = "2"
+pulldown-cmark = "0.13"
+rusqlite = { version = "0.37", features = ["bundled"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+png = "0.17"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
+  "Win32_Storage_FileSystem",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3"
