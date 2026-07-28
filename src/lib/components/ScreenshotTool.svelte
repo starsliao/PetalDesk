@@ -803,6 +803,16 @@
     void exportImage("copy");
   }
 
+  function handleContextMenu(event: MouseEvent): void {
+    const hasUsableSelection = !!selection && selection.width >= 1 && selection.height >= 1;
+    const pointIsInsideSelection = hasUsableSelection && !!session && hitTestSelection(stagePoint(event));
+    if (pointIsInsideSelection) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    void cancel();
+  }
+
   function selectionPath(): string {
     if (!session || !selection) return "";
     const { frameWidth: width, frameHeight: height } = session;
@@ -904,6 +914,16 @@
     if (session && sourceImage && (!requestedSessionId || requestedSessionId === session.id)) {
       loading = false;
       error = "";
+      if (requestedSessionId) {
+        try {
+          await tick();
+          updateViewport();
+          renderNow();
+          await api.present(session.id);
+        } catch (value) {
+          reportError(value);
+        }
+      }
       stageElement?.focus();
       return;
     }
@@ -912,6 +932,7 @@
     busy = false;
     error = "";
     if (requestedSessionId) pendingSessionId = requestedSessionId;
+    let frameSessionId = requestedSessionId;
     try {
       const loadedSession = await withTimeout(
         api.getSession(requestedSessionId),
@@ -924,6 +945,7 @@
         return;
       }
       pendingSessionId = loadedSession.id;
+      frameSessionId = loadedSession.id;
       const settingsPromise = withTimeout(
         api.getSettings(),
         Math.min(2_000, loadTimeoutMs),
@@ -944,7 +966,6 @@
       releaseSourceImage();
       resetEditor();
       session = loadedSession;
-      pendingSessionId = null;
       sourceImage = image;
       sourcePng = frame;
       toolSettings = { ...DEFAULT_TOOL_SETTINGS, ...(settings?.toolParameters ?? {}) };
@@ -964,18 +985,30 @@
       loading = false;
       await tick();
       updateViewport();
-      stageElement.focus();
       renderNow();
+      await api.present(loadedSession.id);
+      if (componentDisposed || generation !== loadGeneration) return;
+      pendingSessionId = null;
+      stageElement.focus();
       scheduleWindowGeometryValidation?.();
     } catch (value) {
       if (componentDisposed || generation !== loadGeneration) return;
       loading = false;
       reportError(value);
+      await tick();
+      if (frameSessionId && !componentDisposed && generation === loadGeneration) {
+        try {
+          renderNow();
+          await api.present(frameSessionId);
+        } catch {
+          // The original error remains the actionable message for the user.
+        }
+      }
     }
   }
 
   function requestLoad(requestedSessionId?: string): void {
-    if (session && sourceImage && (!requestedSessionId || requestedSessionId === session.id)) {
+    if (session && sourceImage && !requestedSessionId) {
       loading = false;
       error = "";
       stageElement?.focus();
@@ -1130,6 +1163,7 @@
   onpointerup={handlePointerUp}
   onpointercancel={handlePointerCancel}
   ondblclick={handleDoubleClick}
+  oncontextmenu={handleContextMenu}
   onpointerleave={() => { if (!interaction) { hoverPoint = null; hoverCss = null; } }}
 >
   <canvas class="source-canvas" bind:this={sourceCanvas} aria-hidden="true"></canvas>

@@ -17,6 +17,7 @@ $makensis = Join-Path $env:LOCALAPPDATA "tauri\NSIS\makensis.exe"
 $configPath = Join-Path $tauriRoot "tauri.conf.json"
 $storagePathHooks = Join-Path $tauriRoot "nsis\storage-path.nsh"
 $installerDisplayName = "飞花 - PetalDesk"
+$desktopShortcutName = "飞花"
 
 function Invoke-CheckedCommand {
     param(
@@ -359,10 +360,12 @@ if (-not $installerText.Contains("storage-path.nsh")) {
 }
 
 # Keep Tauri's productName as the stable internal identity. Only replace NSIS
-# presentation fields so install paths, registry keys, shortcuts, executable
-# names, and the final installer filename remain PetalDesk-compatible.
+# presentation fields; install paths, registry keys, executable names, and the
+# final installer filename remain PetalDesk-compatible. The desktop shortcut is
+# handled separately below and is intentionally presented as “飞花”.
 $productNameDefine = "!define PRODUCTNAME `"$($config.productName)`""
 $displayNameDefine = "!define PETALDESK_DISPLAYNAME `"$installerDisplayName`""
+$shortcutNameDefine = "!define PETALDESK_SHORTCUTNAME `"$desktopShortcutName`""
 $productNameDefineCount = ([regex]::Matches(
     $installerText,
     [regex]::Escape($productNameDefine)
@@ -372,7 +375,11 @@ if ($productNameDefineCount -ne 1) {
 }
 $installerText = $installerText.Replace(
     $productNameDefine,
-    "$productNameDefine$([Environment]::NewLine)$displayNameDefine"
+    @(
+        $productNameDefine,
+        $displayNameDefine,
+        $shortcutNameDefine
+    ) -join [Environment]::NewLine
 )
 
 $displayNameReplacements = @(
@@ -418,6 +425,70 @@ foreach ($replacement in $displayNameReplacements) {
     }
     $installerText = $installerText.Replace($replacement.Find, $replacement.Replace)
 }
+
+# Keep PetalDesk as the internal product identity while presenting the desktop
+# shortcut with the concise Chinese name requested by the application UI.
+$desktopShortcutReference = '$DESKTOP\${PRODUCTNAME}.lnk'
+$desktopShortcutReplacement = '$DESKTOP\${PETALDESK_SHORTCUTNAME}.lnk'
+$desktopShortcutReferenceCount = ([regex]::Matches(
+    $installerText,
+    [regex]::Escape($desktopShortcutReference)
+)).Count
+if ($desktopShortcutReferenceCount -ne 7) {
+    throw "无法完整定位 NSIS 桌面快捷方式路径（期望 7，实际 $desktopShortcutReferenceCount）。"
+}
+$installerText = $installerText.Replace(
+    $desktopShortcutReference,
+    $desktopShortcutReplacement
+)
+
+# Upgrade an existing PetalDesk.lnk in place even when the installer is running
+# in update mode. The target check avoids touching an unrelated shortcut that
+# happens to have the same filename.
+$desktopShortcutFunction = 'Function CreateOrUpdateDesktopShortcut'
+$desktopShortcutFunctionCount = ([regex]::Matches(
+    $installerText,
+    [regex]::Escape($desktopShortcutFunction)
+)).Count
+if ($desktopShortcutFunctionCount -ne 1) {
+    throw "无法唯一定位 NSIS 桌面快捷方式函数。"
+}
+$desktopShortcutMigration = @'
+Function MigrateLegacyDesktopShortcutName
+  !insertmacro IsShortcutTarget "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
+  Pop $0
+  ${If} $0 <> 1
+  ${AndIf} $OldMainBinaryName != ""
+    !insertmacro IsShortcutTarget "$DESKTOP\${PRODUCTNAME}.lnk" "$INSTDIR\$OldMainBinaryName"
+    Pop $0
+  ${EndIf}
+  ${If} $0 = 1
+    !insertmacro UnpinShortcut "$DESKTOP\${PRODUCTNAME}.lnk"
+    Delete "$DESKTOP\${PRODUCTNAME}.lnk"
+    CreateShortcut "$DESKTOP\${PETALDESK_SHORTCUTNAME}.lnk" "$INSTDIR\${MAINBINARYNAME}.exe"
+    !insertmacro SetLnkAppUserModelId "$DESKTOP\${PETALDESK_SHORTCUTNAME}.lnk"
+  ${EndIf}
+FunctionEnd
+
+Function CreateOrUpdateDesktopShortcut
+'@
+$installerText = $installerText.Replace(
+    $desktopShortcutFunction,
+    $desktopShortcutMigration.TrimEnd()
+)
+
+$startMenuShortcutAnchor = '  ; Create start menu shortcut'
+$startMenuShortcutAnchorCount = ([regex]::Matches(
+    $installerText,
+    [regex]::Escape($startMenuShortcutAnchor)
+)).Count
+if ($startMenuShortcutAnchorCount -ne 1) {
+    throw "无法唯一定位 NSIS 开始菜单快捷方式创建位置。"
+}
+$installerText = $installerText.Replace(
+    $startMenuShortcutAnchor,
+    "  Call MigrateLegacyDesktopShortcutName$([Environment]::NewLine)$([Environment]::NewLine)$startMenuShortcutAnchor"
+)
 
 $languageFiles = @(
     (Join-Path $nsisDir "SimpChinese.nsh"),

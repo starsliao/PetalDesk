@@ -538,6 +538,7 @@ pub fn run() {
             screenshot::start_screenshot_capture,
             screenshot::get_screenshot_session,
             screenshot::get_screenshot_frame,
+            screenshot::present_screenshot_capture,
             screenshot::cancel_screenshot_capture,
             screenshot::prepare_screenshot_export,
             screenshot::commit_screenshot_export,

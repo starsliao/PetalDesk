@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_TOOL_SETTINGS, type ScreenshotApi } from "../screenshot";
 import ScreenshotTool from "./ScreenshotTool.svelte";
 
+const drawImageSpy = vi.fn();
+
 class TestImageBitmap {
   width = 800;
   height = 600;
@@ -16,7 +18,7 @@ function canvasContext(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
     restore: vi.fn(),
     setTransform: vi.fn(),
     clearRect: vi.fn(),
-    drawImage: vi.fn(),
+    drawImage: drawImageSpy,
     getImageData: vi.fn(() => ({ data: Uint8ClampedArray.from([18, 52, 86, 255]) })),
     beginPath: vi.fn(),
     closePath: vi.fn(),
@@ -50,7 +52,7 @@ function canvasContext(canvas: HTMLCanvasElement): CanvasRenderingContext2D {
   } as unknown as CanvasRenderingContext2D;
 }
 
-function mockApi(): ScreenshotApi & Record<"exportPng" | "saveToolSettings", ReturnType<typeof vi.fn>> {
+function mockApi(): ScreenshotApi & Record<"present" | "exportPng" | "saveToolSettings", ReturnType<typeof vi.fn>> {
   return {
     getSession: vi.fn().mockResolvedValue({
       id: "session-1",
@@ -60,6 +62,7 @@ function mockApi(): ScreenshotApi & Record<"exportPng" | "saveToolSettings", Ret
       capturedAt: "2026-07-27T01:02:03Z",
     }),
     getFrame: vi.fn().mockResolvedValue(Uint8Array.from([137, 80, 78, 71])),
+    present: vi.fn().mockResolvedValue(undefined),
     cancel: vi.fn().mockResolvedValue(undefined),
     getSettings: vi.fn().mockResolvedValue({
       schemaVersion: 1,
@@ -75,6 +78,7 @@ function mockApi(): ScreenshotApi & Record<"exportPng" | "saveToolSettings", Ret
 }
 
 beforeEach(() => {
+  drawImageSpy.mockReset();
   vi.stubGlobal("ImageBitmap", TestImageBitmap);
   vi.stubGlobal("createImageBitmap", vi.fn().mockResolvedValue(new TestImageBitmap()));
   vi.stubGlobal("ResizeObserver", class {
@@ -109,6 +113,23 @@ afterEach(() => {
 });
 
 describe("ScreenshotTool", () => {
+  it("keeps the native window hidden until the screenshot frame is painted", async () => {
+    const api = mockApi();
+    let resolveFrame: ((frame: Uint8Array) => void) | undefined;
+    api.getFrame = vi.fn(() => new Promise<Uint8Array>((resolve) => {
+      resolveFrame = resolve;
+    }));
+    render(ScreenshotTool, { api });
+
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalledWith("session-1"));
+    expect(api.present).not.toHaveBeenCalled();
+
+    resolveFrame?.(Uint8Array.from([137, 80, 78, 71]));
+    await waitFor(() => expect(api.present).toHaveBeenCalledWith("session-1"));
+    expect(drawImageSpy).toHaveBeenCalled();
+    expect(drawImageSpy.mock.invocationCallOrder[0]).toBeLessThan(api.present.mock.invocationCallOrder[0]);
+  });
+
   it("keeps the selection resizable after annotation without changing annotation history", async () => {
     const api = mockApi();
     const rendered = render(ScreenshotTool, { api });
@@ -156,6 +177,7 @@ describe("ScreenshotTool", () => {
     await waitFor(() => expect(rendered.getByText("无法开始截图")).toBeInTheDocument());
     expect(rendered.getByText("读取截图画面超时，请重试截图。")).toBeInTheDocument();
     expect(rendered.getByRole("button", { name: "重试" })).toBeInTheDocument();
+    await waitFor(() => expect(api.present).toHaveBeenCalledWith("session-1"));
 
     await fireEvent.click(rendered.getByRole("button", { name: "关闭" }));
     await waitFor(() => expect(api.cancel).toHaveBeenCalledWith("session-1"));
@@ -222,5 +244,54 @@ describe("ScreenshotTool", () => {
       expect.any(Uint8Array),
     ));
     expect(rendered.getByRole("button", { name: "撤销" })).toBeDisabled();
+  });
+
+  it("cancels when right-clicking before a selection is created", async () => {
+    const api = mockApi();
+    const rendered = render(ScreenshotTool, { api });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    const contextMenu = new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: 300,
+      clientY: 240,
+    });
+    stage.dispatchEvent(contextMenu);
+
+    expect(contextMenu.defaultPrevented).toBe(true);
+    await waitFor(() => expect(api.cancel).toHaveBeenCalledWith("session-1"));
+  });
+
+  it("cancels outside the selection but preserves the existing menu inside it", async () => {
+    const api = mockApi();
+    const rendered = render(ScreenshotTool, { api });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+
+    const insideContextMenu = new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: 300,
+      clientY: 250,
+    });
+    stage.dispatchEvent(insideContextMenu);
+    expect(insideContextMenu.defaultPrevented).toBe(false);
+    expect(api.cancel).not.toHaveBeenCalled();
+
+    const outsideContextMenu = new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: 700,
+      clientY: 500,
+    });
+    stage.dispatchEvent(outsideContextMenu);
+    expect(outsideContextMenu.defaultPrevented).toBe(true);
+    await waitFor(() => expect(api.cancel).toHaveBeenCalledWith("session-1"));
   });
 });

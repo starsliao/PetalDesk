@@ -5,9 +5,7 @@ on:
     branches:
       - main
     paths:
-      - "docs/**"
-      - "artifacts/**"
-      - "static/app-icon.svg"
+      - "website/**"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -25,25 +23,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Prepare static website
         shell: bash
         run: |
-          mkdir -p _site/static _site/artifacts
-          sed \
-            -e 's#\.\./static/#./static/#g' \
-            -e 's#\.\./artifacts/#./artifacts/#g' \
-            docs/index.html > _site/index.html
-          cp static/app-icon.svg _site/static/app-icon.svg
-          cp artifacts/*.png _site/artifacts/
+          mkdir -p _site
+          cp -R website/. _site/
           touch _site/.nojekyll
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: _site
 
@@ -56,4 +49,4 @@ jobs:
     steps:
       - name: Deploy GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

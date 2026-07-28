@@ -193,6 +193,7 @@ export interface ScreenshotExportResult {
 export interface ScreenshotApi {
   getSession(sessionId?: string): Promise<ScreenshotSession | null>;
   getFrame(sessionId: string): Promise<Uint8Array>;
+  present(sessionId: string): Promise<void>;
   cancel(sessionId?: string): Promise<void>;
   getSettings(): Promise<ScreenshotSettings>;
   setShortcut(shortcut: string): Promise<ScreenshotSettings>;

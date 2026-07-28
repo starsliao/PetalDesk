@@ -75,6 +75,10 @@ export const screenshotApi: ScreenshotApi = {
     }
   },
 
+  async present(sessionId: string): Promise<void> {
+    await command<void>("present_screenshot_capture", { sessionId });
+  },
+
   async cancel(sessionId?: string): Promise<void> {
     await command<void>("cancel_screenshot_capture", { sessionId });
   },

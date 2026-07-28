@@ -8,6 +8,7 @@
       content="飞花 - PetalDesk 是一款 Windows 本地便签与效率工具，支持 Markdown、纯文本、截图、计时器、提醒和任务甘特图。"
     />
     <meta name="theme-color" content="#f7f7f5" />
+    <link rel="icon" href="./assets/app-icon.svg" type="image/svg+xml" />
     <title>飞花 - PetalDesk｜本地便签与效率工具</title>
     <style>
       :root {
@@ -145,6 +146,76 @@
       .nav-link:hover {
         color: var(--ink);
         border-bottom-color: var(--ink);
+      }
+
+      .github-nav-link {
+        display: none;
+        align-items: center;
+        justify-content: center;
+        width: 36px;
+        height: 36px;
+        flex: 0 0 auto;
+        color: var(--white);
+        background: #24292f;
+        border: 1px solid #24292f;
+        border-radius: 50%;
+        transition:
+          transform 160ms ease,
+          background-color 160ms ease;
+      }
+
+      .github-nav-link:hover {
+        background: #111820;
+        transform: translateY(-1px);
+      }
+
+      .github-nav-link svg {
+        width: 18px;
+        height: 18px;
+      }
+
+      .github-ribbon {
+        position: fixed;
+        top: 68px;
+        right: 0;
+        z-index: 90;
+        width: 156px;
+        height: 156px;
+        overflow: hidden;
+        pointer-events: none;
+      }
+
+      .github-ribbon-link {
+        position: absolute;
+        top: 31px;
+        right: -53px;
+        display: block;
+        width: 210px;
+        padding: 9px 0 8px;
+        color: var(--white);
+        background: #24292f;
+        border-top: 1px dashed rgba(255, 255, 255, 0.78);
+        border-bottom: 1px dashed rgba(255, 255, 255, 0.78);
+        box-shadow: 0 4px 12px rgba(36, 36, 38, 0.24);
+        font-size: 13px;
+        font-weight: 800;
+        line-height: 1.2;
+        text-align: center;
+        transform: rotate(45deg);
+        transition:
+          background-color 160ms ease,
+          box-shadow 160ms ease;
+        pointer-events: auto;
+      }
+
+      .github-ribbon-link:hover {
+        background: #111820;
+        box-shadow: 0 5px 15px rgba(36, 36, 38, 0.32);
+      }
+
+      .github-ribbon-link:focus-visible {
+        outline: 3px solid #e7b900;
+        outline-offset: -3px;
       }
 
       .nav-download,
@@ -328,7 +399,7 @@
 
       .section-heading {
         display: grid;
-        grid-template-columns: minmax(0, 0.9fr) minmax(300px, 1.1fr);
+        grid-template-columns: minmax(460px, 0.9fr) minmax(300px, 1.1fr);
         align-items: end;
         gap: 56px;
         margin-bottom: 60px;
@@ -348,6 +419,11 @@
         font-size: 40px;
         line-height: 1.24;
         letter-spacing: 0;
+      }
+
+      .section-title-line {
+        display: block;
+        white-space: nowrap;
       }
 
       .section-intro {
@@ -450,6 +526,62 @@
       }
 
       .mode p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .note-editor-figure {
+        display: grid;
+        grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr);
+        margin: 36px 0 0;
+        border: 1px solid #c6c6c2;
+        background: #f1f1ed;
+      }
+
+      .note-editor-shot {
+        display: grid;
+        min-width: 0;
+        padding: 34px 42px 42px;
+        place-items: center;
+        background:
+          linear-gradient(135deg, rgb(255 255 255 / 72%), transparent 52%),
+          #e7e8e3;
+      }
+
+      .note-editor-shot img {
+        display: block;
+        width: min(100%, 594px);
+        height: auto;
+        border: 1px solid rgb(64 64 65 / 18%);
+        box-shadow: 15px 15px 0 #d0d1cc;
+      }
+
+      .note-editor-figure figcaption {
+        display: flex;
+        align-items: flex-start;
+        flex-direction: column;
+        justify-content: center;
+        gap: 12px;
+        padding: 38px 34px;
+        border-left: 1px solid #c6c6c2;
+      }
+
+      .note-editor-kicker {
+        color: #77777a;
+        font-family: Consolas, monospace;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+      }
+
+      .note-editor-figure .caption-title {
+        color: var(--ink);
+        font-size: 23px;
+        line-height: 1.35;
+      }
+
+      .note-editor-figure figcaption p {
         margin: 0;
         color: var(--muted);
         font-size: 14px;
@@ -770,6 +902,20 @@
       }
 
       @media (max-width: 760px) {
+        .github-ribbon {
+          top: 62px;
+          width: 126px;
+          height: 126px;
+        }
+
+        .github-ribbon-link {
+          top: 25px;
+          right: -48px;
+          width: 172px;
+          padding-block: 7px;
+          font-size: 11px;
+        }
+
         .container {
           width: min(calc(100% - 30px), var(--max-width));
         }
@@ -849,6 +995,19 @@
           border-left: 0;
         }
 
+        .note-editor-figure {
+          grid-template-columns: 1fr;
+        }
+
+        .note-editor-shot {
+          padding: 26px 34px 34px;
+        }
+
+        .note-editor-figure figcaption {
+          border-top: 1px solid #c6c6c2;
+          border-left: 0;
+        }
+
         .screenshot-figure figcaption {
           align-items: flex-start;
           flex-direction: column;
@@ -871,6 +1030,14 @@
       }
 
       @media (max-width: 560px) {
+        .github-ribbon {
+          display: none;
+        }
+
+        .github-nav-link {
+          display: inline-flex;
+        }
+
         .nav {
           gap: 10px;
         }
@@ -981,6 +1148,18 @@
           padding: 22px 20px;
         }
 
+        .note-editor-shot {
+          padding: 18px 20px 26px;
+        }
+
+        .note-editor-shot img {
+          box-shadow: 9px 9px 0 #d0d1cc;
+        }
+
+        .note-editor-figure figcaption {
+          padding: 26px 22px;
+        }
+
         .data-layout {
           gap: 36px;
         }
@@ -1001,6 +1180,16 @@
 
         .install-section {
           padding-block: 68px;
+        }
+      }
+
+      @media (max-width: 340px) {
+        .brand span {
+          display: none;
+        }
+
+        .section h2 {
+          font-size: 25px;
         }
       }
 
@@ -1045,17 +1234,42 @@
   </head>
   <body>
     <a class="skip-link" href="#main">跳到主要内容</a>
+    <div class="github-ribbon">
+      <a
+        class="github-ribbon-link"
+        href="https://github.com/starsliao/PetalDesk"
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-label="在新窗口打开 PetalDesk GitHub 仓库"
+        lang="en"
+      >Fork me on GitHub</a>
+    </div>
 
     <header class="site-header">
       <nav class="nav container" aria-label="主导航">
         <a class="brand" href="#top" aria-label="飞花 - PetalDesk 首页">
-          <img src="../static/app-icon.svg" alt="" width="36" height="36" />
+          <img src="./assets/app-icon.svg" alt="" width="36" height="36" />
           <span>飞花 - PetalDesk</span>
         </a>
         <div class="nav-links">
           <a class="nav-link" href="#notes">便签</a>
           <a class="nav-link" href="#tools">小工具</a>
           <a class="nav-link" href="#data">本地数据</a>
+          <a
+            class="github-nav-link"
+            href="https://github.com/starsliao/PetalDesk"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="在新窗口打开 PetalDesk GitHub 仓库"
+            title="在 GitHub 查看"
+          >
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.6-.18-3.28-.8-3.28-3.56 0-.79.28-1.43.74-1.93-.07-.18-.32-.91.07-1.9 0 0 .6-.19 1.97.74A6.8 6.8 0 0 1 8 4.58c.68 0 1.36.09 2 .26 1.37-.93 1.97-.74 1.97-.74.39.99.14 1.72.07 1.9.46.5.74 1.14.74 1.93 0 2.77-1.69 3.37-3.3 3.55.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z"
+              />
+            </svg>
+          </a>
           <a
             class="nav-download"
             href="https://github.com/starsliao/PetalDesk/releases/download/v0.2.1/PetalDesk_0.2.1_x64-setup.exe"
@@ -1086,7 +1300,7 @@
           <div class="hero-visual">
             <figure class="product-frame">
               <img
-                src="../artifacts/main-window-0.2.1.png"
+                src="./assets/screenshots/main-window-0.2.1.png"
                 alt="飞花 - PetalDesk 0.2.1 主界面，展示黄色、绿色和蓝色本地便签"
                 width="1360"
                 height="820"
@@ -1110,7 +1324,10 @@
           <div class="section-heading">
             <div>
               <span class="section-index">01 / 便签</span>
-              <h2 id="notes-title">简洁是外表，顺手才是日常。</h2>
+              <h2 id="notes-title">
+                <span class="section-title-line">简洁是外表，</span>
+                <span class="section-title-line">顺手才是日常。</span>
+              </h2>
             </div>
             <p class="section-intro">
               便签可以独立打开、移动、缩放和置顶。主界面支持拖动手柄手动排列，新建便签追加在末尾，置顶时移到第一位；每一张的颜色、编辑样式与只读状态也都彼此独立。
@@ -1150,6 +1367,23 @@
               <p>适合快速摘录与临时草稿；不解析语法，只保留稳定的文字输入、查找和撤回重做。</p>
             </div>
           </div>
+
+          <figure class="note-editor-figure" id="note-editor-preview">
+            <div class="note-editor-shot">
+              <img
+                src="./assets/screenshots/markdown-note-editor.png"
+                alt="飞花 - PetalDesk 的黄色 Markdown 便签，顶部显示格式工具栏，正文展示标题、粗体和列表排版"
+                width="594"
+                height="666"
+                loading="lazy"
+              />
+            </div>
+            <figcaption>
+              <span class="note-editor-kicker">MARKDOWN NOTE</span>
+              <span class="caption-title">工具在手边，内容仍是主角。</span>
+              <p>格式、链接、图片、分隔线、查找与源码切换集中在一条轻量工具栏里，编辑和阅读不必来回切换窗口。</p>
+            </figcaption>
+          </figure>
         </div>
       </section>
 
@@ -1158,7 +1392,10 @@
           <div class="section-heading">
             <div>
               <span class="section-index">02 / 小工具</span>
-              <h2 id="tools-title">需要时出现，完成后退到一旁。</h2>
+              <h2 id="tools-title">
+                <span class="section-title-line">需要时出现，</span>
+                <span class="section-title-line">完成后退到一旁。</span>
+              </h2>
             </div>
             <p class="section-intro">
               从托盘或便签窗口随时打开。计时、提醒、任务规划和截图各自专注，不把主界面变成拥挤的控制台。
@@ -1190,7 +1427,7 @@
 
           <figure class="screenshot-figure">
             <img
-              src="../artifacts/gantt-tool.png"
+              src="./assets/screenshots/gantt-tool.png"
               alt="飞花 - PetalDesk 任务甘特图展示七项任务的完成状态、进度和时间安排"
               width="1280"
               height="720"
@@ -1204,7 +1441,7 @@
 
           <figure class="screenshot-figure">
             <img
-              src="../artifacts/screenshot-tool-final.png"
+              src="./assets/screenshots/screenshot-tool-final.png"
               alt="飞花 - PetalDesk 截图工具正在框选产品演示页面，显示标注工具栏、像素尺寸与取色放大镜"
               width="1920"
               height="1080"
@@ -1223,7 +1460,10 @@
           <div class="section-heading">
             <div>
               <span class="section-index">03 / 本地数据</span>
-              <h2 id="data-title">你的内容，始终是你能看见的文件。</h2>
+              <h2 id="data-title">
+                <span class="section-title-line">你的内容，</span>
+                <span class="section-title-line">始终是你能看见的文件。</span>
+              </h2>
             </div>
             <p class="section-intro">
               飞花 - PetalDesk 把便签、附件、设置和小工具数据统一放进“飞花 - PetalDesk 数据存储”。换电脑时复制整个目录，再指定它即可继续使用。
@@ -1308,7 +1548,7 @@
     <footer class="site-footer">
       <div class="container footer-inner">
         <div class="footer-brand">
-          <img src="../static/app-icon.svg" alt="" width="28" height="28" />
+          <img src="./assets/app-icon.svg" alt="" width="28" height="28" />
           <span>飞花 - PetalDesk</span>
         </div>
         <span>本地优先 · 数据可见 · Windows 桌面体验</span>

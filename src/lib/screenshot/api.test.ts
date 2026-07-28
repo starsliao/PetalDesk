@@ -28,6 +28,14 @@ describe("screenshot desktop API", () => {
     await expect(screenshotApi.getSession()).resolves.toBeNull();
   });
 
+  it("presents a prepared capture session through its dedicated command", async () => {
+    backend.invoke.mockResolvedValueOnce(undefined);
+    await screenshotApi.present("session-1");
+    expect(backend.invoke).toHaveBeenCalledWith("present_screenshot_capture", {
+      sessionId: "session-1",
+    });
+  });
+
   it("submits exported PNG as a raw body with the one-time ticket header", async () => {
     backend.invoke
       .mockResolvedValueOnce({ canceled: false, ticket: "ticket-42" })

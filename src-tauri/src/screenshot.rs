@@ -485,8 +485,12 @@ pub(crate) fn start_capture_inner(app: &AppHandle) -> AppResult<ScreenshotSessio
     let store = app.state::<ScreenshotStore>();
     let _start_guard = lock_unpoisoned(&store.start_lock);
     if let Some(session) = store.active_session() {
-        show_capture_window(app, &session.monitor)?;
-        let _ = app.emit("screenshot_session_ready", &session);
+        if capture_window_is_visible(app) {
+            present_capture_window(app)?;
+        } else {
+            prepare_capture_window(app, &session.monitor)?;
+            let _ = app.emit("screenshot_session_ready", &session);
+        }
         return Ok(session);
     }
 
@@ -511,7 +515,7 @@ pub(crate) fn start_capture_inner(app: &AppHandle) -> AppResult<ScreenshotSessio
         meta: session.clone(),
         png,
     });
-    if let Err(error) = show_capture_window(app, &session.monitor) {
+    if let Err(error) = prepare_capture_window(app, &session.monitor) {
         store.clear_session(Some(&session.id));
         return Err(error);
     }
@@ -530,6 +534,24 @@ pub fn get_screenshot_frame(
     session_id: String,
 ) -> AppResult<Response> {
     Ok(Response::new(store.session_png(&session_id)?))
+}
+
+#[tauri::command]
+pub fn present_screenshot_capture(
+    app: AppHandle,
+    store: State<'_, ScreenshotStore>,
+    session_id: String,
+) -> AppResult<()> {
+    let monitor = {
+        let session = lock_unpoisoned(&store.session);
+        session
+            .as_ref()
+            .filter(|active| active.meta.id == session_id)
+            .map(|active| active.meta.monitor.clone())
+            .ok_or_else(|| AppError::not_found("截图会话已结束或已被替换"))?
+    };
+    prepare_capture_window(&app, &monitor)?;
+    present_capture_window(&app)
 }
 
 #[tauri::command]
@@ -819,7 +841,13 @@ fn ensure_capture_window(app: &AppHandle) -> AppResult<()> {
     Ok(())
 }
 
-fn show_capture_window(app: &AppHandle, monitor: &MonitorBounds) -> AppResult<()> {
+fn capture_window_is_visible(app: &AppHandle) -> bool {
+    app.get_webview_window(CAPTURE_WINDOW_LABEL)
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false)
+}
+
+fn prepare_capture_window(app: &AppHandle, monitor: &MonitorBounds) -> AppResult<()> {
     ensure_capture_window(app)?;
     let window = app
         .get_webview_window(CAPTURE_WINDOW_LABEL)
@@ -831,6 +859,13 @@ fn show_capture_window(app: &AppHandle, monitor: &MonitorBounds) -> AppResult<()
         .set_size(PhysicalSize::new(monitor.width, monitor.height))
         .map_err(|error| AppError::new("window_error", format!("调整截图窗口失败: {error}")))?;
     let _ = window.set_always_on_top(true);
+    Ok(())
+}
+
+fn present_capture_window(app: &AppHandle) -> AppResult<()> {
+    let window = app
+        .get_webview_window(CAPTURE_WINDOW_LABEL)
+        .ok_or_else(|| AppError::new("window_error", "截图窗口尚未准备完成"))?;
     window
         .show()
         .map_err(|error| AppError::new("window_error", format!("显示截图窗口失败: {error}")))?;
