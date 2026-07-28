@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 use tauri::ipc::{InvokeBody, Request, Response};
 use tauri::{
@@ -103,7 +103,9 @@ pub struct ScreenshotSession {
 #[derive(Debug, Clone)]
 struct ActiveSession {
     meta: ScreenshotSession,
-    png: Vec<u8>,
+    /// Shared so handing the frame out does not duplicate several megabytes,
+    /// and so no copy happens while the session mutex is held.
+    png: Arc<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,7 +159,7 @@ struct ExportTicket {
 
 #[derive(Debug, Clone)]
 struct PinnedScreenshot {
-    png: Vec<u8>,
+    png: Arc<Vec<u8>>,
     width: u32,
     height: u32,
 }
@@ -249,13 +251,13 @@ impl ScreenshotStore {
             .map(|session| session.meta.clone())
     }
 
-    fn session_png(&self, session_id: &str) -> AppResult<Vec<u8>> {
+    fn session_png(&self, session_id: &str) -> AppResult<Arc<Vec<u8>>> {
         let session = lock_unpoisoned(&self.session);
         let active = session
             .as_ref()
             .filter(|active| active.meta.id == session_id)
             .ok_or_else(|| AppError::not_found("截图会话已结束或已被替换"))?;
-        Ok(active.png.clone())
+        Ok(Arc::clone(&active.png))
     }
 
     fn clear_session(&self, expected_id: Option<&str>) -> bool {
@@ -513,7 +515,7 @@ pub(crate) fn start_capture_inner(app: &AppHandle) -> AppResult<ScreenshotSessio
     };
     *lock_unpoisoned(&store.session) = Some(ActiveSession {
         meta: session.clone(),
-        png,
+        png: Arc::new(png),
     });
     if let Err(error) = prepare_capture_window(app, &session.monitor) {
         store.clear_session(Some(&session.id));
@@ -533,7 +535,11 @@ pub fn get_screenshot_frame(
     store: State<'_, ScreenshotStore>,
     session_id: String,
 ) -> AppResult<Response> {
-    Ok(Response::new(store.session_png(&session_id)?))
+    // `Response` owns its body, so unwrap the Arc when we hold the only
+    // reference and fall back to a copy otherwise.
+    Ok(Response::new(
+        Arc::try_unwrap(store.session_png(&session_id)?).unwrap_or_else(|shared| (*shared).clone()),
+    ))
 }
 
 #[tauri::command]
@@ -627,8 +633,10 @@ pub fn commit_screenshot_export(
         .get(EXPORT_TOKEN_HEADER)
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| AppError::invalid("缺少截图导出凭证"))?;
+    // One copy out of the IPC body is unavoidable; wrapping it here keeps the
+    // pin path from making a second one.
     let png = match request.body() {
-        InvokeBody::Raw(bytes) => bytes.clone(),
+        InvokeBody::Raw(bytes) => Arc::new(bytes.clone()),
         InvokeBody::Json(_) => {
             return Err(AppError::invalid(
                 "截图必须以 Uint8Array 原始二进制提交，不能使用 JSON 或 Base64",
@@ -691,21 +699,30 @@ pub fn get_pinned_screenshot(
     store: State<'_, ScreenshotStore>,
     pin_id: String,
 ) -> AppResult<Response> {
-    let pins = lock_unpoisoned(&store.pins);
-    let pin = pins
-        .get(&pin_id)
-        .ok_or_else(|| AppError::not_found("置顶截图不存在或已经关闭"))?;
-    Ok(Response::new(pin.png.clone()))
+    // Copy outside the lock: pins stay resident, so the Arc is always shared and
+    // a copy is unavoidable here, but it must not block other pin windows.
+    let png = {
+        let pins = lock_unpoisoned(&store.pins);
+        Arc::clone(
+            &pins
+                .get(&pin_id)
+                .ok_or_else(|| AppError::not_found("置顶截图不存在或已经关闭"))?
+                .png,
+        )
+    };
+    Ok(Response::new((*png).clone()))
 }
 
 #[tauri::command]
 pub fn copy_pinned_screenshot(store: State<'_, ScreenshotStore>, pin_id: String) -> AppResult<()> {
     let png = {
         let pins = lock_unpoisoned(&store.pins);
-        pins.get(&pin_id)
-            .ok_or_else(|| AppError::not_found("置顶截图不存在或已经关闭"))?
-            .png
-            .clone()
+        Arc::clone(
+            &pins
+                .get(&pin_id)
+                .ok_or_else(|| AppError::not_found("置顶截图不存在或已经关闭"))?
+                .png,
+        )
     };
     let decoded = decode_png(&png)?;
     write_png_to_clipboard(&png, &decoded)
@@ -728,10 +745,12 @@ fn save_pinned_screenshot_inner(
     let store = app.state::<ScreenshotStore>();
     let png = {
         let pins = lock_unpoisoned(&store.pins);
-        pins.get(pin_id)
-            .ok_or_else(|| AppError::not_found("置顶截图不存在或已经关闭"))?
-            .png
-            .clone()
+        Arc::clone(
+            &pins
+                .get(pin_id)
+                .ok_or_else(|| AppError::not_found("置顶截图不存在或已经关闭"))?
+                .png,
+        )
     };
     let Some(path) = choose_png_save_path(app, &store.settings())? else {
         return Ok(SavePinnedScreenshotResult {

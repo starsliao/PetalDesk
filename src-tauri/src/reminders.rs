@@ -63,6 +63,10 @@ pub struct UpsertReminderRequest {
 pub struct ReminderStore {
     path: PathBuf,
     reminders: Mutex<Vec<Reminder>>,
+    /// Earliest known due time across enabled reminders. The scheduler ticks
+    /// every second; without this it cloned the whole list and re-normalized
+    /// every schedule on each tick, forever, for nothing.
+    earliest_due: Mutex<Option<NaiveDateTime>>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,7 +108,17 @@ impl ReminderStore {
         Ok(Self {
             path: path.to_path_buf(),
             reminders: Mutex::new(reminders),
+            earliest_due: Mutex::new(None),
         })
+    }
+
+    /// Drops the due-time gate so the next tick re-derives it. Called from every
+    /// path that can change schedules or enabled state.
+    fn invalidate_due_gate(&self) {
+        *self
+            .earliest_due
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     #[cfg(test)]
@@ -231,9 +245,24 @@ impl ReminderStore {
     }
 
     fn pending_due_at(&self, now: NaiveDateTime) -> AppResult<Vec<DueReminder>> {
+        // Fast path: nothing can be due yet, so skip the lock, the clone and the
+        // schedule normalization entirely.
+        {
+            let gate = self
+                .earliest_due
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(earliest) = *gate {
+                if now < earliest {
+                    return Ok(Vec::new());
+                }
+            }
+        }
+
         let mut current = self.reminders.lock().expect("reminder store lock poisoned");
         let mut reminders = current.clone();
         let mut due = Vec::new();
+        let mut earliest_pending: Option<NaiveDateTime> = None;
         let now_text = format_local_datetime(&now);
 
         for reminder in reminders.iter_mut().filter(|reminder| reminder.enabled) {
@@ -264,6 +293,10 @@ impl ReminderStore {
                 reminder.next_due_at = Some(due_at_text.clone());
             }
             if due_at > now {
+                earliest_pending = Some(match earliest_pending {
+                    Some(current) => current.min(due_at),
+                    None => due_at,
+                });
                 continue;
             }
 
@@ -277,6 +310,17 @@ impl ReminderStore {
             self.persist(&reminders)?;
             *current = reminders;
         }
+
+        // Only arm the gate once everything currently due has been collected;
+        // `acknowledge_due` invalidates it again as it reschedules.
+        *self
+            .earliest_due
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = if due.is_empty() {
+            earliest_pending
+        } else {
+            None
+        };
         Ok(due)
     }
 
@@ -285,11 +329,19 @@ impl ReminderStore {
     }
 
     fn is_due_current(&self, due: &DueReminder) -> bool {
+        // Identity plus the scheduled instant is enough to prove this is still
+        // the same pending occurrence; comparing every field walked the whole
+        // struct on a path that runs per fired reminder.
         self.reminders
             .lock()
             .expect("reminder store lock poisoned")
             .iter()
-            .any(|reminder| reminder == &due.reminder)
+            .any(|reminder| {
+                reminder.id == due.reminder.id
+                    && reminder.enabled
+                    && reminder.next_due_at == due.reminder.next_due_at
+                    && reminder.last_triggered_at == due.reminder.last_triggered_at
+            })
     }
 
     fn acknowledge_due_at(
@@ -347,6 +399,9 @@ impl ReminderStore {
     }
 
     fn persist(&self, reminders: &[Reminder]) -> AppResult<()> {
+        // Any persisted change can move the next due time, so the gate has to be
+        // re-derived. `pending_due_at` re-arms it after this returns.
+        self.invalidate_due_gate();
         atomic_write_json(&self.path, reminders)
     }
 }
@@ -401,7 +456,9 @@ pub fn set_reminder_enabled(
 
 pub fn start_scheduler(app: AppHandle) {
     std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        // Reminders are minute-granular, so a second of slack costs nothing and
+        // the due-time gate makes most wakeups a single comparison.
+        std::thread::sleep(std::time::Duration::from_secs(2));
         let store = app.state::<ReminderStore>();
         let Ok(reminders) = store.pending_due() else {
             continue;

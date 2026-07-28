@@ -284,22 +284,31 @@
   ) {
     const hiddenMarkWidget = new HiddenMarkWidget();
 
-    const buildDecorations = (state: EditorState): DecorationSet => {
-      const ranges: Range<Decoration>[] = [];
-      const activeLineStarts = new Set<number>();
-      const preserveBlankLineStarts = new Set<number>();
-      const collapsedLineStarts = new Set<number>();
-
-      if (revealActiveLines) {
-        for (const selection of state.selection.ranges) {
-          const firstLine = state.doc.lineAt(selection.from);
-          const endPosition = selection.empty ? selection.to : Math.max(selection.from, selection.to - 1);
-          const lastLine = state.doc.lineAt(endPosition);
-          for (let lineNumber = firstLine.number; lineNumber <= lastLine.number; lineNumber += 1) {
-            activeLineStarts.add(state.doc.line(lineNumber).from);
-          }
+    /// Which line starts the caret currently reveals. This is the only part of
+    /// the selection the decorations depend on, so it doubles as the cache key
+    /// that lets same-line cursor moves reuse the previous set.
+    const activeLineStartsOf = (state: EditorState): Set<number> => {
+      const starts = new Set<number>();
+      if (!revealActiveLines) return starts;
+      for (const selection of state.selection.ranges) {
+        const firstLine = state.doc.lineAt(selection.from);
+        const endPosition = selection.empty ? selection.to : Math.max(selection.from, selection.to - 1);
+        if (endPosition <= firstLine.to) {
+          starts.add(firstLine.from);
+          continue;
+        }
+        const lastLine = state.doc.lineAt(endPosition);
+        for (let lineNumber = firstLine.number; lineNumber <= lastLine.number; lineNumber += 1) {
+          starts.add(state.doc.line(lineNumber).from);
         }
       }
+      return starts;
+    };
+
+    const buildDecorations = (state: EditorState, activeLineStarts: Set<number>): DecorationSet => {
+      const ranges: Range<Decoration>[] = [];
+      const preserveBlankLineStarts = new Set<number>();
+      const collapsedLineStarts = new Set<number>();
 
       const isLineActive = (position: number): boolean => activeLineStarts.has(state.doc.lineAt(position).from);
       const touchesActiveLine = (from: number, to: number): boolean => {
@@ -323,7 +332,10 @@
       syntaxTree(state).iterate({
         enter(node) {
           const parentName = node.node.parent?.name;
-          const source = state.sliceDoc(node.from, node.to);
+          // Only five of the branches below need the node text; slicing it up
+          // front allocated a string for every node in the document instead.
+          let sourceCache: string | undefined;
+          const readSource = (): string => (sourceCache ??= state.sliceDoc(node.from, node.to));
           const active = touchesActiveLine(node.from, node.to);
           const heading = /^(?:ATXHeading([1-6])|SetextHeading([12]))$/.exec(node.name);
 
@@ -371,7 +383,7 @@
               if (!active) {
                 ranges.push(
                   Decoration.replace({
-                    widget: new MarkdownImageWidget(source, urls, node.from),
+                    widget: new MarkdownImageWidget(readSource(), urls, node.from),
                   }).range(node.from, node.to),
                 );
                 return false;
@@ -417,8 +429,8 @@
                 ranges.push(
                   Decoration.mark({
                     class: "cm-typora-link",
-                    attributes: isOpenableLink(source)
-                      ? { "data-link-url": normalizeLinkUrl(source) }
+                    attributes: isOpenableLink(readSource())
+                      ? { "data-link-url": normalizeLinkUrl(readSource()) }
                       : undefined,
                   }).range(node.from, node.to),
                 );
@@ -433,7 +445,7 @@
               } else {
                 ranges.push(
                   Decoration.replace({
-                    widget: new ListMarkerWidget(source, node.from),
+                    widget: new ListMarkerWidget(readSource(), node.from),
                   }).range(node.from, node.to),
                 );
               }
@@ -444,7 +456,7 @@
               } else {
                 ranges.push(
                   Decoration.replace({
-                    widget: new TaskMarkerWidget(/x/i.test(source), node.from),
+                    widget: new TaskMarkerWidget(/x/i.test(readSource()), node.from),
                   }).range(node.from, node.to),
                 );
               }
@@ -491,7 +503,7 @@
               ranges.push(Decoration.mark({ class: "cm-typora-code-info" }).range(node.from, node.to));
               break;
             case "Escape":
-              if (!active && source.startsWith("\\") && node.to > node.from + 1) {
+              if (!active && node.to > node.from + 1 && readSource().startsWith("\\")) {
                 hideMark(node.from, node.from + 1);
               }
               break;
@@ -499,15 +511,19 @@
         },
       });
 
-      for (let lineNumber = 1; lineNumber <= state.doc.lines; lineNumber += 1) {
-        const line = state.doc.line(lineNumber);
+      // Sequential iteration instead of `doc.line(n)` per line: the latter is a
+      // random-access lookup into the rope, repeated once per line of the whole
+      // document on every rebuild.
+      let lineStart = 0;
+      for (const text of state.doc.iterLines()) {
         if (
-          line.text.trim().length === 0
-          && !activeLineStarts.has(line.from)
-          && !preserveBlankLineStarts.has(line.from)
+          text.trim().length === 0
+          && !activeLineStarts.has(lineStart)
+          && !preserveBlankLineStarts.has(lineStart)
         ) {
-          collapsedLineStarts.add(line.from);
+          collapsedLineStarts.add(lineStart);
         }
+        lineStart += text.length + 1;
       }
 
       for (const lineStart of collapsedLineStarts) {
@@ -517,12 +533,30 @@
       return Decoration.set(ranges, true);
     };
 
+    // Rebuilding walked the whole syntax tree, so doing it for every selection
+    // change meant a full pass per arrow keypress. Only the set of revealed
+    // lines matters, and that is unchanged while the caret moves within a line.
+    let lastActiveLineStarts: Set<number> | null = null;
+    const sameActiveLines = (next: Set<number>): boolean => {
+      if (!lastActiveLineStarts || lastActiveLineStarts.size !== next.size) return false;
+      for (const start of next) {
+        if (!lastActiveLineStarts.has(start)) return false;
+      }
+      return true;
+    };
+
     return StateField.define<DecorationSet>({
-      create: buildDecorations,
+      create(state) {
+        const activeLineStarts = activeLineStartsOf(state);
+        lastActiveLineStarts = activeLineStarts;
+        return buildDecorations(state, activeLineStarts);
+      },
       update(decorations, transaction) {
-        return transaction.docChanged || transaction.selection
-          ? buildDecorations(transaction.state)
-          : decorations;
+        if (!transaction.docChanged && !transaction.selection) return decorations;
+        const activeLineStarts = activeLineStartsOf(transaction.state);
+        if (!transaction.docChanged && sameActiveLines(activeLineStarts)) return decorations;
+        lastActiveLineStarts = activeLineStarts;
+        return buildDecorations(transaction.state, activeLineStarts);
       },
       provide: (field) => EditorView.decorations.from(field),
     });

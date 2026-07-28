@@ -387,7 +387,10 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     let app_handle = app.handle().clone();
     std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        // External edits arrive from other editors, so a few seconds of latency
+        // is fine. The scan itself is mtime-gated, so this loop is nearly free
+        // when nothing changed.
+        std::thread::sleep(std::time::Duration::from_secs(5));
         if let Ok(notes) = app_handle
             .state::<WorkspaceStore>()
             .detect_external_changes()

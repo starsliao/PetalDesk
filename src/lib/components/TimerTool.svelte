@@ -88,8 +88,16 @@
     logs = snapshot.logs;
   }
 
+  /// The face only renders hours and minutes, so anything finer than a minute
+  /// boundary is invisible. Assigning `logs` here would also hand Svelte a new
+  /// array reference on every tick and re-derive the history list for nothing.
   function refreshClock(): void {
-    if (store) applySnapshot(store.snapshot());
+    if (!store) return;
+    const snapshot = store.snapshot();
+    isRunning = snapshot.isRunning;
+    if (formatTimerMain(snapshot.elapsedMs) !== formatTimerMain(elapsedMs)) {
+      elapsedMs = snapshot.elapsedMs;
+    }
   }
 
   function resetTimer(): void {
@@ -284,7 +292,6 @@
 
     const handleBeforeUnload = recordClosePause;
 
-    const interval = window.setInterval(refreshClock, 250);
     const handleVisibilityChange = () => {
       if (!document.hidden) refreshClock();
     };
@@ -293,11 +300,28 @@
 
     return () => {
       disposed = true;
-      window.clearInterval(interval);
       window.removeEventListener("beforeunload", handleBeforeUnload);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       document.documentElement.classList.remove("timer-tool-window");
       document.body.classList.remove("timer-tool-window");
+    };
+  });
+
+  // A paused timer cannot change, and a running one only needs to wake up when
+  // the displayed minute rolls over. The old fixed 250ms interval did 240 no-op
+  // wakeups per visible change and kept ticking while paused.
+  $effect(() => {
+    if (!isRunning) return;
+    let handle: number | undefined;
+    const tick = (): void => {
+      refreshClock();
+      const untilNextMinute = 60_000 - (store ? store.snapshot().elapsedMs % 60_000 : 0);
+      // Clamp so a clock jump cannot park the next wakeup far in the future.
+      handle = window.setTimeout(tick, Math.min(60_000, Math.max(250, untilNextMinute + 20)));
+    };
+    tick();
+    return () => {
+      if (handle !== undefined) window.clearTimeout(handle);
     };
   });
 </script>

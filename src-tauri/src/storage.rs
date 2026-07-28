@@ -13,11 +13,15 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, RwLock, TryLockError};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
 const MAX_ASSET_BYTES: usize = 25 * 1024 * 1024;
 const BACKUP_LIMIT: usize = 5;
+/// Snapshotting every autosave rewrote two files and rescanned the backup
+/// directory several times per second while typing. Keep the safety net but
+/// charge it at most once per interval per note.
+const BACKUP_MIN_INTERVAL: Duration = Duration::from_secs(180);
 const DATA_CONFIG_SCHEMA_VERSION: u32 = 1;
 const NOTE_ORDER_SCHEMA_VERSION: u32 = 1;
 const STORAGE_POINTER_FILE: &str = "storage-path.txt";
@@ -64,6 +68,33 @@ fn note_order_schema_version() -> u32 {
     NOTE_ORDER_SCHEMA_VERSION
 }
 
+/// Cheap identity of `note.md` on disk. Comparing this avoids reading and
+/// hashing note bodies on every external-change poll.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+impl FileStamp {
+    fn of(path: &Path) -> Option<Self> {
+        let metadata = fs::metadata(path).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        Some(Self {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        })
+    }
+
+    /// A stamp without a usable mtime cannot prove the file is unchanged, so
+    /// such entries always fall through to a full content comparison.
+    fn is_trustworthy(&self) -> bool {
+        self.modified.is_some()
+    }
+}
+
 pub struct WorkspaceStore {
     workspace: RwLock<PathBuf>,
     default_editor_mode: RwLock<String>,
@@ -71,7 +102,13 @@ pub struct WorkspaceStore {
     startup_recovery: RwLock<Vec<RecoveredDraft>>,
     mutation_lock: Mutex<()>,
     note_order_lock: Mutex<()>,
-    index_lock: Mutex<()>,
+    /// `note.md` stamps already known to match the recorded `contentHash`.
+    external_scan_cache: Mutex<HashMap<String, FileStamp>>,
+    /// Last time each note was snapshotted into `backups/`.
+    backup_clock: Mutex<HashMap<String, Instant>>,
+    /// Long-lived FTS connection. Reopening it per write re-ran the pragmas and
+    /// the `CREATE VIRTUAL TABLE` probe every time.
+    index_connection: Mutex<Option<Connection>>,
 }
 
 impl WorkspaceStore {
@@ -111,7 +148,9 @@ impl WorkspaceStore {
             startup_recovery: RwLock::new(Vec::new()),
             mutation_lock: Mutex::new(()),
             note_order_lock: Mutex::new(()),
-            index_lock: Mutex::new(()),
+            external_scan_cache: Mutex::new(HashMap::new()),
+            backup_clock: Mutex::new(HashMap::new()),
+            index_connection: Mutex::new(None),
         };
         store.save_data_storage_config()?;
         store.save_storage_pointer()?;
@@ -133,7 +172,9 @@ impl WorkspaceStore {
             startup_recovery: RwLock::new(Vec::new()),
             mutation_lock: Mutex::new(()),
             note_order_lock: Mutex::new(()),
-            index_lock: Mutex::new(()),
+            external_scan_cache: Mutex::new(HashMap::new()),
+            backup_clock: Mutex::new(HashMap::new()),
+            index_connection: Mutex::new(None),
         })
     }
 
@@ -457,7 +498,7 @@ impl WorkspaceStore {
 
         let note_dir = self.note_dir(&request.id)?;
         let persisted = (|| -> AppResult<(String, NoteMeta, PathBuf)> {
-            self.backup_current(&current)?;
+            self.backup_current_throttled(&current)?;
             let saved_at = now();
             let mut meta = current.meta;
             if let Some(title) = request.meta_patch.title {
@@ -507,6 +548,9 @@ impl WorkspaceStore {
         };
         remove_file_if_exists(&journal_path)?;
         self.index_note(&request.id, &request.markdown, &meta)?;
+        // Our own write is by definition in sync with the hash we just stored,
+        // so stamp it now instead of letting the poller re-read and re-hash it.
+        self.remember_clean_note(&request.id, &note_dir.join("note.md"));
         Ok(CommitResult {
             revision: meta.revision,
             saved_at,
@@ -535,9 +579,10 @@ impl WorkspaceStore {
                 .expect("note order lock poisoned");
             self.refresh_note_order_locked()?;
         }
-        let _index = self.index_lock.lock().expect("search index lock poisoned");
-        let connection = self.index_connection()?;
-        connection.execute("DELETE FROM note_search WHERE id = ?1", params![id])?;
+        self.with_index(|connection| {
+            connection.execute("DELETE FROM note_search WHERE id = ?1", params![id])?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -728,41 +773,43 @@ impl WorkspaceStore {
     }
 
     fn query_index(&self, query: &str, limit: u32) -> AppResult<Vec<(String, String)>> {
-        let _index = self.index_lock.lock().expect("search index lock poisoned");
-        let connection = self.index_connection()?;
         let match_query = query
             .split_whitespace()
             .map(|word| format!("\"{}\"*", word.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" AND ");
-        let mut statement = connection.prepare(
-            "SELECT id, snippet(note_search, 2, '', '', '…', 24) \
-             FROM note_search \
-             WHERE note_search MATCH ?1 \
-             ORDER BY rank, updated_at DESC LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![match_query, limit], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut results = rows.collect::<Result<Vec<_>, _>>()?;
-        if !results.is_empty() {
-            return Ok(results);
-        }
-
         let like_query = format!("%{query}%");
-        let mut statement = connection.prepare(
-            "SELECT id, substr(body, 1, 160) \
-             FROM note_search \
-             WHERE title LIKE ?1 OR body LIKE ?1 \
-             ORDER BY updated_at DESC LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![like_query, limit], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
+        self.with_index(move |connection| {
+            let mut results = {
+                let mut statement = connection.prepare_cached(
+                    "SELECT id, snippet(note_search, 2, '', '', '…', 24) \
+                     FROM note_search \
+                     WHERE note_search MATCH ?1 \
+                     ORDER BY rank, updated_at DESC LIMIT ?2",
+                )?;
+                let rows = statement.query_map(params![match_query, limit], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            if !results.is_empty() {
+                return Ok(results);
+            }
+
+            let mut statement = connection.prepare_cached(
+                "SELECT id, substr(body, 1, 160) \
+                 FROM note_search \
+                 WHERE title LIKE ?1 OR body LIKE ?1 \
+                 ORDER BY updated_at DESC LIMIT ?2",
+            )?;
+            let rows = statement.query_map(params![like_query, limit], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
     }
 
     pub fn save_window_state(&self, label: &str, state: WindowState) -> AppResult<()> {
@@ -857,30 +904,77 @@ impl WorkspaceStore {
         // the foreground mutation lock, then re-check only the candidates once
         // the lock is available.
         let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        // Freshly observed clean stamps, merged into the shared cache at the end
+        // so the scan itself never holds the cache lock across file I/O.
+        let mut clean = Vec::new();
         for entry in fs::read_dir(self.notes_dir())
             .map_err(|error| AppError::io("检测外部便签修改", error))?
         {
             let entry = entry.map_err(|error| AppError::io("读取便签条目", error))?;
-            if !entry.path().is_dir() {
+            let note_path = entry.path();
+            if !note_path.is_dir() {
                 continue;
             }
             let id = entry.file_name().to_string_lossy().into_owned();
             if validate_note_id(&id).is_err() {
                 continue;
             }
-            let meta = match read_json::<NoteMeta>(&entry.path().join("meta.json")) {
+            seen.insert(id.clone());
+
+            // Fast path: an unchanged mtime/size pair means the body still
+            // matches the hash we verified earlier, so skip the read entirely.
+            let markdown_path = note_path.join("note.md");
+            let stamp = FileStamp::of(&markdown_path);
+            if let Some(stamp) = stamp {
+                if stamp.is_trustworthy() {
+                    let cached = self
+                        .external_scan_cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get(&id)
+                        .copied();
+                    if cached == Some(stamp) {
+                        continue;
+                    }
+                }
+            }
+
+            let meta = match read_json::<NoteMeta>(&note_path.join("meta.json")) {
                 Ok(meta) => meta,
                 Err(_) => continue,
             };
-            let markdown = match fs::read(entry.path().join("note.md")) {
+            let markdown = match fs::read(&markdown_path) {
                 Ok(markdown) => markdown,
                 Err(_) => continue,
             };
             if meta.content_hash == content_hash(&markdown) {
+                // Re-stamp after reading so a write that landed mid-read is not
+                // mistaken for clean on the next poll.
+                if let Some(stamp) = FileStamp::of(&markdown_path) {
+                    if stamp.is_trustworthy() && Some(stamp) == FileStamp::of(&markdown_path) {
+                        clean.push((id, stamp));
+                    }
+                }
                 continue;
             }
             candidates.push(id);
         }
+
+        {
+            let mut cache = self
+                .external_scan_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.retain(|id, _| seen.contains(id));
+            cache.extend(clean);
+            // Deleted notes must not linger, and changed ones get re-stamped
+            // only once their new content has been indexed below.
+            for id in &candidates {
+                cache.remove(id);
+            }
+        }
+
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
@@ -893,11 +987,12 @@ impl WorkspaceStore {
         let mut changed = Vec::new();
         for id in candidates {
             let note_dir = self.note_dir(&id)?;
+            let markdown_path = note_dir.join("note.md");
             let meta = match read_json::<NoteMeta>(&note_dir.join("meta.json")) {
                 Ok(meta) => meta,
                 Err(_) => continue,
             };
-            let markdown = match fs::read(note_dir.join("note.md")) {
+            let markdown = match fs::read(&markdown_path) {
                 Ok(markdown) => markdown,
                 Err(_) => continue,
             };
@@ -906,6 +1001,9 @@ impl WorkspaceStore {
             }
             let snapshot = self.read_snapshot(&id, true)?;
             self.index_note(&id, &snapshot.markdown, &snapshot.meta)?;
+            // `read_snapshot` rewrote `contentHash` to match the file, so the
+            // current stamp is a valid clean marker for later polls.
+            self.remember_clean_note(&id, &markdown_path);
             changed.push(snapshot);
         }
         Ok(changed)
@@ -999,6 +1097,41 @@ impl WorkspaceStore {
             markdown,
             meta,
         })
+    }
+
+    /// Records the on-disk stamp of a note whose body is known to match its
+    /// recorded hash, letting later polls skip the read entirely.
+    fn remember_clean_note(&self, id: &str, markdown_path: &Path) {
+        let Some(stamp) = FileStamp::of(markdown_path) else {
+            return;
+        };
+        if !stamp.is_trustworthy() {
+            return;
+        }
+        self.external_scan_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id.to_string(), stamp);
+    }
+
+    /// Autosave fires every couple of seconds while typing; a full snapshot per
+    /// save is pure write amplification. Keep the most recent pre-edit state but
+    /// rate-limit how often a new one is cut.
+    fn backup_current_throttled(&self, snapshot: &NoteSnapshot) -> AppResult<()> {
+        let now = Instant::now();
+        {
+            let mut clock = self
+                .backup_clock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(last) = clock.get(&snapshot.id) {
+                if now.duration_since(*last) < BACKUP_MIN_INTERVAL {
+                    return Ok(());
+                }
+            }
+            clock.insert(snapshot.id.clone(), now);
+        }
+        self.backup_current(snapshot)
     }
 
     fn backup_current(&self, snapshot: &NoteSnapshot) -> AppResult<()> {
@@ -1099,11 +1232,10 @@ impl WorkspaceStore {
     }
 
     fn rebuild_index(&self) -> AppResult<()> {
-        {
-            let _index = self.index_lock.lock().expect("search index lock poisoned");
-            let connection = self.index_connection()?;
+        self.with_index(|connection| {
             connection.execute("DELETE FROM note_search", [])?;
-        }
+            Ok(())
+        })?;
         for note in self.list_notes()? {
             if let Ok(snapshot) = self.read_snapshot(&note.id, true) {
                 self.index_note(&note.id, &snapshot.markdown, &snapshot.meta)?;
@@ -1113,50 +1245,41 @@ impl WorkspaceStore {
     }
 
     fn index_note(&self, id: &str, markdown: &str, meta: &NoteMeta) -> AppResult<()> {
-        let _index = self.index_lock.lock().expect("search index lock poisoned");
-        let connection = self.index_connection()?;
-        connection.execute("DELETE FROM note_search WHERE id = ?1", params![id])?;
-        connection.execute(
-            "INSERT INTO note_search(id, title, body, updated_at) VALUES (?1, ?2, ?3, ?4)",
-            params![id, &meta.title, markdown, &meta.updated_at],
-        )?;
-        Ok(())
+        self.with_index(|connection| {
+            // One transaction instead of two autocommits halves the WAL syncs on
+            // a path that runs on every autosave.
+            let transaction = connection.transaction()?;
+            transaction.execute("DELETE FROM note_search WHERE id = ?1", params![id])?;
+            transaction.execute(
+                "INSERT INTO note_search(id, title, body, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params![id, &meta.title, markdown, &meta.updated_at],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
-    fn index_connection(&self) -> AppResult<Connection> {
-        let path = self.index_path();
-        let connection = match Connection::open(&path) {
-            Ok(connection) => connection,
-            Err(_) => {
-                let _ = fs::remove_file(&path);
-                Connection::open(&path)?
-            }
-        };
-        connection.busy_timeout(Duration::from_secs(2))?;
-        if connection
-            .execute_batch(
-                "PRAGMA journal_mode=WAL;\
-                 PRAGMA synchronous=NORMAL;\
-                 CREATE VIRTUAL TABLE IF NOT EXISTS note_search USING fts5(\
-                   id UNINDEXED, title, body, updated_at UNINDEXED, tokenize='unicode61'\
-                 );",
-            )
-            .is_err()
-        {
-            drop(connection);
-            remove_sqlite_files(&path);
-            let connection = Connection::open(&path)?;
-            connection.busy_timeout(Duration::from_secs(2))?;
-            connection.execute_batch(
-                "PRAGMA journal_mode=WAL;\
-                 PRAGMA synchronous=NORMAL;\
-                 CREATE VIRTUAL TABLE note_search USING fts5(\
-                   id UNINDEXED, title, body, updated_at UNINDEXED, tokenize='unicode61'\
-                 );",
-            )?;
-            return Ok(connection);
+    /// Serializes index access and reuses one long-lived connection. Opening a
+    /// connection per call meant re-running the pragmas and the
+    /// `CREATE VIRTUAL TABLE` probe on every save and every external-change hit.
+    fn with_index<T>(&self, action: impl FnOnce(&mut Connection) -> AppResult<T>) -> AppResult<T> {
+        let mut slot = self
+            .index_connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_none() {
+            *slot = Some(open_index_connection(&self.index_path())?);
         }
-        Ok(connection)
+        let connection = slot.as_mut().expect("index connection initialized");
+        match action(connection) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                // A corrupt or vanished index file must not poison every later
+                // call, so drop the handle and let the next one reopen it.
+                *slot = None;
+                Err(error)
+            }
+        }
     }
 
     fn index_path(&self) -> PathBuf {
@@ -1699,6 +1822,32 @@ fn summary_from_snapshot(snapshot: &NoteSnapshot) -> NoteSummary {
         revision: snapshot.revision,
     }
 }
+
+fn open_index_connection(path: &Path) -> AppResult<Connection> {
+    let connection = match Connection::open(path) {
+        Ok(connection) => connection,
+        Err(_) => {
+            let _ = fs::remove_file(path);
+            Connection::open(path)?
+        }
+    };
+    connection.busy_timeout(Duration::from_secs(2))?;
+    if connection.execute_batch(INDEX_SCHEMA_SQL).is_err() {
+        drop(connection);
+        remove_sqlite_files(path);
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(Duration::from_secs(2))?;
+        connection.execute_batch(INDEX_SCHEMA_SQL)?;
+        return Ok(connection);
+    }
+    Ok(connection)
+}
+
+const INDEX_SCHEMA_SQL: &str = "PRAGMA journal_mode=WAL;\
+     PRAGMA synchronous=NORMAL;\
+     CREATE VIRTUAL TABLE IF NOT EXISTS note_search USING fts5(\
+       id UNINDEXED, title, body, updated_at UNINDEXED, tokenize='unicode61'\
+     );";
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> AppResult<T> {
     let bytes = fs::read(path).map_err(|error| AppError::io("读取 JSON 文件", error))?;

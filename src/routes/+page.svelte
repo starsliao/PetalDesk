@@ -244,7 +244,10 @@
     desktopCleanups.push(() => window.removeEventListener("storage", handleStorage));
     desktopCleanups.push(() => window.removeEventListener("petaldesk:default-editor-mode-changed", handleBrowserModeChange));
 
-    externalPollTimer = setInterval(() => void pollExternalChanges(), noteId ? 2600 : 5000);
+    // The Rust side already watches the workspace and emits `note_changed`, so
+    // this is only a safety net for a missed event. Polling it every few seconds
+    // duplicated that scan once per open window.
+    externalPollTimer = setInterval(() => void pollExternalChanges(), 60_000);
   }
 
   function isEditorMode(value: unknown): value is EditorMode {
@@ -283,7 +286,10 @@
     searchTimer = setTimeout(() => void refreshMain(), 160);
   }
 
-  function scheduleSave(delay = 450): void {
+  // Each save writes the journal, the body and the metadata, every one of them
+  // fsynced. At 450ms a normal typing pause triggered that several times per
+  // sentence; 1.2s still feels instant and cuts the write rate roughly threefold.
+  function scheduleSave(delay = 1200): void {
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => void saveNow(), delay);
   }

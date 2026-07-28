@@ -58,3 +58,18 @@ windows-sys = { version = "0.60", features = [
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+# This app is I/O bound, not compute bound, so trade a little raw speed for a
+# noticeably smaller binary and less resident code.
+opt-level = "s"
+# Thin LTO instead of fat: `codegen-units = 1` together with fat LTO made rustc
+# itself overflow its stack on the `windows` crate (STATUS_STACK_BUFFER_OVERRUN)
+# with this toolchain, and thin LTO captures most of the size win anyway.
+lto = "thin"
+strip = true
+# `panic = "abort"` would shave a bit more, but Tauri turns a panic inside a
+# command handler into an IPC error instead of taking the process down. Keeping
+# unwinding preserves that: a bug in one command must not kill unsaved notes in
+# every other window.
+panic = "unwind"
