@@ -14,11 +14,14 @@
 pnpm package:windows
 ```
 
-Version `0.3.1` fixes a long-capture startup deadlock that could block the
-screenshot shortcut, tray menu, and application exit. Startup and control
-commands now run away from the Tauri event loop, a pending capture can be
-canceled before its job ID is returned, and generic capture restores focus to
-the selected Windows target before sending scroll input.
+Version `0.3.3` keeps the selected region visible during long capture and makes
+manual scrolling reliable across Explorer, Settings, desktop lists, document
+windows, and browsers. It observes real wheel input, captures at most every
+150 ms while scrolling, adds a settled frame after 250 ms, and keeps a low-rate
+visual fallback for keyboard, touchpad, and scrollbar movement. Native block,
+narrow-column, and phase-correlation candidates are verified against source
+pixels before a strip is accepted. It also preserves fixed bottom chrome once,
+and fixes control-window, screenshot-session, and worker-shutdown races.
 
 The package always includes and registers the Firefox Native Messaging host.
 Set `PETALDESK_CHROME_EXTENSION_ID` and/or `PETALDESK_EDGE_EXTENSION_ID` to the
@@ -47,4 +50,4 @@ XPI. The unsigned ZIP must not be presented as an installable Firefox package.
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.3.1>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.3.3>

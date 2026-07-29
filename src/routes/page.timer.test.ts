@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import pageSource from "./+page.svelte?raw";
 
 type NotesApi = typeof import("$lib/bridge").notesApi;
 let activeUnmount: (() => void) | null = null;
@@ -10,10 +11,12 @@ afterEach(() => {
   document.documentElement.classList.remove("timer-tool-window");
   document.documentElement.classList.remove("screenshot-tool-page");
   document.documentElement.classList.remove("pinned-screenshot-page");
+  document.documentElement.classList.remove("transparent-tool-page");
   document.body.classList.remove("timer-tool-page");
   document.body.classList.remove("timer-tool-window");
   document.body.classList.remove("screenshot-tool-page");
   document.body.classList.remove("pinned-screenshot-page");
+  document.body.classList.remove("transparent-tool-page");
   window.history.replaceState({}, "", "/");
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -142,5 +145,41 @@ describe("tool pages", () => {
     expect(rendered.container.querySelector(".timer-tool-window")).not.toBeInTheDocument();
     expect(rendered.container.querySelector(".main-window")).not.toBeInTheDocument();
     expectNotesApiUntouched(api);
+  }, 60_000);
+
+  it("renders a transparent long-capture outline without initializing application content", async () => {
+    vi.resetModules();
+    window.history.replaceState({}, "", "/?tool=screenshot&longOutline=long-42");
+    const [{ render }, { notesApi }, { default: Page }] = await Promise.all([
+      import("@testing-library/svelte"),
+      import("$lib/bridge"),
+      import("./+page.svelte"),
+    ]);
+    const api = watchNotesApi(notesApi);
+    const rendered = render(Page);
+    activeUnmount = () => rendered.unmount();
+
+    const outline = rendered.getByTestId("long-capture-outline");
+    expect(outline).toBeInTheDocument();
+    expect(outline).toHaveTextContent("");
+    expect(outline.childElementCount).toBe(0);
+    expect(document.title).toBe("长截图范围 - 飞花 - PetalDesk");
+    expect(document.documentElement).toHaveClass("transparent-tool-page");
+    expect(document.body).toHaveClass("transparent-tool-page");
+    expect(pageSource).toMatch(
+      /\.long-capture-outline-window\s*\{[^}]*position:\s*fixed;[^}]*background:\s*transparent;[^}]*pointer-events:\s*none;/,
+    );
+    expect(pageSource).toMatch(
+      /:global\(html\.transparent-tool-page\),\s*:global\(body\.transparent-tool-page\)\s*\{[^}]*background:\s*transparent\s*!important;/,
+    );
+    expect(rendered.container.querySelector(".screenshot-tool-window")).not.toBeInTheDocument();
+    expect(rendered.container.querySelector(".long-capture-control-window")).not.toBeInTheDocument();
+    expect(rendered.container.querySelector(".main-window")).not.toBeInTheDocument();
+    expectNotesApiUntouched(api);
+
+    rendered.unmount();
+    activeUnmount = null;
+    expect(document.documentElement).not.toHaveClass("transparent-tool-page");
+    expect(document.body).not.toHaveClass("transparent-tool-page");
   }, 60_000);
 });

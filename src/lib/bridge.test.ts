@@ -96,7 +96,7 @@ describe("browser note styles", () => {
   });
 
   it("defaults to Typora mode and persists a new global selection", async () => {
-    expect((await notesApi.appInfo()).version).toBe("0.3.1");
+    expect((await notesApi.appInfo()).version).toBe("0.3.3");
     expect((await notesApi.appInfo()).defaultEditorMode).toBe("typora");
 
     await expect(notesApi.setDefaultEditorMode("plain")).resolves.toBe("plain");

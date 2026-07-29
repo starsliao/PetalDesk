@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/svelte";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import LongCaptureControl from "./LongCaptureControl.svelte";
+import longCaptureControlSource from "./LongCaptureControl.svelte?raw";
 import type { LongCaptureStatus, ScreenshotApi } from "./types";
 
 function status(state: LongCaptureStatus["state"], patch: Partial<LongCaptureStatus> = {}): LongCaptureStatus {
@@ -71,14 +72,112 @@ describe("LongCaptureControl", () => {
     const rendered = render(LongCaptureControl, {
       jobId: "long-1",
       api,
-      initialStatus: status("capturing", { message: "等待手动滚动" }),
+      initialStatus: status("capturing", { engine: "manual", message: "等待手动滚动" }),
       monitor: false,
     });
 
+    expect(rendered.getByText("在原窗口向下滚动，完成后点“完成”")).toBeInTheDocument();
     expect(rendered.getByText("等待手动滚动")).toBeInTheDocument();
+    expect(rendered.getByRole("button", { name: "暂停长截图" })).toHaveTextContent("暂停");
+    expect(rendered.getByRole("button", { name: "完成长截图" })).toHaveTextContent("完成");
   });
 
-  it("uses Escape to cancel the independent control window job", async () => {
+  it("keeps the completion action visually primary while hovered", () => {
+    const rendered = render(LongCaptureControl, {
+      jobId: "long-1",
+      api: controlApi(),
+      initialStatus: status("capturing"),
+      monitor: false,
+    });
+
+    const finish = rendered.getByRole("button", { name: "完成长截图" });
+    expect(finish).toHaveClass("finish", "labeled");
+
+    expect(longCaptureControlSource).toMatch(
+      /button\.finish:hover:not\(:disabled\)\s*\{[^}]*color:\s*#fff;[^}]*background:\s*#004f93;[^}]*border-color:\s*#003f76;/,
+    );
+  });
+
+  it("tells a paused manual capture to resume before scrolling", () => {
+    const api = controlApi();
+    const rendered = render(LongCaptureControl, {
+      jobId: "long-1",
+      api,
+      initialStatus: status("paused", { engine: "manual", message: "长截图已暂停" }),
+      monitor: false,
+    });
+
+    expect(rendered.getByText("已暂停，点击继续后再滚动")).toBeInTheDocument();
+    expect(rendered.getByRole("button", { name: "继续长截图" })).toHaveTextContent("继续");
+  });
+
+  it("retries temporary null and failed status reads with bounded backoff", async () => {
+    const api = controlApi();
+    vi.mocked(api.getLongCaptureStatus)
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new Error("临时读取失败"))
+      .mockResolvedValueOnce(status("capturing", { engine: "manual", message: "等待手动滚动" }));
+    const rendered = render(LongCaptureControl, {
+      jobId: "long-1",
+      api,
+      statusRetryBaseMs: 5,
+      statusRetryMaxMs: 10,
+    });
+
+    await waitFor(() => expect(api.getLongCaptureStatus).toHaveBeenCalledTimes(3));
+    expect(rendered.getByText("在原窗口向下滚动，完成后点“完成”")).toBeInTheDocument();
+    expect(rendered.getByText("等待手动滚动")).toBeInTheDocument();
+    expect(rendered.queryByText("临时读取失败")).not.toBeInTheDocument();
+  });
+
+  it("recovers after a status read timeout and stops polling at a terminal state", async () => {
+    const api = controlApi();
+    vi.mocked(api.getLongCaptureStatus)
+      .mockImplementationOnce(() => new Promise<LongCaptureStatus | null>(() => undefined))
+      .mockResolvedValueOnce(status("ready"));
+    const rendered = render(LongCaptureControl, {
+      jobId: "long-1",
+      api,
+      controlTimeoutMs: 250,
+      statusRetryBaseMs: 5,
+      statusRetryMaxMs: 10,
+      statusPollIntervalMs: 5,
+    });
+
+    await waitFor(() => expect(api.getLongCaptureStatus).toHaveBeenCalledTimes(2), { timeout: 1_000 });
+    expect(rendered.getByText("3 帧 · 2,400 px")).toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(api.getLongCaptureStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops failed status polling and lets the user reconnect", async () => {
+    const api = controlApi();
+    vi.mocked(api.getLongCaptureStatus).mockRejectedValue(new Error("连接失败"));
+    const rendered = render(LongCaptureControl, {
+      jobId: "long-1",
+      api,
+      statusRetryBaseMs: 5,
+      statusRetryMaxMs: 5,
+      statusRetryLimit: 2,
+    });
+
+    await waitFor(() => expect(api.getLongCaptureStatus).toHaveBeenCalledTimes(2));
+    expect(rendered.getByText("无法连接长截图任务，请重连或取消。")).toBeInTheDocument();
+    const reconnect = rendered.getByRole("button", { name: "重新连接长截图" });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(api.getLongCaptureStatus).toHaveBeenCalledTimes(2);
+
+    vi.mocked(api.getLongCaptureStatus).mockResolvedValue(status("capturing", {
+      engine: "manual",
+      message: "等待手动滚动",
+    }));
+    await fireEvent.click(reconnect);
+    await waitFor(() => expect(api.getLongCaptureStatus).toHaveBeenCalledTimes(3));
+    expect(rendered.getByText("在原窗口向下滚动，完成后点“完成”")).toBeInTheDocument();
+    expect(rendered.queryByText("无法连接长截图任务，请重连或取消。")).not.toBeInTheDocument();
+  });
+
+  it("uses Escape to cancel when keyboard shortcuts are enabled", async () => {
     const api = controlApi();
     const oncancel = vi.fn();
     render(LongCaptureControl, {
@@ -94,7 +193,24 @@ describe("LongCaptureControl", () => {
     expect(oncancel).toHaveBeenCalledOnce();
   });
 
-  it("delegates global shortcuts when embedded in another editor", async () => {
+  it("uses Space and Enter when keyboard shortcuts are enabled", async () => {
+    const api = controlApi();
+    render(LongCaptureControl, {
+      jobId: "long-1",
+      api,
+      initialStatus: status("paused"),
+      monitor: false,
+    });
+
+    await fireEvent.keyDown(window, { key: " ", code: "Space" });
+    await waitFor(() => expect(api.resumeLongCapture).toHaveBeenCalledWith("long-1"));
+    await fireEvent.keyDown(window, { key: " ", code: "Space" });
+    await waitFor(() => expect(api.pauseLongCapture).toHaveBeenCalledWith("long-1"));
+    await fireEvent.keyDown(window, { key: "Enter" });
+    await waitFor(() => expect(api.finishLongCapture).toHaveBeenCalledWith("long-1"));
+  });
+
+  it("ignores shortcuts when disabled so the target window keeps keyboard control", async () => {
     const api = controlApi();
     const rendered = render(LongCaptureControl, {
       jobId: "long-1",

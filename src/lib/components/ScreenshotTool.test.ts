@@ -292,7 +292,7 @@ describe("ScreenshotTool", () => {
     expect(rendered.getByRole("button", { name: "保存截图" })).toBeEnabled();
   });
 
-  it("captures from a selected scroll anchor and previews only visible image tiles", async () => {
+  it("starts manual long capture from the selection center and previews only visible image tiles", async () => {
     const api = mockApi();
     api.getLongCaptureStatus.mockResolvedValue(longStatus("paused"));
     const rendered = render(ScreenshotTool, { api });
@@ -305,15 +305,13 @@ describe("ScreenshotTool", () => {
     await waitFor(() => expect(rendered.getByRole("button", { name: "长截图" })).toBeEnabled());
 
     await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
-    await fireEvent.click(rendered.getByRole("button", { name: "从顶部" }));
-    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
 
     await waitFor(() => expect(api.startLongCapture).toHaveBeenCalledWith({
       sessionId: "session-1",
       selection: { x: 100, y: 100, width: 400, height: 300 },
       scrollAnchor: { x: 300, y: 250 },
       scope: "selection",
-      mode: "top",
+      mode: "manual",
     }));
     expect(rendered.getByText(/2 帧/)).toBeInTheDocument();
 
@@ -347,6 +345,140 @@ describe("ScreenshotTool", () => {
     expect(api.cancel).not.toHaveBeenCalled();
   });
 
+  it("keeps automatic long-capture modes behind the mode menu", async () => {
+    const api = mockApi();
+    const rendered = render(ScreenshotTool, { api });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await waitFor(() => expect(rendered.getByRole("button", { name: "选择长截图模式" })).toBeEnabled());
+
+    await fireEvent.click(rendered.getByRole("button", { name: "选择长截图模式" }));
+    expect(rendered.getByLabelText("长截图模式")).toBeInTheDocument();
+    expect(rendered.getByRole("button", { name: "选择长截图模式" })).toHaveAttribute("aria-controls", "long-mode-options");
+    await fireEvent.click(rendered.getByRole("button", { name: "从顶部自动" }));
+    expect(rendered.getByRole("toolbar", { name: "选择自动滚动区域" })).toBeInTheDocument();
+    expect(api.startLongCapture).not.toHaveBeenCalled();
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 220, clientY: 180 });
+
+    await waitFor(() => expect(api.startLongCapture).toHaveBeenCalledWith({
+      sessionId: "session-1",
+      selection: { x: 100, y: 100, width: 400, height: 300 },
+      scrollAnchor: { x: 220, y: 180 },
+      scope: "selection",
+      mode: "top",
+    }));
+  });
+
+  it("dismisses the long-capture mode menu without changing the selection", async () => {
+    const api = mockApi();
+    const rendered = render(ScreenshotTool, { api });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await waitFor(() => expect(rendered.getByRole("button", { name: "选择长截图模式" })).toBeEnabled());
+
+    await fireEvent.click(rendered.getByRole("button", { name: "选择长截图模式" }));
+    expect(rendered.getByLabelText("长截图模式")).toBeInTheDocument();
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 700, clientY: 500 });
+    await fireEvent.pointerUp(stage, { pointerId: 2, clientX: 700, clientY: 500 });
+
+    expect(rendered.queryByLabelText("长截图模式")).not.toBeInTheDocument();
+    expect(rendered.getByText("400 × 300 px")).toBeInTheDocument();
+    expect(rendered.container.querySelector(".selection-border")).toHaveAttribute("x", "100");
+    expect(rendered.container.querySelector(".selection-border")).toHaveAttribute("y", "100");
+    expect(api.startLongCapture).not.toHaveBeenCalled();
+  });
+
+  it("cancels automatic anchor selection locally and restores manual as the default", async () => {
+    const api = mockApi();
+    const rendered = render(ScreenshotTool, { api });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await waitFor(() => expect(rendered.getByRole("button", { name: "选择长截图模式" })).toBeEnabled());
+
+    await fireEvent.click(rendered.getByRole("button", { name: "选择长截图模式" }));
+    await fireEvent.click(rendered.getByRole("button", { name: "当前位置自动" }));
+    expect(rendered.getByRole("toolbar", { name: "选择自动滚动区域" })).toBeInTheDocument();
+
+    const contextMenu = new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: 300,
+      clientY: 250,
+    });
+    stage.dispatchEvent(contextMenu);
+
+    expect(contextMenu.defaultPrevented).toBe(true);
+    await waitFor(() => expect(rendered.queryByRole("toolbar", { name: "选择自动滚动区域" })).not.toBeInTheDocument());
+    expect(api.cancelLongCaptureSession).not.toHaveBeenCalled();
+    expect(api.cancelLongCapture).not.toHaveBeenCalled();
+
+    await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
+    await waitFor(() => expect(api.startLongCapture).toHaveBeenCalledWith(expect.objectContaining({
+      mode: "manual",
+      scrollAnchor: { x: 300, y: 250 },
+    })));
+  });
+
+  it("starts an automatic capture from the selection center with Enter", async () => {
+    const api = mockApi();
+    const rendered = render(ScreenshotTool, { api });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.click(rendered.getByRole("button", { name: "选择长截图模式" }));
+    await fireEvent.click(rendered.getByRole("button", { name: "当前位置自动" }));
+    expect(rendered.getByRole("button", { name: "选区中心" })).toBeInTheDocument();
+
+    await fireEvent.keyDown(window, { key: "Enter" });
+
+    await waitFor(() => expect(api.startLongCapture).toHaveBeenCalledWith(expect.objectContaining({
+      mode: "current",
+      scrollAnchor: { x: 300, y: 250 },
+    })));
+  });
+
+  it("resets an automatic mode when annotation confirmation is dismissed", async () => {
+    const api = mockApi();
+    const rendered = render(ScreenshotTool, { api });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.click(rendered.getByRole("button", { name: "形状" }));
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 180, clientY: 170 });
+    await fireEvent.pointerMove(stage, { pointerId: 2, clientX: 280, clientY: 240 });
+    await fireEvent.pointerUp(stage, { pointerId: 2, clientX: 280, clientY: 240 });
+
+    await fireEvent.click(rendered.getByRole("button", { name: "选择长截图模式" }));
+    await fireEvent.click(rendered.getByRole("button", { name: "从顶部自动" }));
+    expect(rendered.getByRole("alertdialog", { name: "清除标注并开始长截图？" })).toBeInTheDocument();
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(rendered.queryByRole("alertdialog", { name: "清除标注并开始长截图？" })).not.toBeInTheDocument();
+    expect(api.cancelLongCaptureSession).not.toHaveBeenCalled();
+
+    await fireEvent.click(rendered.getByRole("button", { name: "选择长截图模式" }));
+    expect(rendered.getByRole("button", { name: "手动滚动（默认）" })).toHaveClass("active");
+    expect(rendered.getByRole("button", { name: "从顶部自动" })).not.toHaveClass("active");
+  });
+
   it("does not duplicate an embedded long-capture control action from the window shortcut", async () => {
     const api = mockApi();
     let resolvePause: ((status: LongCaptureStatus) => void) | undefined;
@@ -365,7 +497,6 @@ describe("ScreenshotTool", () => {
     await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
-    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
     await waitFor(() => expect(rendered.getByRole("button", { name: "暂停长截图" })).toBeInTheDocument());
 
     await fireEvent.click(rendered.getByRole("button", { name: "暂停长截图" }));
@@ -401,7 +532,6 @@ describe("ScreenshotTool", () => {
     await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
-    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
     await waitFor(() => expect(rendered.getByRole("button", { name: "暂停长截图" })).toBeInTheDocument());
 
     await fireEvent.click(rendered.getByRole("button", { name: "暂停长截图" }));
@@ -437,7 +567,6 @@ describe("ScreenshotTool", () => {
     await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
-    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
     await waitFor(() => expect(rendered.getByRole("button", { name: "暂停长截图" })).toBeInTheDocument());
     await fireEvent.click(rendered.getByRole("button", { name: "暂停长截图" }));
     await waitFor(() => expect(api.pauseLongCapture).toHaveBeenCalledOnce());
@@ -485,7 +614,6 @@ describe("ScreenshotTool", () => {
     await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
-    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
 
     await waitFor(() => expect(rendered.getByText("长截图失败")).toBeInTheDocument());
     expect(rendered.getByText("页面滚动期间失去响应")).toBeInTheDocument();
@@ -516,7 +644,6 @@ describe("ScreenshotTool", () => {
     await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
-    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
 
     await waitFor(() => expect(api.cancelLongCaptureSession).toHaveBeenCalledWith("session-1"));
     await waitFor(() => expect(rendered.getByText("长截图启动超时，已恢复普通截图。")).toBeInTheDocument());
@@ -543,7 +670,6 @@ describe("ScreenshotTool", () => {
     await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
-    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
     await waitFor(() => expect(api.startLongCapture).toHaveBeenCalledOnce());
 
     await fireEvent.keyDown(window, { key: "Escape" });
@@ -572,7 +698,6 @@ describe("ScreenshotTool", () => {
     await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
-    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
     await waitFor(() => expect(api.getLongCaptureStatus).toHaveBeenCalledWith("long-1"), { timeout: 2_500 });
 
     await fireEvent.keyDown(window, { key: "Escape" });
@@ -598,7 +723,6 @@ describe("ScreenshotTool", () => {
     await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
-    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
 
     await waitFor(() => expect(api.getLongCaptureStatus).toHaveBeenCalledWith("long-1"), { timeout: 2_500 });
     await waitFor(() => expect(rendered.getByText("长截图任务已结束，请重新开始。")).toBeInTheDocument());
@@ -629,8 +753,6 @@ describe("ScreenshotTool", () => {
 
     await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
     await fireEvent.click(rendered.getByRole("button", { name: "清除并继续" }));
-    expect(rendered.getByRole("toolbar", { name: "长截图范围" })).toBeInTheDocument();
-    await fireEvent.pointerDown(stage, { button: 0, pointerId: 3, clientX: 300, clientY: 250 });
     await waitFor(() => expect(api.startLongCapture).toHaveBeenCalledOnce());
     expect(api.startLongCapture).toHaveBeenCalledWith(expect.objectContaining({
       scrollAnchor: { x: 300, y: 250 },
@@ -651,7 +773,6 @@ describe("ScreenshotTool", () => {
     await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await waitFor(() => expect(rendered.getByRole("button", { name: "长截图" })).toBeEnabled());
     await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
-    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
     await waitFor(() => expect(api.startLongCapture).toHaveBeenCalled());
 
     tauri.listeners.get("long_capture_ready")?.({ payload: longStatus("ready", { frameCount: 8, height: 6400 }) });
@@ -678,7 +799,6 @@ describe("ScreenshotTool", () => {
     await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
     await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
-    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
     await waitFor(() => expect(rendered.getByRole("button", { name: "完成长截图" })).toBeEnabled());
 
     await fireEvent.keyDown(window, { key: "Enter" });

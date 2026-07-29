@@ -357,7 +357,7 @@ export const notesApi = {
     if (isTauriRuntime()) return command<AppInfo>("get_app_info");
     return {
       workspacePath: "浏览器演示数据",
-      version: "0.3.1",
+      version: "0.3.3",
       defaultEditorMode: readBrowserDefaultEditorMode(),
       recoveredDrafts: 0,
     };

@@ -251,6 +251,12 @@ impl ScreenshotStore {
             .map(|session| session.meta.clone())
     }
 
+    /// Lock order is screenshot lifecycle, then long-capture pending/job and
+    /// operation locks. Long-capture code must never acquire this in reverse.
+    pub(crate) fn lock_start(&self) -> MutexGuard<'_, ()> {
+        lock_unpoisoned(&self.start_lock)
+    }
+
     fn session_png(&self, session_id: &str) -> AppResult<Arc<Vec<u8>>> {
         let session = lock_unpoisoned(&self.session);
         let active = session
@@ -569,21 +575,54 @@ pub fn present_screenshot_capture(
 }
 
 #[tauri::command]
-pub fn cancel_screenshot_capture(
+pub async fn cancel_screenshot_capture(
     app: AppHandle,
-    store: State<'_, ScreenshotStore>,
     session_id: Option<String>,
-) -> bool {
-    let closing_id = store.active_session().map(|session| session.id);
-    let cleared = store.clear_session(session_id.as_deref());
+) -> AppResult<bool> {
+    tauri::async_runtime::spawn_blocking(move || {
+        cancel_screenshot_capture_inner(&app, session_id.as_deref())
+    })
+    .await
+    .map_err(|error| {
+        AppError::new(
+            "capture_cancel_error",
+            format!("取消截图任务异常结束: {error}"),
+        )
+    })
+}
+
+fn cancel_screenshot_capture_inner(app: &AppHandle, session_id: Option<&str>) -> bool {
+    let store = app.state::<ScreenshotStore>();
+    // Keep ordinary screenshot startup from observing a long-capture job after
+    // its owning session has already disappeared. Do not hold the session lock
+    // while canceling: closing the control window can dispatch callbacks that
+    // read the active session.
+    let _start_guard = store.lock_start();
+    let Some(closing_id) = store.active_session().map(|session| session.id) else {
+        return false;
+    };
+    if session_id.is_some_and(|expected_id| expected_id != closing_id) {
+        return false;
+    }
+
+    let long_capture_error =
+        crate::long_screenshot::cancel_for_screenshot_session_end(&app, &closing_id).err();
+    // Cancellation is requested before the fallible persistence/window-close
+    // work. Even when that work reports an error, clear the ordinary owner so
+    // the screenshot UI and shortcut cannot remain stuck.
+    let cleared = store.clear_session(Some(&closing_id));
     if cleared {
         if let Some(window) = app.get_webview_window(CAPTURE_WINDOW_LABEL) {
             let _ = window.hide();
         }
         let _ = app.emit(
             "screenshot_session_closed",
-            serde_json::json!({ "id": closing_id }),
+            serde_json::json!({ "id": &closing_id }),
         );
+    }
+    if let Some(error) = long_capture_error {
+        eprintln!("取消截图时清理长截图失败: {error}");
+        let _ = app.emit("screenshot_capture_error", error);
     }
     cleared
 }
@@ -698,7 +737,10 @@ pub fn commit_screenshot_export(
             });
         }
     }
-    finish_capture(&app, &store, &ticket.session_id);
+    // Export ends the ordinary screenshot session. Reuse the owner-aware
+    // teardown so a concurrently starting long capture is canceled before the
+    // session disappears, and a stale export cannot affect a newer session.
+    let _ = cancel_screenshot_capture_inner(&app, Some(&ticket.session_id));
     Ok(result)
 }
 
@@ -821,16 +863,55 @@ pub fn close_pinned_screenshot(
     removed
 }
 
-pub(crate) fn handle_window_closed(app: &AppHandle, label: &str) {
+fn spawn_capture_window_cleanup(app: &AppHandle, session_id: Option<String>, destroy_window: bool) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(session_id) = session_id {
+            let _ = cancel_screenshot_capture_inner(&app, Some(&session_id));
+        }
+        if destroy_window {
+            if let Some(window) = app.get_webview_window(CAPTURE_WINDOW_LABEL) {
+                let _ = window.destroy();
+            }
+        }
+    });
+}
+
+pub(crate) fn handle_window_close_requested(app: &AppHandle, label: &str) -> bool {
     let store = app.state::<ScreenshotStore>();
     if label == CAPTURE_WINDOW_LABEL {
-        store.clear_session(None);
+        let session_id = store.active_session().map(|session| session.id);
+        let Some(session_id) = session_id else {
+            return false;
+        };
+        // Keep the window alive until its long-capture owner has observed
+        // cancellation. The caller prevents this close request; the worker
+        // performs the final destroy after clearing the ordinary session.
+        spawn_capture_window_cleanup(app, Some(session_id), true);
+        true
+    } else if let Some(pin_id) = label.strip_prefix(PIN_WINDOW_PREFIX) {
+        lock_unpoisoned(&store.pins).remove(pin_id);
+        false
+    } else {
+        false
+    }
+}
+
+pub(crate) fn handle_window_destroyed(app: &AppHandle, label: &str) {
+    let store = app.state::<ScreenshotStore>();
+    if label == CAPTURE_WINDOW_LABEL {
+        let session_id = store.active_session().map(|session| session.id);
+        // `destroy()` bypasses CloseRequested. Run the same owner-first cleanup
+        // so a WebView crash or frontend fallback cannot orphan a long job.
+        if session_id.is_some() {
+            spawn_capture_window_cleanup(app, session_id, false);
+        }
     } else if let Some(pin_id) = label.strip_prefix(PIN_WINDOW_PREFIX) {
         lock_unpoisoned(&store.pins).remove(pin_id);
     }
 }
 
-pub(crate) fn finish_capture(app: &AppHandle, store: &ScreenshotStore, session_id: &str) {
+fn finish_capture_unlocked(app: &AppHandle, store: &ScreenshotStore, session_id: &str) {
     if !store.clear_session(Some(session_id)) {
         return;
     }
@@ -841,6 +922,19 @@ pub(crate) fn finish_capture(app: &AppHandle, store: &ScreenshotStore, session_i
         "screenshot_session_closed",
         serde_json::json!({ "id": session_id }),
     );
+}
+
+pub(crate) fn finish_capture_after_cleanup(
+    app: &AppHandle,
+    store: &ScreenshotStore,
+    session_id: &str,
+    cleanup: impl FnOnce(),
+) {
+    // Screenshot startup uses the same lock. Keep long-job cleanup and session
+    // teardown indivisible so a shortcut cannot observe only one side removed.
+    let _start_guard = lock_unpoisoned(&store.start_lock);
+    cleanup();
+    finish_capture_unlocked(app, store, session_id);
 }
 
 fn choose_png_save_path(
@@ -1598,5 +1692,36 @@ mod tests {
             ScreenshotExportAction::Copy
         );
         assert!(store.consume_ticket(&token).is_err());
+    }
+
+    #[test]
+    fn stale_session_teardown_cannot_clear_the_current_session() {
+        let root = tempdir().unwrap();
+        let store = ScreenshotStore::load(root.path()).unwrap();
+        *lock_unpoisoned(&store.session) = Some(ActiveSession {
+            meta: ScreenshotSession {
+                id: "session-new".to_string(),
+                monitor: MonitorBounds {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                    scale_factor: 1.0,
+                },
+                frame_width: 100,
+                frame_height: 100,
+                captured_at: "now".to_string(),
+            },
+            png: Arc::new(Vec::new()),
+        });
+
+        let _start_guard = store.lock_start();
+        assert!(!store.clear_session(Some("session-old")));
+        assert_eq!(
+            store.active_session().map(|session| session.id),
+            Some("session-new".to_string())
+        );
+        assert!(store.clear_session(Some("session-new")));
+        assert!(store.active_session().is_none());
     }
 }

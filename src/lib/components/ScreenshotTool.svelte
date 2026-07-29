@@ -4,6 +4,7 @@
     ArrowLeft,
     ArrowRight,
     Bold,
+    ChevronDown,
     Copy,
     Eraser,
     GalleryVerticalEnd,
@@ -167,8 +168,9 @@
   let longCapability = $state<LongCaptureCapability | null>(null);
   let longCapabilityLoaded = $state(false);
   let longConfirmOpen = $state(false);
+  let longModeMenuOpen = $state(false);
+  let pendingLongMode = $state<LongCaptureMode>("manual");
   let choosingScrollAnchor = $state(false);
-  let longMode = $state<LongCaptureMode>("manual");
   let longStatus = $state<LongCaptureStatus | null>(null);
   let longBusy = $state(false);
   let longPreviewScrollTop = $state(0);
@@ -201,6 +203,8 @@
   const longAnnotations = $derived(longPreviewAnnotations ?? longHistory.present);
 
   let stageElement = $state<HTMLDivElement>(undefined!);
+  let longModeFirstButton = $state<HTMLButtonElement>(undefined!);
+  let longConfirmKeepButton = $state<HTMLButtonElement>(undefined!);
   let displayCanvas = $state<HTMLCanvasElement>(undefined!);
   let sourceCanvas = $state<HTMLCanvasElement>(undefined!);
   let magnifierCanvas = $state<HTMLCanvasElement>(undefined!);
@@ -320,6 +324,8 @@
   function resetLongCapture(): void {
     longStartGeneration += 1;
     longActiveJobId = null;
+    longModeMenuOpen = false;
+    pendingLongMode = "manual";
     choosingScrollAnchor = false;
     longConfirmOpen = false;
     longBusy = false;
@@ -394,22 +400,44 @@
     applyLongCaptureStatus(next, generation);
   }
 
-  function requestLongCapture(): void {
+  function requestLongCapture(mode: LongCaptureMode = "manual"): void {
     if (!selection || selection.width < 1 || selection.height < 1) return;
     if (!longCapabilityLoaded || !longCapability?.available) {
       showToast(longCapability?.reason || "长截图暂不可用");
       return;
     }
+    pendingLongMode = mode;
+    longModeMenuOpen = false;
     finishText(true);
     if (history.present.length > 0 || draft) {
       longConfirmOpen = true;
+      void tick().then(() => longConfirmKeepButton?.focus());
       return;
     }
     activeTool = null;
     selectedId = null;
     hoverPoint = null;
     hoverCss = null;
-    choosingScrollAnchor = true;
+    beginLongCapture();
+  }
+
+  function toggleLongModeMenu(): void {
+    if (!longCapabilityLoaded || !longCapability?.available) return;
+    longModeMenuOpen = !longModeMenuOpen;
+    activeTool = null;
+    selectedId = null;
+    void tick().then(() => {
+      updateViewport();
+      if (longModeMenuOpen) longModeFirstButton?.focus();
+    });
+  }
+
+  function dismissLongCapturePreparation(): void {
+    longModeMenuOpen = false;
+    pendingLongMode = "manual";
+    choosingScrollAnchor = false;
+    longConfirmOpen = false;
+    void tick().then(() => stageElement?.focus());
   }
 
   function confirmLongCapture(): void {
@@ -420,23 +448,40 @@
     selectedId = null;
     activeTool = null;
     longConfirmOpen = false;
-    choosingScrollAnchor = true;
+    beginLongCapture();
   }
 
-  async function startLongCapture(scrollAnchor: Point): Promise<void> {
+  function beginLongCapture(): void {
+    if (pendingLongMode === "manual") {
+      void startLongCapture();
+      return;
+    }
+    choosingScrollAnchor = true;
+    void tick().then(() => stageElement?.focus());
+  }
+
+  async function startLongCapture(selectedAnchor?: Point): Promise<void> {
     const activeSession = session;
     const activeSelection = selection;
     if (!activeSession || !activeSelection || !api.startLongCapture) return;
+    const roundedSelection = roundRect(activeSelection);
+    const scrollAnchor = selectedAnchor
+      ? { x: Math.round(selectedAnchor.x), y: Math.round(selectedAnchor.y) }
+      : {
+          x: roundedSelection.x + Math.floor(roundedSelection.width / 2),
+          y: roundedSelection.y + Math.floor(roundedSelection.height / 2),
+        };
     const generation = ++longStartGeneration;
     choosingScrollAnchor = false;
+    longModeMenuOpen = false;
     longBusy = true;
     error = "";
     const request = api.startLongCapture({
       sessionId: activeSession.id,
-      selection: roundRect(activeSelection),
-      scrollAnchor: { x: Math.round(scrollAnchor.x), y: Math.round(scrollAnchor.y) },
+      selection: roundedSelection,
+      scrollAnchor,
       scope: "selection",
-      mode: longMode,
+      mode: pendingLongMode,
     });
     void request.then((lateStatus) => {
       if (generation !== longStartGeneration) {
@@ -471,8 +516,9 @@
 
   async function cancelLongCaptureToEditor(): Promise<void> {
     const status = longStatus;
+    const startPending = longBusy;
     const activeSessionId = session?.id;
-    if (!status && !activeSessionId) return resetLongCapture();
+    if (!status && !startPending) return resetLongCapture();
     error = "";
     // Recover the editor and unmount its controller before awaiting native IPC.
     // This invalidates pending start/control responses and also debounces a
@@ -481,7 +527,7 @@
     try {
       if (status) {
         await withTimeout(api.cancelLongCapture(status.jobId), 5_000, "取消长截图超时。");
-      } else if (activeSessionId) {
+      } else if (startPending && activeSessionId) {
         await withTimeout(api.cancelLongCaptureSession(activeSessionId), 5_000, "取消长截图启动超时。");
       }
     } catch (value) {
@@ -799,6 +845,7 @@
   }
 
   function activateTool(tool: ScreenshotToolName): void {
+    longModeMenuOpen = false;
     activeTool = tool;
     selectedId = null;
     void tick().then(updateViewport);
@@ -1051,10 +1098,15 @@
   function handlePointerDown(event: PointerEvent): void {
     if (loading || busy || !session || event.button !== 0 || isUiTarget(event.target)) return;
     const point = stagePoint(event);
+    if (longModeMenuOpen) {
+      event.preventDefault();
+      dismissLongCapturePreparation();
+      return;
+    }
     if (choosingScrollAnchor) {
       event.preventDefault();
       if (hitTestSelection(point)) void startLongCapture(point);
-      else showToast("请在选区内点击真正可滚动的内容");
+      else showToast("请在选区内点击要自动滚动的正文区域");
       return;
     }
     if (longCaptureActive) return;
@@ -1320,14 +1372,22 @@
     if (longConfirmOpen) {
       if (event.key === "Escape") {
         event.preventDefault();
-        longConfirmOpen = false;
+        dismissLongCapturePreparation();
       }
+      return;
+    }
+    if (longModeMenuOpen && event.key === "Escape") {
+      event.preventDefault();
+      dismissLongCapturePreparation();
       return;
     }
     if (choosingScrollAnchor) {
       if (event.key === "Escape") {
         event.preventDefault();
-        resetLongCapture();
+        dismissLongCapturePreparation();
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        void startLongCapture();
       }
       return;
     }
@@ -1419,7 +1479,13 @@
   }
 
   function handleContextMenu(event: MouseEvent): void {
-    if (longCaptureActive) {
+    if (longConfirmOpen || choosingScrollAnchor) {
+      event.preventDefault();
+      event.stopPropagation();
+      dismissLongCapturePreparation();
+      return;
+    }
+    if (longStatus || longBusy) {
       event.preventDefault();
       event.stopPropagation();
       void cancelLongCaptureToEditor();
@@ -1896,11 +1962,22 @@
         <button class:active={activeTool === "eraser"} type="button" title="橡皮擦" aria-label="橡皮擦" onclick={() => activateTool("eraser")}><Eraser size={19} /></button>
         <button
           type="button"
-          title={longCapability?.reason || "长截图"}
+          title={longCapability?.reason || "长截图（默认手动滚动）"}
           aria-label="长截图"
           disabled={!longCapabilityLoaded || !longCapability?.available}
-          onclick={requestLongCapture}
+          onclick={() => requestLongCapture("manual")}
         ><GalleryVerticalEnd size={19} /></button>
+        <button
+          class:active={longModeMenuOpen}
+          class="long-mode-toggle"
+          type="button"
+          title="选择长截图模式"
+          aria-label="选择长截图模式"
+          aria-expanded={longModeMenuOpen}
+          aria-controls="long-mode-options"
+          disabled={!longCapabilityLoaded || !longCapability?.available}
+          onclick={toggleLongModeMenu}
+        ><ChevronDown size={15} /></button>
         <span class="separator"></span>
         <button type="button" title="撤销 Ctrl+Z" aria-label="撤销" disabled={history.past.length === 0} onclick={undo}><Undo2 size={19} /></button>
         <button type="button" title="重做 Ctrl+Y" aria-label="重做" disabled={history.future.length === 0} onclick={redo}><Redo2 size={19} /></button>
@@ -1911,7 +1988,16 @@
         <button class="primary-action" type="button" title="复制 Ctrl+C" aria-label="复制截图" onclick={() => void exportImage("copy")}><Copy size={19} /></button>
       </div>
 
-      {#if activeTool}
+      {#if longModeMenuOpen}
+        <div id="long-mode-options" class="tool-options long-mode-options" role="toolbar" aria-label="长截图模式">
+          <strong>长截图模式</strong>
+          <div class="segmented">
+            <button bind:this={longModeFirstButton} class:active={pendingLongMode === "manual"} type="button" onclick={() => requestLongCapture("manual")}>手动滚动（默认）</button>
+            <button class:active={pendingLongMode === "current"} type="button" onclick={() => requestLongCapture("current")}>当前位置自动</button>
+            <button class:active={pendingLongMode === "top"} type="button" onclick={() => requestLongCapture("top")}>从顶部自动</button>
+          </div>
+        </div>
+      {:else if activeTool}
         <div class="tool-options" aria-label="工具参数">
           {#if activeTool === "shape"}
             <div class="segmented" aria-label="形状类型">
@@ -1994,14 +2080,11 @@
   {/if}
 
   {#if choosingScrollAnchor}
-    <div class="long-anchor-bar ui-layer" role="toolbar" aria-label="长截图范围">
-      <strong>点击选区内可滚动内容</strong>
-      <div class="segmented" aria-label="长截图起点">
-        <button class:active={longMode === "manual"} type="button" onclick={() => (longMode = "manual")}>手动滚动</button>
-        <button class:active={longMode === "current"} type="button" onclick={() => (longMode = "current")}>当前位置</button>
-        <button class:active={longMode === "top"} type="button" onclick={() => (longMode = "top")}>从顶部</button>
-      </div>
-      <button class="icon-control" type="button" title="返回截图" aria-label="取消选择滚动位置" onclick={resetLongCapture}><X size={17} /></button>
+    <div class="long-anchor-bar ui-layer" role="toolbar" aria-label="选择自动滚动区域">
+      <strong>点击选区内要自动滚动的正文</strong>
+      <span>{pendingLongMode === "top" ? "将先回到顶部" : "从当前位置开始"}</span>
+      <button class="anchor-center-action" type="button" title="使用选区中心 Enter" onclick={() => void startLongCapture()}>选区中心</button>
+      <button class="icon-control" type="button" title="返回截图 Esc" aria-label="取消选择自动滚动区域" onclick={dismissLongCapturePreparation}><X size={17} /></button>
     </div>
   {/if}
 
@@ -2028,7 +2111,7 @@
         <strong id="long-confirm-title">清除标注并开始长截图？</strong>
         <p>长截图开始前需要清除当前选区中的标注。</p>
         <div>
-          <button type="button" onclick={() => (longConfirmOpen = false)}>保留标注</button>
+          <button bind:this={longConfirmKeepButton} type="button" onclick={dismissLongCapturePreparation}>保留标注</button>
           <button class="confirm-action" type="button" onclick={confirmLongCapture}>清除并继续</button>
         </div>
       </div>
@@ -2239,6 +2322,7 @@
   .primary-tools > button:hover:not(:disabled), .text-toggles button:hover { background: #e7e7e7; border-color: #d0d0d0; }
   .primary-tools > button.active, .text-toggles button.active { color: #fff; background: #0067c0; border-color: #005a9e; }
   .primary-tools > button.primary-action { color: #fff; background: #0067c0; border-color: #005a9e; }
+  .primary-tools > button.long-mode-toggle { width: 25px; margin-left: -2px; }
   .primary-tools > button:disabled { opacity: .38; }
   .separator { width: 1px; height: 25px; margin: 0 3px; background: #d2d2d2; }
   .tool-options { display: flex; min-width: max-content; min-height: 43px; padding: 5px 8px; align-items: center; gap: 9px; border-top: 1px solid #d8d8d8; }
@@ -2248,6 +2332,7 @@
   .segmented button.active { color: #fff; background: #0067c0; border-color: #005a9e; }
   .tool-options label { display: inline-flex; align-items: center; gap: 5px; color: #4c4c4c; font-size: 12px; white-space: nowrap; }
   .tool-options select { height: 29px; max-width: 155px; border: 1px solid #bbb; border-radius: 4px; background: #fff; }
+  .long-mode-options strong { font-size: 12px; white-space: nowrap; }
   .palette { display: flex; gap: 4px; }
   .palette button { width: 22px; height: 22px; padding: 0; border: 1px solid rgb(0 0 0 / 28%); border-radius: 50%; box-shadow: inset 0 0 0 1px rgb(255 255 255 / 45%); }
   .palette button.selected { box-shadow: 0 0 0 2px #fafafa, 0 0 0 4px #0067c0; }
@@ -2256,7 +2341,11 @@
   .text-toggles button { width: 29px; height: 29px; }
   .text-editor { position: absolute; z-index: 15; box-sizing: border-box; min-width: 36px; min-height: 26px; padding: 4px 6px; resize: none; color: #ff3b30; background: rgb(255 255 255 / 92%); border: 1px solid #0a84ff; outline: 1px solid #fff; overflow: hidden; user-select: text; }
   .long-anchor-bar, .long-progress { position: absolute; z-index: 40; top: 12px; left: 50%; display: flex; box-sizing: border-box; min-height: 44px; max-width: calc(100vw - 24px); padding: 5px 7px 5px 11px; align-items: center; gap: 8px; color: #242424; background: rgb(250 250 250 / 98%); border: 1px solid rgb(0 0 0 / 25%); border-radius: 6px; box-shadow: 0 6px 20px rgb(0 0 0 / 28%); transform: translateX(-50%); cursor: default; font: 12px "Segoe UI", sans-serif; }
+  .long-anchor-bar { min-width: min(430px, calc(100vw - 24px)); }
   .long-anchor-bar strong, .long-progress strong { flex: 0 0 auto; font-size: 12px; }
+  .long-anchor-bar > span { min-width: 0; margin-left: auto; color: #666; white-space: nowrap; }
+  .anchor-center-action { flex: 0 0 auto; height: 30px; padding: 0 10px; color: #2d2d2d; background: #fff; border: 1px solid #c8c8c8; border-radius: 4px; white-space: nowrap; }
+  .anchor-center-action:hover { background: #e7e7e7; border-color: #aaa; }
   .long-progress { min-width: min(540px, calc(100vw - 24px)); }
   .long-stats { flex: 0 0 auto; color: #555; white-space: nowrap; }
   .long-message { min-width: 0; max-width: 220px; color: #6b4d18; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

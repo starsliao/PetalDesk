@@ -1,6 +1,6 @@
 [package]
 name = "petaldesk"
-version = "0.3.1"
+version = "0.3.3"
 description = "飞花 - PetalDesk local Markdown notes and desktop tools"
 authors = ["飞花 - PetalDesk contributors"]
 edition = "2021"
@@ -42,6 +42,7 @@ infer = "0.19"
 mime_guess = "2"
 pulldown-cmark = "0.13"
 rusqlite = { version = "0.37", features = ["bundled"] }
+rustfft = "6.4"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4", "serde"] }
 png = "0.17"
@@ -77,3 +78,6 @@ strip = true
 # unwinding preserves that: a bug in one command must not kill unsaved notes in
 # every other window.
 panic = "unwind"
+
+[profile.release.package.rustfft]
+opt-level = 3

@@ -2,6 +2,8 @@ use crate::browser_bridge::{
     BrowserBridge, BrowserBridgeStatus, BrowserConnectionStatus, BrowserFamily,
 };
 use crate::error::{AppError, AppResult};
+use crate::long_screenshot_input::{ScrollInputMonitor, ScrollInputSnapshot};
+use crate::phase_match::phase_offset_rgba;
 use crate::screenshot::{
     self, MonitorBounds, ScreenshotExportAction, ScreenshotStore, CAPTURE_WINDOW_LABEL,
 };
@@ -9,7 +11,7 @@ use crate::storage::{atomic_write, atomic_write_json, INTERNAL_DATA_DIR};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
@@ -32,6 +34,9 @@ const DEFAULT_TILE_HEIGHT: u32 = 1_024;
 const MAX_TILE_HEIGHT: u32 = 2_048;
 const MAX_TILE_PIXELS: u64 = 16_000_000;
 static CONTROL_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
+const CONTROL_WINDOW_DESTROY_TIMEOUT: Duration = Duration::from_secs(3);
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(14);
+const APP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const SETTLE_SAMPLE_INTERVAL: Duration = Duration::from_millis(90);
 const SETTLE_MAX_SAMPLES: usize = 18;
 const LOW_CONFIDENCE_LIMIT: u8 = 3;
@@ -46,9 +51,37 @@ const MAX_ANNOTATION_STRIP_BYTES: usize = 64 * 1024 * 1024;
 const ANNOTATION_EXPORT_TOKEN_HEADER: &str = "x-petaldesk-long-export-token";
 const ANNOTATION_EXPORT_Y_HEADER: &str = "x-petaldesk-long-export-y";
 const CONTROL_WINDOW_LABEL: &str = "screenshot-long-control";
+const OUTLINE_WINDOW_LABEL: &str = "screenshot-long-outline";
 const CONTROL_WINDOW_HEIGHT: u32 = 68;
 const CONTROL_WINDOW_MAX_WIDTH: u32 = 680;
-const MANUAL_SCROLL_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const MANUAL_SCROLL_STOP_CHECK_INTERVAL: Duration = Duration::from_millis(25);
+const MANUAL_SCROLL_ACTIVE_CAPTURE_INTERVAL: Duration = Duration::from_millis(150);
+const MANUAL_SCROLL_SETTLE_AFTER: Duration = Duration::from_millis(250);
+const MANUAL_SCROLL_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(350);
+const MANUAL_SCROLL_FEEDBACK_AFTER: Duration = Duration::from_secs(3);
+const MANUAL_SCROLL_UNMATCHED_PAUSE_AFTER: Duration = Duration::from_secs(4);
+const AUTO_SCROLL_END_CONFIRMATIONS: u8 = 3;
+const AUTO_SCROLL_INITIAL_DELTA: i32 = 30;
+const OUTLINE_MARGIN_LOGICAL: f64 = 6.0;
+const MATCH_GRID_COLUMNS: usize = 8;
+const MATCH_GRID_ROWS: usize = 6;
+const MATCH_MIN_TEXTURED_BLOCKS: usize = 8;
+const MATCH_MIN_HORIZONTAL_BANDS: usize = 2;
+const MATCH_MIN_VERTICAL_BANDS: usize = 3;
+const MATCH_MIN_OVERLAP_PERCENT: usize = 30;
+const MATCH_SAMPLES_PER_BLOCK_AXIS: usize = 12;
+const MOTION_MIN_SUPPORT_BLOCKS: usize = 4;
+const MOTION_FINE_RADIUS_MAX: usize = 24;
+const MATCH_CANDIDATE_GROUPS: usize = 32;
+const MATCH_SELECTED_GROUPS: usize = 12;
+const MATCH_VERIFICATION_GROUPS: usize = 8;
+const MATCH_DISTRIBUTION_BANDS: usize = 6;
+const CHANGE_SAMPLE_GROUPS: usize = 32;
+const CHANGE_VERTICAL_BANDS: usize = 6;
+const MATCH_MAX_COARSE_CANDIDATES: usize = 192;
+const MATCH_MAX_COARSE_ROWS: usize = 192;
+const MATCH_MAX_REFINE_SEEDS: usize = 4;
+const MATCH_MAX_FINE_ROWS: usize = 384;
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -190,6 +223,7 @@ pub struct PrepareLongCaptureAnnotationExportResult {
 }
 
 struct LongCaptureAnnotationExportTicket {
+    job: Arc<LongCaptureJob>,
     job_id: String,
     session_id: String,
     action: ScreenshotExportAction,
@@ -218,6 +252,8 @@ struct LongCaptureManifest {
     height: u32,
     message: String,
     segments: Vec<LongCaptureSegment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fixed_bottom: Option<LongCaptureFixedBottom>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +266,13 @@ struct LongCaptureSegment {
     confidence: f32,
     frame_file: String,
     strip_file: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LongCaptureFixedBottom {
+    height: u32,
+    file: String,
 }
 
 #[derive(Debug, Clone)]
@@ -299,6 +342,29 @@ fn should_cleanup_after_worker(runtime: &LongCaptureRuntime) -> bool {
     runtime.cancel_requested || runtime.manifest.state == LongCaptureState::Canceled
 }
 
+fn should_cancel_after_control_destroy(state: LongCaptureState) -> bool {
+    matches!(
+        state,
+        LongCaptureState::Preparing | LongCaptureState::Capturing | LongCaptureState::Paused
+    )
+}
+
+fn wait_for_worker_done(job: &LongCaptureJob, timeout: Duration) -> bool {
+    let runtime = lock_unpoisoned(&job.runtime);
+    let (runtime, _) = job
+        .wake
+        .wait_timeout_while(runtime, timeout, |runtime| !runtime.worker_done)
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    runtime.worker_done
+}
+
+fn worker_shutdown_timeout_error() -> AppError {
+    AppError::new(
+        "long_capture_worker_shutdown_timeout",
+        "长截图后台任务仍在结束，请稍后重试导出",
+    )
+}
+
 impl LongCaptureJob {
     fn status(&self) -> LongCaptureStatus {
         status_from_runtime(&lock_unpoisoned(&self.runtime))
@@ -312,6 +378,14 @@ pub struct LongScreenshotStore {
     annotation_exports: Mutex<HashMap<String, LongCaptureAnnotationExportTicket>>,
     start_lock: Mutex<()>,
     pending_start: Mutex<Option<PendingLongCaptureStart>>,
+    control_destroys: Mutex<ControlDestroyTracker>,
+    control_destroyed: Condvar,
+}
+
+#[derive(Default)]
+struct ControlDestroyTracker {
+    expected: HashMap<isize, bool>,
+    completed: HashSet<isize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +425,8 @@ impl LongScreenshotStore {
             annotation_exports: Mutex::new(HashMap::new()),
             start_lock: Mutex::new(()),
             pending_start: Mutex::new(None),
+            control_destroys: Mutex::new(ControlDestroyTracker::default()),
+            control_destroyed: Condvar::new(),
         })
     }
 
@@ -419,6 +495,81 @@ impl LongScreenshotStore {
             .filter(|job| job.status().session_id == session_id)
             .cloned()
     }
+
+    fn expect_control_destroy(&self, instance_id: isize, wait_for_completion: bool) -> bool {
+        let mut tracker = lock_unpoisoned(&self.control_destroys);
+        if tracker.completed.contains(&instance_id) {
+            return false;
+        }
+        match tracker.expected.entry(instance_id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                *entry.get_mut() |= wait_for_completion;
+                false
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(wait_for_completion);
+                true
+            }
+        }
+    }
+
+    fn revoke_expected_control_destroy(&self, instance_id: isize) {
+        let mut tracker = lock_unpoisoned(&self.control_destroys);
+        tracker.expected.remove(&instance_id);
+        tracker.completed.remove(&instance_id);
+        self.control_destroyed.notify_all();
+    }
+
+    fn consume_expected_control_destroy(&self, instance_id: Option<isize>) -> bool {
+        let mut tracker = lock_unpoisoned(&self.control_destroys);
+        let instance_id = match instance_id {
+            Some(instance_id) => instance_id,
+            None if tracker.expected.len() == 1 => *tracker
+                .expected
+                .keys()
+                .next()
+                .expect("one expected control destroy"),
+            None => return false,
+        };
+        let Some(wait_for_completion) = tracker.expected.remove(&instance_id) else {
+            return false;
+        };
+        if wait_for_completion {
+            tracker.completed.insert(instance_id);
+            self.control_destroyed.notify_all();
+        }
+        true
+    }
+
+    fn wait_for_control_destroy(&self, instance_id: isize, timeout: Duration) -> bool {
+        let mut tracker = lock_unpoisoned(&self.control_destroys);
+        let deadline = Instant::now() + timeout;
+        loop {
+            if tracker.completed.remove(&instance_id) {
+                return true;
+            }
+            if !tracker.expected.contains_key(&instance_id) {
+                return false;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                if let Some(wait_for_completion) = tracker.expected.get_mut(&instance_id) {
+                    *wait_for_completion = false;
+                }
+                return false;
+            };
+            let waited = self
+                .control_destroyed
+                .wait_timeout(tracker, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tracker = waited.0;
+            if waited.1.timed_out() && !tracker.completed.contains(&instance_id) {
+                if let Some(wait_for_completion) = tracker.expected.get_mut(&instance_id) {
+                    *wait_for_completion = false;
+                }
+                return false;
+            }
+        }
+    }
 }
 
 fn clear_job_cache(store: &LongScreenshotStore, expected_id: &str) {
@@ -462,25 +613,32 @@ pub(crate) fn shutdown(app: &AppHandle) {
     if let Some(pending) = lock_unpoisoned(&store.pending_start).as_mut() {
         pending.cancel_requested = true;
     }
-    let job = lock_unpoisoned(&store.job).take();
-    if let Some(job) = job {
-        {
-            let mut runtime = lock_unpoisoned(&job.runtime);
-            runtime.cancel_requested = true;
-            runtime.pause_requested = false;
-            runtime.generation = runtime.generation.wrapping_add(1);
-            if transition_to_canceled(&mut runtime.manifest.state) {
-                runtime.manifest.message = "应用退出，长截图已取消".to_string();
-            }
+    let job = lock_unpoisoned(&store.job).as_ref().cloned();
+    let worker_stopped = if let Some(job) = job.as_ref() {
+        let outcome = request_job_cancel(job, "应用退出，长截图已取消");
+        if let Some(error) = outcome.persistence_error {
+            eprintln!("保存长截图退出状态失败: {error}");
         }
-        job.wake.notify_all();
-        let _ = restore_browser_session(&job);
+        let stopped = outcome.cleanup_now || wait_for_worker_done(job, APP_SHUTDOWN_TIMEOUT);
+        if stopped {
+            clear_job_cache(&store, &outcome.status.job_id);
+        } else {
+            // The process is already exiting. Keep the directory intact while
+            // a worker may still be writing; startup orphan cleanup owns it
+            // after this process has gone away.
+            eprintln!("长截图后台任务未在退出超时内结束，保留缓存供下次启动清理");
+        }
+        let _ = restore_browser_session(job);
         restore_hidden_pin_windows(app, &job.hidden_pin_labels);
-        let _ = std::fs::remove_dir_all(&job.directory);
-    }
+        stopped
+    } else {
+        true
+    };
     let _ = close_control_window(app);
     clear_all_annotation_exports(&store);
-    cleanup_cache_directories_owned_by(&store.cache_root, std::process::id());
+    if worker_stopped {
+        cleanup_cache_directories_owned_by(&store.cache_root, std::process::id());
+    }
 }
 
 fn cleanup_cache_directories_owned_by(root: &Path, process_id: u32) {
@@ -646,12 +804,17 @@ fn start_long_capture_inner(
     }
     let store = app.state::<LongScreenshotStore>();
     let screenshot_store = app.state::<ScreenshotStore>();
+    // Register the pending long-capture owner under the same lock used by
+    // ordinary screenshot start/cancel. Once pending is visible, cancellation
+    // can reliably stop either the pending transition or the published job.
+    let screenshot_start_guard = screenshot_store.lock_start();
     let session = screenshot_store
         .active_session()
         .filter(|session| session.id == request.session_id)
         .ok_or_else(|| AppError::not_found("截图会话已结束或已被替换"))?;
     let session_id = session.id.clone();
     store.begin_pending_start(&session_id)?;
+    drop(screenshot_start_guard);
     let _pending_guard = PendingLongCaptureStartGuard {
         store: &store,
         session_id,
@@ -705,13 +868,29 @@ fn start_long_capture_registered_inner(
         let _ = std::fs::remove_dir_all(&directory);
         return Err(error);
     }
+    // Building a WebView can synchronously dispatch to Tauri's window thread.
+    // Do it while the ordinary screenshot overlay is still visible and before
+    // publishing the job, so a slow WebView startup never leaves the desktop
+    // behind a hidden, non-responsive capture surface. Recreate it for every
+    // job because the job id is part of the control page URL.
+    if let Err(error) = prepare_control_window(app, &target.monitor, target.bounds, &job_id) {
+        let _ = std::fs::remove_dir_all(&directory);
+        return Err(error);
+    }
+    if let Err(error) = prepare_outline_window(app, &target.monitor, target.bounds) {
+        let _ = close_control_window(app);
+        let _ = std::fs::remove_dir_all(&directory);
+        return Err(error);
+    }
     if store.pending_start_cancel_requested(&session.id) {
+        let _ = close_control_window(app);
         let _ = std::fs::remove_dir_all(&directory);
         return Err(pending_start_canceled_error());
     }
     let hidden_pin_labels = hide_visible_pin_windows(&app);
     if let Err(error) = hide_capture_overlay(&app) {
         restore_hidden_pin_windows(&app, &hidden_pin_labels);
+        let _ = close_control_window(app);
         let _ = std::fs::remove_dir_all(&directory);
         return Err(error);
     }
@@ -720,6 +899,7 @@ fn start_long_capture_registered_inner(
     if store.pending_start_cancel_requested(&session.id) {
         restore_hidden_pin_windows(app, &hidden_pin_labels);
         let error = recover_capture_overlay(app, &session.monitor, pending_start_canceled_error());
+        let _ = close_control_window(app);
         let _ = std::fs::remove_dir_all(&directory);
         return Err(error);
     }
@@ -766,10 +946,12 @@ fn start_long_capture_registered_inner(
         height: 0,
         message: preparing_message,
         segments: Vec::new(),
+        fixed_bottom: None,
     };
     if let Err(error) = atomic_write_json(&directory.join("manifest.json"), &manifest) {
         restore_hidden_pin_windows(&app, &hidden_pin_labels);
         let error = recover_capture_overlay(&app, &session.monitor, error);
+        let _ = close_control_window(app);
         let _ = std::fs::remove_dir_all(&directory);
         return Err(error);
     }
@@ -951,12 +1133,16 @@ enum LongCaptureReentrySurface {
 fn long_capture_reentry_surface(
     pending_start: bool,
     state: Option<LongCaptureState>,
+    engine: Option<LongCaptureEngine>,
 ) -> Option<LongCaptureReentrySurface> {
     if pending_start {
         return Some(LongCaptureReentrySurface::Pending);
     }
     match state? {
         LongCaptureState::Preparing | LongCaptureState::Capturing => {
+            Some(LongCaptureReentrySurface::Control)
+        }
+        LongCaptureState::Paused if engine == Some(LongCaptureEngine::Manual) => {
             Some(LongCaptureReentrySurface::Control)
         }
         LongCaptureState::Paused | LongCaptureState::Ready | LongCaptureState::Failed => {
@@ -966,32 +1152,82 @@ fn long_capture_reentry_surface(
     }
 }
 
+fn screenshot_session_owns_job(active_session_id: Option<&str>, job_session_id: &str) -> bool {
+    active_session_id.is_some_and(|active| active == job_session_id)
+}
+
 pub(crate) fn restore_active_long_capture_surface(app: &AppHandle) -> AppResult<bool> {
     let Some(store) = app.try_state::<LongScreenshotStore>() else {
         return Ok(false);
     };
-    if lock_unpoisoned(&store.pending_start).is_some() {
+    let pending_session_id = lock_unpoisoned(&store.pending_start)
+        .as_ref()
+        .map(|pending| pending.session_id.clone());
+    if let Some(session_id) = pending_session_id {
+        // Reentry while WebView construction is pending must remain actionable.
+        // Cancel the pending transition before restoring the ordinary overlay,
+        // otherwise the starter could hide it again immediately afterwards.
+        store.request_pending_start_cancel(&session_id);
+        if let Some(session) = app
+            .state::<ScreenshotStore>()
+            .active_session()
+            .filter(|session| session.id == session_id)
+        {
+            show_capture_overlay(app, &session.monitor)?;
+        }
         return Ok(true);
     }
     let Some(job) = lock_unpoisoned(&store.job).as_ref().cloned() else {
         return Ok(false);
     };
-    let _operation_guard = lock_unpoisoned(&job.operation_lock);
-    let Some(surface) = long_capture_reentry_surface(false, Some(job.status().state)) else {
+    let owner_session_id = job.status().session_id;
+    let active_session = app.state::<ScreenshotStore>().active_session();
+    let owner_session_is_active = screenshot_session_owns_job(
+        active_session.as_ref().map(|session| session.id.as_str()),
+        &owner_session_id,
+    );
+    if !owner_session_is_active {
+        // A capture WebView crash or an external session close must not leave a
+        // job that consumes every future screenshot shortcut with "busy".
+        if let Err(error) = cancel_for_screenshot_session_end(app, &owner_session_id) {
+            eprintln!("清理失去截图会话的长截图任务失败: {error}");
+            let _ = app.emit("screenshot_capture_error", error);
+        }
         return Ok(false);
-    };
-    match surface {
-        LongCaptureReentrySurface::Pending => {}
-        LongCaptureReentrySurface::Control => {
-            // A control window overlapping the ROI is hidden briefly around
-            // each frame. Forcing it visible there would capture the controls.
-            if !job.target.control_overlaps_roi {
-                show_control_window(app, &job)?;
+    }
+    let (surface, surface_result) = {
+        let _operation_guard = lock_unpoisoned(&job.operation_lock);
+        let status = job.status();
+        let Some(surface) =
+            long_capture_reentry_surface(false, Some(status.state), Some(status.engine))
+        else {
+            return Ok(false);
+        };
+        let result = match surface {
+            LongCaptureReentrySurface::Pending => Ok(()),
+            LongCaptureReentrySurface::Control => {
+                // Frame capture uses the same operation lock while the control
+                // is hidden. Reentry waits for that bounded transaction.
+                show_control_window(app, &job)
             }
+            LongCaptureReentrySurface::Overlay => show_capture_overlay(app, &job.target.monitor),
+        };
+        (surface, result)
+    };
+    if let Err(surface_error) = surface_result {
+        if surface == LongCaptureReentrySurface::Control
+            && surface_error.code == "long_capture_control_missing"
+        {
+            return match cancel_long_capture_job_inner(app, &store, &job) {
+                Ok(_) => Ok(true),
+                Err(cancel_error) => Err(append_recovery_error(
+                    surface_error,
+                    "取消失去控制窗口的长截图失败",
+                    &cancel_error,
+                )),
+            };
         }
-        LongCaptureReentrySurface::Overlay => {
-            show_capture_overlay(app, &job.target.monitor)?;
-        }
+        return Err(surface_error);
     }
     Ok(true)
 }
@@ -1026,10 +1262,7 @@ fn pause_long_capture_inner(app: &AppHandle, job_id: &str) -> AppResult<LongCapt
         persist_runtime(&job, &runtime)?;
         status_from_runtime(&runtime)
     };
-    switch_visible_surface(
-        || show_capture_overlay(&app, &job.target.monitor),
-        || hide_control_window(&app),
-    )?;
+    show_paused_capture_surface(&app, &job, status.engine)?;
     let _ = app.emit("long_capture_paused", &status);
     Ok(status)
 }
@@ -1155,16 +1388,16 @@ fn undo_long_capture_segment_inner(app: &AppHandle, job_id: &str) -> AppResult<L
             .segments
             .pop()
             .expect("segment length checked");
-        runtime.manifest.height = removed.output_y;
+        runtime.manifest.height = removed
+            .output_y
+            .saturating_add(fixed_bottom_height(&runtime.manifest));
+        refresh_fixed_bottom_from_latest_frame(&job, &runtime.manifest)?;
         persist_runtime(&job, &runtime)?;
         removed
     };
     remove_segment_files(&job.directory, &removed);
     let status = job.status();
-    switch_visible_surface(
-        || show_capture_overlay(&app, &job.target.monitor),
-        || hide_control_window(&app),
-    )?;
+    show_paused_capture_surface(&app, &job, status.engine)?;
     let _ = app.emit("long_capture_paused", &status);
     Ok(status)
 }
@@ -1284,37 +1517,100 @@ fn cancel_long_capture_session_inner(
     cancel_long_capture_job_inner(app, &store, &job).map(Some)
 }
 
+/// Ends a long-capture job because its owning ordinary screenshot session is
+/// being closed. Unlike the user-facing cancel command this must not restore
+/// the overlay that is currently closing or has already been destroyed.
+pub(crate) fn cancel_for_screenshot_session_end(
+    app: &AppHandle,
+    session_id: &str,
+) -> AppResult<()> {
+    let store = app.state::<LongScreenshotStore>();
+    store.request_pending_start_cancel(session_id);
+    let Some(job) = store.job_for_session(session_id) else {
+        return Ok(());
+    };
+    let _operation_guard = lock_unpoisoned(&job.operation_lock);
+    let outcome = request_job_cancel(&job, "截图窗口已关闭，长截图已取消");
+    let close_error = close_control_window(app).err();
+    if outcome.cleanup_now {
+        clear_job_cache(&store, &outcome.status.job_id);
+    }
+    match (outcome.persistence_error, close_error) {
+        (Some(persistence_error), Some(close_error)) => Err(append_recovery_error(
+            persistence_error,
+            "关闭长截图控制窗口失败",
+            &close_error,
+        )),
+        (Some(persistence_error), None) => Err(persistence_error),
+        (None, Some(close_error)) => Err(close_error),
+        (None, None) => Ok(()),
+    }
+}
+
 fn cancel_long_capture_job_inner(
     app: &AppHandle,
     store: &LongScreenshotStore,
     job: &Arc<LongCaptureJob>,
 ) -> AppResult<LongCaptureStatus> {
     let _operation_guard = lock_unpoisoned(&job.operation_lock);
-    let job_id = job.status().job_id;
-    let (status, cleanup_now) = {
+    let outcome = request_job_cancel(job, "长截图已取消");
+    let job_id = outcome.status.job_id.clone();
+    let surface_result = switch_visible_surface(
+        || show_capture_overlay(app, &job.target.monitor),
+        || close_control_window(app),
+    );
+    if outcome.cleanup_now {
+        clear_job_cache(store, &job_id);
+    }
+    let surface_error = surface_result
+        .err()
+        .map(|error| recover_capture_surface(app, job, error));
+    match (outcome.persistence_error, surface_error) {
+        (Some(persistence_error), Some(surface_error)) => Err(append_recovery_error(
+            persistence_error,
+            "恢复普通截图界面失败",
+            &surface_error,
+        )),
+        (Some(persistence_error), None) => Err(persistence_error),
+        (None, Some(surface_error)) => Err(surface_error),
+        (None, None) => Ok(outcome.status),
+    }
+}
+
+struct CancelJobOutcome {
+    status: LongCaptureStatus,
+    cleanup_now: bool,
+    persistence_error: Option<AppError>,
+}
+
+fn request_job_cancel(job: &LongCaptureJob, message: &str) -> CancelJobOutcome {
+    let (status, cleanup_now, persistence_error) = {
         let mut runtime = lock_unpoisoned(&job.runtime);
         let cleanup_now = runtime.worker_done;
         runtime.cancel_requested = true;
         runtime.pause_requested = false;
         runtime.generation = runtime.generation.wrapping_add(1);
-        if transition_to_canceled(&mut runtime.manifest.state) {
-            runtime.manifest.message = "长截图已取消".to_string();
-            persist_runtime(&job, &runtime)?;
-        }
-        (status_from_runtime(&runtime), cleanup_now)
+        let persistence_error = if transition_to_canceled(&mut runtime.manifest.state) {
+            runtime.manifest.message = message.to_string();
+            persist_runtime(job, &runtime).err()
+        } else {
+            None
+        };
+        (
+            status_from_runtime(&runtime),
+            cleanup_now,
+            persistence_error,
+        )
     };
+    // Cancellation is a runtime safety action, not a persistence transaction.
+    // A deleted cache directory or full disk must never leave a paused worker
+    // asleep behind a failed manifest write.
     job.wake.notify_all();
-    let surface_result = switch_visible_surface(
-        || show_capture_overlay(app, &job.target.monitor),
-        || close_control_window(app),
-    );
-    if cleanup_now {
-        clear_job_cache(store, &job_id);
+    CancelJobOutcome {
+        status,
+        cleanup_now,
+        persistence_error,
     }
-    if let Err(surface_error) = surface_result {
-        return Err(recover_capture_surface(&app, &job, surface_error));
-    }
-    Ok(status)
 }
 
 #[tauri::command]
@@ -1435,6 +1731,7 @@ fn prepare_long_capture_annotation_export_inner(
     lock_unpoisoned(&store.annotation_exports).insert(
         token.clone(),
         LongCaptureAnnotationExportTicket {
+            job: Arc::clone(&job),
             job_id: manifest.job_id,
             session_id: manifest.session_id,
             action,
@@ -1539,6 +1836,18 @@ fn finish_long_capture_annotation_export_inner(
     token: &str,
 ) -> AppResult<LongCaptureExportResult> {
     let store = app.state::<LongScreenshotStore>();
+    let job = {
+        let tickets = lock_unpoisoned(&store.annotation_exports);
+        Arc::clone(
+            &tickets
+                .get(token)
+                .ok_or_else(|| AppError::not_found("长截图标注导出票据不存在或已过期"))?
+                .job,
+        )
+    };
+    if !wait_for_worker_done(&job, WORKER_SHUTDOWN_TIMEOUT) {
+        return Err(worker_shutdown_timeout_error());
+    }
     purge_expired_annotation_exports(&store);
     let ticket = lock_unpoisoned(&store.annotation_exports)
         .remove(token)
@@ -1577,8 +1886,12 @@ fn finish_long_capture_annotation_export_inner(
             }
         }
     }
-    screenshot::finish_capture(app, &app.state::<ScreenshotStore>(), &ticket.session_id);
-    clear_job_cache(&app.state::<LongScreenshotStore>(), &ticket.job_id);
+    screenshot::finish_capture_after_cleanup(
+        app,
+        &app.state::<ScreenshotStore>(),
+        &ticket.session_id,
+        || clear_job_cache(&app.state::<LongScreenshotStore>(), &ticket.job_id),
+    );
     Ok(result)
 }
 
@@ -1630,6 +1943,9 @@ fn export_long_capture_inner(
         }
         runtime.manifest.clone()
     };
+    if !wait_for_worker_done(job, WORKER_SHUTDOWN_TIMEOUT) {
+        return Err(worker_shutdown_timeout_error());
+    }
     validate_annotation_payload(annotation_payload, &manifest)?;
     let result = match action {
         ScreenshotExportAction::Save => {
@@ -1679,8 +1995,12 @@ fn export_long_capture_inner(
             }
         }
     };
-    screenshot::finish_capture(app, &app.state::<ScreenshotStore>(), &manifest.session_id);
-    clear_job_cache(&app.state::<LongScreenshotStore>(), &manifest.job_id);
+    screenshot::finish_capture_after_cleanup(
+        app,
+        &app.state::<ScreenshotStore>(),
+        &manifest.session_id,
+        || clear_job_cache(&app.state::<LongScreenshotStore>(), &manifest.job_id),
+    );
     Ok(result)
 }
 
@@ -1968,6 +2288,7 @@ fn stream_manifest_png_file(
         let mut stream = writer.stream_writer_with_size(64 * 1024).map_err(|error| {
             AppError::new("png_error", format!("创建长截图流式编码器失败: {error}"))
         })?;
+        let mut written_rows = 0_u32;
         for segment in &manifest.segments {
             let strip = decode_png(
                 &std::fs::read(directory.join(&segment.strip_file))
@@ -1982,6 +2303,29 @@ fn stream_manifest_png_file(
             stream
                 .write_all(&strip.rgba)
                 .map_err(|error| AppError::io("写入长截图 PNG", error))?;
+            written_rows = written_rows.saturating_add(segment.height);
+        }
+        if let Some(fixed_bottom) = manifest.fixed_bottom.as_ref() {
+            let footer = decode_png(
+                &std::fs::read(directory.join(&fixed_bottom.file))
+                    .map_err(|error| AppError::io("读取长截图固定底栏", error))?,
+            )?;
+            if footer.width != manifest.width || footer.height != fixed_bottom.height {
+                return Err(AppError::new(
+                    "invalid_long_capture_cache",
+                    "长截图固定底栏尺寸与清单不一致",
+                ));
+            }
+            stream
+                .write_all(&footer.rgba)
+                .map_err(|error| AppError::io("写入长截图固定底栏", error))?;
+            written_rows = written_rows.saturating_add(fixed_bottom.height);
+        }
+        if written_rows != manifest.height {
+            return Err(AppError::new(
+                "invalid_long_capture_cache",
+                "长截图导出条带总高度与清单不一致",
+            ));
         }
         stream
             .finish()
@@ -2297,6 +2641,27 @@ fn show_capture_overlay(app: &AppHandle, monitor: &MonitorBounds) -> AppResult<(
     screenshot::present_capture_window(app)
 }
 
+fn show_paused_capture_surface(
+    app: &AppHandle,
+    job: &LongCaptureJob,
+    engine: LongCaptureEngine,
+) -> AppResult<()> {
+    if engine == LongCaptureEngine::Manual {
+        // Manual capture depends on the user interacting with the real target.
+        // Keep that target visible and leave the independent control available
+        // so pause never turns into an inert frozen screenshot overlay.
+        switch_visible_surface(
+            || show_control_window(app, job),
+            || hide_capture_overlay(app),
+        )
+    } else {
+        switch_visible_surface(
+            || show_capture_overlay(app, &job.target.monitor),
+            || hide_control_window(app),
+        )
+    }
+}
+
 fn control_window_geometry(
     monitor: &MonitorBounds,
     selection: PhysicalRect,
@@ -2354,6 +2719,32 @@ fn control_window_geometry(
         PhysicalPosition::new(x, y as i32),
         PhysicalSize::new(width, height),
         overlaps,
+    )
+}
+
+fn outline_window_geometry(
+    monitor: &MonitorBounds,
+    selection: PhysicalRect,
+) -> (PhysicalPosition<i32>, PhysicalSize<u32>) {
+    let scale = if monitor.scale_factor.is_finite() && monitor.scale_factor > 0.0 {
+        monitor.scale_factor
+    } else {
+        1.0
+    };
+    // CSS paints at most five logical pixels inward from the outline window.
+    // Keep a sixth pixel outside the ROI so CAPTUREBLT never sees the border,
+    // including at high DPI and on monitors with negative coordinates.
+    let margin = ((OUTLINE_MARGIN_LOGICAL * scale).ceil() as u32).max(6);
+    let margin_i32 = i32::try_from(margin).unwrap_or(i32::MAX);
+    (
+        PhysicalPosition::new(
+            selection.x.saturating_sub(margin_i32),
+            selection.y.saturating_sub(margin_i32),
+        ),
+        PhysicalSize::new(
+            selection.width.saturating_add(margin.saturating_mul(2)),
+            selection.height.saturating_add(margin.saturating_mul(2)),
+        ),
     )
 }
 
@@ -2465,49 +2856,137 @@ fn show_control_window_no_activate(window: &tauri::WebviewWindow<tauri::Wry>) ->
         .map_err(|error| AppError::new("window_error", format!("显示长截图控制窗口失败: {error}")))
 }
 
-fn show_control_window(app: &AppHandle, job: &LongCaptureJob) -> AppResult<()> {
-    let (position, size, _) = control_window_geometry(&job.target.monitor, job.target.bounds);
-    let window = if let Some(window) = app.get_webview_window(CONTROL_WINDOW_LABEL) {
-        window
-    } else {
-        let _creation_guard = lock_unpoisoned(&CONTROL_WINDOW_CREATION_LOCK);
-        if let Some(window) = app.get_webview_window(CONTROL_WINDOW_LABEL) {
-            window
-        } else {
-            WebviewWindowBuilder::new(
-                app,
-                CONTROL_WINDOW_LABEL,
-                WebviewUrl::App(
-                    format!("?tool=screenshot&longControl={}", job.status().job_id).into(),
-                ),
-            )
-            .title("长截图控制 - 飞花 - PetalDesk")
-            .decorations(false)
-            .shadow(false)
-            .resizable(false)
-            .always_on_top(true)
-            .skip_taskbar(true)
-            .focused(false)
-            .visible(false)
-            .inner_size(f64::from(size.width), f64::from(size.height))
-            .build()
-            .map_err(|error| {
-                AppError::new("window_error", format!("创建长截图控制窗口失败: {error}"))
-            })?
-        }
-    };
+fn position_control_window(
+    window: &tauri::WebviewWindow<tauri::Wry>,
+    monitor: &MonitorBounds,
+    selection: PhysicalRect,
+) -> AppResult<()> {
+    let (position, size, _) = control_window_geometry(monitor, selection);
     configure_control_window_no_activate(&window)?;
     window
         .set_position(position)
         .and_then(|_| window.set_size(size))
+        .map_err(|error| AppError::new("window_error", format!("定位长截图控制窗口失败: {error}")))
+}
+
+fn prepare_control_window(
+    app: &AppHandle,
+    monitor: &MonitorBounds,
+    selection: PhysicalRect,
+    job_id: &str,
+) -> AppResult<()> {
+    let (_, size, _) = control_window_geometry(monitor, selection);
+    let _creation_guard = lock_unpoisoned(&CONTROL_WINDOW_CREATION_LOCK);
+    if let Some(window) = app.get_webview_window(CONTROL_WINDOW_LABEL) {
+        destroy_control_window_instance_and_wait(app, &window, "重建长截图控制窗口前关闭旧窗口")?;
+    }
+    let window = WebviewWindowBuilder::new(
+        app,
+        CONTROL_WINDOW_LABEL,
+        WebviewUrl::App(format!("?tool=screenshot&longControl={job_id}").into()),
+    )
+    .title("长截图控制 - 飞花 - PetalDesk")
+    .decorations(false)
+    .shadow(false)
+    .resizable(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .focused(false)
+    .visible(false)
+    .inner_size(f64::from(size.width), f64::from(size.height))
+    .build()
+    .map_err(|error| AppError::new("window_error", format!("创建长截图控制窗口失败: {error}")))?;
+    position_control_window(&window, monitor, selection)
+}
+
+fn prepare_outline_window(
+    app: &AppHandle,
+    monitor: &MonitorBounds,
+    selection: PhysicalRect,
+) -> AppResult<()> {
+    let _creation_guard = lock_unpoisoned(&CONTROL_WINDOW_CREATION_LOCK);
+    let window = if let Some(window) = app.get_webview_window(OUTLINE_WINDOW_LABEL) {
+        window
+    } else {
+        WebviewWindowBuilder::new(
+            app,
+            OUTLINE_WINDOW_LABEL,
+            WebviewUrl::App("?tool=screenshot&longOutline=1".into()),
+        )
+        .title("长截图范围 - 飞花 - PetalDesk")
+        .decorations(false)
+        .shadow(false)
+        .transparent(true)
+        .resizable(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .focused(false)
+        .visible(false)
+        .inner_size(320.0, 200.0)
+        .build()
         .map_err(|error| {
-            AppError::new("window_error", format!("定位长截图控制窗口失败: {error}"))
+            AppError::new("window_error", format!("创建长截图选区边框失败: {error}"))
+        })?
+    };
+    let (position, size) = outline_window_geometry(monitor, selection);
+    configure_control_window_no_activate(&window)?;
+    window
+        .set_ignore_cursor_events(true)
+        .and_then(|_| window.set_position(position))
+        .and_then(|_| window.set_size(size))
+        .map_err(|error| AppError::new("window_error", format!("定位长截图选区边框失败: {error}")))
+}
+
+fn show_outline_window(app: &AppHandle, job: &LongCaptureJob) -> AppResult<()> {
+    prepare_outline_window(app, &job.target.monitor, job.target.bounds)?;
+    let window = app
+        .get_webview_window(OUTLINE_WINDOW_LABEL)
+        .ok_or_else(|| AppError::new("window_error", "长截图选区边框不可用"))?;
+    show_control_window_no_activate(&window)
+}
+
+fn hide_outline_window(app: &AppHandle) -> AppResult<()> {
+    if let Some(window) = app.get_webview_window(OUTLINE_WINDOW_LABEL) {
+        window.hide().map_err(|error| {
+            AppError::new("window_error", format!("隐藏长截图选区边框失败: {error}"))
         })?;
-    show_control_window_no_activate(&window)?;
+    }
     Ok(())
 }
 
-fn hide_control_window(app: &AppHandle) -> AppResult<()> {
+fn show_control_window(app: &AppHandle, job: &LongCaptureJob) -> AppResult<()> {
+    if let Err(error) = show_outline_window(app, job) {
+        // A reused outline may already be visible when repositioning or
+        // showing it fails. Roll it back just like a panel failure so an
+        // orphaned topmost border cannot remain on the desktop.
+        let _ = hide_outline_window(app);
+        return Err(error);
+    }
+    if let Err(error) = show_control_panel(app, job) {
+        let _ = hide_outline_window(app);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn show_control_panel(app: &AppHandle, job: &LongCaptureJob) -> AppResult<()> {
+    let window = app
+        .get_webview_window(CONTROL_WINDOW_LABEL)
+        .ok_or_else(|| {
+            AppError::new(
+                "long_capture_control_missing",
+                "长截图控制窗口已关闭，正在恢复普通截图界面",
+            )
+        })?;
+    position_control_window(&window, &job.target.monitor, job.target.bounds)?;
+    if let Err(error) = show_control_window_no_activate(&window) {
+        let _ = window.hide();
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn hide_control_panel(app: &AppHandle) -> AppResult<()> {
     if let Some(window) = app.get_webview_window(CONTROL_WINDOW_LABEL) {
         window.hide().map_err(|error| {
             AppError::new("window_error", format!("隐藏长截图控制窗口失败: {error}"))
@@ -2516,13 +2995,101 @@ fn hide_control_window(app: &AppHandle) -> AppResult<()> {
     Ok(())
 }
 
+fn hide_control_window(app: &AppHandle) -> AppResult<()> {
+    let outline_error = hide_outline_window(app).err();
+    hide_control_panel(app)?;
+    outline_error.map_or(Ok(()), Err)
+}
+
 fn close_control_window(app: &AppHandle) -> AppResult<()> {
+    let outline_error = hide_outline_window(app).err();
     if let Some(window) = app.get_webview_window(CONTROL_WINDOW_LABEL) {
-        window.destroy().map_err(|error| {
-            AppError::new("window_error", format!("关闭长截图控制窗口失败: {error}"))
-        })?;
+        destroy_control_window_instance(app, &window, "关闭长截图控制窗口")?;
+    }
+    outline_error.map_or(Ok(()), Err)
+}
+
+fn destroy_control_window_instance(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow<tauri::Wry>,
+    action: &str,
+) -> AppResult<()> {
+    let store = app.try_state::<LongScreenshotStore>();
+    let instance_id = control_window_instance_id(window);
+    let registered = if let (Some(store), Some(instance_id)) = (store.as_ref(), instance_id) {
+        store.expect_control_destroy(instance_id, false)
+    } else {
+        true
+    };
+    if !registered {
+        return Ok(());
+    }
+    if let Err(error) = window.destroy() {
+        if let (Some(store), Some(instance_id)) = (store.as_ref(), instance_id) {
+            store.revoke_expected_control_destroy(instance_id);
+        }
+        return Err(AppError::new(
+            "window_error",
+            format!("{action}失败: {error}"),
+        ));
     }
     Ok(())
+}
+
+fn destroy_control_window_instance_and_wait(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow<tauri::Wry>,
+    action: &str,
+) -> AppResult<()> {
+    let store = app.try_state::<LongScreenshotStore>().ok_or_else(|| {
+        AppError::new(
+            "long_capture_control_destroy_error",
+            format!("{action}失败: 长截图状态尚未初始化"),
+        )
+    })?;
+    let instance_id = control_window_instance_id(window).ok_or_else(|| {
+        AppError::new(
+            "long_capture_control_destroy_error",
+            format!("{action}失败: 无法识别原控制窗口"),
+        )
+    })?;
+    let deadline = Instant::now() + CONTROL_WINDOW_DESTROY_TIMEOUT;
+    if store.expect_control_destroy(instance_id, true) {
+        if let Err(error) = window.destroy() {
+            store.revoke_expected_control_destroy(instance_id);
+            return Err(AppError::new(
+                "window_error",
+                format!("{action}失败: {error}"),
+            ));
+        }
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() || !store.wait_for_control_destroy(instance_id, remaining) {
+        return Err(AppError::new(
+            "long_capture_control_destroy_timeout",
+            format!("{action}超时，请重试截图"),
+        ));
+    }
+    while app.get_webview_window(CONTROL_WINDOW_LABEL).is_some() {
+        if Instant::now() >= deadline {
+            return Err(AppError::new(
+                "long_capture_control_destroy_timeout",
+                format!("{action}超时，请重试截图"),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn control_window_instance_id(window: &tauri::WebviewWindow<tauri::Wry>) -> Option<isize> {
+    window.hwnd().ok().map(|handle| handle.0 as isize)
+}
+
+#[cfg(not(windows))]
+fn control_window_instance_id(_window: &tauri::WebviewWindow<tauri::Wry>) -> Option<isize> {
+    None
 }
 
 pub(crate) fn handle_control_window_close_requested(app: &AppHandle, label: &str) -> bool {
@@ -2539,6 +3106,54 @@ pub(crate) fn handle_control_window_close_requested(app: &AppHandle, label: &str
             let _ = cancel_long_capture_job_inner(&app, &store, &job);
         } else {
             let _ = close_control_window(&app);
+        }
+    });
+    true
+}
+
+pub(crate) fn handle_control_window_destroyed(
+    app: &AppHandle,
+    label: &str,
+    instance_id: Option<isize>,
+) -> bool {
+    if label != CONTROL_WINDOW_LABEL {
+        return false;
+    }
+    let Some(store) = app.try_state::<LongScreenshotStore>() else {
+        return true;
+    };
+    if store.consume_expected_control_destroy(instance_id) {
+        return true;
+    }
+    let job = lock_unpoisoned(&store.job).as_ref().cloned();
+    let Some(job) = job else {
+        return true;
+    };
+    if !should_cancel_after_control_destroy(job.status().state) {
+        // Finishing intentionally destroys the controller. Even if Windows no
+        // longer exposes its HWND to the event callback, a completed capture
+        // must remain available for preview and export.
+        return true;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(store) = app.try_state::<LongScreenshotStore>() else {
+            return;
+        };
+        let status = job.status();
+        let active_session = app.state::<ScreenshotStore>().active_session();
+        let session_is_active = screenshot_session_owns_job(
+            active_session.as_ref().map(|session| session.id.as_str()),
+            &status.session_id,
+        );
+        let result = if session_is_active {
+            cancel_long_capture_job_inner(&app, &store, &job).map(|_| ())
+        } else {
+            cancel_for_screenshot_session_end(&app, &status.session_id)
+        };
+        if let Err(error) = result {
+            eprintln!("长截图控制窗口异常销毁后的清理失败: {error}");
+            let _ = app.emit("screenshot_capture_error", error);
         }
     });
     true
@@ -2949,7 +3564,22 @@ fn capture_worker(app: AppHandle, job: Arc<LongCaptureJob>) {
         status_from_runtime(&runtime)
     };
     let _ = app.emit("long_capture_progress", &started_status);
-    let result = run_capture_worker(&app, &job);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_capture_worker(&app, &job)
+    }))
+    .unwrap_or_else(|panic| {
+        let message = if let Some(message) = panic.downcast_ref::<&str>() {
+            (*message).to_string()
+        } else if let Some(message) = panic.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "未知 Rust panic".to_string()
+        };
+        Err(AppError::new(
+            "long_capture_worker_panic",
+            format!("长截图后台任务异常中止: {message}"),
+        ))
+    });
     let canceled = matches!(&result, Ok(WorkerStop::Cancel));
     browser_restore.restore_now();
     if let Some(position) = original_cursor {
@@ -3035,6 +3665,17 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
         let runtime = lock_unpoisoned(&job.runtime);
         engine_uses_manual_scrolling(runtime.manifest.engine)
     };
+    let manual_input = if manual_scrolling {
+        match ScrollInputMonitor::start() {
+            Ok(input) => Some(input),
+            Err(error) => {
+                eprintln!("系统滚轮监听不可用，长截图改用画面变化兼容检测: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     if job.target.mode == LongCaptureMode::Top && !browser_enhanced && !manual_scrolling {
         scroll_target_to_top(app, job)?;
     }
@@ -3059,9 +3700,15 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
         let runtime = lock_unpoisoned(&job.runtime);
         runtime.generation
     };
+    let mut manual_input_snapshot = manual_input
+        .as_ref()
+        .map(ScrollInputMonitor::snapshot)
+        .unwrap_or_default();
     let mut needs_scroll = true;
     let mut no_motion_count = 0_u8;
     let mut low_confidence_count = 0_u8;
+    let mut wheel_delta_units = AUTO_SCROLL_INITIAL_DELTA;
+    let mut fixed_bottom_tracker = FixedBottomTracker::default();
 
     loop {
         let checkpoint = match wait_for_worker(job) {
@@ -3071,9 +3718,13 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
         if checkpoint.generation != known_generation {
             previous = load_latest_accepted_frame(job)?;
             known_generation = checkpoint.generation;
+            if let Some(input) = manual_input.as_ref() {
+                manual_input_snapshot = input.snapshot();
+            }
             needs_scroll = !checkpoint.retry_current;
             no_motion_count = 0;
             low_confidence_count = 0;
+            fixed_bottom_tracker = FixedBottomTracker::default();
         } else if checkpoint.retry_current {
             needs_scroll = false;
             low_confidence_count = 0;
@@ -3101,54 +3752,83 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
                     }
                 }
             } else {
-                if job.target.control_overlaps_roi {
-                    hide_control_window(app)?;
-                    flush_desktop_compositor();
-                }
-                if no_motion_count == 0 {
-                    send_wheel_scroll(&job.target)?;
-                } else {
-                    update_message(
-                        job,
-                        checkpoint.generation,
-                        "滚轮未推动目标，正在尝试 PageDown",
-                    )?;
-                    emit_progress(app, job);
-                    send_page_down(&job.target)?;
+                let scroll_result = {
+                    let _operation_guard = job
+                        .target
+                        .control_overlaps_roi
+                        .then(|| lock_unpoisoned(&job.operation_lock));
+                    if job.target.control_overlaps_roi {
+                        hide_control_panel(app)?;
+                        flush_desktop_compositor();
+                    }
+                    send_wheel_scroll(&job.target, wheel_delta_units)
+                };
+                if let Err(scroll_error) = scroll_result {
+                    if job.target.control_overlaps_roi {
+                        let _operation_guard = lock_unpoisoned(&job.operation_lock);
+                        let should_restore = {
+                            let runtime = lock_unpoisoned(&job.runtime);
+                            control_surface_needed(&runtime)
+                        };
+                        if should_restore {
+                            if let Err(restore_error) = show_control_panel(app, job) {
+                                return Err(append_recovery_error(
+                                    scroll_error,
+                                    "恢复长截图控制窗口失败",
+                                    &restore_error,
+                                ));
+                            }
+                        }
+                    }
+                    return Err(scroll_error);
                 }
             }
         }
-        let current = if manual_scrolling && needs_scroll {
-            wait_for_manual_scroll(app, job, &previous, checkpoint.generation)?
+        let (current, detected_overlap) = if manual_scrolling && needs_scroll {
+            wait_for_manual_scroll(
+                app,
+                job,
+                &previous,
+                checkpoint.generation,
+                manual_input.as_ref(),
+                &mut manual_input_snapshot,
+            )?
         } else {
-            capture_job_roi(app, job, true)?
+            (capture_job_roi(app, job, true)?, None)
         };
         if !iteration_is_current(job, checkpoint.generation) {
             continue;
         }
 
-        let previous_strips = GrayStrips::from_frame(&previous);
-        let current_strips = GrayStrips::from_frame(&current);
-        let stationary_score =
-            alignment_score(&previous_strips, &current_strips, 0, 2).unwrap_or(f32::INFINITY);
-        if stationary_score <= 2.25 {
+        // Try the stronger displacement estimator first. A small scroll in a
+        // sparse or mostly blank window can have a tiny whole-frame average
+        // difference while still exposing valid new rows.
+        let overlap = detected_overlap.or_else(|| find_vertical_overlap(&previous, &current));
+        let stationary_score = sampled_frame_difference(&previous, &current);
+        if overlap.is_none() && stationary_score <= 2.25 {
             no_motion_count = if browser_step.is_some_and(|step| step.at_bottom && !step.moved) {
-                2
+                AUTO_SCROLL_END_CONFIRMATIONS
             } else {
                 no_motion_count.saturating_add(1)
             };
+            if !manual_scrolling && !browser_enhanced {
+                // Some classic Win32 controls only react after accumulated
+                // wheel input reaches WHEEL_DELTA. Grow through 30/60/120
+                // before concluding that the target is at the bottom.
+                wheel_delta_units = wheel_delta_units.saturating_mul(2).clamp(30, 240);
+            }
             needs_scroll = true;
             update_message(
                 job,
                 checkpoint.generation,
-                if no_motion_count >= 2 {
+                if no_motion_count >= AUTO_SCROLL_END_CONFIRMATIONS {
                     "已检测到滚动区域底部"
                 } else {
                     "未检测到新内容，正在确认是否到底"
                 },
             )?;
             emit_progress(app, job);
-            if no_motion_count >= 2 {
+            if no_motion_count >= AUTO_SCROLL_END_CONFIRMATIONS {
                 if job.status().frame_count <= 1 {
                     pause_for_attention(
                         app,
@@ -3166,9 +3846,29 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
         }
         no_motion_count = 0;
 
-        let Some(overlap) = find_vertical_overlap(&previous, &current) else {
+        let Some(overlap) = overlap else {
             low_confidence_count = low_confidence_count.saturating_add(1);
-            needs_scroll = false;
+            if !manual_scrolling && !browser_enhanced {
+                // The visual surface moved but no safe overlap remained. Put
+                // it back where the accepted frame was captured, reduce the
+                // step, and retry instead of repeatedly sampling the same bad
+                // position or committing a guessed seam.
+                send_wheel_scroll(&job.target, -wheel_delta_units)?;
+                std::thread::sleep(Duration::from_millis(260));
+                wheel_delta_units = (wheel_delta_units / 2).max(30);
+                needs_scroll = true;
+                update_message(
+                    job,
+                    checkpoint.generation,
+                    "本次滚动超出可靠重叠范围，已回滚并缩小步长",
+                )?;
+                emit_progress(app, job);
+                if low_confidence_count < LOW_CONFIDENCE_LIMIT {
+                    continue;
+                }
+            } else {
+                needs_scroll = false;
+            }
             if low_confidence_count >= LOW_CONFIDENCE_LIMIT {
                 pause_for_attention(
                     app,
@@ -3187,7 +3887,20 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
             continue;
         };
 
-        let reached_limit = accept_scrolled_frame(job, &current, overlap, checkpoint.generation)?;
+        let reached_limit = accept_scrolled_frame(
+            job,
+            &current,
+            overlap,
+            checkpoint.generation,
+            &mut fixed_bottom_tracker,
+        )?;
+        if !manual_scrolling && !browser_enhanced {
+            wheel_delta_units = calibrated_wheel_delta_units(
+                job.target.bounds.height,
+                overlap.displacement,
+                wheel_delta_units,
+            );
+        }
         previous = current;
         needs_scroll = true;
         low_confidence_count = 0;
@@ -3207,35 +3920,106 @@ fn capture_job_roi(
     job: &LongCaptureJob,
     wait_for_settle: bool,
 ) -> AppResult<Frame> {
-    if job.target.control_overlaps_roi {
-        hide_control_window(app)?;
-        flush_desktop_compositor();
-    }
-    let result = if wait_for_settle {
-        capture_settled_roi(job.target.bounds)
-    } else {
-        capture_roi(job.target.bounds)
+    let capture = || {
+        if wait_for_settle {
+            capture_settled_roi(job.target.bounds)
+        } else {
+            capture_roi(job.target.bounds)
+        }
     };
-    if job.target.control_overlaps_roi {
-        let _operation_guard = lock_unpoisoned(&job.operation_lock);
-        let should_restore_control = {
-            let runtime = lock_unpoisoned(&job.runtime);
-            control_surface_needed(&runtime)
+    if !job.target.control_overlaps_roi {
+        return capture();
+    }
+
+    // Reentry, pause and cancel use the same lock. Only the panel is hidden;
+    // the click-through outline stays outside the selected pixels and remains
+    // visible while frames are sampled.
+    let _operation_guard = lock_unpoisoned(&job.operation_lock);
+    hide_control_panel(app)?;
+    flush_desktop_compositor();
+    let result = capture();
+    let should_restore_control = {
+        let runtime = lock_unpoisoned(&job.runtime);
+        control_surface_needed(&runtime)
+    };
+    if !should_restore_control {
+        return result;
+    }
+    if let Err(restore_error) = show_control_panel(app, job) {
+        let _ = hide_outline_window(app);
+        let failure = match result {
+            Ok(_) => restore_error,
+            Err(capture_error) => {
+                append_recovery_error(capture_error, "恢复长截图控制窗口失败", &restore_error)
+            }
         };
-        if !should_restore_control {
-            return result;
-        }
-        if let Err(restore_error) = show_control_window(app, job) {
-            let failure = match result {
-                Ok(_) => restore_error,
-                Err(capture_error) => {
-                    append_recovery_error(capture_error, "恢复长截图控制窗口失败", &restore_error)
-                }
-            };
-            return Err(recover_capture_surface(app, job, failure));
-        }
+        return Err(recover_capture_surface(app, job, failure));
     }
     result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualCaptureTrigger {
+    ActiveScroll,
+    Settled,
+    FallbackPoll,
+}
+
+#[derive(Debug)]
+struct ManualCaptureSchedule {
+    last_capture_at: Instant,
+    settle_deadline: Option<Instant>,
+    next_fallback_at: Instant,
+}
+
+impl ManualCaptureSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_capture_at: now
+                .checked_sub(MANUAL_SCROLL_ACTIVE_CAPTURE_INTERVAL)
+                .unwrap_or(now),
+            settle_deadline: None,
+            next_fallback_at: now + MANUAL_SCROLL_FALLBACK_POLL_INTERVAL,
+        }
+    }
+
+    fn observe_scroll(&mut self, now: Instant) {
+        self.settle_deadline = Some(now + MANUAL_SCROLL_SETTLE_AFTER);
+    }
+
+    fn next_trigger(&mut self, now: Instant) -> Option<ManualCaptureTrigger> {
+        let trigger = if self.settle_deadline.is_some_and(|deadline| now >= deadline) {
+            self.settle_deadline = None;
+            Some(ManualCaptureTrigger::Settled)
+        } else if self.settle_deadline.is_some()
+            && now.duration_since(self.last_capture_at) >= MANUAL_SCROLL_ACTIVE_CAPTURE_INTERVAL
+        {
+            Some(ManualCaptureTrigger::ActiveScroll)
+        } else if now >= self.next_fallback_at {
+            Some(ManualCaptureTrigger::FallbackPoll)
+        } else {
+            None
+        }?;
+        self.last_capture_at = now;
+        self.next_fallback_at = now + MANUAL_SCROLL_FALLBACK_POLL_INTERVAL;
+        Some(trigger)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ManualUnmatchedMotion {
+    started_at: Option<Instant>,
+}
+
+impl ManualUnmatchedMotion {
+    fn observe(&mut self, now: Instant, visible_movement: bool) -> bool {
+        if !visible_movement {
+            self.started_at = None;
+            return false;
+        }
+        let started_at = *self.started_at.get_or_insert(now);
+        now.saturating_duration_since(started_at) >= MANUAL_SCROLL_UNMATCHED_PAUSE_AFTER
+    }
 }
 
 fn wait_for_manual_scroll(
@@ -3243,22 +4027,121 @@ fn wait_for_manual_scroll(
     job: &LongCaptureJob,
     previous: &Frame,
     generation: u64,
-) -> AppResult<Frame> {
-    update_message(job, generation, "等待手动滚动")?;
+    input: Option<&ScrollInputMonitor>,
+    observed_input: &mut ScrollInputSnapshot,
+) -> AppResult<(Frame, Option<OverlapMatch>)> {
+    let mut input_available = input.is_some_and(ScrollInputMonitor::is_running);
+    update_message(
+        job,
+        generation,
+        if input_available {
+            "等待在选区内滚动"
+        } else {
+            "等待内容滚动（兼容检测模式）"
+        },
+    )?;
     emit_progress(app, job);
+    let started = Instant::now();
+    let mut schedule = ManualCaptureSchedule::new(started);
+    let mut unmatched_motion = ManualUnmatchedMotion::default();
+    let mut movement_seen = false;
+    let mut feedback_for_movement = None;
     loop {
-        std::thread::sleep(MANUAL_SCROLL_POLL_INTERVAL);
+        if !iteration_is_current(job, generation) {
+            return Ok((previous.clone(), None));
+        }
+
+        let now = Instant::now();
+        input_available = input.is_some_and(ScrollInputMonitor::is_running);
+        if let Some(input) = input.filter(|input| input.is_running()) {
+            let snapshot = input.snapshot();
+            let received_vertical_wheel =
+                snapshot.vertical_events != observed_input.vertical_events;
+            *observed_input = snapshot;
+            if received_vertical_wheel && cursor_inside_capture_bounds(job) {
+                schedule.observe_scroll(now);
+            }
+        }
+
+        let Some(trigger) = schedule.next_trigger(now) else {
+            if started.elapsed() >= MANUAL_SCROLL_FEEDBACK_AFTER && feedback_for_movement.is_none()
+            {
+                update_message(
+                    job,
+                    generation,
+                    if input_available {
+                        "请在选区内向下滚动；也支持键盘和拖动滚动条"
+                    } else {
+                        "正在兼容检测画面变化；请滚动、按翻页键或拖动滚动条"
+                    },
+                )?;
+                emit_progress(app, job);
+                feedback_for_movement = Some(false);
+            }
+            std::thread::sleep(MANUAL_SCROLL_STOP_CHECK_INTERVAL);
+            continue;
+        };
+
         let candidate = capture_manual_candidate(app, job, previous)?;
         if !iteration_is_current(job, generation) {
-            return Ok(candidate);
+            return Ok((candidate, None));
         }
-        if sampled_frame_difference(previous, &candidate) > 2.5 {
-            // Polling masks the visible control strip so it can remain stable.
-            // Once movement is detected, hide it once and acquire a clean
-            // settled frame; only clean frames are ever stitched or exported.
-            return capture_job_roi(app, job, true);
+        let visual_change = sparse_frame_change(previous, &candidate);
+        let match_probe_change =
+            visual_change.is_some_and(SparseFrameChange::is_match_probe_candidate);
+        let visible_movement =
+            visual_change.is_some_and(SparseFrameChange::is_visible_movement_candidate);
+        let overlap = (trigger != ManualCaptureTrigger::FallbackPoll || match_probe_change)
+            .then(|| find_vertical_overlap(previous, &candidate))
+            .flatten();
+        if let Some(overlap) = overlap {
+            if !job.target.control_overlaps_roi {
+                return Ok((candidate, Some(overlap)));
+            }
+            let clean = capture_job_roi(app, job, false)?;
+            if let Some(overlap) = find_vertical_overlap(previous, &clean) {
+                return Ok((clean, Some(overlap)));
+            }
+        }
+        if unmatched_motion.observe(Instant::now(), visible_movement) {
+            pause_for_attention(
+                app,
+                job,
+                generation,
+                "滚动跨度已超出可靠接缝范围，长截图已暂停以避免漏段。请向上回滚，让上一段已确认内容重新出现在选区中，再点击继续",
+            )?;
+            return Ok((candidate, None));
+        }
+        movement_seen |= visible_movement;
+        if trigger != ManualCaptureTrigger::FallbackPoll || movement_seen {
+            if feedback_for_movement != Some(movement_seen) {
+                update_message(
+                    job,
+                    generation,
+                    if movement_seen {
+                        "已检测到画面滚动，但还没有可靠接缝；请放慢滚动或向上回滚少量内容"
+                    } else {
+                        "已收到滚轮，但选区内容没有变化；请确认鼠标位于真正可滚动的内容上"
+                    },
+                )?;
+                emit_progress(app, job);
+                feedback_for_movement = Some(movement_seen);
+            }
         }
     }
+}
+
+fn cursor_inside_capture_bounds(job: &LongCaptureJob) -> bool {
+    let Some(cursor) = current_cursor_position() else {
+        return false;
+    };
+    let bounds = job.target.bounds;
+    let right = i64::from(bounds.x) + i64::from(bounds.width);
+    let bottom = i64::from(bounds.y) + i64::from(bounds.height);
+    cursor.x >= bounds.x
+        && cursor.y >= bounds.y
+        && i64::from(cursor.x) < right
+        && i64::from(cursor.y) < bottom
 }
 
 fn capture_manual_candidate(
@@ -3394,13 +4277,108 @@ fn focus_capture_target(job: &LongCaptureJob) -> AppResult<()> {
     }
 }
 
+const FIXED_BOTTOM_FILE: &str = "fixed-bottom.png";
+
+fn fixed_bottom_height(manifest: &LongCaptureManifest) -> u32 {
+    manifest
+        .fixed_bottom
+        .as_ref()
+        .map(|fixed| fixed.height)
+        .unwrap_or(0)
+}
+
+fn write_fixed_bottom(job: &LongCaptureJob, frame: &Frame, height: u32) -> AppResult<()> {
+    let start = frame
+        .height
+        .checked_sub(height)
+        .ok_or_else(|| AppError::invalid("长截图固定底栏高度超过当前帧"))?;
+    let footer = crop_rows(frame, start, height)?;
+    atomic_write(
+        &job.directory.join(FIXED_BOTTOM_FILE),
+        &encode_png(&footer)?,
+    )
+}
+
+fn rebuild_strips_with_fixed_bottom(
+    job: &LongCaptureJob,
+    manifest: &mut LongCaptureManifest,
+    height: u32,
+) -> AppResult<()> {
+    if height < 6 || height >= manifest.selection.height / 2 {
+        return Err(AppError::invalid("长截图固定底栏高度无效"));
+    }
+    let mut output_y = 0_u32;
+    let mut rebuilt = Vec::with_capacity(manifest.segments.len());
+    let mut latest_frame = None;
+    for (position, segment) in manifest.segments.iter().enumerate() {
+        let frame = decode_png(
+            &std::fs::read(job.directory.join(&segment.frame_file))
+                .map_err(|error| AppError::io("读取长截图固定底栏源帧", error))?,
+        )?;
+        let body_end = frame
+            .height
+            .checked_sub(height)
+            .ok_or_else(|| AppError::invalid("长截图固定底栏超过源帧"))?;
+        let (start, rows) = if position == 0 {
+            (0, body_end)
+        } else {
+            (
+                body_end
+                    .checked_sub(segment.displacement)
+                    .ok_or_else(|| AppError::invalid("长截图固定底栏片段位移无效"))?,
+                segment.height.min(segment.displacement),
+            )
+        };
+        let strip = crop_rows(&frame, start, rows)?;
+        let strip_file = format!("strips/{:06}.png", segment.index);
+        atomic_write(&job.directory.join(&strip_file), &encode_png(&strip)?)?;
+        let mut rebuilt_segment = segment.clone();
+        rebuilt_segment.output_y = output_y;
+        rebuilt_segment.height = rows;
+        rebuilt_segment.strip_file = strip_file;
+        output_y = output_y.saturating_add(rows);
+        rebuilt.push(rebuilt_segment);
+        latest_frame = Some(frame);
+    }
+    let latest_frame = latest_frame
+        .ok_or_else(|| AppError::new("long_capture_not_ready", "长截图没有固定底栏源帧"))?;
+    write_fixed_bottom(job, &latest_frame, height)?;
+    manifest.segments = rebuilt;
+    manifest.fixed_bottom = Some(LongCaptureFixedBottom {
+        height,
+        file: FIXED_BOTTOM_FILE.to_string(),
+    });
+    manifest.height = output_y.saturating_add(height);
+    Ok(())
+}
+
+fn refresh_fixed_bottom_from_latest_frame(
+    job: &LongCaptureJob,
+    manifest: &LongCaptureManifest,
+) -> AppResult<()> {
+    let Some(fixed_bottom) = manifest.fixed_bottom.as_ref() else {
+        return Ok(());
+    };
+    let frame_file = manifest
+        .segments
+        .last()
+        .map(|segment| segment.frame_file.as_str())
+        .ok_or_else(|| AppError::new("long_capture_not_ready", "长截图没有固定底栏源帧"))?;
+    let frame = decode_png(
+        &std::fs::read(job.directory.join(frame_file))
+            .map_err(|error| AppError::io("读取长截图固定底栏源帧", error))?,
+    )?;
+    write_fixed_bottom(job, &frame, fixed_bottom.height)
+}
+
 fn accept_scrolled_frame(
     job: &LongCaptureJob,
     frame: &Frame,
     overlap: OverlapMatch,
     generation: u64,
+    fixed_bottom_tracker: &mut FixedBottomTracker,
 ) -> AppResult<bool> {
-    let (index, output_y, allowed_rows) = {
+    let (index, output_y, allowed_rows, fixed_bottom) = {
         let runtime = lock_unpoisoned(&job.runtime);
         if runtime.generation != generation || runtime.manifest.state != LongCaptureState::Capturing
         {
@@ -3408,10 +4386,12 @@ fn accept_scrolled_frame(
         }
         let maximum_height = maximum_height_for_width(runtime.manifest.width);
         let remaining = maximum_height.saturating_sub(runtime.manifest.height);
+        let fixed_bottom = fixed_bottom_height(&runtime.manifest);
         (
             runtime.manifest.segments.len() as u32,
-            runtime.manifest.height,
+            runtime.manifest.height.saturating_sub(fixed_bottom),
             overlap.displacement.min(remaining),
+            fixed_bottom,
         )
     };
     if allowed_rows == 0 {
@@ -3420,10 +4400,19 @@ fn accept_scrolled_frame(
 
     let frame_file = format!("frames/{index:06}.png");
     let strip_file = format!("strips/{index:06}.png");
-    let strip_start = frame.height.saturating_sub(overlap.displacement);
+    let body_end = frame
+        .height
+        .checked_sub(fixed_bottom)
+        .ok_or_else(|| AppError::invalid("长截图固定底栏超过当前帧"))?;
+    let strip_start = body_end
+        .checked_sub(overlap.displacement)
+        .ok_or_else(|| AppError::invalid("长截图接缝位移超过正文区域"))?;
     let strip = crop_rows(frame, strip_start, allowed_rows)?;
     atomic_write(&job.directory.join(&frame_file), &encode_png(frame)?)?;
     atomic_write(&job.directory.join(&strip_file), &encode_png(&strip)?)?;
+    if fixed_bottom > 0 {
+        write_fixed_bottom(job, frame, fixed_bottom)?;
+    }
 
     let mut runtime = lock_unpoisoned(&job.runtime);
     if runtime.generation != generation || runtime.manifest.state != LongCaptureState::Capturing {
@@ -3440,7 +4429,14 @@ fn accept_scrolled_frame(
         frame_file,
         strip_file,
     });
-    runtime.manifest.height = output_y.saturating_add(allowed_rows);
+    runtime.manifest.height = output_y
+        .saturating_add(allowed_rows)
+        .saturating_add(fixed_bottom);
+    if runtime.manifest.fixed_bottom.is_none() {
+        if let Some(height) = fixed_bottom_tracker.observe(overlap.static_bottom) {
+            rebuild_strips_with_fixed_bottom(job, &mut runtime.manifest, height)?;
+        }
+    }
     runtime.manifest.message = format!(
         "已确认第 {} 帧，接缝置信度 {:.0}%",
         runtime.manifest.segments.len(),
@@ -3497,10 +4493,7 @@ fn pause_for_attention(
     };
     let _ = app.emit("long_capture_attention_required", &status);
     let _ = app.emit("long_capture_paused", &status);
-    switch_visible_surface(
-        || show_capture_overlay(app, &job.target.monitor),
-        || hide_control_window(app),
-    )
+    show_paused_capture_surface(app, job, status.engine)
 }
 
 fn finish_worker_capture(app: &AppHandle, job: &LongCaptureJob, message: &str) -> AppResult<()> {
@@ -3568,28 +4561,13 @@ struct GrayStrips {
 }
 
 impl GrayStrips {
-    fn from_frame(frame: &Frame) -> Self {
+    fn from_frame(frame: &Frame, x_positions: &[usize]) -> Self {
         let width = frame.width as usize;
         let height = frame.height as usize;
-        let strip_count = width.clamp(1, 5);
-        let samples_per_strip = if width >= 24 { 3 } else { 1 };
-        let samples_per_row = strip_count * samples_per_strip;
-        let mut x_positions = Vec::with_capacity(samples_per_row);
-        let half_span = (width / 80).clamp(1, 12);
-        for strip in 0..strip_count {
-            let center = ((strip + 1) * width / (strip_count + 1)).min(width - 1);
-            if samples_per_strip == 1 {
-                x_positions.push(center);
-            } else {
-                x_positions.push(center.saturating_sub(half_span));
-                x_positions.push(center);
-                x_positions.push((center + half_span).min(width - 1));
-            }
-        }
-
+        let samples_per_row = x_positions.len();
         let mut values = Vec::with_capacity(height * samples_per_row);
         for y in 0..height {
-            for &x in &x_positions {
+            for &x in x_positions {
                 let offset = (y * width + x) * 4;
                 values.push(luma(&frame.rgba[offset..offset + 3]));
             }
@@ -3617,73 +4595,1305 @@ impl GrayStrips {
     }
 }
 
+#[derive(Debug, Clone)]
+struct MatchColumnGroup {
+    index: usize,
+    positions: Vec<usize>,
+    score: f32,
+    temporal_difference: f32,
+}
+
+#[derive(Debug)]
+struct MatchColumnSelection {
+    primary: Vec<usize>,
+    verification: Vec<usize>,
+}
+
+fn distributed_column_groups(width: usize, maximum_groups: usize) -> Vec<Vec<usize>> {
+    if width == 0 || maximum_groups == 0 {
+        return Vec::new();
+    }
+    let group_count = width.min(maximum_groups).max(1);
+    let span = (width / group_count.saturating_mul(6).max(1)).clamp(1, 6);
+    (0..group_count)
+        .map(|index| {
+            let center = ((index * 2 + 1) * width / (group_count * 2)).min(width - 1);
+            let mut positions = vec![
+                center.saturating_sub(span),
+                center,
+                (center + span).min(width - 1),
+            ];
+            positions.sort_unstable();
+            positions.dedup();
+            positions
+        })
+        .collect()
+}
+
+fn column_group_score(left: &Frame, right: &Frame, positions: &[usize]) -> f32 {
+    let width = left.width as usize;
+    let height = left.height as usize;
+    let row_step = (height / 720).max(1);
+    let mut left_texture = 0_u64;
+    let mut right_texture = 0_u64;
+    let mut samples = 0_u64;
+    for y in (row_step..height).step_by(row_step) {
+        let previous_y = y - row_step;
+        for &x in positions {
+            let offset = (y * width + x) * 4;
+            let previous_offset = (previous_y * width + x) * 4;
+            let left_value = luma(&left.rgba[offset..offset + 3]);
+            let right_value = luma(&right.rgba[offset..offset + 3]);
+            left_texture += u64::from(
+                left_value.abs_diff(luma(&left.rgba[previous_offset..previous_offset + 3])),
+            );
+            right_texture += u64::from(
+                right_value.abs_diff(luma(&right.rgba[previous_offset..previous_offset + 3])),
+            );
+            samples += 1;
+        }
+    }
+    if samples == 0 {
+        return 0.0;
+    }
+    left_texture.min(right_texture) as f32 / samples as f32
+}
+
+fn column_group_temporal_difference(left: &Frame, right: &Frame, positions: &[usize]) -> f32 {
+    let width = left.width as usize;
+    let height = left.height as usize;
+    let row_step = (height / 720).max(1);
+    let mut difference = 0_u64;
+    let mut samples = 0_u64;
+    for y in (0..height).step_by(row_step) {
+        for &x in positions {
+            let offset = (y * width + x) * 4;
+            difference += u64::from(
+                luma(&left.rgba[offset..offset + 3])
+                    .abs_diff(luma(&right.rgba[offset..offset + 3])),
+            );
+            samples += 1;
+        }
+    }
+    if samples == 0 {
+        0.0
+    } else {
+        difference as f32 / samples as f32
+    }
+}
+
+fn select_match_group_indices(
+    candidates: &[MatchColumnGroup],
+    requested_count: usize,
+    excluded: &[usize],
+) -> Vec<usize> {
+    let available = candidates
+        .iter()
+        .filter(|candidate| !excluded.contains(&candidate.index))
+        .count();
+    let selected_count = requested_count.min(available);
+    if selected_count == 0 {
+        return Vec::new();
+    }
+    let band_count = MATCH_DISTRIBUTION_BANDS.min(selected_count).max(1);
+    let candidate_count = candidates
+        .iter()
+        .map(|candidate| candidate.index)
+        .max()
+        .map(|index| index + 1)
+        .unwrap_or(1);
+    let mut selected = Vec::with_capacity(selected_count);
+    for band in 0..band_count {
+        if let Some(index) = candidates
+            .iter()
+            .filter(|candidate| {
+                !excluded.contains(&candidate.index)
+                    && candidate.index * band_count / candidate_count == band
+            })
+            .max_by(|left, right| left.score.total_cmp(&right.score))
+            .map(|candidate| candidate.index)
+        {
+            selected.push(index);
+        }
+    }
+
+    let mut ranked = candidates
+        .iter()
+        .filter(|candidate| !excluded.contains(&candidate.index))
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.score.total_cmp(&left.score));
+    for candidate in ranked {
+        if selected.len() >= selected_count {
+            break;
+        }
+        if !selected.contains(&candidate.index) {
+            selected.push(candidate.index);
+        }
+    }
+    selected
+}
+
+fn match_positions(candidates: &[MatchColumnGroup], selected: &[usize]) -> Vec<usize> {
+    let mut positions = selected
+        .iter()
+        .filter_map(|index| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.index == *index)
+        })
+        .flat_map(|candidate| candidate.positions.iter().copied())
+        .collect::<Vec<_>>();
+    positions.sort_unstable();
+    positions.dedup();
+    positions
+}
+
+fn select_match_columns(left: &Frame, right: &Frame) -> MatchColumnSelection {
+    let groups = distributed_column_groups(left.width as usize, MATCH_CANDIDATE_GROUPS);
+    let candidates = groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, positions)| MatchColumnGroup {
+            index,
+            score: column_group_score(left, right, &positions),
+            temporal_difference: column_group_temporal_difference(left, right, &positions),
+            positions,
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return MatchColumnSelection {
+            primary: Vec::new(),
+            verification: Vec::new(),
+        };
+    }
+    // Static sidebars and headers can contain more vertical texture than a
+    // short code line. When at least two groups visibly changed, exclude only
+    // fully stationary groups from displacement matching. This is a binary
+    // eligibility gate rather than animation-amplitude weighting.
+    let moving_candidates = candidates
+        .iter()
+        .filter(|candidate| candidate.score >= 1.1 && candidate.temporal_difference >= 0.75)
+        .cloned()
+        .collect::<Vec<_>>();
+    let distributed_motion = sparse_frame_change(left, right)
+        .is_some_and(SparseFrameChange::is_distributed_change_candidate);
+    let selection_candidates = if distributed_motion && moving_candidates.len() >= 2 {
+        &moving_candidates
+    } else {
+        &candidates
+    };
+    let primary_groups =
+        select_match_group_indices(selection_candidates, MATCH_SELECTED_GROUPS, &[]);
+    let verification_groups = select_match_group_indices(
+        selection_candidates,
+        MATCH_VERIFICATION_GROUPS,
+        &primary_groups,
+    );
+    MatchColumnSelection {
+        primary: match_positions(selection_candidates, &primary_groups),
+        verification: match_positions(selection_candidates, &verification_groups),
+    }
+}
+
+fn frames_have_matching_geometry(left: &Frame, right: &Frame) -> bool {
+    left.width == right.width
+        && left.height == right.height
+        && left.width > 0
+        && left.height > 0
+        && left.validate().is_ok()
+        && right.validate().is_ok()
+}
+
+#[cfg(test)]
+fn gray_strips_for_pair(left: &Frame, right: &Frame) -> Option<(GrayStrips, GrayStrips)> {
+    if !frames_have_matching_geometry(left, right) {
+        return None;
+    }
+    let selection = select_match_columns(left, right);
+    if selection.primary.is_empty() {
+        return None;
+    }
+    Some((
+        GrayStrips::from_frame(left, &selection.primary),
+        GrayStrips::from_frame(right, &selection.primary),
+    ))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SparseFrameChange {
+    changed_rows: usize,
+    sampled_rows: usize,
+    changed_samples: usize,
+    strong_samples: usize,
+    total_samples: usize,
+    changed_groups: usize,
+    sampled_groups: usize,
+    changed_vertical_bands: usize,
+}
+
+impl SparseFrameChange {
+    fn is_visible_movement_candidate(self) -> bool {
+        self.is_match_probe_candidate() || self.is_distributed_change_candidate()
+    }
+
+    fn is_match_probe_candidate(self) -> bool {
+        self.sampled_rows > 0
+            && self.total_samples > 0
+            && self.changed_rows * 100 >= self.sampled_rows * 2
+            && self.changed_samples * 1_000 >= self.total_samples
+            && self.strong_samples * 5_000 >= self.total_samples
+            && self.changed_groups > 0
+            && self.changed_vertical_bands >= 2
+    }
+
+    fn is_distributed_change_candidate(self) -> bool {
+        let required_vertical_bands = CHANGE_VERTICAL_BANDS.min(self.sampled_rows).min(4);
+        self.sampled_rows > 0
+            && self.total_samples > 0
+            && self.changed_rows * 100 >= self.sampled_rows * 8
+            && self.changed_samples * 300 >= self.total_samples
+            && self.strong_samples * 1_000 >= self.total_samples
+            // Two independently sampled column groups are enough for a narrow
+            // code or document column. Requiring horizontal bands made real
+            // VS Code scrolling depend on how long each source line happened
+            // to be.
+            && self.changed_groups * 16 >= self.sampled_groups
+            // A caret or compact animation can affect a few columns, but not
+            // meaningful rows throughout most of the viewport.
+            && self.changed_vertical_bands >= required_vertical_bands
+    }
+}
+
+fn sparse_frame_change(left: &Frame, right: &Frame) -> Option<SparseFrameChange> {
+    if !frames_have_matching_geometry(left, right) {
+        return None;
+    }
+    let width = left.width as usize;
+    let height = left.height as usize;
+    let groups = distributed_column_groups(width, CHANGE_SAMPLE_GROUPS);
+    let positions = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(group, positions)| positions.iter().map(move |position| (*position, group)))
+        .collect::<Vec<_>>();
+    let row_step = (height / 720).max(1);
+    let changed_per_row = (positions.len() / 48).max(1);
+    let mut changed_rows = 0_usize;
+    let mut sampled_rows = 0_usize;
+    let mut changed_samples = 0_usize;
+    let mut strong_samples = 0_usize;
+    let mut group_changes = vec![0_usize; groups.len()];
+    let mut vertical_band_changes = [0_usize; CHANGE_VERTICAL_BANDS];
+    let mut vertical_band_samples = [0_usize; CHANGE_VERTICAL_BANDS];
+    for y in (0..height).step_by(row_step) {
+        let vertical_band = (y * CHANGE_VERTICAL_BANDS / height).min(CHANGE_VERTICAL_BANDS - 1);
+        vertical_band_samples[vertical_band] += 1;
+        let mut row_changes = 0_usize;
+        for &(x, group) in &positions {
+            let offset = (y * width + x) * 4;
+            let difference = luma(&left.rgba[offset..offset + 3])
+                .abs_diff(luma(&right.rgba[offset..offset + 3]));
+            if difference >= 10 {
+                changed_samples += 1;
+                row_changes += 1;
+                group_changes[group] += 1;
+            }
+            if difference >= 28 {
+                strong_samples += 1;
+            }
+        }
+        if row_changes >= changed_per_row {
+            changed_rows += 1;
+            vertical_band_changes[vertical_band] += 1;
+        }
+        sampled_rows += 1;
+    }
+    let mut changed_groups = 0_usize;
+    for (group, changes) in group_changes.into_iter().enumerate() {
+        let group_samples = sampled_rows.saturating_mul(groups[group].len());
+        if group_samples > 0 && changes.saturating_mul(100) >= group_samples.saturating_mul(2) {
+            changed_groups += 1;
+        }
+    }
+    Some(SparseFrameChange {
+        changed_rows,
+        sampled_rows,
+        changed_samples,
+        strong_samples,
+        total_samples: sampled_rows * positions.len(),
+        changed_groups,
+        sampled_groups: groups.len(),
+        changed_vertical_bands: vertical_band_changes
+            .into_iter()
+            .zip(vertical_band_samples)
+            .filter(|(changed, sampled)| {
+                *sampled > 0 && *changed >= 2 && *changed * 100 >= *sampled * 4
+            })
+            .count(),
+    })
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualScrollEvidence {
+    SignificantVisualChange,
+}
+
+#[cfg(test)]
+fn manual_scroll_evidence(left: &Frame, right: &Frame) -> Option<ManualScrollEvidence> {
+    // A verified vertical displacement is sufficient evidence of scrolling.
+    // Whole-frame difference thresholds reject small scrolls in sparse or
+    // mostly uniform windows before the stronger overlap matcher can run.
+    find_vertical_overlap(left, right)?;
+    Some(ManualScrollEvidence::SignificantVisualChange)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct OverlapMatch {
     displacement: u32,
     confidence: f32,
+    static_bottom: u32,
 }
 
-fn find_vertical_overlap(previous: &Frame, current: &Frame) -> Option<OverlapMatch> {
-    if previous.width != current.width || previous.height != current.height || previous.height < 24
+#[derive(Debug, Default)]
+struct FixedBottomTracker {
+    candidate: Option<(u32, u8)>,
+}
+
+impl FixedBottomTracker {
+    fn observe(&mut self, height: u32) -> Option<u32> {
+        if height < 6 {
+            self.candidate = None;
+            return None;
+        }
+        let (candidate, confirmations) = match self.candidate {
+            Some((candidate, confirmations)) if candidate.abs_diff(height) <= 3 => {
+                (candidate.min(height), confirmations.saturating_add(1))
+            }
+            _ => (height, 1),
+        };
+        self.candidate = Some((candidate, confirmations));
+        (confirmations >= 2).then_some(candidate)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScoredDisplacement {
+    displacement: usize,
+    score: f32,
+}
+
+fn coarse_displacement_candidates(minimum: usize, maximum: usize) -> (Vec<usize>, usize) {
+    if maximum < minimum {
+        return (Vec::new(), 1);
+    }
+    let span = maximum - minimum + 1;
+    let step = span.div_ceil(MATCH_MAX_COARSE_CANDIDATES).max(1);
+    let mut candidates = (minimum..=maximum).step_by(step).collect::<Vec<_>>();
+    if candidates.last().copied() != Some(maximum) {
+        if candidates.len() >= MATCH_MAX_COARSE_CANDIDATES {
+            if let Some(last) = candidates.last_mut() {
+                *last = maximum;
+            }
+        } else {
+            candidates.push(maximum);
+        }
+    }
+    (candidates, step)
+}
+
+fn select_refine_seeds(scores: &[ScoredDisplacement], coarse_step: usize) -> Vec<usize> {
+    let mut ranked = scores.to_vec();
+    ranked.sort_by(|left, right| left.score.total_cmp(&right.score));
+    let minimum_separation = coarse_step.saturating_mul(2).max(2);
+    let mut seeds = Vec::with_capacity(MATCH_MAX_REFINE_SEEDS);
+    for candidate in ranked {
+        if seeds
+            .iter()
+            .all(|seed: &usize| seed.abs_diff(candidate.displacement) > minimum_separation)
+        {
+            seeds.push(candidate.displacement);
+            if seeds.len() >= MATCH_MAX_REFINE_SEEDS {
+                break;
+            }
+        }
+    }
+    seeds
+}
+
+fn refinement_candidates(
+    seeds: &[usize],
+    minimum: usize,
+    maximum: usize,
+    coarse_step: usize,
+) -> Vec<usize> {
+    let radius = coarse_step.max(1);
+    let mut candidates = Vec::with_capacity(seeds.len() * (radius * 2 + 1));
+    for seed in seeds {
+        let start = seed.saturating_sub(radius).max(minimum);
+        let end = seed.saturating_add(radius).min(maximum);
+        candidates.extend(start..=end);
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
+}
+
+fn alignment_score_bounded(
+    previous: &GrayStrips,
+    current: &GrayStrips,
+    displacement: usize,
+    maximum_rows: usize,
+) -> Option<f32> {
+    if displacement >= previous.height || maximum_rows == 0 {
+        return None;
+    }
+    let overlap = previous.height - displacement;
+    let trim = (overlap / 12).min(48);
+    let sampled_span = overlap.saturating_sub(trim.saturating_mul(2));
+    let row_step = sampled_span.div_ceil(maximum_rows).max(1);
+    alignment_score(previous, current, displacement, row_step)
+}
+
+fn alignment_detail_score_bounded(
+    previous: &GrayStrips,
+    current: &GrayStrips,
+    displacement: usize,
+    maximum_rows: usize,
+) -> Option<f32> {
+    if previous.height != current.height
+        || previous.samples_per_row != current.samples_per_row
+        || previous.samples_per_row == 0
+        || displacement >= previous.height
+        || maximum_rows == 0
     {
         return None;
     }
-    let previous = GrayStrips::from_frame(previous);
-    let current = GrayStrips::from_frame(current);
-    if previous.texture.min(current.texture) < 1.1 {
+    let overlap = previous.height - displacement;
+    if overlap < 8 {
         return None;
     }
-    let height = previous.height;
-    let minimum = 2_usize;
-    let maximum = (height.saturating_mul(9) / 10).min(height.saturating_sub(8));
-    if maximum <= minimum {
+    let trim = (overlap / 12).min(48);
+    let start = trim;
+    let end = overlap.saturating_sub(trim);
+    if end <= start + 4 {
         return None;
     }
-
-    let mut best_displacement = 0_usize;
-    let mut best_score = f32::INFINITY;
-    let mut candidates = Vec::with_capacity(maximum - minimum + 1);
-    for displacement in minimum..=maximum {
-        let Some(score) = alignment_score(&previous, &current, displacement, 4) else {
-            continue;
-        };
-        candidates.push((displacement, score));
-        if score < best_score {
-            best_score = score;
-            best_displacement = displacement;
+    let row_step = (end - start).div_ceil(maximum_rows).max(1);
+    let mut difference = 0_u64;
+    let mut samples = 0_u64;
+    for y in (start..end).step_by(row_step) {
+        let previous_row = (y + displacement) * previous.samples_per_row;
+        let current_row = y * current.samples_per_row;
+        for sample in 0..previous.samples_per_row {
+            difference += u64::from(
+                previous.values[previous_row + sample]
+                    .abs_diff(current.values[current_row + sample]),
+            );
+            samples += 1;
         }
     }
-    if !best_score.is_finite() {
+    if samples == 0 {
+        None
+    } else {
+        Some(difference as f32 / samples as f32)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MotionSupport {
+    textured_blocks: usize,
+    support_blocks: usize,
+    horizontal_bands: usize,
+    vertical_bands: usize,
+}
+
+fn rgb_difference(left: &[u8], right: &[u8]) -> u32 {
+    (0..3)
+        .map(|channel| u32::from(left[channel].abs_diff(right[channel])))
+        .sum()
+}
+
+fn block_motion_support(
+    previous: &Frame,
+    current: &Frame,
+    displacement: usize,
+) -> Option<MotionSupport> {
+    if !frames_have_matching_geometry(previous, current)
+        || displacement == 0
+        || displacement >= previous.height as usize
+    {
         return None;
     }
+    let width = previous.width as usize;
+    let overlap = previous.height as usize - displacement;
+    let mut textured_blocks = 0_usize;
+    let mut support_blocks = 0_usize;
+    let mut horizontal_support = [false; MATCH_GRID_COLUMNS];
+    let mut vertical_support = [false; MATCH_GRID_ROWS];
 
-    let refine_start = best_displacement.saturating_sub(3).max(minimum);
-    let refine_end = (best_displacement + 3).min(maximum);
-    for displacement in refine_start..=refine_end {
-        if let Some(score) = alignment_score(&previous, &current, displacement, 1) {
-            if score < best_score {
-                best_score = score;
-                best_displacement = displacement;
+    for block_y in 0..MATCH_GRID_ROWS {
+        let top = block_y * overlap / MATCH_GRID_ROWS;
+        let bottom = ((block_y + 1) * overlap / MATCH_GRID_ROWS).max(top + 1);
+        for block_x in 0..MATCH_GRID_COLUMNS {
+            let left = block_x * width / MATCH_GRID_COLUMNS;
+            let right = ((block_x + 1) * width / MATCH_GRID_COLUMNS).max(left + 1);
+            let mut previous_sum = [0_f64; 3];
+            let mut current_sum = [0_f64; 3];
+            let mut previous_square = [0_f64; 3];
+            let mut current_square = [0_f64; 3];
+            let mut matched_difference = 0_u64;
+            let mut stationary_difference = 0_u64;
+            let mut pixels = 0_u64;
+            for sample_y in 0..MATCH_SAMPLES_PER_BLOCK_AXIS {
+                let y = top
+                    + ((sample_y * 2 + 1) * (bottom - top) / (MATCH_SAMPLES_PER_BLOCK_AXIS * 2))
+                        .min(bottom - top - 1);
+                for sample_x in 0..MATCH_SAMPLES_PER_BLOCK_AXIS {
+                    let x = left
+                        + ((sample_x * 2 + 1) * (right - left)
+                            / (MATCH_SAMPLES_PER_BLOCK_AXIS * 2))
+                            .min(right - left - 1);
+                    let matched_offset = ((y + displacement) * width + x) * 4;
+                    let stationary_offset = (y * width + x) * 4;
+                    let current_offset = stationary_offset;
+                    matched_difference += u64::from(rgb_difference(
+                        &previous.rgba[matched_offset..matched_offset + 3],
+                        &current.rgba[current_offset..current_offset + 3],
+                    ));
+                    stationary_difference += u64::from(rgb_difference(
+                        &previous.rgba[stationary_offset..stationary_offset + 3],
+                        &current.rgba[current_offset..current_offset + 3],
+                    ));
+                    for channel in 0..3 {
+                        let left_value = f64::from(previous.rgba[matched_offset + channel]);
+                        let right_value = f64::from(current.rgba[current_offset + channel]);
+                        previous_sum[channel] += left_value;
+                        current_sum[channel] += right_value;
+                        previous_square[channel] += left_value * left_value;
+                        current_square[channel] += right_value * right_value;
+                    }
+                    pixels += 1;
+                }
+            }
+            if pixels == 0 {
+                continue;
+            }
+            let pixel_count = pixels as f64;
+            let mut variance = 0_f64;
+            for channel in 0..3 {
+                variance += (previous_square[channel] / pixel_count
+                    - (previous_sum[channel] / pixel_count).powi(2))
+                .max(0.0);
+                variance += (current_square[channel] / pixel_count
+                    - (current_sum[channel] / pixel_count).powi(2))
+                .max(0.0);
+            }
+            let texture = (variance / 6.0).sqrt();
+            if texture < 1.5 {
+                continue;
+            }
+            textured_blocks += 1;
+            let channels = pixels * 3;
+            let matched = matched_difference as f64 / channels as f64;
+            let stationary = stationary_difference as f64 / channels as f64;
+            let required_improvement = (stationary * 0.06).max(0.35);
+            if matched <= 38.0 && matched + required_improvement < stationary {
+                support_blocks += 1;
+                horizontal_support[block_x] = true;
+                vertical_support[block_y] = true;
             }
         }
     }
 
-    let exclusion = (height / 100).clamp(4, 16);
-    let second_score = candidates
+    Some(MotionSupport {
+        textured_blocks,
+        support_blocks,
+        horizontal_bands: horizontal_support
+            .into_iter()
+            .filter(|value| *value)
+            .count(),
+        vertical_bands: vertical_support.into_iter().filter(|value| *value).count(),
+    })
+}
+
+#[derive(Debug)]
+struct BlockMatchFrame<'a> {
+    width: usize,
+    height: usize,
+    scale: usize,
+    frame: &'a Frame,
+}
+
+impl<'a> BlockMatchFrame<'a> {
+    fn from_frame(frame: &'a Frame, scale: usize) -> Self {
+        let scale = scale.max(1);
+        let source_width = frame.width as usize;
+        let source_height = frame.height as usize;
+        let width = (source_width / scale).max(1);
+        let height = (source_height / scale).max(1);
+        Self {
+            width,
+            height,
+            scale,
+            frame,
+        }
+    }
+
+    fn pixel(&self, x: usize, y: usize) -> [u8; 3] {
+        let source_x = (x * self.scale).min(self.frame.width as usize - 1);
+        let source_y = (y * self.scale).min(self.frame.height as usize - 1);
+        let offset = (source_y * self.frame.width as usize + source_x) * 4;
+        [
+            self.frame.rgba[offset],
+            self.frame.rgba[offset + 1],
+            self.frame.rgba[offset + 2],
+        ]
+    }
+
+    fn difference(&self, x: usize, y: usize, other: &Self, other_y: usize) -> u32 {
+        self.pixel(x, y)
+            .into_iter()
+            .zip(other.pixel(x, other_y))
+            .map(|(left, right)| u32::from(left.abs_diff(right)))
+            .sum::<u32>()
+            / 3
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BlockMotionCandidate {
+    displacement: usize,
+    score: f64,
+    eligible_blocks: usize,
+    support_blocks: usize,
+    horizontal_bands: usize,
+    vertical_bands: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StaticMatchMargins {
+    top: usize,
+    bottom: usize,
+    left: usize,
+    right: usize,
+}
+
+fn stationary_row_difference(
+    previous: &BlockMatchFrame<'_>,
+    current: &BlockMatchFrame<'_>,
+    y: usize,
+) -> Option<f64> {
+    if previous.width != current.width || previous.height != current.height || y >= previous.height
+    {
+        return None;
+    }
+    let step = (previous.width / 240).max(1);
+    let mut difference = 0_u64;
+    let mut samples = 0_u64;
+    for x in (0..previous.width).step_by(step) {
+        difference += u64::from(previous.difference(x, y, current, y));
+        samples += 1;
+    }
+    (samples > 0).then_some(difference as f64 / samples as f64)
+}
+
+fn stationary_column_difference(
+    previous: &BlockMatchFrame<'_>,
+    current: &BlockMatchFrame<'_>,
+    x: usize,
+    top: usize,
+    bottom: usize,
+) -> Option<f64> {
+    if previous.width != current.width
+        || previous.height != current.height
+        || x >= previous.width
+        || top + bottom >= previous.height
+    {
+        return None;
+    }
+    let height = previous.height - top - bottom;
+    let step = (height / 200).max(1);
+    let mut difference = 0_u64;
+    let mut samples = 0_u64;
+    for y in (top..previous.height - bottom).step_by(step) {
+        difference += u64::from(previous.difference(x, y, current, y));
+        samples += 1;
+    }
+    (samples > 0).then_some(difference as f64 / samples as f64)
+}
+
+fn detect_static_match_margins(
+    previous: &BlockMatchFrame<'_>,
+    current: &BlockMatchFrame<'_>,
+) -> StaticMatchMargins {
+    if previous.width != current.width || previous.height != current.height {
+        return StaticMatchMargins::default();
+    }
+    let maximum = previous.height / 5;
+    let mut top = 0_usize;
+    while top < maximum
+        && stationary_row_difference(previous, current, top).is_some_and(|score| score <= 4.0)
+    {
+        top += 1;
+    }
+    let mut bottom = 0_usize;
+    while bottom < maximum
+        && top + bottom + MATCH_GRID_ROWS * 2 < previous.height
+        && stationary_row_difference(previous, current, previous.height - 1 - bottom)
+            .is_some_and(|score| score <= 4.0)
+    {
+        bottom += 1;
+    }
+    top = if top >= 3 { top } else { 0 };
+    bottom = if bottom >= 3 { bottom } else { 0 };
+
+    let maximum_horizontal = previous.width / 3;
+    let mut left = 0_usize;
+    while left < maximum_horizontal
+        && stationary_column_difference(previous, current, left, top, bottom)
+            .is_some_and(|score| score <= 4.0)
+    {
+        left += 1;
+    }
+    let mut right = 0_usize;
+    while right < maximum_horizontal
+        && left + right + MATCH_GRID_COLUMNS * 2 < previous.width
+        && stationary_column_difference(previous, current, previous.width - 1 - right, top, bottom)
+            .is_some_and(|score| score <= 4.0)
+    {
+        right += 1;
+    }
+    StaticMatchMargins {
+        top,
+        bottom,
+        left: if left >= 3 { left } else { 0 },
+        right: if right >= 3 { right } else { 0 },
+    }
+}
+
+fn score_block_motion_candidate(
+    previous: &BlockMatchFrame<'_>,
+    current: &BlockMatchFrame<'_>,
+    displacement: usize,
+    sample_step: usize,
+    margins: StaticMatchMargins,
+) -> Option<BlockMotionCandidate> {
+    if previous.width != current.width || previous.height != current.height {
+        return None;
+    }
+    let content_height = previous
+        .height
+        .checked_sub(margins.top.saturating_add(margins.bottom))?;
+    if displacement >= content_height {
+        return None;
+    }
+    let content_width = previous
+        .width
+        .checked_sub(margins.left.saturating_add(margins.right))?;
+    let overlap_height = content_height - displacement;
+    if overlap_height * 100 < content_height * MATCH_MIN_OVERLAP_PERCENT
+        || content_width < MATCH_GRID_COLUMNS * 2
+        || overlap_height < MATCH_GRID_ROWS * 2
+    {
+        return None;
+    }
+
+    let block_width = (content_width / MATCH_GRID_COLUMNS).max(2);
+    let block_height = (overlap_height / MATCH_GRID_ROWS).max(2);
+    let mut scores = Vec::with_capacity(MATCH_GRID_COLUMNS * MATCH_GRID_ROWS);
+    let mut support_blocks = 0_usize;
+    let mut horizontal_support = [false; MATCH_GRID_COLUMNS];
+    let mut vertical_support = [false; MATCH_GRID_ROWS];
+
+    for block_y in 0..MATCH_GRID_ROWS {
+        let top = block_y * block_height;
+        let bottom = if block_y + 1 == MATCH_GRID_ROWS {
+            overlap_height
+        } else {
+            (top + block_height).min(overlap_height)
+        };
+        for block_x in 0..MATCH_GRID_COLUMNS {
+            let left = block_x * block_width;
+            let right = if block_x + 1 == MATCH_GRID_COLUMNS {
+                content_width
+            } else {
+                (left + block_width).min(content_width)
+            };
+            let x_step = sample_step.max(((right - left) / 6).max(1));
+            let y_step = sample_step.max(((bottom - top) / 5).max(1));
+            let mut matched_difference = 0_u64;
+            let mut stationary_difference = 0_u64;
+            let mut texture = 0_u64;
+            let mut samples = 0_u64;
+
+            for y in (top..bottom).step_by(y_step) {
+                for x in (left..right).step_by(x_step) {
+                    let x = margins.left + x;
+                    let current_y = margins.top + y;
+                    let previous_y = current_y + displacement;
+                    matched_difference +=
+                        u64::from(previous.difference(x, previous_y, current, current_y));
+                    stationary_difference +=
+                        u64::from(previous.difference(x, current_y, current, current_y));
+                    if x + 1 < previous.width {
+                        let here = previous.pixel(x, previous_y);
+                        let beside = previous.pixel(x + 1, previous_y);
+                        texture += u64::from(
+                            here.into_iter()
+                                .zip(beside)
+                                .map(|(left, right)| u32::from(left.abs_diff(right)))
+                                .sum::<u32>()
+                                / 3,
+                        );
+                    }
+                    if previous_y + 1 < previous.height {
+                        texture +=
+                            u64::from(previous.difference(x, previous_y, previous, previous_y + 1));
+                    }
+                    samples += 1;
+                }
+            }
+            if samples < 4 || texture as f64 / (samples as f64) < 1.5 {
+                continue;
+            }
+            let matched = matched_difference as f64 / samples as f64;
+            let stationary = stationary_difference as f64 / samples as f64;
+
+            // A toolbar, title row, sidebar or scrollbar remains better
+            // aligned at zero displacement. Exclude it from candidate ranking
+            // instead of allowing fixed chrome to outvote the scrolling body.
+            if displacement > 0 && stationary <= 1.25 && matched > stationary + 0.35 {
+                continue;
+            }
+            scores.push(matched);
+            if displacement > 0 {
+                let required_improvement = (stationary * 0.06).max(0.35);
+                if matched + required_improvement < stationary {
+                    support_blocks += 1;
+                    horizontal_support[block_x] = true;
+                    vertical_support[block_y] = true;
+                }
+            }
+        }
+    }
+
+    if scores.len() < 4 {
+        return None;
+    }
+    scores.sort_by(f64::total_cmp);
+    let retained = scores.len().saturating_mul(92).div_ceil(100).max(4);
+    let score = scores.iter().take(retained).sum::<f64>() / retained as f64;
+    Some(BlockMotionCandidate {
+        displacement,
+        score,
+        eligible_blocks: scores.len(),
+        support_blocks,
+        horizontal_bands: horizontal_support
+            .into_iter()
+            .filter(|supported| *supported)
+            .count(),
+        vertical_bands: vertical_support
+            .into_iter()
+            .filter(|supported| *supported)
+            .count(),
+    })
+}
+
+fn reliable_vertical_overlap(previous: &Frame, current: &Frame) -> Option<OverlapMatch> {
+    if !frames_have_matching_geometry(previous, current) || previous.height < 24 {
+        return None;
+    }
+    let full_height = previous.height as usize;
+    let full_width = previous.width as usize;
+    let scale = full_width.max(full_height).div_ceil(220).max(1);
+    let previous_coarse = BlockMatchFrame::from_frame(previous, scale);
+    let current_coarse = BlockMatchFrame::from_frame(current, scale);
+    let coarse_margins = detect_static_match_margins(&previous_coarse, &current_coarse);
+    let stationary =
+        score_block_motion_candidate(&previous_coarse, &current_coarse, 0, 1, coarse_margins)?;
+    if stationary.score <= 1.25 {
+        return None;
+    }
+
+    let previous_full = BlockMatchFrame::from_frame(previous, 1);
+    let current_full = BlockMatchFrame::from_frame(current, 1);
+    let full_margins = detect_static_match_margins(&previous_full, &current_full);
+    let full_content_height =
+        full_height.saturating_sub(full_margins.top.saturating_add(full_margins.bottom));
+    let maximum_full = full_content_height.saturating_mul(100 - MATCH_MIN_OVERLAP_PERCENT) / 100;
+    let coarse_content_height = previous_coarse
+        .height
+        .saturating_sub(coarse_margins.top.saturating_add(coarse_margins.bottom));
+    let maximum_coarse =
+        coarse_content_height.saturating_mul(100 - MATCH_MIN_OVERLAP_PERCENT) / 100;
+    let mut coarse = (1..=maximum_coarse)
+        .filter_map(|displacement| {
+            score_block_motion_candidate(
+                &previous_coarse,
+                &current_coarse,
+                displacement,
+                1,
+                coarse_margins,
+            )
+        })
+        .collect::<Vec<_>>();
+    coarse.sort_by(|left, right| left.score.total_cmp(&right.score));
+    if coarse.is_empty() {
+        return None;
+    }
+    let radius = scale.saturating_mul(4).clamp(4, MOTION_FINE_RADIUS_MAX);
+    let mut fine_displacements = coarse
+        .iter()
+        .take(8)
+        .flat_map(|candidate| {
+            let estimate = candidate.displacement.saturating_mul(scale);
+            let start = estimate.saturating_sub(radius).max(2);
+            let end = estimate.saturating_add(radius).min(maximum_full);
+            start..=end
+        })
+        .collect::<Vec<_>>();
+    fine_displacements.sort_unstable();
+    fine_displacements.dedup();
+    let mut fine = fine_displacements
         .into_iter()
-        .filter(|(displacement, _)| displacement.abs_diff(best_displacement) > exclusion)
-        .map(|(_, score)| score)
+        .filter_map(|displacement| {
+            score_block_motion_candidate(
+                &previous_full,
+                &current_full,
+                displacement,
+                (scale / 2).max(1),
+                full_margins,
+            )
+        })
+        .collect::<Vec<_>>();
+    fine.sort_by(|left, right| left.score.total_cmp(&right.score));
+    let best = *fine.first()?;
+    let second = fine
+        .iter()
+        .find(|candidate| candidate.displacement.abs_diff(best.displacement) > 3)
+        .copied();
+    let confidence_gap = second
+        .map(|candidate| {
+            ((candidate.score - best.score) / candidate.score.max(1.0)).clamp(0.0, 1.0)
+        })
+        .unwrap_or(1.0);
+    let distributed_support = best.vertical_bands >= MATCH_MIN_VERTICAL_BANDS
+        || (best.score <= 1.5
+            && best.support_blocks >= 8
+            && best.horizontal_bands >= 4
+            && best.vertical_bands >= 2);
+
+    if best.score > 38.0
+        || best.eligible_blocks < MATCH_MIN_TEXTURED_BLOCKS
+        || best.support_blocks < MOTION_MIN_SUPPORT_BLOCKS
+        || best.horizontal_bands < MATCH_MIN_HORIZONTAL_BANDS
+        || !distributed_support
+        || (best.score > 8.0 && confidence_gap < 0.025)
+    {
+        return None;
+    }
+
+    let quality = (1.0 - best.score / 38.0).clamp(0.0, 1.0);
+    let support_ratio = (best.support_blocks as f64 / best.eligible_blocks as f64).clamp(0.0, 1.0);
+    Some(OverlapMatch {
+        displacement: best.displacement as u32,
+        confidence: (quality * 0.65 + confidence_gap * 0.25 + support_ratio * 0.1).clamp(0.0, 1.0)
+            as f32,
+        static_bottom: 0,
+    })
+}
+
+fn phase_vertical_overlap(previous: &Frame, current: &Frame) -> Option<OverlapMatch> {
+    if !frames_have_matching_geometry(previous, current) || previous.height < 24 {
+        return None;
+    }
+    let phase = phase_offset_rgba(
+        &previous.rgba,
+        &current.rgba,
+        previous.width as usize,
+        previous.height as usize,
+    )?;
+    if phase.psr < 5.0 {
+        return None;
+    }
+    let horizontal_tolerance =
+        (phase.factor as i32 * 2 + 2).max((previous.width as i32 / 100).max(3));
+    if phase.dx.abs() > horizontal_tolerance {
+        return None;
+    }
+    let estimate = phase.dy.checked_neg()?;
+    if estimate < 2 {
+        return None;
+    }
+
+    let previous_view = BlockMatchFrame::from_frame(previous, 1);
+    let current_view = BlockMatchFrame::from_frame(current, 1);
+    let margins = detect_static_match_margins(&previous_view, &current_view);
+    let content_height = previous_view
+        .height
+        .checked_sub(margins.top.saturating_add(margins.bottom))?;
+    let maximum = content_height.saturating_mul(100 - MATCH_MIN_OVERLAP_PERCENT) / 100;
+    let radius = phase.factor as usize + 3;
+    let start = (estimate as usize).saturating_sub(radius).max(2);
+    let end = (estimate as usize).saturating_add(radius).min(maximum);
+    if end < start {
+        return None;
+    }
+    let sample_step = (phase.factor as usize / 2).max(1);
+    let best = (start..=end)
+        .filter_map(|displacement| {
+            score_block_motion_candidate(
+                &previous_view,
+                &current_view,
+                displacement,
+                sample_step,
+                margins,
+            )
+        })
+        .filter(|candidate| {
+            candidate.score <= 38.0
+                && candidate.eligible_blocks >= MATCH_MIN_TEXTURED_BLOCKS.saturating_sub(2)
+                && candidate.support_blocks >= MOTION_MIN_SUPPORT_BLOCKS
+                && candidate.horizontal_bands >= MATCH_MIN_HORIZONTAL_BANDS
+                && candidate.vertical_bands >= 2
+        })
+        .min_by(|left, right| left.score.total_cmp(&right.score))?;
+    let quality = (1.0 - best.score / 38.0).clamp(0.0, 1.0);
+    let phase_quality = ((f64::from(phase.psr) - 5.0) / 15.0).clamp(0.0, 1.0);
+    let support = (best.support_blocks as f64 / best.eligible_blocks.max(1) as f64).clamp(0.0, 1.0);
+    Some(OverlapMatch {
+        displacement: best.displacement as u32,
+        confidence: (quality * 0.55 + phase_quality * 0.25 + support * 0.2) as f32,
+        static_bottom: 0,
+    })
+}
+
+fn row_transition_score(frame: &Frame, boundary_y: usize) -> Option<f64> {
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    if boundary_y == 0 || boundary_y >= height {
+        return None;
+    }
+    let step = (width / 240).max(1);
+    let mut difference = 0_u64;
+    let mut samples = 0_u64;
+    for x in (0..width).step_by(step) {
+        let above = ((boundary_y - 1) * width + x) * 4;
+        let below = (boundary_y * width + x) * 4;
+        difference += u64::from(rgb_difference(
+            &frame.rgba[above..above + 3],
+            &frame.rgba[below..below + 3],
+        ));
+        samples += 3;
+    }
+    (samples > 0).then_some(difference as f64 / samples as f64)
+}
+
+fn refine_static_bottom_boundary(frame: &Frame, maximum: usize) -> usize {
+    let height = frame.height as usize;
+    let maximum = maximum.min(height.saturating_sub(1));
+    let best = (6..=maximum)
+        .filter_map(|bottom| {
+            row_transition_score(frame, height - bottom).map(|score| (bottom, score))
+        })
+        .max_by(|left, right| left.1.total_cmp(&right.1));
+    best.filter(|(_, score)| *score >= 3.0)
+        .map(|(bottom, _)| bottom)
+        .unwrap_or(0)
+}
+
+fn attach_static_bottom(
+    previous: &Frame,
+    current: &Frame,
+    mut matched: OverlapMatch,
+) -> OverlapMatch {
+    let previous_view = BlockMatchFrame::from_frame(previous, 1);
+    let current_view = BlockMatchFrame::from_frame(current, 1);
+    let margins = detect_static_match_margins(&previous_view, &current_view);
+    if margins.bottom >= 6 && margins.bottom <= previous.height as usize / 5 {
+        matched.static_bottom = refine_static_bottom_boundary(current, margins.bottom) as u32;
+    }
+    matched
+}
+
+fn find_vertical_overlap(previous: &Frame, current: &Frame) -> Option<OverlapMatch> {
+    let block_match = reliable_vertical_overlap(previous, current);
+    if let Some(matched) = block_match.filter(|matched| matched.confidence >= 0.82) {
+        return Some(attach_static_bottom(previous, current, matched));
+    }
+    let narrow_match = find_vertical_overlap_legacy(previous, current).and_then(|matched| {
+        let support = block_motion_support(previous, current, matched.displacement as usize)?;
+        let broad_support = support.textured_blocks >= MATCH_MIN_TEXTURED_BLOCKS
+            && support.support_blocks >= MOTION_MIN_SUPPORT_BLOCKS
+            && support.horizontal_bands >= MATCH_MIN_HORIZONTAL_BANDS
+            && support.vertical_bands >= MATCH_MIN_VERTICAL_BANDS;
+        let narrow_high_confidence_support = matched.confidence >= 0.985
+            && support.textured_blocks >= MATCH_MIN_TEXTURED_BLOCKS
+            && support.support_blocks >= 1
+            && support.horizontal_bands >= 1
+            && support.vertical_bands >= 1
+            && sparse_frame_change(previous, current)
+                .is_some_and(SparseFrameChange::is_distributed_change_candidate);
+        (broad_support || narrow_high_confidence_support).then_some(matched)
+    });
+    let verified = match (block_match, narrow_match) {
+        (Some(block), Some(narrow)) if block.displacement != narrow.displacement => {
+            if block.confidence >= narrow.confidence {
+                Some(block)
+            } else {
+                Some(narrow)
+            }
+        }
+        (Some(block), _) => Some(block),
+        (None, narrow) => narrow,
+    };
+    verified
+        .or_else(|| phase_vertical_overlap(previous, current))
+        .map(|matched| attach_static_bottom(previous, current, matched))
+}
+
+fn maximum_legacy_displacement(height: usize) -> usize {
+    height.saturating_mul(100 - MATCH_MIN_OVERLAP_PERCENT) / 100
+}
+
+fn find_vertical_overlap_legacy(previous: &Frame, current: &Frame) -> Option<OverlapMatch> {
+    if !frames_have_matching_geometry(previous, current) || previous.height < 24 {
+        return None;
+    }
+    let selection = select_match_columns(previous, current);
+    if selection.primary.is_empty() {
+        return None;
+    }
+    let previous_primary = GrayStrips::from_frame(previous, &selection.primary);
+    let current_primary = GrayStrips::from_frame(current, &selection.primary);
+    if previous_primary.texture.min(current_primary.texture) < 1.1 {
+        return None;
+    }
+    let verification = (!selection.verification.is_empty()).then(|| {
+        (
+            GrayStrips::from_frame(previous, &selection.verification),
+            GrayStrips::from_frame(current, &selection.verification),
+        )
+    });
+    let height = previous_primary.height;
+    let minimum = 2_usize;
+    let maximum = maximum_legacy_displacement(height);
+    if maximum <= minimum {
+        return None;
+    }
+
+    let (coarse_candidates, coarse_step) = coarse_displacement_candidates(minimum, maximum);
+    let coarse_scores = coarse_candidates
+        .into_iter()
+        .filter_map(|displacement| {
+            alignment_score_bounded(
+                &previous_primary,
+                &current_primary,
+                displacement,
+                MATCH_MAX_COARSE_ROWS,
+            )
+            .map(|score| ScoredDisplacement {
+                displacement,
+                score,
+            })
+        })
+        .collect::<Vec<_>>();
+    if coarse_scores.is_empty() {
+        return None;
+    }
+    let seeds = select_refine_seeds(&coarse_scores, coarse_step);
+    let fine_candidates = refinement_candidates(&seeds, minimum, maximum, coarse_step);
+    let candidates = fine_candidates
+        .into_iter()
+        .filter_map(|displacement| {
+            alignment_score_bounded(
+                &previous_primary,
+                &current_primary,
+                displacement,
+                MATCH_MAX_FINE_ROWS,
+            )
+            .map(|score| ScoredDisplacement {
+                displacement,
+                score,
+            })
+        })
+        .collect::<Vec<_>>();
+    let robust_best = candidates
+        .iter()
+        .min_by(|left, right| left.score.total_cmp(&right.score))?;
+    let exclusion = (height / 100).clamp(4, 16);
+    let detail_tolerance = (robust_best.score * 0.05).max(0.25);
+    let best = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.displacement.abs_diff(robust_best.displacement) <= exclusion
+                && candidate.score <= robust_best.score + detail_tolerance
+        })
+        .filter_map(|candidate| {
+            alignment_detail_score_bounded(
+                &previous_primary,
+                &current_primary,
+                candidate.displacement,
+                MATCH_MAX_FINE_ROWS,
+            )
+            .map(|detail_score| (candidate, detail_score))
+        })
+        .min_by(|left, right| {
+            left.1
+                .total_cmp(&right.1)
+                .then_with(|| left.0.score.total_cmp(&right.0.score))
+        })
+        .map(|(candidate, _)| candidate)
+        .unwrap_or(robust_best);
+    let best_displacement = best.displacement;
+    let best_score = best.score;
+    if !best_score.is_finite() {
+        return None;
+    }
+
+    let second_score = candidates
+        .iter()
+        .filter(|candidate| candidate.displacement.abs_diff(best_displacement) > exclusion)
+        .map(|candidate| candidate.score)
         .fold(f32::INFINITY, f32::min);
     let gap = second_score - best_score;
     let required_gap = (best_score * 0.10).max(0.55);
     if best_score > 9.5 || !second_score.is_finite() || gap < required_gap {
         return None;
     }
+
+    if let Some((previous_verification, current_verification)) = verification {
+        if previous_verification
+            .texture
+            .min(current_verification.texture)
+            >= 1.1
+        {
+            let matched_score = alignment_score_bounded(
+                &previous_verification,
+                &current_verification,
+                best_displacement,
+                MATCH_MAX_FINE_ROWS,
+            )?;
+            let stationary_score = alignment_score_bounded(
+                &previous_verification,
+                &current_verification,
+                0,
+                MATCH_MAX_FINE_ROWS,
+            )?;
+            let required_improvement = (stationary_score * 0.05).max(0.35);
+            if matched_score > 11.5 || matched_score + required_improvement >= stationary_score {
+                return None;
+            }
+        }
+    }
+
     let quality = (1.0 - best_score / 14.0).clamp(0.0, 1.0);
     let separation = (gap / (best_score + gap).max(0.1)).clamp(0.0, 1.0);
     Some(OverlapMatch {
         displacement: best_displacement as u32,
         confidence: (quality * 0.72 + separation * 0.28).clamp(0.0, 1.0),
+        static_bottom: 0,
     })
 }
 
@@ -3899,6 +6109,32 @@ fn compose_region(
         rgba[target_start..target_end].copy_from_slice(&strip.rgba[source_start..source_end]);
         copied_rows = copied_rows.saturating_add(rows);
     }
+    if let Some(fixed_bottom) = manifest.fixed_bottom.as_ref() {
+        let footer_start = manifest.height.saturating_sub(fixed_bottom.height);
+        let copy_start = y.max(footer_start);
+        let copy_end = tile_end.min(manifest.height);
+        if copy_end > copy_start {
+            let footer = decode_png(
+                &std::fs::read(directory.join(&fixed_bottom.file))
+                    .map_err(|error| AppError::io("读取长截图固定底栏", error))?,
+            )?;
+            if footer.width != manifest.width || footer.height != fixed_bottom.height {
+                return Err(AppError::new(
+                    "invalid_long_capture_cache",
+                    "长截图固定底栏尺寸与清单不一致",
+                ));
+            }
+            let rows = copy_end - copy_start;
+            let source_row = copy_start - footer_start;
+            let target_row = copy_start - y;
+            let source_start = source_row as usize * row_bytes;
+            let source_end = source_start + rows as usize * row_bytes;
+            let target_start = target_row as usize * row_bytes;
+            let target_end = target_start + rows as usize * row_bytes;
+            rgba[target_start..target_end].copy_from_slice(&footer.rgba[source_start..source_end]);
+            copied_rows = copied_rows.saturating_add(rows);
+        }
+    }
     if copied_rows != height {
         return Err(AppError::new(
             "invalid_long_capture_cache",
@@ -4110,11 +6346,37 @@ fn capture_roi(_bounds: PhysicalRect) -> AppResult<Frame> {
 }
 
 #[cfg(windows)]
-fn send_wheel_scroll(target: &CaptureTarget) -> AppResult<()> {
-    send_scroll_ticks(
-        target,
-        -(wheel_ticks_for_height(target.bounds.height) as i32),
-    )
+fn send_wheel_scroll(target: &CaptureTarget, delta_units: i32) -> AppResult<()> {
+    use std::mem::size_of;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_WHEEL, MOUSEINPUT,
+    };
+
+    focus_scroll_target(target)?;
+    let magnitude = delta_units.abs().clamp(30, 240);
+    let wheel_delta = if delta_units < 0 {
+        magnitude
+    } else {
+        -magnitude
+    };
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: wheel_delta as u32,
+                dwFlags: MOUSEEVENTF_WHEEL,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let sent = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+    if sent != 1 {
+        return Err(last_windows_error("发送长截图滚动输入"));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -4154,63 +6416,8 @@ fn send_scroll_ticks(target: &CaptureTarget, ticks: i32) -> AppResult<()> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn send_page_down(target: &CaptureTarget) -> AppResult<()> {
-    use std::mem::size_of;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_NEXT,
-    };
-
-    focus_scroll_target(target)?;
-    // Unlike wheel input, PageDown is delivered to the foreground keyboard
-    // target. Refuse to send it if focus changed after activation.
-    if !scroll_target_has_foreground_focus(target) {
-        return Err(AppError::new(
-            "long_capture_target_focus_lost",
-            "长截图目标已失去输入焦点，未发送 PageDown。请重新点击目标内容后继续",
-        ));
-    }
-    let inputs = [
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VK_NEXT,
-                    wScan: 0,
-                    dwFlags: 0,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        },
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VK_NEXT,
-                    wScan: 0,
-                    dwFlags: KEYEVENTF_KEYUP,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
-        },
-    ];
-    let sent = unsafe {
-        SendInput(
-            inputs.len() as u32,
-            inputs.as_ptr(),
-            size_of::<INPUT>() as i32,
-        )
-    };
-    if sent != inputs.len() as u32 {
-        return Err(last_windows_error("发送长截图 PageDown 输入"));
-    }
-    Ok(())
-}
-
 #[cfg(not(windows))]
-fn send_wheel_scroll(_target: &CaptureTarget) -> AppResult<()> {
+fn send_wheel_scroll(_target: &CaptureTarget, _delta_units: i32) -> AppResult<()> {
     Err(AppError::new(
         "unsupported_platform",
         "长截图滚动输入仅支持 Windows",
@@ -4219,14 +6426,6 @@ fn send_wheel_scroll(_target: &CaptureTarget) -> AppResult<()> {
 
 #[cfg(not(windows))]
 fn send_scroll_ticks(_target: &CaptureTarget, _ticks: i32) -> AppResult<()> {
-    Err(AppError::new(
-        "unsupported_platform",
-        "长截图滚动输入仅支持 Windows",
-    ))
-}
-
-#[cfg(not(windows))]
-fn send_page_down(_target: &CaptureTarget) -> AppResult<()> {
     Err(AppError::new(
         "unsupported_platform",
         "长截图滚动输入仅支持 Windows",
@@ -4394,10 +6593,19 @@ fn focus_scroll_target(_target: &CaptureTarget) -> AppResult<()> {
     ))
 }
 
-fn wheel_ticks_for_height(viewport_height: u32) -> u32 {
-    // Windows and applications apply their own line/page settings. A bounded
-    // batch gives browsers roughly 55-70% movement while retaining overlap.
-    (viewport_height / 140).clamp(3, 10)
+fn calibrated_wheel_delta_units(
+    viewport_height: u32,
+    displacement: u32,
+    current_units: i32,
+) -> i32 {
+    if viewport_height == 0 || displacement == 0 {
+        return current_units.clamp(30, 240);
+    }
+    let target_displacement = f64::from(viewport_height) * 0.5;
+    let desired = (f64::from(current_units.abs()) * target_displacement / f64::from(displacement))
+        .round() as i32;
+    let desired = desired.clamp(30, 240);
+    ((current_units.abs().clamp(30, 240) + desired) / 2).clamp(30, 240)
 }
 
 #[cfg(windows)]
@@ -4475,6 +6683,180 @@ mod tests {
         }
     }
 
+    fn dark_editor_frame_with_columns(
+        width: u32,
+        height: u32,
+        document_y: u32,
+        code_columns: u32,
+    ) -> Frame {
+        let mut frame = solid_frame(width, height, 28);
+        let header_height = 36_u32.min(height);
+        let sidebar_width = 180_u32.min(width);
+        for y in 0..height {
+            for x in 0..width {
+                let value = if y < header_height {
+                    38 + ((x / 90) % 3) as u8 * 4
+                } else if x < sidebar_width {
+                    let row = (y - header_height) / 20;
+                    if (x + row * 11) % 97 < 18 {
+                        62
+                    } else {
+                        32
+                    }
+                } else {
+                    let document_row = document_y + y - header_height;
+                    let line = document_row / 18;
+                    let glyph_y = document_row % 18;
+                    let editor_x = x - sidebar_width;
+                    let column = editor_x / 8;
+                    let glyph_x = editor_x % 8;
+                    let token = line.wrapping_mul(37).wrapping_add(column.wrapping_mul(19));
+                    let glyph_visible = column < code_columns
+                        && token % 7 != 0
+                        && (4..14).contains(&glyph_y)
+                        && (glyph_x == 1 || glyph_x == 2 || (glyph_y == 4 && glyph_x < 6));
+                    if glyph_visible {
+                        match token % 4 {
+                            0 => 186,
+                            1 => 132,
+                            2 => 104,
+                            _ => 156,
+                        }
+                    } else if column == 0 && glyph_y == 17 {
+                        42
+                    } else {
+                        28
+                    }
+                };
+                let offset = (y as usize * width as usize + x as usize) * 4;
+                frame.rgba[offset..offset + 3].fill(value);
+            }
+        }
+        frame
+    }
+
+    fn dark_editor_frame(width: u32, height: u32, document_y: u32) -> Frame {
+        dark_editor_frame_with_columns(width, height, document_y, 82)
+    }
+
+    fn windows_list_frame(width: u32, height: u32, document_y: u32) -> Frame {
+        let mut frame = Frame {
+            width,
+            height,
+            rgba: [246, 247, 249, 255].repeat(width as usize * height as usize),
+        };
+        let header = 48_u32.min(height);
+        let footer = 28_u32.min(height.saturating_sub(header));
+        let sidebar = 148_u32.min(width);
+        for y in 0..height {
+            for x in 0..width {
+                let rgb = if y < header {
+                    let accent = ((x / 72) % 3) as u8 * 4;
+                    [225 + accent, 230 + accent, 236 + accent]
+                } else if y >= height.saturating_sub(footer) {
+                    [233, 235, 239]
+                } else if x < sidebar {
+                    let selected = ((y - header) / 44) == 2;
+                    if selected {
+                        [214, 230, 248]
+                    } else {
+                        [238, 240, 244]
+                    }
+                } else {
+                    let document_row = document_y + y - header;
+                    let row = document_row / 34;
+                    let row_y = document_row % 34;
+                    let body_x = x - sidebar;
+                    let row_seed = row.wrapping_mul(1_103).wrapping_add(97);
+                    if row_y == 33 {
+                        [222, 225, 230]
+                    } else if (8..25).contains(&row_y) && (18..36).contains(&body_x) {
+                        match row % 4 {
+                            0 => [72, 132, 210],
+                            1 => [83, 166, 112],
+                            2 => [194, 112, 75],
+                            _ => [133, 106, 194],
+                        }
+                    } else if (10..14).contains(&row_y)
+                        && body_x > 50
+                        && body_x < 130 + row_seed % 360
+                    {
+                        [70, 74, 82]
+                    } else if (19..22).contains(&row_y)
+                        && body_x > 50
+                        && body_x < 96 + row_seed % 220
+                    {
+                        [145, 150, 160]
+                    } else if row % 2 == 0 {
+                        [250, 251, 252]
+                    } else {
+                        [244, 246, 249]
+                    }
+                };
+                let offset = (y as usize * width as usize + x as usize) * 4;
+                frame.rgba[offset..offset + 3].copy_from_slice(&rgb);
+            }
+        }
+        frame
+    }
+
+    fn windows_settings_frame(width: u32, height: u32, document_y: u32) -> Frame {
+        let mut frame = Frame {
+            width,
+            height,
+            rgba: [250, 250, 250, 255].repeat(width as usize * height as usize),
+        };
+        let header = 56_u32.min(height);
+        let content_left = width / 5;
+        let content_right = width.saturating_mul(4) / 5;
+        for y in 0..height {
+            for x in 0..width {
+                let rgb = if y < header {
+                    if (18..34).contains(&y) && x > 24 && x < width / 3 {
+                        [55, 58, 64]
+                    } else {
+                        [242, 243, 245]
+                    }
+                } else if x < content_left || x >= content_right {
+                    [250, 250, 250]
+                } else {
+                    let document_row = document_y + y - header;
+                    let section = document_row / 78;
+                    let section_y = document_row % 78;
+                    let section_x = x - content_left;
+                    let section_width = content_right - content_left;
+                    if section_y == 77 {
+                        [226, 228, 232]
+                    } else if (13..18).contains(&section_y)
+                        && section_x > 16
+                        && section_x < section_width / 2 + (section * 23) % 110
+                    {
+                        [50, 53, 60]
+                    } else if (29..33).contains(&section_y)
+                        && section_x > 16
+                        && section_x < section_width / 3 + (section * 17) % 90
+                    {
+                        [137, 141, 149]
+                    } else if (22..47).contains(&section_y)
+                        && section_x > section_width.saturating_sub(58)
+                        && section_x < section_width.saturating_sub(18)
+                    {
+                        if section % 2 == 0 {
+                            [32, 120, 214]
+                        } else {
+                            [184, 188, 195]
+                        }
+                    } else {
+                        [250, 250, 250]
+                    }
+                };
+                let offset = (y as usize * width as usize + x as usize) * 4;
+                frame.rgba[offset..offset + 3].copy_from_slice(&rgb);
+            }
+        }
+        frame
+    }
+
     fn runtime_for_state(state: LongCaptureState) -> LongCaptureRuntime {
         LongCaptureRuntime {
             manifest: LongCaptureManifest {
@@ -4496,6 +6878,7 @@ mod tests {
                 height: 0,
                 message: String::new(),
                 segments: Vec::new(),
+                fixed_bottom: None,
             },
             pause_requested: false,
             cancel_requested: false,
@@ -4507,6 +6890,49 @@ mod tests {
             browser_active: false,
             browser_restore_needed: false,
             browser_session: None,
+        }
+    }
+
+    fn job_for_state(directory: PathBuf, state: LongCaptureState) -> LongCaptureJob {
+        LongCaptureJob {
+            directory,
+            target: CaptureTarget {
+                bounds: PhysicalRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                scroll_anchor: PhysicalPoint { x: 0, y: 0 },
+                monitor: MonitorBounds {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                    scale_factor: 1.0,
+                },
+                mode: LongCaptureMode::Current,
+                control_overlaps_roi: false,
+                scroll_windows: None,
+            },
+            hidden_pin_labels: Vec::new(),
+            browser: None,
+            operation_lock: Mutex::new(()),
+            runtime: Mutex::new(runtime_for_state(state)),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn test_store(cache_root: PathBuf) -> LongScreenshotStore {
+        LongScreenshotStore {
+            cache_root,
+            browser_bridge: None,
+            job: Mutex::new(None),
+            annotation_exports: Mutex::new(HashMap::new()),
+            start_lock: Mutex::new(()),
+            pending_start: Mutex::new(None),
+            control_destroys: Mutex::new(ControlDestroyTracker::default()),
+            control_destroyed: Condvar::new(),
         }
     }
 
@@ -4533,6 +6959,193 @@ mod tests {
         let mut paused = LongCaptureState::Paused;
         assert!(transition_to_canceled(&mut paused));
         assert_eq!(paused, LongCaptureState::Canceled);
+    }
+
+    #[test]
+    fn unexpected_control_destroy_never_cancels_a_terminal_capture() {
+        assert!(should_cancel_after_control_destroy(
+            LongCaptureState::Preparing
+        ));
+        assert!(should_cancel_after_control_destroy(
+            LongCaptureState::Capturing
+        ));
+        assert!(should_cancel_after_control_destroy(
+            LongCaptureState::Paused
+        ));
+        assert!(!should_cancel_after_control_destroy(
+            LongCaptureState::Ready
+        ));
+        assert!(!should_cancel_after_control_destroy(
+            LongCaptureState::Failed
+        ));
+        assert!(!should_cancel_after_control_destroy(
+            LongCaptureState::Canceled
+        ));
+    }
+
+    #[test]
+    fn outline_window_border_stays_outside_the_selected_pixels() {
+        let selection = PhysicalRect {
+            x: -2_200,
+            y: 120,
+            width: 1_200,
+            height: 800,
+        };
+        for scale_factor in [1.0, 1.5, 4.0] {
+            let monitor = MonitorBounds {
+                x: -2_560,
+                y: 0,
+                width: 2_560,
+                height: 1_440,
+                scale_factor,
+            };
+            let (position, size) = outline_window_geometry(&monitor, selection);
+            let right = i64::from(position.x) + i64::from(size.width);
+            let bottom = i64::from(position.y) + i64::from(size.height);
+            let selection_right = i64::from(selection.x) + i64::from(selection.width);
+            let selection_bottom = i64::from(selection.y) + i64::from(selection.height);
+            let maximum_painted_extent = (5.0 * scale_factor).ceil() as i64;
+
+            assert!(i64::from(selection.x - position.x) > maximum_painted_extent);
+            assert!(i64::from(selection.y - position.y) > maximum_painted_extent);
+            assert!(right - selection_right > maximum_painted_extent);
+            assert!(bottom - selection_bottom > maximum_painted_extent);
+        }
+    }
+
+    #[test]
+    fn awaited_control_destroy_event_wakes_the_exact_waiter() {
+        let root = tempdir().unwrap();
+        let store = Arc::new(test_store(root.path().to_path_buf()));
+        assert!(store.expect_control_destroy(100, true));
+        assert!(!store.expect_control_destroy(100, true));
+        let waiter_store = Arc::clone(&store);
+        let waiter = std::thread::spawn(move || {
+            waiter_store.wait_for_control_destroy(100, Duration::from_secs(1))
+        });
+        assert!(store.consume_expected_control_destroy(Some(100)));
+        assert!(waiter.join().unwrap());
+        assert!(!store.consume_expected_control_destroy(Some(100)));
+        assert!(!store.consume_expected_control_destroy(None));
+    }
+
+    #[test]
+    fn timed_out_control_destroy_still_suppresses_its_late_event() {
+        let root = tempdir().unwrap();
+        let store = test_store(root.path().to_path_buf());
+        assert!(store.expect_control_destroy(200, true));
+        assert!(!store.wait_for_control_destroy(200, Duration::from_millis(1)));
+        {
+            let tracker = lock_unpoisoned(&store.control_destroys);
+            assert_eq!(tracker.expected.get(&200), Some(&false));
+            assert!(!tracker.completed.contains(&200));
+        }
+        assert!(store.consume_expected_control_destroy(Some(200)));
+        let tracker = lock_unpoisoned(&store.control_destroys);
+        assert!(!tracker.expected.contains_key(&200));
+        assert!(!tracker.completed.contains(&200));
+    }
+
+    #[test]
+    fn duplicate_destroy_request_does_not_erase_a_completed_event() {
+        let root = tempdir().unwrap();
+        let store = test_store(root.path().to_path_buf());
+        assert!(store.expect_control_destroy(250, true));
+        assert!(store.consume_expected_control_destroy(Some(250)));
+        assert!(!store.expect_control_destroy(250, false));
+        assert!(store.wait_for_control_destroy(250, Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn non_awaited_control_destroy_does_not_retain_completion_state() {
+        let root = tempdir().unwrap();
+        let store = test_store(root.path().to_path_buf());
+        assert!(store.expect_control_destroy(300, false));
+        assert!(store.consume_expected_control_destroy(Some(300)));
+        let tracker = lock_unpoisoned(&store.control_destroys);
+        assert!(!tracker.expected.contains_key(&300));
+        assert!(!tracker.completed.contains(&300));
+    }
+
+    #[test]
+    fn orphaned_job_detection_requires_the_exact_screenshot_session() {
+        assert!(screenshot_session_owns_job(Some("session-1"), "session-1"));
+        assert!(!screenshot_session_owns_job(None, "session-1"));
+        assert!(!screenshot_session_owns_job(
+            Some("replacement-session"),
+            "session-1"
+        ));
+    }
+
+    #[test]
+    fn cancel_wakes_a_paused_worker_even_when_manifest_persistence_fails() {
+        let root = tempdir().unwrap();
+        let blocked_directory = root.path().join("cache-parent-is-a-file");
+        std::fs::write(&blocked_directory, b"not a directory").unwrap();
+        let job = Arc::new(job_for_state(blocked_directory, LongCaptureState::Paused));
+        {
+            let mut runtime = lock_unpoisoned(&job.runtime);
+            runtime.pause_requested = true;
+        }
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter_job = Arc::clone(&job);
+        let waiter = std::thread::spawn(move || {
+            let runtime = lock_unpoisoned(&waiter_job.runtime);
+            ready_tx.send(()).unwrap();
+            let (runtime, timeout) = waiter_job
+                .wake
+                .wait_timeout_while(runtime, Duration::from_secs(2), |runtime| {
+                    !runtime.cancel_requested
+                })
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            done_tx
+                .send((runtime.cancel_requested, timeout.timed_out()))
+                .unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let outcome = request_job_cancel(&job, "test cancellation");
+        assert!(outcome.persistence_error.is_some());
+        assert_eq!(outcome.status.state, LongCaptureState::Canceled);
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            (true, false)
+        );
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn worker_done_wait_completes_after_notification() {
+        let root = tempdir().unwrap();
+        let job = Arc::new(job_for_state(
+            root.path().join("worker-done"),
+            LongCaptureState::Ready,
+        ));
+        let completed_job = Arc::clone(&job);
+        let completed = std::thread::spawn(move || {
+            let mut runtime = lock_unpoisoned(&completed_job.runtime);
+            runtime.worker_done = true;
+            completed_job.wake.notify_all();
+        });
+        assert!(wait_for_worker_done(&job, Duration::from_secs(1)));
+        completed.join().unwrap();
+    }
+
+    #[test]
+    fn worker_done_timeout_leaves_the_job_in_the_store() {
+        let root = tempdir().unwrap();
+        let job = Arc::new(job_for_state(
+            root.path().join("worker-timeout"),
+            LongCaptureState::Ready,
+        ));
+        let store = test_store(root.path().to_path_buf());
+        *lock_unpoisoned(&store.job) = Some(Arc::clone(&job));
+
+        assert!(!wait_for_worker_done(&job, Duration::from_millis(1)));
+        let stored = lock_unpoisoned(&store.job).as_ref().cloned().unwrap();
+        assert!(Arc::ptr_eq(&stored, &job));
     }
 
     #[test]
@@ -4677,28 +7290,153 @@ mod tests {
     }
 
     #[test]
+    fn manual_capture_schedule_throttles_active_frames_and_adds_a_settled_frame() {
+        let started = Instant::now();
+        let mut schedule = ManualCaptureSchedule::new(started);
+
+        schedule.observe_scroll(started);
+        assert_eq!(
+            schedule.next_trigger(started),
+            Some(ManualCaptureTrigger::ActiveScroll)
+        );
+        schedule.observe_scroll(started + Duration::from_millis(100));
+        assert_eq!(
+            schedule.next_trigger(started + Duration::from_millis(149)),
+            None
+        );
+        assert_eq!(
+            schedule.next_trigger(started + Duration::from_millis(150)),
+            Some(ManualCaptureTrigger::ActiveScroll)
+        );
+        assert_eq!(
+            schedule.next_trigger(started + Duration::from_millis(300)),
+            Some(ManualCaptureTrigger::ActiveScroll)
+        );
+        assert_eq!(
+            schedule.next_trigger(started + Duration::from_millis(349)),
+            None
+        );
+        assert_eq!(
+            schedule.next_trigger(started + Duration::from_millis(350)),
+            Some(ManualCaptureTrigger::Settled)
+        );
+    }
+
+    #[test]
+    fn manual_capture_schedule_polls_for_keyboard_and_scrollbar_changes() {
+        let started = Instant::now();
+        let mut schedule = ManualCaptureSchedule::new(started);
+        assert_eq!(
+            schedule.next_trigger(started + Duration::from_millis(349)),
+            None
+        );
+        assert_eq!(
+            schedule.next_trigger(started + Duration::from_millis(350)),
+            Some(ManualCaptureTrigger::FallbackPoll)
+        );
+        assert_eq!(
+            schedule.next_trigger(started + Duration::from_millis(699)),
+            None
+        );
+        assert_eq!(
+            schedule.next_trigger(started + Duration::from_millis(700)),
+            Some(ManualCaptureTrigger::FallbackPoll)
+        );
+    }
+
+    #[test]
+    fn sparse_cross_viewport_change_can_probe_without_claiming_distributed_motion() {
+        let sparse = SparseFrameChange {
+            changed_rows: 20,
+            sampled_rows: 720,
+            changed_samples: 12,
+            strong_samples: 2,
+            total_samples: 10_000,
+            changed_groups: 1,
+            sampled_groups: 32,
+            changed_vertical_bands: 2,
+        };
+        assert!(sparse.is_match_probe_candidate());
+        assert!(!sparse.is_distributed_change_candidate());
+        assert!(sparse.is_visible_movement_candidate());
+
+        let localized = SparseFrameChange {
+            changed_vertical_bands: 1,
+            ..sparse
+        };
+        assert!(!localized.is_match_probe_candidate());
+        assert!(!localized.is_visible_movement_candidate());
+    }
+
+    #[test]
+    fn unmatched_manual_motion_pauses_instead_of_waiting_forever() {
+        let started = Instant::now();
+        let mut unmatched = ManualUnmatchedMotion::default();
+
+        assert!(!unmatched.observe(started, true));
+        assert!(!unmatched.observe(
+            started + MANUAL_SCROLL_UNMATCHED_PAUSE_AFTER - Duration::from_millis(1),
+            true
+        ));
+        assert!(unmatched.observe(started + MANUAL_SCROLL_UNMATCHED_PAUSE_AFTER, true));
+
+        assert!(!unmatched.observe(
+            started + MANUAL_SCROLL_UNMATCHED_PAUSE_AFTER + Duration::from_millis(1),
+            false
+        ));
+        assert!(!unmatched.observe(
+            started + MANUAL_SCROLL_UNMATCHED_PAUSE_AFTER + Duration::from_secs(30),
+            true
+        ));
+    }
+
+    #[test]
     fn screenshot_reentry_keeps_the_existing_long_capture_surface() {
         assert_eq!(
-            long_capture_reentry_surface(true, None),
+            long_capture_reentry_surface(true, None, None),
             Some(LongCaptureReentrySurface::Pending)
         );
         assert_eq!(
-            long_capture_reentry_surface(false, Some(LongCaptureState::Capturing)),
+            long_capture_reentry_surface(
+                false,
+                Some(LongCaptureState::Capturing),
+                Some(LongCaptureEngine::Wheel),
+            ),
             Some(LongCaptureReentrySurface::Control)
         );
         assert_eq!(
-            long_capture_reentry_surface(false, Some(LongCaptureState::Paused)),
+            long_capture_reentry_surface(
+                false,
+                Some(LongCaptureState::Paused),
+                Some(LongCaptureEngine::Manual),
+            ),
+            Some(LongCaptureReentrySurface::Control)
+        );
+        assert_eq!(
+            long_capture_reentry_surface(
+                false,
+                Some(LongCaptureState::Paused),
+                Some(LongCaptureEngine::Wheel),
+            ),
             Some(LongCaptureReentrySurface::Overlay)
         );
         assert_eq!(
-            long_capture_reentry_surface(false, Some(LongCaptureState::Ready)),
+            long_capture_reentry_surface(
+                false,
+                Some(LongCaptureState::Ready),
+                Some(LongCaptureEngine::Manual),
+            ),
             Some(LongCaptureReentrySurface::Overlay)
         );
         assert_eq!(
-            long_capture_reentry_surface(false, Some(LongCaptureState::Canceled)),
+            long_capture_reentry_surface(
+                false,
+                Some(LongCaptureState::Canceled),
+                Some(LongCaptureEngine::Wheel),
+            ),
             None
         );
-        assert_eq!(long_capture_reentry_surface(false, None), None);
+        assert_eq!(long_capture_reentry_surface(false, None, None), None);
     }
 
     #[cfg(windows)]
@@ -4765,12 +7503,316 @@ mod tests {
     }
 
     #[test]
+    fn phase_overlap_hint_is_verified_at_the_exact_scroll_displacement() {
+        let previous = patterned_frame(640, 540, 0);
+        let current = patterned_frame(640, 540, 137);
+        let matched = phase_vertical_overlap(&previous, &current)
+            .expect("phase hint should survive full-resolution seam verification");
+        assert_eq!(matched.displacement, 137);
+        assert!(
+            matched.confidence >= 0.5,
+            "confidence={}",
+            matched.confidence
+        );
+    }
+
+    #[test]
+    fn block_match_detects_windows_list_with_fixed_chrome() {
+        let previous = windows_list_frame(1_080, 680, 0);
+        for displacement in [17_u32, 53, 141] {
+            let current = windows_list_frame(1_080, 680, displacement);
+            let matched = reliable_vertical_overlap(&previous, &current)
+                .expect("Windows-style list scroll should have a reliable overlap");
+            assert_eq!(matched.displacement, displacement);
+            assert!(
+                matched.confidence >= 0.65,
+                "confidence={}",
+                matched.confidence
+            );
+            let matched = find_vertical_overlap(&previous, &current)
+                .expect("verified matcher should preserve fixed chrome metadata");
+            assert_eq!(matched.static_bottom, 28);
+        }
+    }
+
+    #[test]
+    fn fixed_bottom_requires_two_consistent_frames() {
+        let mut tracker = FixedBottomTracker::default();
+        assert_eq!(tracker.observe(28), None);
+        assert_eq!(tracker.observe(27), Some(27));
+
+        let mut reset = FixedBottomTracker::default();
+        assert_eq!(reset.observe(28), None);
+        assert_eq!(reset.observe(0), None);
+        assert_eq!(reset.observe(28), None);
+        assert_eq!(reset.observe(40), None);
+    }
+
+    #[test]
+    fn fixed_bottom_rebuild_keeps_body_continuous_and_appends_footer_once() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("frames")).unwrap();
+        std::fs::create_dir_all(root.path().join("strips")).unwrap();
+        let width = 420_u32;
+        let height = 260_u32;
+        let displacement = 53_u32;
+        let footer_height = 28_u32;
+        let frames = [
+            windows_list_frame(width, height, 0),
+            windows_list_frame(width, height, displacement),
+            windows_list_frame(width, height, displacement * 2),
+        ];
+        for (index, frame) in frames.iter().enumerate() {
+            atomic_write(
+                &root.path().join(format!("frames/{index:06}.png")),
+                &encode_png(frame).unwrap(),
+            )
+            .unwrap();
+        }
+        let job = job_for_state(root.path().to_path_buf(), LongCaptureState::Capturing);
+        let mut manifest = runtime_for_state(LongCaptureState::Capturing).manifest;
+        manifest.selection.width = width;
+        manifest.selection.height = height;
+        manifest.width = width;
+        manifest.height = height + displacement * 2;
+        manifest.segments = (0..3)
+            .map(|index| LongCaptureSegment {
+                index,
+                output_y: if index == 0 {
+                    0
+                } else {
+                    height + displacement * (index - 1)
+                },
+                height: if index == 0 { height } else { displacement },
+                displacement: if index == 0 { height } else { displacement },
+                confidence: 1.0,
+                frame_file: format!("frames/{index:06}.png"),
+                strip_file: format!("strips/{index:06}.png"),
+            })
+            .collect();
+
+        rebuild_strips_with_fixed_bottom(&job, &mut manifest, footer_height).unwrap();
+        assert_eq!(manifest.height, height + displacement * 2);
+        assert_eq!(
+            manifest
+                .segments
+                .iter()
+                .map(|segment| (segment.output_y, segment.height))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, height - footer_height),
+                (height - footer_height, displacement),
+                (height - footer_height + displacement, displacement),
+            ]
+        );
+
+        let composed =
+            compose_region(root.path(), &manifest, 0, manifest.height, MAX_LONG_PIXELS).unwrap();
+        let expected_parts = [
+            crop_rows(&frames[0], 0, height - footer_height).unwrap(),
+            crop_rows(
+                &frames[1],
+                height - footer_height - displacement,
+                displacement,
+            )
+            .unwrap(),
+            crop_rows(
+                &frames[2],
+                height - footer_height - displacement,
+                displacement,
+            )
+            .unwrap(),
+            crop_rows(&frames[2], height - footer_height, footer_height).unwrap(),
+        ];
+        let expected = expected_parts
+            .into_iter()
+            .flat_map(|part| part.rgba)
+            .collect::<Vec<_>>();
+        assert_eq!(composed.rgba, expected);
+
+        let output = root.path().join("fixed-bottom-export.png");
+        stream_manifest_png(root.path(), &manifest, &output).unwrap();
+        let exported = decode_png(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(exported.rgba, expected);
+    }
+
+    #[test]
+    fn block_match_detects_sparse_windows_settings_content() {
+        let previous = windows_settings_frame(1_200, 720, 0);
+        let current = windows_settings_frame(1_200, 720, 39);
+        let matched = reliable_vertical_overlap(&previous, &current)
+            .expect("sparse settings content should have a reliable overlap");
+        assert_eq!(matched.displacement, 39);
+        assert!(
+            matched.confidence >= 0.6,
+            "confidence={}",
+            matched.confidence
+        );
+    }
+
+    #[test]
     fn overlap_match_rejects_ambiguous_low_texture_frames() {
         let previous = solid_frame(160, 120, 245);
         let current = solid_frame(160, 120, 245);
         assert!(find_vertical_overlap(&previous, &current).is_none());
-        let strips = GrayStrips::from_frame(&previous);
-        assert_eq!(alignment_score(&strips, &strips, 0, 1), Some(0.0));
+        let (previous_strips, current_strips) = gray_strips_for_pair(&previous, &current).unwrap();
+        assert_eq!(
+            alignment_score(&previous_strips, &current_strips, 0, 1),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn manual_scroll_detects_sparse_dark_editor_text() {
+        let previous = dark_editor_frame(960, 540, 0);
+        let current = dark_editor_frame(960, 540, 54);
+        assert_eq!(
+            manual_scroll_evidence(&previous, &current),
+            Some(ManualScrollEvidence::SignificantVisualChange)
+        );
+        let overlap = find_vertical_overlap(&previous, &current).unwrap();
+        assert_eq!(overlap.displacement, 54);
+    }
+
+    #[test]
+    fn manual_scroll_rejects_a_step_with_too_little_overlap() {
+        let previous = patterned_frame(640, 540, 0);
+        let current = patterned_frame(640, 540, 450);
+        assert!(find_vertical_overlap(&previous, &current).is_none());
+    }
+
+    #[test]
+    fn manual_scroll_detects_narrow_short_code_lines() {
+        for displacement in [18, 54, 126] {
+            for code_columns in [8, 12, 20] {
+                let previous = dark_editor_frame_with_columns(960, 540, 0, code_columns);
+                let current = dark_editor_frame_with_columns(960, 540, displacement, code_columns);
+                assert_eq!(
+                    manual_scroll_evidence(&previous, &current),
+                    Some(ManualScrollEvidence::SignificantVisualChange),
+                    "displacement={displacement}, code_columns={code_columns}"
+                );
+                assert_eq!(
+                    find_vertical_overlap(&previous, &current)
+                        .expect("narrow code scroll should have a reliable seam")
+                        .displacement,
+                    displacement,
+                    "displacement={displacement}, code_columns={code_columns}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn manual_scroll_ignores_static_frame_and_small_caret_change() {
+        let previous = dark_editor_frame(960, 540, 0);
+        assert_eq!(manual_scroll_evidence(&previous, &previous), None);
+
+        let mut caret = previous.clone();
+        for y in 210..234_usize {
+            for x in 620..622_usize {
+                let offset = (y * caret.width as usize + x) * 4;
+                caret.rgba[offset..offset + 3].fill(220);
+            }
+        }
+        assert_eq!(manual_scroll_evidence(&previous, &caret), None);
+    }
+
+    #[test]
+    fn manual_scroll_fails_closed_for_invalid_frame_geometry() {
+        let previous = dark_editor_frame(320, 240, 0);
+        let different_size = dark_editor_frame(319, 240, 24);
+        assert_eq!(manual_scroll_evidence(&previous, &different_size), None);
+        assert!(find_vertical_overlap(&previous, &different_size).is_none());
+
+        let mut truncated = previous.clone();
+        truncated.rgba.truncate(truncated.rgba.len() - 4);
+        assert_eq!(manual_scroll_evidence(&previous, &truncated), None);
+        assert!(gray_strips_for_pair(&previous, &truncated).is_none());
+        assert!(find_vertical_overlap(&previous, &truncated).is_none());
+    }
+
+    #[test]
+    fn manual_scroll_ignores_local_animation() {
+        let previous = dark_editor_frame(960, 540, 0);
+        let mut animated = previous.clone();
+        for y in 120..300_usize {
+            for x in 610..690_usize {
+                let offset = (y * animated.width as usize + x) * 4;
+                let value = if (x / 6 + y / 6) % 2 == 0 { 225 } else { 48 };
+                animated.rgba[offset..offset + 3].fill(value);
+            }
+        }
+        assert_eq!(manual_scroll_evidence(&previous, &animated), None);
+        assert!(find_vertical_overlap(&previous, &animated).is_none());
+    }
+
+    #[test]
+    fn manual_scroll_rejects_tall_narrow_animation_without_global_displacement() {
+        let previous = dark_editor_frame(960, 540, 0);
+        let mut animated = previous.clone();
+        for y in 40..520_usize {
+            for x in 610..690_usize {
+                let offset = (y * animated.width as usize + x) * 4;
+                let value = if (x / 6 + y / 6) % 2 == 0 { 225 } else { 48 };
+                animated.rgba[offset..offset + 3].fill(value);
+            }
+        }
+        let change = sparse_frame_change(&previous, &animated).unwrap();
+        assert!(change.is_distributed_change_candidate());
+        assert!(find_vertical_overlap(&previous, &animated).is_none());
+        assert_eq!(manual_scroll_evidence(&previous, &animated), None);
+    }
+
+    #[test]
+    fn overlap_rejects_repeated_rows_with_local_animation() {
+        let width = 960_u32;
+        let height = 540_u32;
+        let mut previous = solid_frame(width, height, 24);
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let stripe = ((y % 24) * 9 + (x % 37) * 3) as u8;
+                let value = 36_u8.saturating_add(stripe % 150);
+                let offset = (y * width as usize + x) * 4;
+                previous.rgba[offset..offset + 3].fill(value);
+            }
+        }
+        let mut animated = previous.clone();
+        for y in 90..330_usize {
+            for x in 40..180_usize {
+                let offset = (y * width as usize + x) * 4;
+                let value = if (x + y) % 11 < 5 { 230 } else { 18 };
+                animated.rgba[offset..offset + 3].fill(value);
+            }
+        }
+        assert!(find_vertical_overlap(&previous, &animated).is_none());
+    }
+
+    #[test]
+    fn overlap_search_candidate_budget_is_bounded_at_4k_heights() {
+        for height in [2_160_usize, 3_840_usize] {
+            let minimum = 2_usize;
+            let maximum = maximum_legacy_displacement(height);
+            let (coarse, step) = coarse_displacement_candidates(minimum, maximum);
+            assert!(coarse.len() <= MATCH_MAX_COARSE_CANDIDATES);
+
+            let scores = coarse
+                .iter()
+                .enumerate()
+                .map(|(index, displacement)| ScoredDisplacement {
+                    displacement: *displacement,
+                    score: index as f32,
+                })
+                .collect::<Vec<_>>();
+            let seeds = select_refine_seeds(&scores, step);
+            let fine = refinement_candidates(&seeds, minimum, maximum, step);
+            assert!(seeds.len() <= MATCH_MAX_REFINE_SEEDS);
+            assert!(fine.len() <= MATCH_MAX_REFINE_SEEDS * (step * 2 + 1));
+
+            let sampled_row_budget =
+                coarse.len() * MATCH_MAX_COARSE_ROWS + fine.len() * MATCH_MAX_FINE_ROWS;
+            assert!(sampled_row_budget < 100_000, "height={height}");
+        }
     }
 
     #[test]
@@ -4872,12 +7914,87 @@ mod tests {
                     strip_file: "strips/000001.png".to_string(),
                 },
             ],
+            fixed_bottom: None,
         };
         let tile = compose_tile(root.path(), &manifest, 2, 3).unwrap();
         assert_eq!((tile.width, tile.height), (3, 3));
         assert_eq!(tile.rgba[0], 30);
         assert_eq!(tile.rgba[3 * 4], 40);
         assert_eq!(tile.rgba[6 * 4], 50);
+    }
+
+    #[test]
+    fn fixed_bottom_is_appended_once_in_tiles_and_streamed_exports() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("strips")).unwrap();
+        for (name, frame) in [
+            ("body.png", solid_frame(2, 2, 20)),
+            ("tail.png", solid_frame(2, 1, 90)),
+            (FIXED_BOTTOM_FILE, solid_frame(2, 1, 220)),
+        ] {
+            std::fs::write(
+                root.path().join("strips").join(name),
+                encode_png(&frame).unwrap(),
+            )
+            .unwrap();
+        }
+        let manifest = LongCaptureManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            job_id: "job".to_string(),
+            session_id: "session".to_string(),
+            state: LongCaptureState::Ready,
+            engine: LongCaptureEngine::Manual,
+            selection: PhysicalRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 3,
+            },
+            scroll_anchor: PhysicalPoint { x: 1, y: 1 },
+            scope: LongCaptureScope::Selection,
+            mode: LongCaptureMode::Manual,
+            width: 2,
+            height: 4,
+            message: "ready".to_string(),
+            segments: vec![
+                LongCaptureSegment {
+                    index: 0,
+                    output_y: 0,
+                    height: 2,
+                    displacement: 2,
+                    confidence: 1.0,
+                    frame_file: "unused.png".to_string(),
+                    strip_file: "strips/body.png".to_string(),
+                },
+                LongCaptureSegment {
+                    index: 1,
+                    output_y: 2,
+                    height: 1,
+                    displacement: 1,
+                    confidence: 0.9,
+                    frame_file: "unused.png".to_string(),
+                    strip_file: "strips/tail.png".to_string(),
+                },
+            ],
+            fixed_bottom: Some(LongCaptureFixedBottom {
+                height: 1,
+                file: format!("strips/{FIXED_BOTTOM_FILE}"),
+            }),
+        };
+
+        let tile = compose_tile(root.path(), &manifest, 1, 3).unwrap();
+        assert_eq!((tile.width, tile.height), (2, 3));
+        assert_eq!(tile.rgba[0], 20);
+        assert_eq!(tile.rgba[2 * 4], 90);
+        assert_eq!(tile.rgba[4 * 4], 220);
+
+        let output = root.path().join("fixed-bottom-result.png");
+        stream_manifest_png(root.path(), &manifest, &output).unwrap();
+        let decoded = decode_png(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!((decoded.width, decoded.height), (2, 4));
+        assert_eq!(decoded.rgba[0], 20);
+        assert_eq!(decoded.rgba[4 * 4], 90);
+        assert_eq!(decoded.rgba[6 * 4], 220);
     }
 
     #[test]
@@ -4946,12 +8063,14 @@ mod tests {
     }
 
     #[test]
-    fn resource_limits_bound_height_and_wheel_batch() {
+    fn resource_limits_and_adaptive_wheel_delta_stay_bounded() {
         assert_eq!(maximum_height_for_width(1_000), 100_000);
         assert_eq!(maximum_height_for_width(4_000), 50_000);
         assert_eq!(maximum_height_for_width(0), 0);
-        assert_eq!(wheel_ticks_for_height(100), 3);
-        assert_eq!(wheel_ticks_for_height(4_000), 10);
+        assert_eq!(calibrated_wheel_delta_units(1_000, 500, 120), 120);
+        assert_eq!(calibrated_wheel_delta_units(1_000, 100, 120), 180);
+        assert_eq!(calibrated_wheel_delta_units(100, 100, 120), 90);
+        assert_eq!(calibrated_wheel_delta_units(1_000, 0, 400), 240);
         assert_eq!(annotation_export_strip_height(7_680), 1_024);
         assert_eq!(annotation_export_strip_height(16_000), 744);
         assert_eq!(annotation_export_strip_height(0), 1);
@@ -5027,6 +8146,7 @@ mod tests {
                     strip_file: "strips/1.png".to_string(),
                 },
             ],
+            fixed_bottom: None,
         };
         let output = root.path().join("result.png");
         stream_manifest_png(root.path(), &manifest, &output).unwrap();
@@ -5042,6 +8162,10 @@ mod tests {
         let directory = root.path().join("annotation");
         std::fs::create_dir_all(&directory).unwrap();
         let ticket = LongCaptureAnnotationExportTicket {
+            job: Arc::new(job_for_state(
+                root.path().join("annotation-job"),
+                LongCaptureState::Ready,
+            )),
             job_id: "job".to_string(),
             session_id: "session".to_string(),
             action: ScreenshotExportAction::Save,
@@ -5098,6 +8222,7 @@ mod tests {
             height: 2_400,
             message: "ready".to_string(),
             segments: Vec::new(),
+            fixed_bottom: None,
         };
         let empty = serde_json::json!({
             "version": 1,
@@ -5266,6 +8391,7 @@ mod tests {
             height: 20,
             message: "ready".to_string(),
             segments: Vec::new(),
+            fixed_bottom: None,
         };
         let restore_binding = BrowserSessionBinding {
             tab_id: 17,
@@ -5315,28 +8441,24 @@ mod tests {
             runtime: Mutex::new(runtime),
             wake: Condvar::new(),
         });
-        let store = LongScreenshotStore {
-            cache_root: root.path().to_path_buf(),
-            browser_bridge: None,
-            job: Mutex::new(Some(job)),
-            annotation_exports: Mutex::new(HashMap::from([(
-                "export-1".to_string(),
-                LongCaptureAnnotationExportTicket {
-                    job_id: "job-1".to_string(),
-                    session_id: "session-1".to_string(),
-                    action: ScreenshotExportAction::Save,
-                    save_path: None,
-                    directory: export_directory.clone(),
-                    width: 10,
-                    height: 20,
-                    strip_height: 10,
-                    next_y: 0,
-                    issued_at: Instant::now(),
-                },
-            )])),
-            start_lock: Mutex::new(()),
-            pending_start: Mutex::new(None),
-        };
+        let store = test_store(root.path().to_path_buf());
+        *lock_unpoisoned(&store.job) = Some(Arc::clone(&job));
+        *lock_unpoisoned(&store.annotation_exports) = HashMap::from([(
+            "export-1".to_string(),
+            LongCaptureAnnotationExportTicket {
+                job,
+                job_id: "job-1".to_string(),
+                session_id: "session-1".to_string(),
+                action: ScreenshotExportAction::Save,
+                save_path: None,
+                directory: export_directory.clone(),
+                width: 10,
+                height: 20,
+                strip_height: 10,
+                next_y: 0,
+                issued_at: Instant::now(),
+            },
+        )]);
 
         clear_job_cache(&store, "job-1");
         assert!(lock_unpoisoned(&store.job).is_none());
@@ -5348,14 +8470,7 @@ mod tests {
     #[test]
     fn pending_start_cancellation_is_scoped_to_its_screenshot_session() {
         let root = tempdir().unwrap();
-        let store = LongScreenshotStore {
-            cache_root: root.path().to_path_buf(),
-            browser_bridge: None,
-            job: Mutex::new(None),
-            annotation_exports: Mutex::new(HashMap::new()),
-            start_lock: Mutex::new(()),
-            pending_start: Mutex::new(None),
-        };
+        let store = test_store(root.path().to_path_buf());
 
         store.begin_pending_start("session-1").unwrap();
         let duplicate = store.begin_pending_start("session-2").unwrap_err();
@@ -5369,5 +8484,50 @@ mod tests {
         assert!(store.pending_start_cancel_requested("session-1"));
         store.finish_pending_start("session-1");
         assert!(!store.pending_start_cancel_requested("session-1"));
+    }
+
+    #[test]
+    fn stale_session_and_job_ids_cannot_remove_the_current_job() {
+        let root = tempdir().unwrap();
+        let job_directory = root.path().join("current-job");
+        let export_directory = root.path().join("current-export");
+        std::fs::create_dir_all(&job_directory).unwrap();
+        std::fs::create_dir_all(&export_directory).unwrap();
+        let job = Arc::new(job_for_state(
+            job_directory.clone(),
+            LongCaptureState::Ready,
+        ));
+        let store = test_store(root.path().to_path_buf());
+        *lock_unpoisoned(&store.job) = Some(Arc::clone(&job));
+        lock_unpoisoned(&store.annotation_exports).insert(
+            "current-export".to_string(),
+            LongCaptureAnnotationExportTicket {
+                job: Arc::clone(&job),
+                job_id: "job".to_string(),
+                session_id: "session".to_string(),
+                action: ScreenshotExportAction::Save,
+                save_path: None,
+                directory: export_directory.clone(),
+                width: 1,
+                height: 1,
+                strip_height: 1,
+                next_y: 0,
+                issued_at: Instant::now(),
+            },
+        );
+
+        assert!(store.job_for_session("session-old").is_none());
+        assert!(Arc::ptr_eq(
+            &store.job_for_session("session").unwrap(),
+            &job
+        ));
+        clear_job_cache(&store, "job-old");
+        assert!(Arc::ptr_eq(
+            lock_unpoisoned(&store.job).as_ref().unwrap(),
+            &job
+        ));
+        assert!(lock_unpoisoned(&store.annotation_exports).contains_key("current-export"));
+        assert!(job_directory.is_dir());
+        assert!(export_directory.is_dir());
     }
 }

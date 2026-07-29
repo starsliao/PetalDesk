@@ -5,6 +5,7 @@
   import { NoteShell, NotesList, TrashView } from "$lib/components";
   import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
   import ScreenshotSettingsDialog from "$lib/components/ScreenshotSettingsDialog.svelte";
+  import LongCaptureControl from "$lib/screenshot/LongCaptureControl.svelte";
   import ReminderTool from "$lib/components/ReminderTool.svelte";
   import TimerTool from "$lib/components/TimerTool.svelte";
   import {
@@ -25,7 +26,6 @@
   type NoteEditorComponent = typeof import("$lib/components/NoteEditor.svelte").default;
   type GanttToolComponent = typeof import("$lib/components/GanttTool.svelte").default;
   type ScreenshotToolComponent = typeof import("$lib/components/ScreenshotTool.svelte").default;
-  type LongCaptureControlComponent = typeof import("$lib/screenshot/LongCaptureControl.svelte").default;
   type PinnedScreenshotComponent = typeof import("$lib/components/PinnedScreenshot.svelte").default;
 
   type MainView = "notes" | "trash";
@@ -39,14 +39,15 @@
     typeof window !== "undefined" ? new URLSearchParams(window.location.search) : null;
   const screenshotPinId = routeSearch?.get("screenshotPin") ?? null;
   const longCaptureControlId = routeSearch?.get("longControl") ?? null;
+  const longCaptureOutlineId = routeSearch?.get("longOutline") ?? null;
   const requestedTool = routeSearch?.get("tool") ?? null;
   const toolName: ToolName | null = parseToolName(requestedTool);
-  const isToolWindow = toolName !== null || screenshotPinId !== null;
+  const isToolWindow =
+    toolName !== null || screenshotPinId !== null || longCaptureOutlineId !== null;
 
   let initialized = $state(false);
   let GanttTool = $state<GanttToolComponent | null>(null);
   let ScreenshotTool = $state<ScreenshotToolComponent | null>(null);
-  let LongCaptureControl = $state<LongCaptureControlComponent | null>(null);
   let PinnedScreenshot = $state<PinnedScreenshotComponent | null>(null);
   let fatalError = $state("");
   let appInfo = $state<AppInfo | null>(null);
@@ -698,19 +699,18 @@
 
   onMount(() => {
     if (isToolWindow) {
-      const transparent = toolName === "timer";
+      const timerPage = toolName === "timer";
+      const transparentPage = timerPage || longCaptureOutlineId !== null;
       let disposed = false;
-      document.documentElement.classList.toggle("timer-tool-page", transparent);
-      document.body.classList.toggle("timer-tool-page", transparent);
+      document.documentElement.classList.toggle("timer-tool-page", timerPage);
+      document.body.classList.toggle("timer-tool-page", timerPage);
+      document.documentElement.classList.toggle("transparent-tool-page", transparentPage);
+      document.body.classList.toggle("transparent-tool-page", transparentPage);
       if (screenshotPinId) {
         void import("$lib/components/PinnedScreenshot.svelte").then((module) => {
           if (!disposed) PinnedScreenshot = module.default;
         });
-      } else if (toolName === "screenshot" && longCaptureControlId) {
-        void import("$lib/screenshot/LongCaptureControl.svelte").then((module) => {
-          if (!disposed) LongCaptureControl = module.default;
-        });
-      } else if (toolName === "screenshot") {
+      } else if (toolName === "screenshot" && !longCaptureControlId && !longCaptureOutlineId) {
         void import("$lib/components/ScreenshotTool.svelte").then((module) => {
           if (!disposed) ScreenshotTool = module.default;
         });
@@ -723,6 +723,8 @@
         disposed = true;
         document.documentElement.classList.remove("timer-tool-page");
         document.body.classList.remove("timer-tool-page");
+        document.documentElement.classList.remove("transparent-tool-page");
+        document.body.classList.remove("transparent-tool-page");
       };
     }
 
@@ -757,7 +759,9 @@
 <svelte:head>
   <title>{screenshotPinId
       ? "贴图 - 飞花 - PetalDesk"
-      : toolName === "timer"
+      : longCaptureOutlineId
+        ? "长截图范围 - 飞花 - PetalDesk"
+        : toolName === "timer"
         ? "计时器 - 飞花 - PetalDesk"
         : toolName === "reminder"
           ? "提醒 - 飞花 - PetalDesk"
@@ -782,15 +786,12 @@
       </div>
     {/if}
   </main>
+{:else if longCaptureOutlineId}
+  <main class="long-capture-outline-window" data-testid="long-capture-outline" aria-hidden="true"></main>
 {:else if toolName === "screenshot" && longCaptureControlId}
   <main class="long-capture-control-window">
-    {#if LongCaptureControl}
-      <LongCaptureControl jobId={longCaptureControlId} keyboardShortcuts={false} />
-    {:else}
-      <div class="tool-loading screenshot-loading" aria-busy="true">
-        <LoaderCircle class="spinner" size={18} aria-hidden="true" />
-      </div>
-    {/if}
+    <!-- Keep focus on the target app so wheel and keyboard input reach its scroll area. -->
+    <LongCaptureControl jobId={longCaptureControlId} keyboardShortcuts={false} />
   </main>
 {:else if toolName === "screenshot"}
   <main class="screenshot-tool-window">
@@ -992,6 +993,7 @@
 
   .screenshot-tool-window,
   .long-capture-control-window,
+  .long-capture-outline-window,
   .pinned-screenshot-window {
     width: 100vw;
     height: 100vh;
@@ -1014,6 +1016,27 @@
     background: #fafafa;
   }
 
+  .long-capture-outline-window {
+    position: fixed;
+    inset: 0;
+    box-sizing: border-box;
+    width: 100vw;
+    height: 100vh;
+    background: transparent;
+    pointer-events: none;
+  }
+
+  .long-capture-outline-window::before {
+    position: absolute;
+    inset: 2px;
+    border: 2px solid #00a2ff;
+    box-shadow:
+      0 0 0 1px rgb(0 0 0 / 72%),
+      inset 0 0 0 1px rgb(255 255 255 / 92%);
+    content: "";
+    pointer-events: none;
+  }
+
   .pinned-screenshot-window,
   .transparent-loading {
     color: #ffffff;
@@ -1028,8 +1051,8 @@
     place-items: center;
   }
 
-  :global(html.timer-tool-page),
-  :global(body.timer-tool-page) {
+  :global(html.transparent-tool-page),
+  :global(body.transparent-tool-page) {
     min-width: 0;
     min-height: 0;
     overflow: hidden;

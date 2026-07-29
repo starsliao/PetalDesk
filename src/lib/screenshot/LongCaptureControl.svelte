@@ -13,6 +13,10 @@
     monitor?: boolean;
     keyboardShortcuts?: boolean;
     controlTimeoutMs?: number;
+    statusPollIntervalMs?: number;
+    statusRetryBaseMs?: number;
+    statusRetryMaxMs?: number;
+    statusRetryLimit?: number;
     cancelLabel?: string;
     onstatus?: (status: LongCaptureStatus) => void;
     oncancel?: () => void;
@@ -29,6 +33,10 @@
     monitor = true,
     keyboardShortcuts = true,
     controlTimeoutMs = 5_000,
+    statusPollIntervalMs = 750,
+    statusRetryBaseMs = 500,
+    statusRetryMaxMs = 5_000,
+    statusRetryLimit = 6,
     cancelLabel = "取消长截图",
     onstatus,
     oncancel,
@@ -44,6 +52,8 @@
   let disposed = false;
   let actionGeneration = 0;
   let refreshGeneration = 0;
+  let consecutiveRefreshFailures = 0;
+  let pollingStopped = $state(false);
 
   function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
     return new Promise<T>((resolve, reject) => {
@@ -82,6 +92,8 @@
   function publish(next: LongCaptureStatus): void {
     if (next.jobId !== jobId) return;
     if (terminal(status?.state) && next.state !== status?.state && next.state !== "canceled") return;
+    consecutiveRefreshFailures = 0;
+    pollingStopped = false;
     status = next;
     error = "";
     onstatus?.(next);
@@ -106,20 +118,48 @@
       const next = await withTimeout(api.getLongCaptureStatus(jobId), "读取长截图状态超时。");
       if (disposed || generation !== refreshGeneration) return;
       if (next) publish(next);
-      else fail("长截图任务不存在或已结束。");
+      else if (!terminal(status?.state)) {
+        fail("暂时无法读取长截图状态，正在重试。");
+        scheduleRetry();
+      }
     } catch (value) {
-      if (!disposed && generation === refreshGeneration) fail(value);
+      if (!disposed && generation === refreshGeneration && !terminal(status?.state)) {
+        fail(value);
+        scheduleRetry();
+      }
     }
   }
 
-  function schedulePoll(): void {
+  function schedulePoll(delay = statusPollIntervalMs): void {
     if (pollTimer) clearTimeout(pollTimer);
     pollTimer = undefined;
-    if (!monitor || busy || !status || terminal(status.state)) return;
+    if (!monitor || busy || pollingStopped || terminal(status?.state)) return;
     pollTimer = setTimeout(() => {
       pollTimer = undefined;
       void refresh();
-    }, 750);
+    }, Math.max(1, delay));
+  }
+
+  function scheduleRetry(): void {
+    consecutiveRefreshFailures += 1;
+    if (consecutiveRefreshFailures >= Math.max(1, statusRetryLimit)) {
+      pollingStopped = true;
+      fail("无法连接长截图任务，请重连或取消。");
+      return;
+    }
+    const exponent = Math.min(consecutiveRefreshFailures, 8);
+    const base = Math.max(1, statusRetryBaseMs);
+    const maximum = Math.max(base, statusRetryMaxMs);
+    const delay = Math.min(maximum, base * 2 ** exponent);
+    schedulePoll(delay);
+  }
+
+  function reconnect(): void {
+    if (busy) return;
+    consecutiveRefreshFailures = 0;
+    pollingStopped = false;
+    error = "";
+    void refresh();
   }
 
   type ControlAction = "pause" | "resume" | "retry" | "undo" | "finish" | "cancel";
@@ -223,23 +263,37 @@
   {:else}
     <span class="stats">正在连接</span>
   {/if}
+  {#if status?.engine === "manual" && !terminal(status.state)}
+    <span class="manual-guide">
+      {status.state === "paused" ? "已暂停，点击继续后再滚动" : "在原窗口向下滚动，完成后点“完成”"}
+    </span>
+  {/if}
   {#if error || status?.message}
     <span class="message" aria-live="polite" title={error || status?.message || ""}>{error || status?.message}</span>
   {/if}
   <span class="separator"></span>
+  {#if pollingStopped}
+    <button class="labeled" type="button" title="重新连接长截图任务" aria-label="重新连接长截图" onclick={reconnect}>
+      <RotateCcw size={17} /><span>重连</span>
+    </button>
+  {/if}
   {#if status?.state === "failed"}
     <button class="failed-exit" type="button" title={cancelLabel} aria-label={cancelLabel} disabled={busy && activeAction === "cancel"} onclick={() => void run("cancel")}>
       {#if floating}<ArrowLeft size={17} />{:else}<X size={17} />{/if}<span>{cancelLabel}</span>
     </button>
   {:else}
     {#if status?.state === "capturing"}
-      <button type="button" title={keyboardShortcuts ? "暂停 Space" : "暂停"} aria-label="暂停长截图" disabled={busy} onclick={() => void run("pause")}><Pause size={17} /></button>
+      <button class:labeled={status.engine === "manual"} type="button" title={keyboardShortcuts ? "暂停 Space" : "暂停"} aria-label="暂停长截图" disabled={busy} onclick={() => void run("pause")}>
+        <Pause size={17} />{#if status.engine === "manual"}<span>暂停</span>{/if}
+      </button>
     {:else if status?.state === "paused"}
-      <button type="button" title={keyboardShortcuts ? "继续 Space" : "继续"} aria-label="继续长截图" disabled={busy} onclick={() => void run("resume")}><Play size={17} /></button>
+      <button class:labeled={status.engine === "manual"} type="button" title={keyboardShortcuts ? "继续 Space" : "继续"} aria-label="继续长截图" disabled={busy} onclick={() => void run("resume")}>
+        <Play size={17} />{#if status.engine === "manual"}<span>继续</span>{/if}
+      </button>
       <button type="button" title="重试当前段" aria-label="重试当前段" disabled={busy} onclick={() => void run("retry")}><RotateCcw size={17} /></button>
     {/if}
     <button type="button" title="回退上一段" aria-label="回退上一段" disabled={busy || !canRun("undo")} onclick={() => void run("undo")}><Undo2 size={17} /></button>
-    <button class="finish" type="button" title={keyboardShortcuts ? "完成 Enter" : "完成"} aria-label="完成长截图" disabled={busy || !canRun("finish")} onclick={() => void run("finish")}><Check size={17} /></button>
+    <button class="finish labeled" type="button" title={keyboardShortcuts ? "完成 Enter" : "完成"} aria-label="完成长截图" disabled={busy || !canRun("finish")} onclick={() => void run("finish")}><Check size={17} /><span>完成</span></button>
     <button type="button" title={cancelLabel} aria-label={cancelLabel} disabled={busy && activeAction === "cancel"} onclick={() => void run("cancel")}><X size={17} /></button>
   {/if}
 </div>
@@ -250,16 +304,19 @@
   strong, .stats { flex: 0 0 auto; white-space: nowrap; }
   strong { font-size: 12px; }
   .stats { color: #555; }
-  .message { min-width: 0; max-width: 250px; color: #555; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .manual-guide { flex: 0 0 auto; color: #174f78; font-weight: 600; white-space: nowrap; }
+  .message { min-width: 0; flex: 1 1 auto; color: #555; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .long-capture-control.failed .message { color: #8a2d22; }
   .separator { width: 1px; height: 24px; margin-left: auto; background: #d2d2d2; }
   button { display: grid; flex: 0 0 auto; width: 32px; height: 32px; padding: 0; place-items: center; color: #2d2d2d; background: transparent; border: 1px solid transparent; border-radius: 4px; }
+  button.labeled { display: flex; width: auto; padding: 0 9px; align-items: center; gap: 4px; white-space: nowrap; }
   button:hover:not(:disabled) { background: #e7e7e7; border-color: #d0d0d0; }
   button:disabled { opacity: .42; }
   button.finish { color: #fff; background: #0067c0; border-color: #005a9e; }
+  button.finish:hover:not(:disabled) { color: #fff; background: #004f93; border-color: #003f76; }
   button.failed-exit { display: flex; width: auto; padding: 0 10px; gap: 5px; color: #fff; background: #0067c0; border-color: #005a9e; white-space: nowrap; }
   button.failed-exit:hover:not(:disabled) { background: #005a9e; border-color: #004e8c; }
   :global(.long-capture-control .spin) { animation: spin .8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  @media (max-width: 520px) { .message { display: none; } .long-capture-control.floating { width: calc(100vw - 24px); min-width: 0; overflow-x: auto; } }
+  @media (max-width: 520px) { .stats, .message { display: none; } .manual-guide { font-size: 11px; } .long-capture-control.floating { width: calc(100vw - 24px); min-width: 0; overflow-x: auto; } }
 </style>

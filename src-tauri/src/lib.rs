@@ -4,7 +4,9 @@ mod commands;
 mod error;
 mod gantt;
 mod long_screenshot;
+mod long_screenshot_input;
 mod models;
+mod phase_match;
 mod reminders;
 mod screenshot;
 mod storage;
@@ -528,7 +530,10 @@ pub fn run() {
                     api.prevent_close();
                     return;
                 }
-                screenshot::handle_window_closed(&app, &label);
+                if screenshot::handle_window_close_requested(&app, &label) {
+                    api.prevent_close();
+                    return;
+                }
                 trace_activation(&format!("window_close:{label}:requested"));
                 if let (Ok(position), Ok(size), Ok(scale), Ok(maximized)) = (
                     window.outer_position(),
@@ -566,6 +571,19 @@ pub fn run() {
                         refresh_tray_menu(&app);
                     });
                 }
+            } else if let WindowEvent::Destroyed = event {
+                let app = window.app_handle().clone();
+                let label = window.label().to_string();
+                #[cfg(windows)]
+                let control_window_instance = window.hwnd().ok().map(|handle| handle.0 as isize);
+                #[cfg(not(windows))]
+                let control_window_instance = None;
+                long_screenshot::handle_control_window_destroyed(
+                    &app,
+                    &label,
+                    control_window_instance,
+                );
+                screenshot::handle_window_destroyed(&app, &label);
             }
         })
         .invoke_handler(tauri::generate_handler![
