@@ -399,8 +399,11 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             "new-note" => spawn_create_note(app),
             ABOUT_MENU_ID => show_about_dialog(),
             "quit" => {
-                long_screenshot::shutdown(app);
-                app.exit(0);
+                let app = app.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    long_screenshot::shutdown(&app);
+                    app.exit(0);
+                });
             }
             id => {
                 if let Some(tool) = tool_from_tray_menu_id(id) {
@@ -521,6 +524,10 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle().clone();
                 let label = window.label().to_string();
+                if long_screenshot::handle_control_window_close_requested(&app, &label) {
+                    api.prevent_close();
+                    return;
+                }
                 screenshot::handle_window_closed(&app, &label);
                 trace_activation(&format!("window_close:{label}:requested"));
                 if let (Ok(position), Ok(size), Ok(scale), Ok(maximized)) = (
@@ -614,6 +621,7 @@ pub fn run() {
             long_screenshot::undo_long_capture_segment,
             long_screenshot::finish_long_capture,
             long_screenshot::cancel_long_capture,
+            long_screenshot::cancel_long_capture_session,
             long_screenshot::get_long_capture_status,
             long_screenshot::get_long_capture_tile,
             long_screenshot::export_long_capture,
@@ -625,16 +633,18 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("无法启动飞花 - PetalDesk 应用");
 
-    app.run(|app, event| match event {
+    app.run(|_app, event| match event {
         RunEvent::Ready => {
             trace_activation("run_event:ready");
         }
         RunEvent::ExitRequested { api, code, .. } => {
             if code.is_none() {
                 api.prevent_exit();
-            } else {
-                long_screenshot::shutdown(app);
             }
+            // Explicit quit and restart paths finish long-capture cleanup on a
+            // worker thread before requesting process exit. Repeating that
+            // blocking cleanup here can stall Tauri's event loop while Windows
+            // is already tearing down the process.
         }
         _ => {}
     });

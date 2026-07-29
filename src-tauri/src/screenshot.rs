@@ -486,6 +486,14 @@ pub async fn start_screenshot_capture(app: AppHandle) -> AppResult<ScreenshotSes
 pub(crate) fn start_capture_inner(app: &AppHandle) -> AppResult<ScreenshotSession> {
     let store = app.state::<ScreenshotStore>();
     let _start_guard = lock_unpoisoned(&store.start_lock);
+    if crate::long_screenshot::restore_active_long_capture_surface(app)? {
+        return store.active_session().ok_or_else(|| {
+            AppError::new(
+                "long_capture_busy",
+                "长截图仍在运行，但原截图会话已结束；请先取消长截图后重试",
+            )
+        });
+    }
     if let Some(session) = store.active_session() {
         if capture_window_is_visible(app) {
             present_capture_window(app)?;
@@ -874,6 +882,9 @@ fn choose_png_save_path(
 }
 
 fn ensure_capture_window(app: &AppHandle) -> AppResult<()> {
+    if app.get_webview_window(CAPTURE_WINDOW_LABEL).is_some() {
+        return Ok(());
+    }
     let _creation_guard = lock_window_creation();
     if app.get_webview_window(CAPTURE_WINDOW_LABEL).is_some() {
         return Ok(());

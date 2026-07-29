@@ -250,6 +250,7 @@ export interface ScreenshotApi {
   undoLongCapture(jobId: string): Promise<LongCaptureStatus>;
   finishLongCapture(jobId: string): Promise<LongCaptureStatus>;
   cancelLongCapture(jobId: string): Promise<LongCaptureStatus>;
+  cancelLongCaptureSession(sessionId: string): Promise<LongCaptureStatus | null>;
   getLongCaptureStatus(jobId: string): Promise<LongCaptureStatus | null>;
   getLongCaptureTile(jobId: string, y: number, height: number): Promise<Uint8Array>;
   exportLongCapture(jobId: string, action: ScreenshotExportAction): Promise<ScreenshotExportResult>;

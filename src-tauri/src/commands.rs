@@ -127,8 +127,14 @@ pub fn set_data_storage_path(
 }
 
 #[tauri::command]
-pub fn restart_app(app: AppHandle) {
-    app.restart()
+pub async fn restart_app(app: AppHandle) -> AppResult<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::long_screenshot::shutdown(&app);
+        app.restart()
+    })
+    .await
+    .map_err(|error| AppError::new("restart_error", format!("重启应用失败: {error}")))?;
+    Ok(())
 }
 
 #[tauri::command]

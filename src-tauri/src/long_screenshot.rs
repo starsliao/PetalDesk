@@ -1,7 +1,6 @@
 use crate::browser_bridge::{
     BrowserBridge, BrowserBridgeStatus, BrowserConnectionStatus, BrowserFamily,
 };
-use crate::commands::lock_window_creation;
 use crate::error::{AppError, AppResult};
 use crate::screenshot::{
     self, MonitorBounds, ScreenshotExportAction, ScreenshotStore, CAPTURE_WINDOW_LABEL,
@@ -32,6 +31,7 @@ const MAX_COPY_PIN_PIXELS: u64 = 16_000_000;
 const DEFAULT_TILE_HEIGHT: u32 = 1_024;
 const MAX_TILE_HEIGHT: u32 = 2_048;
 const MAX_TILE_PIXELS: u64 = 16_000_000;
+static CONTROL_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 const SETTLE_SAMPLE_INTERVAL: Duration = Duration::from_millis(90);
 const SETTLE_MAX_SAMPLES: usize = 18;
 const LOW_CONFIDENCE_LIMIT: u8 = 3;
@@ -48,6 +48,7 @@ const ANNOTATION_EXPORT_Y_HEADER: &str = "x-petaldesk-long-export-y";
 const CONTROL_WINDOW_LABEL: &str = "screenshot-long-control";
 const CONTROL_WINDOW_HEIGHT: u32 = 68;
 const CONTROL_WINDOW_MAX_WIDTH: u32 = 680;
+const MANUAL_SCROLL_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -238,6 +239,13 @@ struct CaptureTarget {
     monitor: MonitorBounds,
     mode: LongCaptureMode,
     control_overlaps_roi: bool,
+    scroll_windows: Option<ScrollTargetWindows>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScrollTargetWindows {
+    root: isize,
+    child: isize,
 }
 
 #[derive(Clone)]
@@ -275,6 +283,7 @@ struct LongCaptureJob {
     target: CaptureTarget,
     hidden_pin_labels: Vec<String>,
     browser: Option<BrowserCaptureContext>,
+    operation_lock: Mutex<()>,
     runtime: Mutex<LongCaptureRuntime>,
     wake: Condvar,
 }
@@ -301,6 +310,25 @@ pub struct LongScreenshotStore {
     browser_bridge: Option<Arc<BrowserBridge>>,
     job: Mutex<Option<Arc<LongCaptureJob>>>,
     annotation_exports: Mutex<HashMap<String, LongCaptureAnnotationExportTicket>>,
+    start_lock: Mutex<()>,
+    pending_start: Mutex<Option<PendingLongCaptureStart>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingLongCaptureStart {
+    session_id: String,
+    cancel_requested: bool,
+}
+
+struct PendingLongCaptureStartGuard<'a> {
+    store: &'a LongScreenshotStore,
+    session_id: String,
+}
+
+impl Drop for PendingLongCaptureStartGuard<'_> {
+    fn drop(&mut self) {
+        self.store.finish_pending_start(&self.session_id);
+    }
 }
 
 impl LongScreenshotStore {
@@ -321,6 +349,8 @@ impl LongScreenshotStore {
             browser_bridge: BrowserBridge::start().ok().map(Arc::new),
             job: Mutex::new(None),
             annotation_exports: Mutex::new(HashMap::new()),
+            start_lock: Mutex::new(()),
+            pending_start: Mutex::new(None),
         })
     }
 
@@ -338,6 +368,56 @@ impl LongScreenshotStore {
             .as_ref()
             .is_some_and(|job| job.status().job_id == expected_id);
         matches.then(|| current.take()).flatten()
+    }
+
+    fn begin_pending_start(&self, session_id: &str) -> AppResult<()> {
+        let mut pending = lock_unpoisoned(&self.pending_start);
+        if pending.is_some() {
+            return Err(AppError::new(
+                "long_capture_busy",
+                "已有长截图正在启动，请稍候或先取消",
+            ));
+        }
+        *pending = Some(PendingLongCaptureStart {
+            session_id: session_id.to_string(),
+            cancel_requested: false,
+        });
+        Ok(())
+    }
+
+    fn finish_pending_start(&self, session_id: &str) {
+        let mut pending = lock_unpoisoned(&self.pending_start);
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == session_id)
+        {
+            *pending = None;
+        }
+    }
+
+    fn request_pending_start_cancel(&self, session_id: &str) -> bool {
+        let mut pending = lock_unpoisoned(&self.pending_start);
+        let Some(pending) = pending
+            .as_mut()
+            .filter(|pending| pending.session_id == session_id)
+        else {
+            return false;
+        };
+        pending.cancel_requested = true;
+        true
+    }
+
+    fn pending_start_cancel_requested(&self, session_id: &str) -> bool {
+        lock_unpoisoned(&self.pending_start)
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == session_id && pending.cancel_requested)
+    }
+
+    fn job_for_session(&self, session_id: &str) -> Option<Arc<LongCaptureJob>> {
+        lock_unpoisoned(&self.job)
+            .as_ref()
+            .filter(|job| job.status().session_id == session_id)
+            .cloned()
     }
 }
 
@@ -379,6 +459,9 @@ pub(crate) fn shutdown(app: &AppHandle) {
     let Some(store) = app.try_state::<LongScreenshotStore>() else {
         return;
     };
+    if let Some(pending) = lock_unpoisoned(&store.pending_start).as_mut() {
+        pending.cancel_requested = true;
+    }
     let job = lock_unpoisoned(&store.job).take();
     if let Some(job) = job {
         {
@@ -503,12 +586,12 @@ fn long_capture_capability(bridge: Option<&BrowserBridge>) -> LongCaptureCapabil
             .and_then(|bridge| bridge.status().ok())
             .is_some_and(|status| browser_statuses(&status).iter().any(|status| status.ready));
     let mut engines = if available {
-        vec![LongCaptureEngine::Wheel, LongCaptureEngine::Manual]
+        vec![LongCaptureEngine::Manual, LongCaptureEngine::Wheel]
     } else {
         Vec::new()
     };
     if browser_enhanced {
-        engines.insert(0, LongCaptureEngine::BrowserEnhanced);
+        engines.insert(1, LongCaptureEngine::BrowserEnhanced);
     }
     LongCaptureCapability {
         available,
@@ -516,11 +599,7 @@ fn long_capture_capability(bridge: Option<&BrowserBridge>) -> LongCaptureCapabil
         reason: (!available).then(|| "长截图通用引擎仅支持 Windows 10/11".to_string()),
         platform: std::env::consts::OS.to_string(),
         engines,
-        preferred_engine: available.then_some(if browser_enhanced {
-            LongCaptureEngine::BrowserEnhanced
-        } else {
-            LongCaptureEngine::Wheel
-        }),
+        preferred_engine: available.then_some(LongCaptureEngine::Manual),
         max_height: MAX_LONG_HEIGHT,
         max_pixels: MAX_LONG_PIXELS,
         tile_height: DEFAULT_TILE_HEIGHT,
@@ -531,11 +610,32 @@ fn browser_statuses(status: &BrowserBridgeStatus) -> [&BrowserConnectionStatus; 
     [&status.chrome, &status.edge, &status.firefox]
 }
 
+fn pending_start_canceled_error() -> AppError {
+    AppError::new(
+        "long_capture_start_canceled",
+        "长截图启动已取消，已恢复普通截图界面",
+    )
+}
+
 #[tauri::command]
-pub fn start_long_capture(
+pub async fn start_long_capture(
     app: AppHandle,
-    store: State<'_, LongScreenshotStore>,
-    screenshot_store: State<'_, ScreenshotStore>,
+    request: StartLongCaptureRequest,
+) -> AppResult<LongCaptureStatus> {
+    // Creating the control WebView synchronously dispatches to Tauri's event
+    // loop. Never run that path inline in the IPC callback that owns the loop.
+    tauri::async_runtime::spawn_blocking(move || start_long_capture_inner(&app, request))
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "long_capture_task_error",
+                format!("启动长截图任务异常结束: {error}"),
+            )
+        })?
+}
+
+fn start_long_capture_inner(
+    app: &AppHandle,
     request: StartLongCaptureRequest,
 ) -> AppResult<LongCaptureStatus> {
     if !cfg!(windows) {
@@ -544,11 +644,32 @@ pub fn start_long_capture(
             "长截图通用引擎仅支持 Windows 10/11",
         ));
     }
+    let store = app.state::<LongScreenshotStore>();
+    let screenshot_store = app.state::<ScreenshotStore>();
     let session = screenshot_store
         .active_session()
         .filter(|session| session.id == request.session_id)
         .ok_or_else(|| AppError::not_found("截图会话已结束或已被替换"))?;
-    let target = validate_capture_target(
+    let session_id = session.id.clone();
+    store.begin_pending_start(&session_id)?;
+    let _pending_guard = PendingLongCaptureStartGuard {
+        store: &store,
+        session_id,
+    };
+    let _start_guard = lock_unpoisoned(&store.start_lock);
+    start_long_capture_registered_inner(app, &store, request, session)
+}
+
+fn start_long_capture_registered_inner(
+    app: &AppHandle,
+    store: &LongScreenshotStore,
+    request: StartLongCaptureRequest,
+    session: crate::screenshot::ScreenshotSession,
+) -> AppResult<LongCaptureStatus> {
+    if store.pending_start_cancel_requested(&session.id) {
+        return Err(pending_start_canceled_error());
+    }
+    let mut target = validate_capture_target(
         &session.monitor,
         request.selection,
         request.scroll_anchor,
@@ -584,6 +705,10 @@ pub fn start_long_capture(
         let _ = std::fs::remove_dir_all(&directory);
         return Err(error);
     }
+    if store.pending_start_cancel_requested(&session.id) {
+        let _ = std::fs::remove_dir_all(&directory);
+        return Err(pending_start_canceled_error());
+    }
     let hidden_pin_labels = hide_visible_pin_windows(&app);
     if let Err(error) = hide_capture_overlay(&app) {
         restore_hidden_pin_windows(&app, &hidden_pin_labels);
@@ -592,6 +717,13 @@ pub fn start_long_capture(
     }
     flush_desktop_compositor();
     std::thread::sleep(Duration::from_millis(60));
+    if store.pending_start_cancel_requested(&session.id) {
+        restore_hidden_pin_windows(app, &hidden_pin_labels);
+        let error = recover_capture_overlay(app, &session.monitor, pending_start_canceled_error());
+        let _ = std::fs::remove_dir_all(&directory);
+        return Err(error);
+    }
+    target.scroll_windows = resolve_scroll_target_windows(target.scroll_anchor);
     let browser = if request.mode != LongCaptureMode::Manual
         && !matches!(
             requested_engine,
@@ -615,6 +747,8 @@ pub fn start_long_capture(
             "浏览器增强不可用，正在切换通用滚动".to_string()
         } else if engine == LongCaptureEngine::BrowserEnhanced {
             "正在连接浏览器增强引擎".to_string()
+        } else if engine == LongCaptureEngine::Manual {
+            "正在准备手动长截图".to_string()
         } else {
             "正在准备长截图".to_string()
         };
@@ -644,6 +778,7 @@ pub fn start_long_capture(
         target,
         hidden_pin_labels,
         browser,
+        operation_lock: Mutex::new(()),
         runtime: Mutex::new(LongCaptureRuntime {
             manifest,
             pause_requested: false,
@@ -661,75 +796,222 @@ pub fn start_long_capture(
     });
     *lock_unpoisoned(&store.job) = Some(Arc::clone(&job));
 
-    if let Err(error) = show_control_window(&app, &job) {
-        let mut runtime = lock_unpoisoned(&job.runtime);
-        runtime.manifest.state = LongCaptureState::Failed;
-        runtime.manifest.message = error.message.clone();
-        runtime.worker_done = true;
-        let _ = persist_runtime(&job, &runtime);
-        drop(runtime);
+    let initial_surface_result = {
+        let _operation_guard = lock_unpoisoned(&job.operation_lock);
+        let result = show_control_window(&app, &job).and_then(|_| focus_capture_target(&job));
+        if let Err(error) = result.as_ref() {
+            let mut runtime = lock_unpoisoned(&job.runtime);
+            if transition_to_failed(&mut runtime.manifest.state) {
+                runtime.manifest.message = error.message.clone();
+            }
+            runtime.worker_done = true;
+            let _ = persist_runtime(&job, &runtime);
+        }
+        result
+    };
+    if let Err(error) = initial_surface_result {
         restore_hidden_pin_windows(&app, &job.hidden_pin_labels);
-        return Err(recover_capture_surface(&app, &job, error));
+        let recovery = switch_visible_surface(
+            || show_capture_overlay(&app, &job.target.monitor),
+            || close_control_window(&app),
+        );
+        let failure = match recovery {
+            Ok(()) => error,
+            Err(surface_error) => recover_capture_surface(
+                &app,
+                &job,
+                append_recovery_error(error, "恢复普通截图界面失败", &surface_error),
+            ),
+        };
+        clear_job_cache(store, &job_id);
+        return Err(failure);
+    }
+    if store.pending_start_cancel_requested(&session.id) {
+        let status = {
+            let mut runtime = lock_unpoisoned(&job.runtime);
+            runtime.cancel_requested = true;
+            runtime.pause_requested = false;
+            runtime.generation = runtime.generation.wrapping_add(1);
+            let _ = transition_to_canceled(&mut runtime.manifest.state);
+            runtime.manifest.message = "长截图启动已取消".to_string();
+            runtime.worker_done = true;
+            let _ = persist_runtime(&job, &runtime);
+            status_from_runtime(&runtime)
+        };
+        job.wake.notify_all();
+        restore_hidden_pin_windows(app, &job.hidden_pin_labels);
+        let surface_result = switch_visible_surface(
+            || show_capture_overlay(app, &job.target.monitor),
+            || close_control_window(app),
+        );
+        clear_job_cache(store, &status.job_id);
+        surface_result?;
+        return Ok(status);
     }
     flush_desktop_compositor();
     let status = job.status();
     let worker_app = app.clone();
     let worker_job = Arc::clone(&job);
-    if let Err(error) = std::thread::Builder::new()
-        .name(format!("long-capture-{}", &job_id[..8]))
-        .spawn(move || capture_worker(worker_app, worker_job))
-    {
-        let failure = AppError::new("capture_error", format!("启动长截图线程失败: {error}"));
+    let worker_start = {
+        let _operation_guard = lock_unpoisoned(&job.operation_lock);
         let mut runtime = lock_unpoisoned(&job.runtime);
-        runtime.manifest.state = LongCaptureState::Failed;
-        runtime.manifest.message = failure.message.clone();
-        runtime.worker_done = true;
-        let _ = persist_runtime(&job, &runtime);
-        drop(runtime);
-        restore_hidden_pin_windows(&app, &job.hidden_pin_labels);
-        let failure = match switch_visible_surface(
-            || show_capture_overlay(&app, &job.target.monitor),
-            || close_control_window(&app),
-        ) {
-            Ok(()) => failure,
-            Err(surface_error) => recover_capture_surface(
-                &app,
-                &job,
-                append_recovery_error(failure, "恢复截图界面失败", &surface_error),
-            ),
-        };
-        return Err(failure);
+        if runtime.manifest.state.is_terminal() {
+            runtime.worker_done = true;
+            let _ = persist_runtime(&job, &runtime);
+            Ok(Some(status_from_runtime(&runtime)))
+        } else {
+            drop(runtime);
+            match std::thread::Builder::new()
+                .name(format!("long-capture-{}", &job_id[..8]))
+                .spawn(move || capture_worker(worker_app, worker_job))
+            {
+                Ok(_) => Ok(None),
+                Err(error) => {
+                    let failure =
+                        AppError::new("capture_error", format!("启动长截图线程失败: {error}"));
+                    let mut runtime = lock_unpoisoned(&job.runtime);
+                    if transition_to_failed(&mut runtime.manifest.state) {
+                        runtime.manifest.message = failure.message.clone();
+                    }
+                    runtime.worker_done = true;
+                    let _ = persist_runtime(&job, &runtime);
+                    Err(failure)
+                }
+            }
+        }
+    };
+    match worker_start {
+        Ok(None) => {}
+        Ok(Some(terminal_status)) => {
+            restore_hidden_pin_windows(&app, &job.hidden_pin_labels);
+            let surface_result = switch_visible_surface(
+                || show_capture_overlay(&app, &job.target.monitor),
+                || close_control_window(&app),
+            );
+            clear_job_cache(store, &job_id);
+            surface_result?;
+            return Ok(terminal_status);
+        }
+        Err(failure) => {
+            restore_hidden_pin_windows(&app, &job.hidden_pin_labels);
+            let failure = match switch_visible_surface(
+                || show_capture_overlay(&app, &job.target.monitor),
+                || close_control_window(&app),
+            ) {
+                Ok(()) => failure,
+                Err(surface_error) => recover_capture_surface(
+                    &app,
+                    &job,
+                    append_recovery_error(failure, "恢复截图界面失败", &surface_error),
+                ),
+            };
+            clear_job_cache(store, &job_id);
+            return Err(failure);
+        }
     }
     let _ = app.emit("long_capture_progress", &status);
     Ok(status)
 }
 
 #[tauri::command]
-pub fn get_long_capture_status(
+pub async fn get_long_capture_status(
     store: State<'_, LongScreenshotStore>,
     job_id: Option<String>,
 ) -> AppResult<Option<LongCaptureStatus>> {
-    let current = lock_unpoisoned(&store.job);
-    let Some(job) = current.as_ref() else {
+    let job = lock_unpoisoned(&store.job).as_ref().cloned();
+    let Some(job) = job else {
         return Ok(None);
     };
-    let status = job.status();
-    if job_id
-        .as_deref()
-        .is_some_and(|expected| expected != status.job_id)
-    {
-        return Err(AppError::not_found("长截图任务不存在或已被替换"));
+    tauri::async_runtime::spawn_blocking(move || {
+        let status = job.status();
+        if job_id
+            .as_deref()
+            .is_some_and(|expected| expected != status.job_id)
+        {
+            return Err(AppError::not_found("长截图任务不存在或已被替换"));
+        }
+        Ok(Some(status))
+    })
+    .await
+    .map_err(|error| {
+        AppError::new(
+            "long_capture_status_error",
+            format!("读取长截图状态异常结束: {error}"),
+        )
+    })?
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LongCaptureReentrySurface {
+    Pending,
+    Control,
+    Overlay,
+}
+
+fn long_capture_reentry_surface(
+    pending_start: bool,
+    state: Option<LongCaptureState>,
+) -> Option<LongCaptureReentrySurface> {
+    if pending_start {
+        return Some(LongCaptureReentrySurface::Pending);
     }
-    Ok(Some(status))
+    match state? {
+        LongCaptureState::Preparing | LongCaptureState::Capturing => {
+            Some(LongCaptureReentrySurface::Control)
+        }
+        LongCaptureState::Paused | LongCaptureState::Ready | LongCaptureState::Failed => {
+            Some(LongCaptureReentrySurface::Overlay)
+        }
+        LongCaptureState::Canceled => None,
+    }
+}
+
+pub(crate) fn restore_active_long_capture_surface(app: &AppHandle) -> AppResult<bool> {
+    let Some(store) = app.try_state::<LongScreenshotStore>() else {
+        return Ok(false);
+    };
+    if lock_unpoisoned(&store.pending_start).is_some() {
+        return Ok(true);
+    }
+    let Some(job) = lock_unpoisoned(&store.job).as_ref().cloned() else {
+        return Ok(false);
+    };
+    let _operation_guard = lock_unpoisoned(&job.operation_lock);
+    let Some(surface) = long_capture_reentry_surface(false, Some(job.status().state)) else {
+        return Ok(false);
+    };
+    match surface {
+        LongCaptureReentrySurface::Pending => {}
+        LongCaptureReentrySurface::Control => {
+            // A control window overlapping the ROI is hidden briefly around
+            // each frame. Forcing it visible there would capture the controls.
+            if !job.target.control_overlaps_roi {
+                show_control_window(app, &job)?;
+            }
+        }
+        LongCaptureReentrySurface::Overlay => {
+            show_capture_overlay(app, &job.target.monitor)?;
+        }
+    }
+    Ok(true)
 }
 
 #[tauri::command]
-pub fn pause_long_capture(
-    app: AppHandle,
-    store: State<'_, LongScreenshotStore>,
-    job_id: String,
-) -> AppResult<LongCaptureStatus> {
+pub async fn pause_long_capture(app: AppHandle, job_id: String) -> AppResult<LongCaptureStatus> {
+    tauri::async_runtime::spawn_blocking(move || pause_long_capture_inner(&app, &job_id))
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "long_capture_task_error",
+                format!("暂停长截图任务异常结束: {error}"),
+            )
+        })?
+}
+
+fn pause_long_capture_inner(app: &AppHandle, job_id: &str) -> AppResult<LongCaptureStatus> {
+    let store = app.state::<LongScreenshotStore>();
     let job = store.job(&job_id)?;
+    let _operation_guard = lock_unpoisoned(&job.operation_lock);
     let status = {
         let mut runtime = lock_unpoisoned(&job.runtime);
         if runtime.manifest.state != LongCaptureState::Capturing {
@@ -753,21 +1035,39 @@ pub fn pause_long_capture(
 }
 
 #[tauri::command]
-pub fn resume_long_capture(
-    app: AppHandle,
-    store: State<'_, LongScreenshotStore>,
-    job_id: String,
-) -> AppResult<LongCaptureStatus> {
-    resume_or_retry(&app, &store.job(&job_id)?, false)
+pub async fn resume_long_capture(app: AppHandle, job_id: String) -> AppResult<LongCaptureStatus> {
+    tauri::async_runtime::spawn_blocking(move || resume_long_capture_inner(&app, &job_id, false))
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "long_capture_task_error",
+                format!("继续长截图任务异常结束: {error}"),
+            )
+        })?
 }
 
 #[tauri::command]
-pub fn retry_long_capture_segment(
+pub async fn retry_long_capture_segment(
     app: AppHandle,
-    store: State<'_, LongScreenshotStore>,
     job_id: String,
 ) -> AppResult<LongCaptureStatus> {
-    resume_or_retry(&app, &store.job(&job_id)?, true)
+    tauri::async_runtime::spawn_blocking(move || resume_long_capture_inner(&app, &job_id, true))
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "long_capture_task_error",
+                format!("重试长截图片段异常结束: {error}"),
+            )
+        })?
+}
+
+fn resume_long_capture_inner(
+    app: &AppHandle,
+    job_id: &str,
+    explicit_retry: bool,
+) -> AppResult<LongCaptureStatus> {
+    let store = app.state::<LongScreenshotStore>();
+    resume_or_retry(app, &store.job(job_id)?, explicit_retry)
 }
 
 fn resume_or_retry(
@@ -775,6 +1075,7 @@ fn resume_or_retry(
     job: &Arc<LongCaptureJob>,
     explicit_retry: bool,
 ) -> AppResult<LongCaptureStatus> {
+    let _operation_guard = lock_unpoisoned(&job.operation_lock);
     {
         let runtime = lock_unpoisoned(&job.runtime);
         if runtime.manifest.state != LongCaptureState::Paused {
@@ -788,6 +1089,7 @@ fn resume_or_retry(
         || show_control_window(app, job),
         || hide_capture_overlay(app),
     )?;
+    focus_capture_target(job)?;
     flush_desktop_compositor();
     let status = {
         let mut runtime = lock_unpoisoned(&job.runtime);
@@ -797,6 +1099,8 @@ fn resume_or_retry(
         runtime.manifest.state = LongCaptureState::Capturing;
         runtime.manifest.message = if explicit_retry {
             "正在重试当前片段".to_string()
+        } else if runtime.manifest.engine == LongCaptureEngine::Manual {
+            "长截图已继续，请在目标窗口中手动滚动".to_string()
         } else {
             "长截图已继续".to_string()
         };
@@ -809,12 +1113,24 @@ fn resume_or_retry(
 }
 
 #[tauri::command]
-pub fn undo_long_capture_segment(
+pub async fn undo_long_capture_segment(
     app: AppHandle,
-    store: State<'_, LongScreenshotStore>,
     job_id: String,
 ) -> AppResult<LongCaptureStatus> {
-    let job = store.job(&job_id)?;
+    tauri::async_runtime::spawn_blocking(move || undo_long_capture_segment_inner(&app, &job_id))
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "long_capture_task_error",
+                format!("回退长截图片段异常结束: {error}"),
+            )
+        })?
+}
+
+fn undo_long_capture_segment_inner(app: &AppHandle, job_id: &str) -> AppResult<LongCaptureStatus> {
+    let store = app.state::<LongScreenshotStore>();
+    let job = store.job(job_id)?;
+    let _operation_guard = lock_unpoisoned(&job.operation_lock);
     let removed = {
         let mut runtime = lock_unpoisoned(&job.runtime);
         if runtime.manifest.state.is_terminal() {
@@ -854,12 +1170,21 @@ pub fn undo_long_capture_segment(
 }
 
 #[tauri::command]
-pub fn finish_long_capture(
-    app: AppHandle,
-    store: State<'_, LongScreenshotStore>,
-    job_id: String,
-) -> AppResult<LongCaptureStatus> {
-    let job = store.job(&job_id)?;
+pub async fn finish_long_capture(app: AppHandle, job_id: String) -> AppResult<LongCaptureStatus> {
+    tauri::async_runtime::spawn_blocking(move || finish_long_capture_inner(&app, &job_id))
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "long_capture_task_error",
+                format!("完成长截图任务异常结束: {error}"),
+            )
+        })?
+}
+
+fn finish_long_capture_inner(app: &AppHandle, job_id: &str) -> AppResult<LongCaptureStatus> {
+    let store = app.state::<LongScreenshotStore>();
+    let job = store.job(job_id)?;
+    let _operation_guard = lock_unpoisoned(&job.operation_lock);
     let (status, should_emit) = {
         let mut runtime = lock_unpoisoned(&job.runtime);
         if runtime.manifest.segments.is_empty() {
@@ -904,12 +1229,68 @@ pub fn finish_long_capture(
 }
 
 #[tauri::command]
-pub fn cancel_long_capture(
+pub async fn cancel_long_capture(app: AppHandle, job_id: String) -> AppResult<LongCaptureStatus> {
+    tauri::async_runtime::spawn_blocking(move || cancel_long_capture_inner(&app, &job_id))
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "long_capture_task_error",
+                format!("取消长截图任务异常结束: {error}"),
+            )
+        })?
+}
+
+fn cancel_long_capture_inner(app: &AppHandle, job_id: &str) -> AppResult<LongCaptureStatus> {
+    let store = app.state::<LongScreenshotStore>();
+    let job = store.job(job_id)?;
+    cancel_long_capture_job_inner(app, &store, &job)
+}
+
+#[tauri::command]
+pub async fn cancel_long_capture_session(
     app: AppHandle,
-    store: State<'_, LongScreenshotStore>,
-    job_id: String,
+    session_id: String,
+) -> AppResult<Option<LongCaptureStatus>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        cancel_long_capture_session_inner(&app, &session_id)
+    })
+    .await
+    .map_err(|error| {
+        AppError::new(
+            "long_capture_task_error",
+            format!("取消启动中的长截图任务异常结束: {error}"),
+        )
+    })?
+}
+
+fn cancel_long_capture_session_inner(
+    app: &AppHandle,
+    session_id: &str,
+) -> AppResult<Option<LongCaptureStatus>> {
+    let store = app.state::<LongScreenshotStore>();
+    let pending_canceled = store.request_pending_start_cancel(session_id);
+    let Some(job) = store.job_for_session(session_id) else {
+        if pending_canceled {
+            let screenshot_store = app.state::<ScreenshotStore>();
+            if let Some(session) = screenshot_store
+                .active_session()
+                .filter(|session| session.id == session_id)
+            {
+                show_capture_overlay(app, &session.monitor)?;
+            }
+        }
+        return Ok(None);
+    };
+    cancel_long_capture_job_inner(app, &store, &job).map(Some)
+}
+
+fn cancel_long_capture_job_inner(
+    app: &AppHandle,
+    store: &LongScreenshotStore,
+    job: &Arc<LongCaptureJob>,
 ) -> AppResult<LongCaptureStatus> {
-    let job = store.job(&job_id)?;
+    let _operation_guard = lock_unpoisoned(&job.operation_lock);
+    let job_id = job.status().job_id;
     let (status, cleanup_now) = {
         let mut runtime = lock_unpoisoned(&job.runtime);
         let cleanup_now = runtime.worker_done;
@@ -924,11 +1305,11 @@ pub fn cancel_long_capture(
     };
     job.wake.notify_all();
     let surface_result = switch_visible_surface(
-        || show_capture_overlay(&app, &job.target.monitor),
-        || close_control_window(&app),
+        || show_capture_overlay(app, &job.target.monitor),
+        || close_control_window(app),
     );
     if cleanup_now {
-        clear_job_cache(&store, &job_id);
+        clear_job_cache(store, &job_id);
     }
     if let Err(surface_error) = surface_result {
         return Err(recover_capture_surface(&app, &job, surface_error));
@@ -937,29 +1318,38 @@ pub fn cancel_long_capture(
 }
 
 #[tauri::command]
-pub fn get_long_capture_tile(
+pub async fn get_long_capture_tile(
     store: State<'_, LongScreenshotStore>,
     job_id: String,
     y: u32,
     height: Option<u32>,
 ) -> AppResult<Response> {
     let job = store.job(&job_id)?;
-    let (manifest, directory) = {
-        let runtime = lock_unpoisoned(&job.runtime);
-        (runtime.manifest.clone(), job.directory.clone())
-    };
-    if y >= manifest.height {
-        return Err(AppError::invalid("长截图瓦片起点超出图片范围"));
-    }
-    let requested = height
-        .unwrap_or(DEFAULT_TILE_HEIGHT)
-        .clamp(1, MAX_TILE_HEIGHT);
-    let pixel_limited = (MAX_TILE_PIXELS / u64::from(manifest.width)).max(1) as u32;
-    let tile_height = requested
-        .min(pixel_limited)
-        .min(manifest.height.saturating_sub(y));
-    let frame = compose_tile(&directory, &manifest, y, tile_height)?;
-    Ok(Response::new(encode_png(&frame)?))
+    tauri::async_runtime::spawn_blocking(move || {
+        let (manifest, directory) = {
+            let runtime = lock_unpoisoned(&job.runtime);
+            (runtime.manifest.clone(), job.directory.clone())
+        };
+        if y >= manifest.height {
+            return Err(AppError::invalid("长截图瓦片起点超出图片范围"));
+        }
+        let requested = height
+            .unwrap_or(DEFAULT_TILE_HEIGHT)
+            .clamp(1, MAX_TILE_HEIGHT);
+        let pixel_limited = (MAX_TILE_PIXELS / u64::from(manifest.width)).max(1) as u32;
+        let tile_height = requested
+            .min(pixel_limited)
+            .min(manifest.height.saturating_sub(y));
+        let frame = compose_tile(&directory, &manifest, y, tile_height)?;
+        Ok(Response::new(encode_png(&frame)?))
+    })
+    .await
+    .map_err(|error| {
+        AppError::new(
+            "long_capture_tile_error",
+            format!("生成长截图预览瓦片异常结束: {error}"),
+        )
+    })?
 }
 
 fn purge_expired_annotation_exports(store: &LongScreenshotStore) {
@@ -1664,6 +2054,7 @@ fn validate_capture_target(
         monitor: monitor.clone(),
         mode,
         control_overlaps_roi,
+        scroll_windows: None,
     })
 }
 
@@ -1966,12 +2357,120 @@ fn control_window_geometry(
     )
 }
 
+fn control_overlap_in_roi(target: &CaptureTarget) -> Option<PhysicalRect> {
+    let (position, size, overlaps) = control_window_geometry(&target.monitor, target.bounds);
+    if !overlaps {
+        return None;
+    }
+    let control_left = i64::from(position.x);
+    let control_top = i64::from(position.y);
+    let control_right = control_left + i64::from(size.width);
+    let control_bottom = control_top + i64::from(size.height);
+    let roi_left = i64::from(target.bounds.x);
+    let roi_top = i64::from(target.bounds.y);
+    let roi_right = roi_left + i64::from(target.bounds.width);
+    let roi_bottom = roi_top + i64::from(target.bounds.height);
+    let left = control_left.max(roi_left);
+    let top = control_top.max(roi_top);
+    let right = control_right.min(roi_right);
+    let bottom = control_bottom.min(roi_bottom);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(PhysicalRect {
+        x: (left - roi_left) as i32,
+        y: (top - roi_top) as i32,
+        width: (right - left) as u32,
+        height: (bottom - top) as u32,
+    })
+}
+
+#[cfg(windows)]
+fn control_window_ex_style(current: isize) -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_NOACTIVATE;
+    current | WS_EX_NOACTIVATE as isize
+}
+
+#[cfg(windows)]
+fn configure_control_window_no_activate(
+    window: &tauri::WebviewWindow<tauri::Wry>,
+) -> AppResult<()> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE,
+    };
+
+    let hwnd = window.hwnd().map_err(|error| {
+        AppError::new(
+            "window_error",
+            format!("读取长截图控制窗口句柄失败: {error}"),
+        )
+    })?;
+    let hwnd = hwnd.0 as *mut std::ffi::c_void;
+    let current = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+    let desired = control_window_ex_style(current);
+    if desired != current {
+        unsafe {
+            let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, desired);
+        }
+    }
+    let confirmed = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
+    if confirmed & WS_EX_NOACTIVATE as isize == 0 {
+        return Err(last_windows_error("设置长截图控制窗口为不抢焦点模式"));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn configure_control_window_no_activate(
+    _window: &tauri::WebviewWindow<tauri::Wry>,
+) -> AppResult<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn show_control_window_no_activate(window: &tauri::WebviewWindow<tauri::Wry>) -> AppResult<()> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_SHOWWINDOW,
+    };
+
+    let hwnd = window.hwnd().map_err(|error| {
+        AppError::new(
+            "window_error",
+            format!("读取长截图控制窗口句柄失败: {error}"),
+        )
+    })?;
+    let hwnd = hwnd.0 as *mut std::ffi::c_void;
+    if unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+        )
+    } == 0
+    {
+        return Err(last_windows_error("无焦点显示长截图控制窗口"));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn show_control_window_no_activate(window: &tauri::WebviewWindow<tauri::Wry>) -> AppResult<()> {
+    window
+        .show()
+        .map_err(|error| AppError::new("window_error", format!("显示长截图控制窗口失败: {error}")))
+}
+
 fn show_control_window(app: &AppHandle, job: &LongCaptureJob) -> AppResult<()> {
     let (position, size, _) = control_window_geometry(&job.target.monitor, job.target.bounds);
     let window = if let Some(window) = app.get_webview_window(CONTROL_WINDOW_LABEL) {
         window
     } else {
-        let _creation_guard = lock_window_creation();
+        let _creation_guard = lock_unpoisoned(&CONTROL_WINDOW_CREATION_LOCK);
         if let Some(window) = app.get_webview_window(CONTROL_WINDOW_LABEL) {
             window
         } else {
@@ -1984,10 +2483,11 @@ fn show_control_window(app: &AppHandle, job: &LongCaptureJob) -> AppResult<()> {
             )
             .title("长截图控制 - 飞花 - PetalDesk")
             .decorations(false)
-            .shadow(true)
+            .shadow(false)
             .resizable(false)
             .always_on_top(true)
             .skip_taskbar(true)
+            .focused(false)
             .visible(false)
             .inner_size(f64::from(size.width), f64::from(size.height))
             .build()
@@ -1996,16 +2496,14 @@ fn show_control_window(app: &AppHandle, job: &LongCaptureJob) -> AppResult<()> {
             })?
         }
     };
+    configure_control_window_no_activate(&window)?;
     window
         .set_position(position)
         .and_then(|_| window.set_size(size))
         .map_err(|error| {
             AppError::new("window_error", format!("定位长截图控制窗口失败: {error}"))
         })?;
-    let _ = window.set_always_on_top(true);
-    window.show().map_err(|error| {
-        AppError::new("window_error", format!("显示长截图控制窗口失败: {error}"))
-    })?;
+    show_control_window_no_activate(&window)?;
     Ok(())
 }
 
@@ -2020,11 +2518,30 @@ fn hide_control_window(app: &AppHandle) -> AppResult<()> {
 
 fn close_control_window(app: &AppHandle) -> AppResult<()> {
     if let Some(window) = app.get_webview_window(CONTROL_WINDOW_LABEL) {
-        window.close().map_err(|error| {
+        window.destroy().map_err(|error| {
             AppError::new("window_error", format!("关闭长截图控制窗口失败: {error}"))
         })?;
     }
     Ok(())
+}
+
+pub(crate) fn handle_control_window_close_requested(app: &AppHandle, label: &str) -> bool {
+    if label != CONTROL_WINDOW_LABEL {
+        return false;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(store) = app.try_state::<LongScreenshotStore>() else {
+            return;
+        };
+        let job = lock_unpoisoned(&store.job).as_ref().cloned();
+        if let Some(job) = job {
+            let _ = cancel_long_capture_job_inner(&app, &store, &job);
+        } else {
+            let _ = close_control_window(&app);
+        }
+    });
+    true
 }
 
 fn recover_capture_overlay(
@@ -2267,6 +2784,9 @@ fn prepare_browser_capture(job: &LongCaptureJob) -> Result<(), String> {
         runtime.browser_session = Some(binding.clone());
         runtime.browser_restore_needed = true;
     }
+    if requested_worker_stop(job).is_some() {
+        return Err("browser capture startup was canceled".to_string());
+    }
     let started = browser_bound_request(
         context,
         &binding,
@@ -2282,9 +2802,15 @@ fn prepare_browser_capture(job: &LongCaptureJob) -> Result<(), String> {
     {
         return Err("browser extension did not start capture mode".to_string());
     }
+    if requested_worker_stop(job).is_some() {
+        return Err("browser capture startup was canceled".to_string());
+    }
     let status = browser_bound_request(context, &binding, "status", serde_json::json!({}))?;
     if status.get("state").and_then(Value::as_str) != Some("capturing") {
         return Err("browser extension capture session changed during startup".to_string());
+    }
+    if requested_worker_stop(job).is_some() {
+        return Err("browser capture startup was canceled".to_string());
     }
     let mut runtime = lock_unpoisoned(&job.runtime);
     runtime.browser_active = true;
@@ -2413,6 +2939,8 @@ fn capture_worker(app: AppHandle, job: Arc<LongCaptureJob>) {
             runtime.manifest.message =
                 if runtime.manifest.engine == LongCaptureEngine::BrowserEnhanced {
                     "正在准备浏览器增强捕获".to_string()
+                } else if runtime.manifest.engine == LongCaptureEngine::Manual {
+                    "正在捕获首帧，随后请手动滚动".to_string()
                 } else {
                     "正在捕获长截图首帧".to_string()
                 };
@@ -2503,7 +3031,11 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
     if let Some(stop) = requested_worker_stop(job) {
         return Ok(stop);
     }
-    if job.target.mode == LongCaptureMode::Top && !browser_enhanced {
+    let manual_scrolling = {
+        let runtime = lock_unpoisoned(&job.runtime);
+        engine_uses_manual_scrolling(runtime.manifest.engine)
+    };
+    if job.target.mode == LongCaptureMode::Top && !browser_enhanced && !manual_scrolling {
         scroll_target_to_top(app, job)?;
     }
     let mut previous = loop {
@@ -2548,7 +3080,7 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
         }
 
         let mut browser_step = None;
-        if needs_scroll && job.target.mode != LongCaptureMode::Manual {
+        if needs_scroll && !manual_scrolling {
             if browser_enhanced {
                 match step_browser_capture(job) {
                     Ok(step) => {
@@ -2569,10 +3101,24 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
                     }
                 }
             } else {
-                send_wheel_scroll(job.target.scroll_anchor, job.target.bounds.height)?;
+                if job.target.control_overlaps_roi {
+                    hide_control_window(app)?;
+                    flush_desktop_compositor();
+                }
+                if no_motion_count == 0 {
+                    send_wheel_scroll(&job.target)?;
+                } else {
+                    update_message(
+                        job,
+                        checkpoint.generation,
+                        "滚轮未推动目标，正在尝试 PageDown",
+                    )?;
+                    emit_progress(app, job);
+                    send_page_down(&job.target)?;
+                }
             }
         }
-        let current = if job.target.mode == LongCaptureMode::Manual && needs_scroll {
+        let current = if manual_scrolling && needs_scroll {
             wait_for_manual_scroll(app, job, &previous, checkpoint.generation)?
         } else {
             capture_job_roi(app, job, true)?
@@ -2603,6 +3149,16 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
             )?;
             emit_progress(app, job);
             if no_motion_count >= 2 {
+                if job.status().frame_count <= 1 {
+                    pause_for_attention(
+                        app,
+                        job,
+                        checkpoint.generation,
+                        "目标内容没有滚动。请返回普通截图，重新点击选区内真正可滚动的内容",
+                    )?;
+                    needs_scroll = false;
+                    continue;
+                }
                 finish_worker_capture(app, job, "已到达滚动区域底部")?;
                 return Ok(WorkerStop::Finish);
             }
@@ -2661,6 +3217,7 @@ fn capture_job_roi(
         capture_roi(job.target.bounds)
     };
     if job.target.control_overlaps_roi {
+        let _operation_guard = lock_unpoisoned(&job.operation_lock);
         let should_restore_control = {
             let runtime = lock_unpoisoned(&job.runtime);
             control_surface_needed(&runtime)
@@ -2690,15 +3247,31 @@ fn wait_for_manual_scroll(
     update_message(job, generation, "等待手动滚动")?;
     emit_progress(app, job);
     loop {
-        std::thread::sleep(Duration::from_millis(150));
-        let candidate = capture_job_roi(app, job, false)?;
+        std::thread::sleep(MANUAL_SCROLL_POLL_INTERVAL);
+        let candidate = capture_manual_candidate(app, job, previous)?;
         if !iteration_is_current(job, generation) {
             return Ok(candidate);
         }
         if sampled_frame_difference(previous, &candidate) > 2.5 {
+            // Polling masks the visible control strip so it can remain stable.
+            // Once movement is detected, hide it once and acquire a clean
+            // settled frame; only clean frames are ever stitched or exported.
             return capture_job_roi(app, job, true);
         }
     }
+}
+
+fn capture_manual_candidate(
+    app: &AppHandle,
+    job: &LongCaptureJob,
+    reference: &Frame,
+) -> AppResult<Frame> {
+    let Some(mask) = control_overlap_in_roi(&job.target) else {
+        return capture_job_roi(app, job, false);
+    };
+    let mut frame = capture_roi(job.target.bounds)?;
+    copy_frame_region(&mut frame, reference, mask)?;
+    Ok(frame)
 }
 
 fn scroll_target_to_top(app: &AppHandle, job: &LongCaptureJob) -> AppResult<()> {
@@ -2711,7 +3284,7 @@ fn scroll_target_to_top(app: &AppHandle, job: &LongCaptureJob) -> AppResult<()> 
                 return Ok(());
             }
         }
-        send_wheel_ticks(job.target.scroll_anchor, 20)?;
+        send_scroll_ticks(&job.target, 20)?;
         let current = capture_job_roi(app, job, true)?;
         if sampled_frame_difference(&previous, &current) <= 1.5 {
             no_motion = no_motion.saturating_add(1);
@@ -2781,7 +3354,11 @@ fn accept_initial_frame(job: &LongCaptureJob, frame: &Frame, generation: u64) ->
         return Ok(false);
     }
     runtime.manifest.height = frame.height;
-    runtime.manifest.message = "已捕获首帧，正在自动滚动".to_string();
+    runtime.manifest.message = if engine_uses_manual_scrolling(runtime.manifest.engine) {
+        "已捕获首帧，请在目标窗口中滚动内容".to_string()
+    } else {
+        "已捕获首帧，正在自动滚动".to_string()
+    };
     runtime.manifest.segments.push(LongCaptureSegment {
         index: 0,
         output_y: 0,
@@ -2793,6 +3370,28 @@ fn accept_initial_frame(job: &LongCaptureJob, frame: &Frame, generation: u64) ->
     });
     persist_runtime(job, &runtime)?;
     Ok(true)
+}
+
+fn engine_uses_manual_scrolling(engine: LongCaptureEngine) -> bool {
+    engine == LongCaptureEngine::Manual
+}
+
+fn focus_capture_target(job: &LongCaptureJob) -> AppResult<()> {
+    let engine = {
+        let runtime = lock_unpoisoned(&job.runtime);
+        runtime.manifest.engine
+    };
+    match focus_scroll_target(&job.target) {
+        Ok(()) => Ok(()),
+        Err(error) if engine_uses_manual_scrolling(engine) => {
+            eprintln!(
+                "手动长截图未能自动激活目标窗口，等待用户自行点击目标: {}",
+                error.message
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn accept_scrolled_frame(
@@ -2883,6 +3482,7 @@ fn pause_for_attention(
     generation: u64,
     message: &str,
 ) -> AppResult<()> {
+    let _operation_guard = lock_unpoisoned(&job.operation_lock);
     let status = {
         let mut runtime = lock_unpoisoned(&job.runtime);
         if runtime.generation != generation || runtime.manifest.state != LongCaptureState::Capturing
@@ -2904,6 +3504,7 @@ fn pause_for_attention(
 }
 
 fn finish_worker_capture(app: &AppHandle, job: &LongCaptureJob, message: &str) -> AppResult<()> {
+    let _operation_guard = lock_unpoisoned(&job.operation_lock);
     let (status, should_emit) = {
         let mut runtime = lock_unpoisoned(&job.runtime);
         if runtime.manifest.state.is_terminal() {
@@ -3166,6 +3767,40 @@ fn capture_settled_roi(bounds: PhysicalRect) -> AppResult<Frame> {
         }
     }
     Ok(previous)
+}
+
+fn copy_frame_region(
+    destination: &mut Frame,
+    source: &Frame,
+    region: PhysicalRect,
+) -> AppResult<()> {
+    destination.validate()?;
+    source.validate()?;
+    if destination.width != source.width || destination.height != source.height {
+        return Err(AppError::invalid("长截图控制条遮罩帧尺寸不一致"));
+    }
+    let x =
+        usize::try_from(region.x).map_err(|_| AppError::invalid("长截图控制条遮罩横坐标无效"))?;
+    let y =
+        usize::try_from(region.y).map_err(|_| AppError::invalid("长截图控制条遮罩纵坐标无效"))?;
+    let width = region.width as usize;
+    let height = region.height as usize;
+    let right = x
+        .checked_add(width)
+        .filter(|right| *right <= destination.width as usize)
+        .ok_or_else(|| AppError::invalid("长截图控制条遮罩宽度越界"))?;
+    let bottom = y
+        .checked_add(height)
+        .filter(|bottom| *bottom <= destination.height as usize)
+        .ok_or_else(|| AppError::invalid("长截图控制条遮罩高度越界"))?;
+    let row_bytes = destination.width as usize * 4;
+    let copy_bytes = (right - x) * 4;
+    for row in y..bottom {
+        let start = row * row_bytes + x * 4;
+        let end = start + copy_bytes;
+        destination.rgba[start..end].copy_from_slice(&source.rgba[start..end]);
+    }
+    Ok(())
 }
 
 fn sampled_frame_difference(left: &Frame, right: &Frame) -> f32 {
@@ -3475,19 +4110,25 @@ fn capture_roi(_bounds: PhysicalRect) -> AppResult<Frame> {
 }
 
 #[cfg(windows)]
-fn send_wheel_scroll(anchor: PhysicalPoint, viewport_height: u32) -> AppResult<()> {
-    send_wheel_ticks(anchor, -(wheel_ticks_for_height(viewport_height) as i32))
+fn send_wheel_scroll(target: &CaptureTarget) -> AppResult<()> {
+    send_scroll_ticks(
+        target,
+        -(wheel_ticks_for_height(target.bounds.height) as i32),
+    )
 }
 
 #[cfg(windows)]
-fn send_wheel_ticks(anchor: PhysicalPoint, ticks: i32) -> AppResult<()> {
+fn send_scroll_ticks(target: &CaptureTarget, ticks: i32) -> AppResult<()> {
     use std::mem::size_of;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_WHEEL, MOUSEINPUT,
     };
 
-    set_cursor_position(anchor)?;
-    let wheel_delta = 120_i32.saturating_mul(ticks);
+    if ticks == 0 {
+        return Ok(());
+    }
+    focus_scroll_target(target)?;
+    let wheel_delta = if ticks < 0 { -120_i32 } else { 120_i32 };
     let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
@@ -3501,15 +4142,75 @@ fn send_wheel_ticks(anchor: PhysicalPoint, ticks: i32) -> AppResult<()> {
             },
         },
     };
-    let sent = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
-    if sent != 1 {
-        return Err(last_windows_error("发送长截图滚动输入"));
+    // Keep every gesture at the standard WHEEL_DELTA. Chromium-based apps,
+    // including VS Code, can discard or over-accelerate one oversized delta.
+    for _ in 0..ticks.unsigned_abs().min(64) {
+        let sent = unsafe { SendInput(1, &input, size_of::<INPUT>() as i32) };
+        if sent != 1 {
+            return Err(last_windows_error("发送长截图滚动输入"));
+        }
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn send_page_down(target: &CaptureTarget) -> AppResult<()> {
+    use std::mem::size_of;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_NEXT,
+    };
+
+    focus_scroll_target(target)?;
+    // Unlike wheel input, PageDown is delivered to the foreground keyboard
+    // target. Refuse to send it if focus changed after activation.
+    if !scroll_target_has_foreground_focus(target) {
+        return Err(AppError::new(
+            "long_capture_target_focus_lost",
+            "长截图目标已失去输入焦点，未发送 PageDown。请重新点击目标内容后继续",
+        ));
+    }
+    let inputs = [
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_NEXT,
+                    wScan: 0,
+                    dwFlags: 0,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        },
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VK_NEXT,
+                    wScan: 0,
+                    dwFlags: KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        },
+    ];
+    let sent = unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            size_of::<INPUT>() as i32,
+        )
+    };
+    if sent != inputs.len() as u32 {
+        return Err(last_windows_error("发送长截图 PageDown 输入"));
     }
     Ok(())
 }
 
 #[cfg(not(windows))]
-fn send_wheel_scroll(_anchor: PhysicalPoint, _viewport_height: u32) -> AppResult<()> {
+fn send_wheel_scroll(_target: &CaptureTarget) -> AppResult<()> {
     Err(AppError::new(
         "unsupported_platform",
         "长截图滚动输入仅支持 Windows",
@@ -3517,7 +4218,176 @@ fn send_wheel_scroll(_anchor: PhysicalPoint, _viewport_height: u32) -> AppResult
 }
 
 #[cfg(not(windows))]
-fn send_wheel_ticks(_anchor: PhysicalPoint, _ticks: i32) -> AppResult<()> {
+fn send_scroll_ticks(_target: &CaptureTarget, _ticks: i32) -> AppResult<()> {
+    Err(AppError::new(
+        "unsupported_platform",
+        "长截图滚动输入仅支持 Windows",
+    ))
+}
+
+#[cfg(not(windows))]
+fn send_page_down(_target: &CaptureTarget) -> AppResult<()> {
+    Err(AppError::new(
+        "unsupported_platform",
+        "长截图滚动输入仅支持 Windows",
+    ))
+}
+
+#[cfg(windows)]
+fn resolve_scroll_target_windows(anchor: PhysicalPoint) -> Option<ScrollTargetWindows> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetAncestor, WindowFromPoint, GA_ROOT};
+
+    let child = unsafe {
+        WindowFromPoint(POINT {
+            x: anchor.x,
+            y: anchor.y,
+        })
+    };
+    if child.is_null() {
+        return None;
+    }
+    let root = unsafe { GetAncestor(child, GA_ROOT) };
+    Some(ScrollTargetWindows {
+        root: (if root.is_null() { child } else { root }) as isize,
+        child: child as isize,
+    })
+}
+
+#[cfg(not(windows))]
+fn resolve_scroll_target_windows(_anchor: PhysicalPoint) -> Option<ScrollTargetWindows> {
+    None
+}
+
+#[cfg(windows)]
+fn focus_scroll_target(target: &CaptureTarget) -> AppResult<()> {
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsWindow,
+        SetForegroundWindow,
+    };
+
+    struct ThreadInputAttachment {
+        source: u32,
+        target: u32,
+    }
+
+    impl ThreadInputAttachment {
+        fn attach(source: u32, target: u32) -> AppResult<Option<Self>> {
+            if source == 0 || target == 0 || source == target {
+                return Ok(None);
+            }
+            if unsafe { AttachThreadInput(source, target, 1) } == 0 {
+                return Err(last_windows_error("连接长截图目标输入线程"));
+            }
+            Ok(Some(Self { source, target }))
+        }
+    }
+
+    impl Drop for ThreadInputAttachment {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = AttachThreadInput(self.source, self.target, 0);
+            }
+        }
+    }
+
+    set_cursor_position(target.scroll_anchor)?;
+    let Some(windows) = target.scroll_windows else {
+        return Err(AppError::new(
+            "long_capture_target_missing",
+            "没有找到滚动位置下方的目标窗口，请返回截图后重新选择滚动内容",
+        ));
+    };
+    let root = windows.root as *mut std::ffi::c_void;
+    let child = windows.child as *mut std::ffi::c_void;
+    if unsafe { IsWindow(root) } == 0 || unsafe { IsWindow(child) } == 0 {
+        return Err(AppError::new(
+            "long_capture_target_closed",
+            "长截图目标窗口已关闭，请重新截图",
+        ));
+    }
+
+    let _ = unsafe { SetForegroundWindow(root) };
+    std::thread::sleep(Duration::from_millis(60));
+
+    let current_thread = unsafe { GetCurrentThreadId() };
+    let foreground = unsafe { GetForegroundWindow() };
+    let foreground_thread = if foreground.is_null() {
+        0
+    } else {
+        unsafe { GetWindowThreadProcessId(foreground, std::ptr::null_mut()) }
+    };
+    let target_thread = unsafe { GetWindowThreadProcessId(child, std::ptr::null_mut()) };
+    if target_thread == 0 {
+        return Err(AppError::new(
+            "long_capture_target_closed",
+            "无法读取长截图目标输入线程，请重新截图",
+        ));
+    }
+
+    let _foreground_attachment = ThreadInputAttachment::attach(current_thread, foreground_thread)?;
+    let _target_attachment = if foreground_thread == target_thread {
+        None
+    } else {
+        ThreadInputAttachment::attach(current_thread, target_thread)?
+    };
+    unsafe {
+        let _ = BringWindowToTop(root);
+        let _ = SetForegroundWindow(root);
+        let _ = SetActiveWindow(root);
+        let _ = SetFocus(child);
+    }
+    std::thread::sleep(Duration::from_millis(80));
+    if !scroll_target_has_foreground_focus(target) {
+        return Err(AppError::new(
+            "long_capture_target_activation_failed",
+            "Windows 未能把输入焦点交还给长截图目标。请重新点击选区内可滚动内容后重试",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn scroll_target_has_foreground_focus(target: &CaptureTarget) -> bool {
+    use std::mem::size_of;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetAncestor, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId, IsChild,
+        GA_ROOT, GUITHREADINFO,
+    };
+
+    let Some(windows) = target.scroll_windows else {
+        return false;
+    };
+    let expected_root = windows.root as *mut std::ffi::c_void;
+    let child = windows.child as *mut std::ffi::c_void;
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_null() {
+        return false;
+    }
+    let root = unsafe { GetAncestor(foreground, GA_ROOT) };
+    let foreground_root = if root.is_null() { foreground } else { root };
+    if foreground_root != expected_root {
+        return false;
+    }
+
+    let target_thread = unsafe { GetWindowThreadProcessId(child, std::ptr::null_mut()) };
+    if target_thread == 0 {
+        return false;
+    }
+    let mut info = GUITHREADINFO {
+        cbSize: size_of::<GUITHREADINFO>() as u32,
+        ..GUITHREADINFO::default()
+    };
+    if unsafe { GetGUIThreadInfo(target_thread, &mut info) } == 0 || info.hwndFocus.is_null() {
+        return false;
+    }
+    info.hwndFocus == child || unsafe { IsChild(child, info.hwndFocus) } != 0
+}
+
+#[cfg(not(windows))]
+fn focus_scroll_target(_target: &CaptureTarget) -> AppResult<()> {
     Err(AppError::new(
         "unsupported_platform",
         "长截图滚动输入仅支持 Windows",
@@ -3723,9 +4593,11 @@ mod tests {
                 },
                 mode: LongCaptureMode::Current,
                 control_overlaps_roi: false,
+                scroll_windows: None,
             },
             hidden_pin_labels: Vec::new(),
             browser: None,
+            operation_lock: Mutex::new(()),
             runtime: Mutex::new(runtime),
             wake: Condvar::new(),
         };
@@ -3792,7 +4664,52 @@ mod tests {
         let capability = serde_json::to_value(long_capture_capability(None)).unwrap();
         assert!(capability.get("available").is_some());
         assert!(capability.get("supported").is_some());
-        assert_eq!(capability["preferredEngine"], "wheel");
+        assert_eq!(capability["preferredEngine"], "manual");
+    }
+
+    #[test]
+    fn manual_engine_never_uses_automatic_scroll_input() {
+        assert!(engine_uses_manual_scrolling(LongCaptureEngine::Manual));
+        assert!(!engine_uses_manual_scrolling(LongCaptureEngine::Wheel));
+        assert!(!engine_uses_manual_scrolling(
+            LongCaptureEngine::BrowserEnhanced
+        ));
+    }
+
+    #[test]
+    fn screenshot_reentry_keeps_the_existing_long_capture_surface() {
+        assert_eq!(
+            long_capture_reentry_surface(true, None),
+            Some(LongCaptureReentrySurface::Pending)
+        );
+        assert_eq!(
+            long_capture_reentry_surface(false, Some(LongCaptureState::Capturing)),
+            Some(LongCaptureReentrySurface::Control)
+        );
+        assert_eq!(
+            long_capture_reentry_surface(false, Some(LongCaptureState::Paused)),
+            Some(LongCaptureReentrySurface::Overlay)
+        );
+        assert_eq!(
+            long_capture_reentry_surface(false, Some(LongCaptureState::Ready)),
+            Some(LongCaptureReentrySurface::Overlay)
+        );
+        assert_eq!(
+            long_capture_reentry_surface(false, Some(LongCaptureState::Canceled)),
+            None
+        );
+        assert_eq!(long_capture_reentry_surface(false, None), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn control_window_style_preserves_flags_and_disables_activation() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_NOACTIVATE;
+
+        let existing = 0x0000_0080_isize;
+        let configured = control_window_ex_style(existing);
+        assert_eq!(configured & existing, existing);
+        assert_ne!(configured & WS_EX_NOACTIVATE as isize, 0);
     }
 
     #[test]
@@ -3854,6 +4771,34 @@ mod tests {
         assert!(find_vertical_overlap(&previous, &current).is_none());
         let strips = GrayStrips::from_frame(&previous);
         assert_eq!(alignment_score(&strips, &strips, 0, 1), Some(0.0));
+    }
+
+    #[test]
+    fn control_overlay_mask_copies_only_the_covered_pixels() {
+        let source = solid_frame(4, 3, 25);
+        let mut destination = solid_frame(4, 3, 220);
+        copy_frame_region(
+            &mut destination,
+            &source,
+            PhysicalRect {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 1,
+            },
+        )
+        .unwrap();
+        for y in 0..3_usize {
+            for x in 0..4_usize {
+                let offset = (y * 4 + x) * 4;
+                let expected = if y == 1 && (1..3).contains(&x) {
+                    25
+                } else {
+                    220
+                };
+                assert_eq!(destination.rgba[offset], expected);
+            }
+        }
     }
 
     #[test]
@@ -3966,6 +4911,23 @@ mod tests {
             },
         );
         assert!(overlaps);
+        let full_screen_target = CaptureTarget {
+            bounds: PhysicalRect {
+                x: 0,
+                y: 0,
+                width: 1_920,
+                height: 1_080,
+            },
+            scroll_anchor: PhysicalPoint { x: 960, y: 540 },
+            monitor: monitor.clone(),
+            mode: LongCaptureMode::Manual,
+            control_overlaps_roi: true,
+            scroll_windows: None,
+        };
+        let overlap = control_overlap_in_roi(&full_screen_target).unwrap();
+        assert_eq!(overlap.y, 8);
+        assert_eq!(overlap.width, CONTROL_WINDOW_MAX_WIDTH);
+        assert_eq!(overlap.height, CONTROL_WINDOW_HEIGHT);
 
         let scaled_monitor = MonitorBounds {
             scale_factor: 1.5,
@@ -4345,9 +5307,11 @@ mod tests {
                 },
                 mode: LongCaptureMode::Current,
                 control_overlaps_roi: false,
+                scroll_windows: None,
             },
             hidden_pin_labels: Vec::new(),
             browser: None,
+            operation_lock: Mutex::new(()),
             runtime: Mutex::new(runtime),
             wake: Condvar::new(),
         });
@@ -4370,6 +5334,8 @@ mod tests {
                     issued_at: Instant::now(),
                 },
             )])),
+            start_lock: Mutex::new(()),
+            pending_start: Mutex::new(None),
         };
 
         clear_job_cache(&store, "job-1");
@@ -4377,5 +5343,31 @@ mod tests {
         assert!(lock_unpoisoned(&store.annotation_exports).is_empty());
         assert!(!job_directory.exists());
         assert!(!export_directory.exists());
+    }
+
+    #[test]
+    fn pending_start_cancellation_is_scoped_to_its_screenshot_session() {
+        let root = tempdir().unwrap();
+        let store = LongScreenshotStore {
+            cache_root: root.path().to_path_buf(),
+            browser_bridge: None,
+            job: Mutex::new(None),
+            annotation_exports: Mutex::new(HashMap::new()),
+            start_lock: Mutex::new(()),
+            pending_start: Mutex::new(None),
+        };
+
+        store.begin_pending_start("session-1").unwrap();
+        let duplicate = store.begin_pending_start("session-2").unwrap_err();
+        assert_eq!(duplicate.code, "long_capture_busy");
+        assert!(!store.request_pending_start_cancel("session-2"));
+        assert!(!store.pending_start_cancel_requested("session-1"));
+        assert!(store.request_pending_start_cancel("session-1"));
+        assert!(store.pending_start_cancel_requested("session-1"));
+
+        store.finish_pending_start("session-2");
+        assert!(store.pending_start_cancel_requested("session-1"));
+        store.finish_pending_start("session-1");
+        assert!(!store.pending_start_cancel_requested("session-1"));
     }
 }

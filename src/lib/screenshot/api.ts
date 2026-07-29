@@ -158,6 +158,11 @@ export const screenshotApi: ScreenshotApi = {
     return longCaptureControl("cancel_long_capture", jobId);
   },
 
+  async cancelLongCaptureSession(sessionId: string): Promise<LongCaptureStatus | null> {
+    const status = await command<LongCaptureStatus | null>("cancel_long_capture_session", { sessionId });
+    return status ? normalizeLongCaptureStatus(status) : null;
+  },
+
   async getLongCaptureStatus(jobId: string): Promise<LongCaptureStatus | null> {
     const status = await command<LongCaptureStatus | null>("get_long_capture_status", { jobId });
     return status ? normalizeLongCaptureStatus(status) : null;

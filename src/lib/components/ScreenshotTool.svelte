@@ -79,6 +79,7 @@
     sessionId?: string;
     api?: ScreenshotApi;
     loadTimeoutMs?: number;
+    longStartTimeoutMs?: number;
     oncomplete?: (result: ScreenshotExportResult) => void;
     oncancel?: () => void;
     onerror?: (message: string) => void;
@@ -130,6 +131,7 @@
     sessionId,
     api = screenshotApi,
     loadTimeoutMs = 8_000,
+    longStartTimeoutMs = 8_000,
     oncomplete,
     oncancel,
     onerror,
@@ -166,7 +168,7 @@
   let longCapabilityLoaded = $state(false);
   let longConfirmOpen = $state(false);
   let choosingScrollAnchor = $state(false);
-  let longMode = $state<LongCaptureMode>("current");
+  let longMode = $state<LongCaptureMode>("manual");
   let longStatus = $state<LongCaptureStatus | null>(null);
   let longBusy = $state(false);
   let longPreviewScrollTop = $state(0);
@@ -364,7 +366,6 @@
     }
     const enteringPreview = next.state === "ready" && longStatus?.state !== "ready";
     longStatus = next;
-    longBusy = false;
     if (enteringPreview) {
       longPreviewScrollTop = 0;
       resetLongAnnotations();
@@ -404,11 +405,11 @@
       longConfirmOpen = true;
       return;
     }
-    choosingScrollAnchor = true;
     activeTool = null;
     selectedId = null;
     hoverPoint = null;
     hoverCss = null;
+    choosingScrollAnchor = true;
   }
 
   function confirmLongCapture(): void {
@@ -423,83 +424,67 @@
   }
 
   async function startLongCapture(scrollAnchor: Point): Promise<void> {
-    if (!session || !selection || !api.startLongCapture) return;
+    const activeSession = session;
+    const activeSelection = selection;
+    if (!activeSession || !activeSelection || !api.startLongCapture) return;
     const generation = ++longStartGeneration;
     choosingScrollAnchor = false;
     longBusy = true;
     error = "";
-    try {
-      const status = await api.startLongCapture({
-        sessionId: session.id,
-        selection: roundRect(selection),
-        scrollAnchor: { x: Math.round(scrollAnchor.x), y: Math.round(scrollAnchor.y) },
-        scope: "selection",
-        mode: longMode,
-      });
+    const request = api.startLongCapture({
+      sessionId: activeSession.id,
+      selection: roundRect(activeSelection),
+      scrollAnchor: { x: Math.round(scrollAnchor.x), y: Math.round(scrollAnchor.y) },
+      scope: "selection",
+      mode: longMode,
+    });
+    void request.then((lateStatus) => {
       if (generation !== longStartGeneration) {
-        if (api.cancelLongCapture) await api.cancelLongCapture(status.jobId).catch(() => undefined);
+        void api.cancelLongCapture(lateStatus.jobId).catch(() => undefined);
+      }
+    }).catch(() => undefined);
+    try {
+      const status = await withTimeout(request, longStartTimeoutMs, "长截图启动超时，已恢复普通截图。");
+      if (generation !== longStartGeneration) {
         return;
       }
       longActiveJobId = status.jobId;
+      longBusy = false;
       applyLongCaptureStatus(status, generation);
     } catch (value) {
       if (generation !== longStartGeneration) return;
-      longBusy = false;
-      choosingScrollAnchor = true;
-      reportError(value);
-    }
-  }
-
-  type LongControlAction = "pause" | "resume" | "retry" | "undo" | "finish";
-
-  async function runLongControl(action: LongControlAction): Promise<void> {
-    const status = longStatus;
-    if (!status || longBusy) return;
-    if (status.state === "failed" || status.state === "canceled" || status.state === "ready") return;
-    if ((action === "resume" || action === "retry") && status.state !== "paused") return;
-    if (action === "pause" && status.state !== "capturing") return;
-    if (action === "undo" && !status.canUndo) return;
-    if (action === "finish" && status.frameCount < 1) return;
-    const method = action === "pause" ? api.pauseLongCapture
-      : action === "resume" ? api.resumeLongCapture
-        : action === "retry" ? api.retryLongCapture
-          : action === "undo" ? api.undoLongCapture
-            : api.finishLongCapture;
-    if (!method) {
-      reportError("当前版本未提供对应的长截图控制接口。");
-      return;
-    }
-    longBusy = true;
-    error = "";
-    const generation = longStartGeneration;
-    try {
-      applyLongCaptureStatus(await method(status.jobId), generation);
-    } catch (value) {
-      if (generation !== longStartGeneration || longActiveJobId !== status.jobId) return;
-      longBusy = false;
+      longStartGeneration += 1;
+      try {
+        await withTimeout(
+          api.cancelLongCaptureSession(activeSession.id),
+          2_500,
+          "恢复普通截图超时。",
+        );
+      } catch {
+        // The regular screenshot session remains available even if no long job
+        // had been registered yet. A late start response is canceled above.
+      }
+      resetLongCapture();
       reportError(value);
     }
   }
 
   async function cancelLongCaptureToEditor(): Promise<void> {
     const status = longStatus;
-    if (!status) {
-      resetLongCapture();
-      return;
-    }
-    if (!api.cancelLongCapture) {
-      reportError("当前版本未提供长截图取消接口。");
-      return;
-    }
-    longBusy = true;
+    const activeSessionId = session?.id;
+    if (!status && !activeSessionId) return resetLongCapture();
     error = "";
-    const generation = longStartGeneration;
+    // Recover the editor and unmount its controller before awaiting native IPC.
+    // This invalidates pending start/control responses and also debounces a
+    // second context-menu cancellation while the first request is in flight.
+    resetLongCapture();
     try {
-      await api.cancelLongCapture(status.jobId);
-      if (generation === longStartGeneration && longActiveJobId === status.jobId) resetLongCapture();
+      if (status) {
+        await withTimeout(api.cancelLongCapture(status.jobId), 5_000, "取消长截图超时。");
+      } else if (activeSessionId) {
+        await withTimeout(api.cancelLongCaptureSession(activeSessionId), 5_000, "取消长截图启动超时。");
+      }
     } catch (value) {
-      if (generation !== longStartGeneration || longActiveJobId !== status.jobId) return;
-      longBusy = false;
       reportError(value);
     }
   }
@@ -1069,7 +1054,7 @@
     if (choosingScrollAnchor) {
       event.preventDefault();
       if (hitTestSelection(point)) void startLongCapture(point);
-      else showToast("请在选区内选择滚动位置");
+      else showToast("请在选区内点击真正可滚动的内容");
       return;
     }
     if (longCaptureActive) return;
@@ -1346,6 +1331,11 @@
       }
       return;
     }
+    if (longStatus && longStatus.state !== "ready") {
+      // The embedded control owns capture-phase shortcuts so keyboard and
+      // button actions share one busy/action generation.
+      return;
+    }
     if (longStatus || longBusy) {
       if (longTextDraft) {
         if (event.key === "Escape") {
@@ -1373,15 +1363,6 @@
       } else if (longStatus?.state === "ready" && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
         event.preventDefault();
         void exportLongImage("save");
-      } else if (!longBusy && (event.code === "Space" || event.key === " ")) {
-        event.preventDefault();
-        if (longStatus?.state === "capturing") void runLongControl("pause");
-        else if (longStatus?.state === "paused") void runLongControl("resume");
-      } else if (!longBusy && event.key === "Enter" && longStatus
-        && longStatus.state !== "ready" && longStatus.state !== "failed" && longStatus.state !== "canceled"
-        && longStatus.frameCount > 0) {
-        event.preventDefault();
-        void runLongControl("finish");
       }
       return;
     }
@@ -2014,11 +1995,11 @@
 
   {#if choosingScrollAnchor}
     <div class="long-anchor-bar ui-layer" role="toolbar" aria-label="长截图范围">
-      <strong>选择滚动位置</strong>
+      <strong>点击选区内可滚动内容</strong>
       <div class="segmented" aria-label="长截图起点">
+        <button class:active={longMode === "manual"} type="button" onclick={() => (longMode = "manual")}>手动滚动</button>
         <button class:active={longMode === "current"} type="button" onclick={() => (longMode = "current")}>当前位置</button>
         <button class:active={longMode === "top"} type="button" onclick={() => (longMode = "top")}>从顶部</button>
-        <button class:active={longMode === "manual"} type="button" onclick={() => (longMode = "manual")}>手动滚动</button>
       </div>
       <button class="icon-control" type="button" title="返回截图" aria-label="取消选择滚动位置" onclick={resetLongCapture}><X size={17} /></button>
     </div>
@@ -2031,11 +2012,11 @@
       {api}
       floating
       monitor={false}
-      keyboardShortcuts={false}
       cancelLabel="返回普通截图"
       onstatus={applyLongCaptureStatus}
       oncancel={resetLongCapture}
       onerror={reportError}
+      onbusychange={(value) => { longBusy = value; }}
     />
   {:else if longBusy && !longStatus}
     <div class="long-progress ui-layer" role="status"><LoaderCircle class="spin" size={17} /><strong>长截图</strong><span class="long-stats">正在启动</span><button class="icon-control" type="button" title="取消 Esc" aria-label="取消长截图" onclick={() => void cancelLongCaptureToEditor()}><X size={17} /></button></div>

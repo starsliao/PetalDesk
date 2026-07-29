@@ -26,6 +26,7 @@ function controlApi() {
     undoLongCapture: vi.fn().mockResolvedValue(status("paused", { frameCount: 2 })),
     finishLongCapture: vi.fn().mockResolvedValue(status("ready")),
     cancelLongCapture: vi.fn().mockResolvedValue(status("canceled")),
+    cancelLongCaptureSession: vi.fn().mockResolvedValue(status("canceled")),
   } as unknown as ScreenshotApi & Record<string, ReturnType<typeof vi.fn>>;
 }
 
@@ -65,6 +66,18 @@ describe("LongCaptureControl", () => {
     expect(api.getLongCaptureStatus).not.toHaveBeenCalled();
   });
 
+  it("shows capture and manual-scroll status instead of an unexplained toolbar", () => {
+    const api = controlApi();
+    const rendered = render(LongCaptureControl, {
+      jobId: "long-1",
+      api,
+      initialStatus: status("capturing", { message: "等待手动滚动" }),
+      monitor: false,
+    });
+
+    expect(rendered.getByText("等待手动滚动")).toBeInTheDocument();
+  });
+
   it("uses Escape to cancel the independent control window job", async () => {
     const api = controlApi();
     const oncancel = vi.fn();
@@ -97,9 +110,110 @@ describe("LongCaptureControl", () => {
     expect(api.cancelLongCapture).not.toHaveBeenCalled();
     expect(api.resumeLongCapture).not.toHaveBeenCalled();
     expect(api.finishLongCapture).not.toHaveBeenCalled();
+    expect(rendered.getByRole("button", { name: "继续长截图" })).toHaveAttribute("title", "继续");
+    expect(rendered.getByRole("button", { name: "完成长截图" })).toHaveAttribute("title", "完成");
 
     await fireEvent.click(rendered.getByRole("button", { name: "继续长截图" }));
     await waitFor(() => expect(api.resumeLongCapture).toHaveBeenCalledOnce());
+  });
+
+  it("lets cancellation supersede a control request that has not returned", async () => {
+    const api = controlApi();
+    let resolvePause: ((next: LongCaptureStatus) => void) | undefined;
+    vi.mocked(api.pauseLongCapture).mockImplementation(() => new Promise<LongCaptureStatus>((resolve) => {
+      resolvePause = resolve;
+    }));
+    const onstatus = vi.fn();
+    const oncancel = vi.fn();
+    const rendered = render(LongCaptureControl, {
+      jobId: "long-1",
+      api,
+      initialStatus: status("capturing"),
+      monitor: false,
+      onstatus,
+      oncancel,
+    });
+
+    await fireEvent.click(rendered.getByRole("button", { name: "暂停长截图" }));
+    await waitFor(() => expect(api.pauseLongCapture).toHaveBeenCalledWith("long-1"));
+    expect(rendered.getByRole("button", { name: "取消长截图" })).toBeEnabled();
+
+    await fireEvent.click(rendered.getByRole("button", { name: "取消长截图" }));
+    await waitFor(() => expect(api.cancelLongCapture).toHaveBeenCalledWith("long-1"));
+    await waitFor(() => expect(oncancel).toHaveBeenCalledOnce());
+    expect(onstatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: "canceled" }));
+
+    resolvePause?.(status("paused"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(onstatus).toHaveBeenLastCalledWith(expect.objectContaining({ state: "canceled" }));
+  });
+
+  it("recovers controls after a native command times out", async () => {
+    const api = controlApi();
+    vi.mocked(api.pauseLongCapture).mockImplementation(() => new Promise<LongCaptureStatus>(() => undefined));
+    const rendered = render(LongCaptureControl, {
+      jobId: "long-1",
+      api,
+      initialStatus: status("capturing"),
+      monitor: false,
+      controlTimeoutMs: 250,
+    });
+
+    await fireEvent.click(rendered.getByRole("button", { name: "暂停长截图" }));
+    await waitFor(() => expect(rendered.getByText("控制长截图超时。")).toBeInTheDocument());
+    expect(rendered.getByRole("button", { name: "暂停长截图" })).toBeEnabled();
+    expect(rendered.getByRole("button", { name: "取消长截图" })).toBeEnabled();
+
+    await fireEvent.click(rendered.getByRole("button", { name: "取消长截图" }));
+    await waitFor(() => expect(api.cancelLongCapture).toHaveBeenCalledWith("long-1"));
+  });
+
+  it("re-enables cancellation when the native cancel command times out", async () => {
+    const api = controlApi();
+    vi.mocked(api.cancelLongCapture).mockImplementation(() => new Promise<LongCaptureStatus>(() => undefined));
+    const rendered = render(LongCaptureControl, {
+      jobId: "long-1",
+      api,
+      initialStatus: status("capturing"),
+      monitor: false,
+      controlTimeoutMs: 250,
+    });
+
+    const cancelButton = rendered.getByRole("button", { name: "取消长截图" });
+    await fireEvent.click(cancelButton);
+    expect(cancelButton).toBeDisabled();
+    await waitFor(() => expect(rendered.getByText("取消长截图超时。")).toBeInTheDocument());
+    expect(cancelButton).toBeEnabled();
+
+    await fireEvent.click(cancelButton);
+    expect(api.cancelLongCapture).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores a stale poll failure after a newer control action", async () => {
+    const api = controlApi();
+    let rejectPoll: ((reason?: unknown) => void) | undefined;
+    vi.mocked(api.getLongCaptureStatus).mockImplementation(() => new Promise<LongCaptureStatus | null>((_resolve, reject) => {
+      rejectPoll = reject;
+    }));
+    const onerror = vi.fn();
+    const rendered = render(LongCaptureControl, {
+      jobId: "long-1",
+      api,
+      initialStatus: status("capturing"),
+      onerror,
+    });
+
+    await waitFor(() => expect(api.getLongCaptureStatus).toHaveBeenCalledWith("long-1"), { timeout: 2_000 });
+    await fireEvent.click(rendered.getByRole("button", { name: "暂停长截图" }));
+    await waitFor(() => expect(api.pauseLongCapture).toHaveBeenCalledWith("long-1"));
+    await waitFor(() => expect(rendered.getByRole("button", { name: "继续长截图" })).toBeInTheDocument());
+
+    rejectPoll?.(new Error("旧轮询失败"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(onerror).not.toHaveBeenCalled();
+    expect(rendered.queryByText("旧轮询失败")).not.toBeInTheDocument();
   });
 
   it("offers only cancellation after an independent capture job fails", async () => {

@@ -785,7 +785,7 @@
 {:else if toolName === "screenshot" && longCaptureControlId}
   <main class="long-capture-control-window">
     {#if LongCaptureControl}
-      <LongCaptureControl jobId={longCaptureControlId} />
+      <LongCaptureControl jobId={longCaptureControlId} keyboardShortcuts={false} />
     {:else}
       <div class="tool-loading screenshot-loading" aria-busy="true">
         <LoaderCircle class="spinner" size={18} aria-hidden="true" />

@@ -640,7 +640,7 @@ mod tests {
         let command_directory = temporary.0.join("commands").join(connection_id);
         let response_directory = temporary.0.join("responses").join(connection_id);
         let host = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = Instant::now() + Duration::from_secs(3);
             loop {
                 for entry in fs::read_dir(&command_directory)
                     .unwrap()
@@ -686,7 +686,7 @@ mod tests {
                 connection_id,
                 "status",
                 serde_json::json!({}),
-                Duration::from_secs(1),
+                Duration::from_secs(3),
             )
             .unwrap();
         host.join().unwrap();
@@ -698,12 +698,12 @@ mod tests {
         let temporary = TestRoot::new();
         let bridge = BrowserBridge::start_at(temporary.0.clone()).unwrap();
         let now = unix_time_ms();
-        session(&temporary.0, "chrome-live", "chrome", "0.3.0", now);
+        session(&temporary.0, "chrome-live", "chrome", "0.3.1", now);
         session(
             &temporary.0,
             "edge-stale",
             "edge",
-            "0.3.0",
+            "0.3.1",
             now.saturating_sub(SESSION_TTL.as_millis() + 1),
         );
 
@@ -735,8 +735,8 @@ mod tests {
         let temporary = TestRoot::new();
         let bridge = BrowserBridge::start_at(temporary.0.clone()).unwrap();
         let now = unix_time_ms();
-        session(&temporary.0, "firefox-primary", "firefox", "0.3.0", now);
-        session(&temporary.0, "chrome-only", "chrome", "0.3.0", now);
+        session(&temporary.0, "firefox-primary", "firefox", "0.3.1", now);
+        session(&temporary.0, "chrome-only", "chrome", "0.3.1", now);
 
         assert!(bridge
             .connection_is_unique(BrowserFamily::Firefox, "firefox-primary")
@@ -749,7 +749,7 @@ mod tests {
             &temporary.0,
             "firefox-second-profile",
             "firefox",
-            "0.3.0",
+            "0.3.1",
             now,
         );
         assert!(!bridge

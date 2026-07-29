@@ -14,10 +14,11 @@
 pnpm package:windows
 ```
 
-Version `0.3.0` adds scrolling long capture. The generic capture path works
-without a browser extension; the Chrome, Edge, and Firefox extensions provide
-browser-assisted scrolling and page-state coordination for more reliable long
-page capture.
+Version `0.3.1` fixes a long-capture startup deadlock that could block the
+screenshot shortcut, tray menu, and application exit. Startup and control
+commands now run away from the Tauri event loop, a pending capture can be
+canceled before its job ID is returned, and generic capture restores focus to
+the selected Windows target before sending scroll input.
 
 The package always includes and registers the Firefox Native Messaging host.
 Set `PETALDESK_CHROME_EXTENSION_ID` and/or `PETALDESK_EDGE_EXTENSION_ID` to the
@@ -46,4 +47,4 @@ XPI. The unsigned ZIP must not be presented as an installable Firefox package.
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.3.0>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.3.1>

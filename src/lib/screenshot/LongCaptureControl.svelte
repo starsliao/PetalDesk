@@ -12,11 +12,13 @@
     floating?: boolean;
     monitor?: boolean;
     keyboardShortcuts?: boolean;
+    controlTimeoutMs?: number;
     cancelLabel?: string;
     onstatus?: (status: LongCaptureStatus) => void;
     oncancel?: () => void;
     onready?: (status: LongCaptureStatus) => void;
     onerror?: (message: string) => void;
+    onbusychange?: (busy: boolean) => void;
   }
 
   let {
@@ -26,11 +28,13 @@
     floating = false,
     monitor = true,
     keyboardShortcuts = true,
+    controlTimeoutMs = 5_000,
     cancelLabel = "取消长截图",
     onstatus,
     oncancel,
     onready,
     onerror,
+    onbusychange,
   }: Props = $props();
 
   let status = $state<LongCaptureStatus | null>(null);
@@ -38,6 +42,37 @@
   let error = $state("");
   let pollTimer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
+  let actionGeneration = 0;
+  let refreshGeneration = 0;
+
+  function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(message));
+      }, Math.max(250, controlTimeoutMs));
+      void promise.then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (reason) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(reason);
+        },
+      );
+    });
+  }
+
+  function terminal(state: LongCaptureStatus["state"] | undefined): boolean {
+    return state === "ready" || state === "failed" || state === "canceled";
+  }
 
   $effect(() => {
     const next = initialStatus;
@@ -46,8 +81,8 @@
 
   function publish(next: LongCaptureStatus): void {
     if (next.jobId !== jobId) return;
+    if (terminal(status?.state) && next.state !== status?.state && next.state !== "canceled") return;
     status = next;
-    busy = false;
     error = "";
     onstatus?.(next);
     if (next.state === "ready") onready?.(next);
@@ -61,26 +96,26 @@
   }
 
   function fail(value: unknown): void {
-    busy = false;
     error = value instanceof Error ? value.message : String(value || "长截图操作失败，请重试。");
     onerror?.(error);
   }
 
   async function refresh(): Promise<void> {
+    const generation = refreshGeneration;
     try {
-      const next = await api.getLongCaptureStatus(jobId);
-      if (disposed) return;
+      const next = await withTimeout(api.getLongCaptureStatus(jobId), "读取长截图状态超时。");
+      if (disposed || generation !== refreshGeneration) return;
       if (next) publish(next);
       else fail("长截图任务不存在或已结束。");
     } catch (value) {
-      if (!disposed) fail(value);
+      if (!disposed && generation === refreshGeneration) fail(value);
     }
   }
 
   function schedulePoll(): void {
     if (pollTimer) clearTimeout(pollTimer);
     pollTimer = undefined;
-    if (!monitor || !status || status.state === "ready" || status.state === "failed" || status.state === "canceled") return;
+    if (!monitor || busy || !status || terminal(status.state)) return;
     pollTimer = setTimeout(() => {
       pollTimer = undefined;
       void refresh();
@@ -88,6 +123,7 @@
   }
 
   type ControlAction = "pause" | "resume" | "retry" | "undo" | "finish" | "cancel";
+  let activeAction = $state<ControlAction | null>(null);
 
   function canRun(action: ControlAction): boolean {
     if (action === "cancel") return true;
@@ -104,20 +140,33 @@
   }
 
   async function run(action: ControlAction): Promise<void> {
-    if (busy || !canRun(action)) return;
+    if ((busy && action !== "cancel") || (busy && activeAction === "cancel") || !canRun(action)) return;
+    const generation = ++actionGeneration;
+    refreshGeneration += 1;
     busy = true;
+    activeAction = action;
+    onbusychange?.(true);
     error = "";
     try {
-      const next = action === "pause" ? await api.pauseLongCapture(jobId)
-        : action === "resume" ? await api.resumeLongCapture(jobId)
-          : action === "retry" ? await api.retryLongCapture(jobId)
-            : action === "undo" ? await api.undoLongCapture(jobId)
-              : action === "finish" ? await api.finishLongCapture(jobId)
-                : await api.cancelLongCapture(jobId);
+      const operation = action === "pause" ? api.pauseLongCapture(jobId)
+        : action === "resume" ? api.resumeLongCapture(jobId)
+          : action === "retry" ? api.retryLongCapture(jobId)
+            : action === "undo" ? api.undoLongCapture(jobId)
+              : action === "finish" ? api.finishLongCapture(jobId)
+                : api.cancelLongCapture(jobId);
+      const next = await withTimeout(operation, `${action === "cancel" ? "取消" : "控制"}长截图超时。`);
+      if (disposed || generation !== actionGeneration) return;
       publish(next);
       if (action === "cancel" && next.state !== "canceled") oncancel?.();
     } catch (value) {
-      fail(value);
+      if (!disposed && generation === actionGeneration) fail(value);
+    } finally {
+      if (!disposed && generation === actionGeneration) {
+        busy = false;
+        activeAction = null;
+        onbusychange?.(false);
+        schedulePoll();
+      }
     }
   }
 
@@ -155,6 +204,9 @@
     }
     return () => {
       disposed = true;
+      actionGeneration += 1;
+      refreshGeneration += 1;
+      if (busy) onbusychange?.(false);
       if (pollTimer) clearTimeout(pollTimer);
       cleanups.forEach((cleanup) => cleanup());
     };
@@ -163,7 +215,7 @@
 
 <svelte:window onkeydown={handleKeydown} />
 
-<div class:floating class="long-capture-control" role="toolbar" aria-label="长截图采集控制">
+<div class:floating class:failed={status?.state === "failed"} class="long-capture-control" role="toolbar" aria-label="长截图采集控制">
   {#if busy || !status || status.state === "preparing"}<LoaderCircle class="spin" size={17} />{/if}
   <strong>{status?.state === "failed" ? "长截图失败" : "长截图"}</strong>
   {#if status}
@@ -171,24 +223,24 @@
   {:else}
     <span class="stats">正在连接</span>
   {/if}
-  {#if error || status?.state === "failed"}
-    <span class="message" title={error || status?.message || "长截图失败，请返回后重新开始。"}>{error || status?.message || "长截图失败，请返回后重新开始。"}</span>
+  {#if error || status?.message}
+    <span class="message" aria-live="polite" title={error || status?.message || ""}>{error || status?.message}</span>
   {/if}
   <span class="separator"></span>
   {#if status?.state === "failed"}
-    <button class="failed-exit" type="button" title={cancelLabel} aria-label={cancelLabel} disabled={busy} onclick={() => void run("cancel")}>
+    <button class="failed-exit" type="button" title={cancelLabel} aria-label={cancelLabel} disabled={busy && activeAction === "cancel"} onclick={() => void run("cancel")}>
       {#if floating}<ArrowLeft size={17} />{:else}<X size={17} />{/if}<span>{cancelLabel}</span>
     </button>
   {:else}
     {#if status?.state === "capturing"}
-      <button type="button" title="暂停 Space" aria-label="暂停长截图" disabled={busy} onclick={() => void run("pause")}><Pause size={17} /></button>
+      <button type="button" title={keyboardShortcuts ? "暂停 Space" : "暂停"} aria-label="暂停长截图" disabled={busy} onclick={() => void run("pause")}><Pause size={17} /></button>
     {:else if status?.state === "paused"}
-      <button type="button" title="继续 Space" aria-label="继续长截图" disabled={busy} onclick={() => void run("resume")}><Play size={17} /></button>
+      <button type="button" title={keyboardShortcuts ? "继续 Space" : "继续"} aria-label="继续长截图" disabled={busy} onclick={() => void run("resume")}><Play size={17} /></button>
       <button type="button" title="重试当前段" aria-label="重试当前段" disabled={busy} onclick={() => void run("retry")}><RotateCcw size={17} /></button>
     {/if}
     <button type="button" title="回退上一段" aria-label="回退上一段" disabled={busy || !canRun("undo")} onclick={() => void run("undo")}><Undo2 size={17} /></button>
-    <button class="finish" type="button" title="完成 Enter" aria-label="完成长截图" disabled={busy || !canRun("finish")} onclick={() => void run("finish")}><Check size={17} /></button>
-    <button type="button" title={cancelLabel} aria-label={cancelLabel} disabled={busy} onclick={() => void run("cancel")}><X size={17} /></button>
+    <button class="finish" type="button" title={keyboardShortcuts ? "完成 Enter" : "完成"} aria-label="完成长截图" disabled={busy || !canRun("finish")} onclick={() => void run("finish")}><Check size={17} /></button>
+    <button type="button" title={cancelLabel} aria-label={cancelLabel} disabled={busy && activeAction === "cancel"} onclick={() => void run("cancel")}><X size={17} /></button>
   {/if}
 </div>
 
@@ -198,7 +250,8 @@
   strong, .stats { flex: 0 0 auto; white-space: nowrap; }
   strong { font-size: 12px; }
   .stats { color: #555; }
-  .message { min-width: 0; max-width: 210px; color: #8a2d22; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .message { min-width: 0; max-width: 250px; color: #555; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .long-capture-control.failed .message { color: #8a2d22; }
   .separator { width: 1px; height: 24px; margin-left: auto; background: #d2d2d2; }
   button { display: grid; flex: 0 0 auto; width: 32px; height: 32px; padding: 0; place-items: center; color: #2d2d2d; background: transparent; border: 1px solid transparent; border-radius: 4px; }
   button:hover:not(:disabled) { background: #e7e7e7; border-color: #d0d0d0; }

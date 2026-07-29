@@ -16,6 +16,8 @@ $manifestRoot = [System.IO.Path]::GetFullPath($ManifestDirectory)
 $chromeManifestPath = Join-Path $manifestRoot 'com.petaldesk.capture.chrome.json'
 $edgeManifestPath = Join-Path $manifestRoot 'com.petaldesk.capture.edge.json'
 $firefoxManifestPath = Join-Path $manifestRoot 'com.petaldesk.capture.firefox.json'
+$productName = ([string][char]0x98DE) + [char]0x82B1 + ' - PetalDesk'
+$hostDescription = "$productName browser capture native messaging host"
 
 foreach ($entry in @(
     @{ Name = 'Chrome'; Value = $ChromeExtensionId }
@@ -28,7 +30,7 @@ foreach ($entry in @(
 
 $firefoxManifest = [ordered]@{
     name = 'com.petaldesk.capture'
-    description = '飞花 - PetalDesk browser capture native messaging host'
+    description = $hostDescription
     path = $hostPath
     type = 'stdio'
     allowed_extensions = @('petaldesk-capture@petaldesk.app')
@@ -46,7 +48,7 @@ if ($PSCmdlet.ShouldProcess($manifestRoot, 'Write Native Messaging manifests')) 
     if (-not [string]::IsNullOrWhiteSpace($ChromeExtensionId)) {
         $chromeManifest = [ordered]@{
             name = 'com.petaldesk.capture'
-            description = '飞花 - PetalDesk browser capture native messaging host'
+            description = $hostDescription
             path = $hostPath
             type = 'stdio'
             allowed_origins = @("chrome-extension://$ChromeExtensionId/")
@@ -61,7 +63,7 @@ if ($PSCmdlet.ShouldProcess($manifestRoot, 'Write Native Messaging manifests')) 
     if (-not [string]::IsNullOrWhiteSpace($EdgeExtensionId)) {
         $edgeManifest = [ordered]@{
             name = 'com.petaldesk.capture'
-            description = '飞花 - PetalDesk browser capture native messaging host'
+            description = $hostDescription
             path = $hostPath
             type = 'stdio'
             allowed_origins = @("chrome-extension://$EdgeExtensionId/")

@@ -131,6 +131,15 @@ describe("screenshot desktop API", () => {
     expect(backend.invoke).toHaveBeenNthCalledWith(2, "undo_long_capture_segment", { jobId: "long-1" });
   });
 
+  it("cancels a pending long capture by screenshot session", async () => {
+    backend.invoke.mockResolvedValueOnce(null);
+
+    await expect(screenshotApi.cancelLongCaptureSession("session-1")).resolves.toBeNull();
+    expect(backend.invoke).toHaveBeenCalledWith("cancel_long_capture_session", {
+      sessionId: "session-1",
+    });
+  });
+
   it("reads long-capture tiles as raw PNG data and delegates export", async () => {
     backend.invoke
       .mockResolvedValueOnce([137, 80, 78, 71])

@@ -80,6 +80,7 @@ type ScreenshotApiMock = ScreenshotApi & Record<
   | "undoLongCapture"
   | "finishLongCapture"
   | "cancelLongCapture"
+  | "cancelLongCaptureSession"
   | "getLongCaptureStatus"
   | "getLongCaptureTile"
   | "exportLongCapture"
@@ -134,6 +135,7 @@ function mockApi(): ScreenshotApiMock {
     undoLongCapture: vi.fn().mockResolvedValue(longStatus("paused", { frameCount: 1 })),
     finishLongCapture: vi.fn().mockResolvedValue(longStatus("ready", { frameCount: 5, height: 4000 })),
     cancelLongCapture: vi.fn().mockResolvedValue(longStatus("canceled")),
+    cancelLongCaptureSession: vi.fn().mockResolvedValue(longStatus("canceled")),
     getLongCaptureStatus: vi.fn().mockResolvedValue(longStatus("capturing")),
     getLongCaptureTile: vi.fn().mockResolvedValue(Uint8Array.from([137, 80, 78, 71])),
     exportLongCapture: vi.fn().mockResolvedValue({ action: "copy" }),
@@ -345,6 +347,129 @@ describe("ScreenshotTool", () => {
     expect(api.cancel).not.toHaveBeenCalled();
   });
 
+  it("does not duplicate an embedded long-capture control action from the window shortcut", async () => {
+    const api = mockApi();
+    let resolvePause: ((status: LongCaptureStatus) => void) | undefined;
+    let resolveResume: ((status: LongCaptureStatus) => void) | undefined;
+    api.pauseLongCapture.mockImplementation(() => new Promise<LongCaptureStatus>((resolve) => {
+      resolvePause = resolve;
+    }));
+    api.resumeLongCapture.mockImplementation(() => new Promise<LongCaptureStatus>((resolve) => {
+      resolveResume = resolve;
+    }));
+    const rendered = render(ScreenshotTool, { api });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
+    await waitFor(() => expect(rendered.getByRole("button", { name: "暂停长截图" })).toBeInTheDocument());
+
+    await fireEvent.click(rendered.getByRole("button", { name: "暂停长截图" }));
+    await waitFor(() => expect(api.pauseLongCapture).toHaveBeenCalledOnce());
+    await fireEvent.keyDown(window, { key: " ", code: "Space" });
+    expect(api.pauseLongCapture).toHaveBeenCalledOnce();
+
+    resolvePause?.(longStatus("paused"));
+    const resumeButton = await waitFor(() => rendered.getByRole("button", { name: "继续长截图" }));
+    await fireEvent.keyDown(window, { key: " ", code: "Space" });
+    await waitFor(() => expect(api.resumeLongCapture).toHaveBeenCalledOnce());
+    expect(resumeButton).toBeDisabled();
+    await fireEvent.click(resumeButton);
+    expect(api.resumeLongCapture).toHaveBeenCalledOnce();
+    resolveResume?.(longStatus("capturing"));
+  });
+
+  it("lets embedded Escape cancel while another long-capture action is pending", async () => {
+    const api = mockApi();
+    let resolvePause: ((status: LongCaptureStatus) => void) | undefined;
+    let resolveCancel: ((status: LongCaptureStatus) => void) | undefined;
+    api.pauseLongCapture.mockImplementation(() => new Promise<LongCaptureStatus>((resolve) => {
+      resolvePause = resolve;
+    }));
+    api.cancelLongCapture.mockImplementation(() => new Promise<LongCaptureStatus>((resolve) => {
+      resolveCancel = resolve;
+    }));
+    const rendered = render(ScreenshotTool, { api });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
+    await waitFor(() => expect(rendered.getByRole("button", { name: "暂停长截图" })).toBeInTheDocument());
+
+    await fireEvent.click(rendered.getByRole("button", { name: "暂停长截图" }));
+    await waitFor(() => expect(api.pauseLongCapture).toHaveBeenCalledOnce());
+    await fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(api.cancelLongCapture).toHaveBeenCalledOnce());
+
+    resolvePause?.(longStatus("paused"));
+    await Promise.resolve();
+    await fireEvent.keyDown(window, { key: " ", code: "Space" });
+    expect(api.resumeLongCapture).not.toHaveBeenCalled();
+
+    resolveCancel?.(longStatus("canceled"));
+    await waitFor(() => expect(rendered.getByRole("button", { name: "长截图" })).toBeEnabled());
+    expect(rendered.queryByRole("button", { name: "继续长截图" })).not.toBeInTheDocument();
+  });
+
+  it("invalidates a pending control action before context-menu cancellation", async () => {
+    const api = mockApi();
+    let resolvePause: ((status: LongCaptureStatus) => void) | undefined;
+    let resolveCancel: ((status: LongCaptureStatus) => void) | undefined;
+    api.pauseLongCapture.mockImplementation(() => new Promise<LongCaptureStatus>((resolve) => {
+      resolvePause = resolve;
+    }));
+    api.cancelLongCapture.mockImplementation(() => new Promise<LongCaptureStatus>((resolve) => {
+      resolveCancel = resolve;
+    }));
+    const rendered = render(ScreenshotTool, { api });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
+    await waitFor(() => expect(rendered.getByRole("button", { name: "暂停长截图" })).toBeInTheDocument());
+    await fireEvent.click(rendered.getByRole("button", { name: "暂停长截图" }));
+    await waitFor(() => expect(api.pauseLongCapture).toHaveBeenCalledOnce());
+
+    const firstContextMenu = new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: 300,
+      clientY: 250,
+    });
+    stage.dispatchEvent(firstContextMenu);
+    expect(firstContextMenu.defaultPrevented).toBe(true);
+    await waitFor(() => expect(api.cancelLongCapture).toHaveBeenCalledOnce());
+    expect(rendered.getByRole("button", { name: "长截图" })).toBeEnabled();
+
+    const secondContextMenu = new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: 300,
+      clientY: 250,
+    });
+    stage.dispatchEvent(secondContextMenu);
+    expect(secondContextMenu.defaultPrevented).toBe(false);
+    expect(api.cancelLongCapture).toHaveBeenCalledOnce();
+
+    resolvePause?.(longStatus("paused"));
+    await Promise.resolve();
+    await fireEvent.keyDown(window, { key: " ", code: "Space" });
+    expect(api.resumeLongCapture).not.toHaveBeenCalled();
+    resolveCancel?.(longStatus("canceled"));
+  });
+
   it("returns to the normal screenshot editor when long capture fails", async () => {
     const api = mockApi();
     api.startLongCapture.mockResolvedValue(longStatus("failed", {
@@ -375,6 +500,60 @@ describe("ScreenshotTool", () => {
     await waitFor(() => expect(rendered.getByRole("button", { name: "长截图" })).toBeEnabled());
     expect(api.retryLongCapture).not.toHaveBeenCalled();
     expect(api.undoLongCapture).not.toHaveBeenCalled();
+  });
+
+  it("recovers the normal editor when starting a long capture times out", async () => {
+    const api = mockApi();
+    let resolveStart: ((status: LongCaptureStatus) => void) | undefined;
+    api.startLongCapture.mockImplementation(() => new Promise<LongCaptureStatus>((resolve) => {
+      resolveStart = resolve;
+    }));
+    const rendered = render(ScreenshotTool, { api, longStartTimeoutMs: 30 });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
+
+    await waitFor(() => expect(api.cancelLongCaptureSession).toHaveBeenCalledWith("session-1"));
+    await waitFor(() => expect(rendered.getByText("长截图启动超时，已恢复普通截图。")).toBeInTheDocument());
+    expect(rendered.getByRole("button", { name: "长截图" })).toBeEnabled();
+    expect(api.cancelLongCapture).not.toHaveBeenCalled();
+
+    resolveStart?.(longStatus("capturing"));
+    await waitFor(() => expect(api.cancelLongCapture).toHaveBeenCalledWith("long-1"));
+    expect(api.cancelLongCapture).toHaveBeenCalledOnce();
+    expect(rendered.queryByRole("button", { name: "暂停长截图" })).not.toBeInTheDocument();
+  });
+
+  it("cancels a pending start and ignores its late response", async () => {
+    const api = mockApi();
+    let resolveStart: ((status: LongCaptureStatus) => void) | undefined;
+    api.startLongCapture.mockImplementation(() => new Promise<LongCaptureStatus>((resolve) => {
+      resolveStart = resolve;
+    }));
+    const rendered = render(ScreenshotTool, { api, longStartTimeoutMs: 1_000 });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
+    await waitFor(() => expect(api.startLongCapture).toHaveBeenCalledOnce());
+
+    await fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(api.cancelLongCaptureSession).toHaveBeenCalledWith("session-1"));
+    await waitFor(() => expect(rendered.getByRole("button", { name: "长截图" })).toBeEnabled());
+
+    resolveStart?.(longStatus("capturing"));
+    await waitFor(() => expect(api.cancelLongCapture).toHaveBeenCalledWith("long-1"));
+    expect(api.cancelLongCapture).toHaveBeenCalledOnce();
+    expect(rendered.queryByRole("button", { name: "暂停长截图" })).not.toBeInTheDocument();
   });
 
   it("handles embedded Escape once and ignores late events and poll results after cancel", async () => {
@@ -453,6 +632,10 @@ describe("ScreenshotTool", () => {
     expect(rendered.getByRole("toolbar", { name: "长截图范围" })).toBeInTheDocument();
     await fireEvent.pointerDown(stage, { button: 0, pointerId: 3, clientX: 300, clientY: 250 });
     await waitFor(() => expect(api.startLongCapture).toHaveBeenCalledOnce());
+    expect(api.startLongCapture).toHaveBeenCalledWith(expect.objectContaining({
+      scrollAnchor: { x: 300, y: 250 },
+      mode: "manual",
+    }));
   });
 
   it("accepts long-capture progress events from the desktop backend", async () => {
@@ -477,6 +660,40 @@ describe("ScreenshotTool", () => {
     await fireEvent.click(rendered.getByRole("button", { name: "复制长截图" }));
     await waitFor(() => expect(api.exportLongCapture).toHaveBeenCalledWith("long-1", "copy"));
     expect(api.prepareLongCaptureAnnotationExport).not.toHaveBeenCalled();
+  });
+
+  it("keeps a terminal ready event when an older finish response arrives late", async () => {
+    vi.stubGlobal("__TAURI_INTERNALS__", {});
+    const api = mockApi();
+    let resolveFinish: ((status: LongCaptureStatus) => void) | undefined;
+    api.finishLongCapture.mockImplementation(() => new Promise<LongCaptureStatus>((resolve) => {
+      resolveFinish = resolve;
+    }));
+    const rendered = render(ScreenshotTool, { api });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(tauri.listeners.has("long_capture_ready")).toBe(true));
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 2, clientX: 300, clientY: 250 });
+    await waitFor(() => expect(rendered.getByRole("button", { name: "完成长截图" })).toBeEnabled());
+
+    await fireEvent.keyDown(window, { key: "Enter" });
+    await waitFor(() => expect(api.finishLongCapture).toHaveBeenCalledOnce());
+    tauri.listeners.get("long_capture_ready")?.({
+      payload: longStatus("ready", { frameCount: 8, height: 6400 }),
+    });
+    await waitFor(() => expect(rendered.getByRole("region", { name: "长截图预览" })).toBeInTheDocument());
+    expect(rendered.getByRole("button", { name: "复制长截图" })).toBeEnabled();
+
+    resolveFinish?.(longStatus("paused", { frameCount: 2 }));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(rendered.getByRole("region", { name: "长截图预览" })).toBeInTheDocument();
+    expect(rendered.queryByRole("button", { name: "继续长截图" })).not.toBeInTheDocument();
   });
 
   it("copies on a real double-click without changing the selection or annotations", async () => {
