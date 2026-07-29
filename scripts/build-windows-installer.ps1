@@ -87,13 +87,18 @@ function Test-LegacyWorkspaceResolver {
     $probeResult = Join-Path $probeRoot "resolved-path.txt"
     $newStorageResult = Join-Path $probeRoot "new-storage-path.txt"
     $extendedStorageResult = Join-Path $probeRoot "extended-storage-path.txt"
+    $namespaceStorageResult = Join-Path $probeRoot "namespace-storage-paths.txt"
     $invalidStorageResult = Join-Path $probeRoot "invalid-storage-paths.txt"
     $settingsPath = Join-Path $legacySettingsDir "settings.json"
     $pointerPath = Join-Path $legacySettingsDir "storage-path.txt"
+    $currentSettingsDir = Join-Path $probeRoot "current-config"
+    $currentPointerPath = Join-Path $currentSettingsDir "storage-path.txt"
+    $currentResolvedResult = Join-Path $probeRoot "current-resolved-path.txt"
     $originalLocalAppData = [Environment]::GetEnvironmentVariable("LOCALAPPDATA", "Process")
 
     try {
         [System.IO.Directory]::CreateDirectory($legacySettingsDir) | Out-Null
+        [System.IO.Directory]::CreateDirectory($currentSettingsDir) | Out-Null
         [System.IO.Directory]::CreateDirectory($legacyWorkspace) | Out-Null
         [System.IO.Directory]::CreateDirectory($newStorageParent) | Out-Null
 
@@ -112,6 +117,11 @@ function Test-LegacyWorkspaceResolver {
             $legacyExtendedWorkspace,
             [System.Text.Encoding]::Unicode
         )
+        [System.IO.File]::WriteAllText(
+            $currentPointerPath,
+            $legacyExtendedWorkspace,
+            [System.Text.Encoding]::Unicode
+        )
 
         $escapedHooksPath = $HooksPath.Replace('$', '$$').Replace('"', '$\"')
         $probeText = @'
@@ -124,6 +134,7 @@ OutFile "probe.exe"
 !include MUI2.nsh
 !include FileFunc.nsh
 !include LogicLib.nsh
+!define PETALDESK_STORAGE_POINTER_DIR "$EXEDIR\current-config"
 !include "__PETALDESK_STORAGE_HOOKS__"
 
 Section
@@ -138,6 +149,15 @@ Section
   FileOpen $0 "$EXEDIR\new-storage-path.txt" w
   FileWriteUTF16LE /BOM $0 "$PetalDeskStoragePathError|$PetalDeskStoragePath"
   FileClose $0
+
+  FileOpen $8 "$EXEDIR\namespace-storage-paths.txt" w
+  StrCpy $PetalDeskStoragePath "\\?\UNC\server\share\PetalDesk"
+  Call PetalDeskNormalizeStoragePath
+  FileWriteUTF16LE /BOM $8 "$PetalDeskStoragePathError|$PetalDeskStoragePath|"
+  StrCpy $PetalDeskStoragePath "\\?\unc\server\share\PetalDesk"
+  Call PetalDeskNormalizeStoragePath
+  FileWriteUTF16LE $8 "$PetalDeskStoragePathError|$PetalDeskStoragePath"
+  FileClose $8
 
   StrCpy $PetalDeskStoragePath "\\?\$EXEDIR\扩展路径 数据\PetalDesk"
   Call PetalDeskPrepareStoragePath
@@ -154,8 +174,19 @@ Section
   FileWriteUTF16LE $9 "$PetalDeskStoragePathError|"
   StrCpy $PetalDeskStoragePath "\\.\C:\PetalDesk"
   Call PetalDeskPrepareStoragePath
+  FileWriteUTF16LE $9 "$PetalDeskStoragePathError|"
+  StrCpy $PetalDeskStoragePath "\\?\Volume{00000000-0000-0000-0000-000000000000}\PetalDesk"
+  Call PetalDeskPrepareStoragePath
   FileWriteUTF16LE $9 "$PetalDeskStoragePathError"
   FileClose $9
+
+
+  StrCpy $PetalDeskStoragePath ""
+  Call PetalDeskResolveStoragePath
+  FileOpen $7 "$EXEDIR\current-resolved-path.txt" w
+  FileWriteUTF16LE /BOM $7 "$PetalDeskStoragePath"
+  FileClose $7
+  Call PetalDeskPersistStoragePath
 SectionEnd
 '@.Replace('__PETALDESK_STORAGE_HOOKS__', $escapedHooksPath)
         [System.IO.File]::WriteAllText(
@@ -186,6 +217,34 @@ SectionEnd
         $expected = [System.IO.Path]::GetFullPath($legacyWorkspace)
         if (-not $resolved.Equals($expected, [System.StringComparison]::OrdinalIgnoreCase)) {
             throw "NSIS 旧数据存储指针解析校验失败：期望 '$expected'，实际 '$resolved'"
+        }
+
+        $currentResolved = [System.IO.File]::ReadAllText(
+            $currentResolvedResult,
+            [System.Text.Encoding]::Unicode
+        )
+        if (-not $currentResolved.Equals(
+                $expected,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "NSIS 当前数据存储指针显示规范化失败：期望 '$expected'，实际 '$currentResolved'"
+        }
+        $persistedPointerBytes = [System.IO.File]::ReadAllBytes($currentPointerPath)
+        if ($persistedPointerBytes.Length -lt 2 -or
+            $persistedPointerBytes[0] -ne 0xFF -or
+            $persistedPointerBytes[1] -ne 0xFE) {
+            throw "NSIS 当前数据存储指针持久化后缺少 UTF-16LE BOM。"
+        }
+        $persistedPointer = [System.Text.Encoding]::Unicode.GetString(
+            $persistedPointerBytes,
+            2,
+            $persistedPointerBytes.Length - 2
+        )
+        if (-not $persistedPointer.Equals(
+                $expected,
+                [System.StringComparison]::OrdinalIgnoreCase
+            ) -or $persistedPointer.StartsWith("\\?\")) {
+            throw "NSIS 当前数据存储指针未写回普通路径：'$persistedPointer'"
         }
 
         # The pre-unified settings.json remains the final compatibility fallback.
@@ -268,11 +327,23 @@ SectionEnd
             throw "NSIS 扩展长度数据路径规范化失败：期望 '$expectedExtendedStorage'，实际 '$preparedExtendedStorage'"
         }
 
+        $namespaceStorage = [System.IO.File]::ReadAllText(
+            $namespaceStorageResult,
+            [System.Text.Encoding]::Unicode
+        )
+        $expectedNamespaceStorage = "|\\server\share\PetalDesk||\\server\share\PetalDesk"
+        if (-not $namespaceStorage.Equals(
+                $expectedNamespaceStorage,
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+            throw "NSIS UNC 扩展路径规范化失败：期望 '$expectedNamespaceStorage'，实际 '$namespaceStorage'"
+        }
+
         $invalidStorage = [System.IO.File]::ReadAllText(
             $invalidStorageResult,
             [System.Text.Encoding]::Unicode
         )
-        if ($invalidStorage -ne "invalid|invalid|invalid") {
+        if ($invalidStorage -ne "invalid|invalid|invalid|invalid") {
             throw "NSIS 未拒绝非完整或设备命名空间路径：$invalidStorage"
         }
 
@@ -299,7 +370,7 @@ SectionEnd
             throw "NSIS 旧数据存储无效 JSON 未安全回退。"
         }
 
-        Write-Host "NSIS 数据存储检查通过（自定义路径保留、旧默认目录映射、新目录创建、\\?\ 前缀、中文、空格、JSON 转义、失败回退）。"
+        Write-Host "NSIS 数据存储检查通过（当前指针解析/写回、自定义路径、UNC、旧默认目录映射、新目录创建、\\?\ 前缀、中文、空格、JSON 转义、失败回退）。"
     }
     finally {
         [Environment]::SetEnvironmentVariable(
@@ -332,6 +403,25 @@ if (-not (Test-Path -LiteralPath $storagePathHooks)) {
 }
 if (-not (Test-Path -LiteralPath $nativeHostRegistrationScript)) {
     throw "没有找到 Native Messaging 注册脚本：$nativeHostRegistrationScript"
+}
+
+$storageHooksText = [System.IO.File]::ReadAllText(
+    $storagePathHooks,
+    [System.Text.Encoding]::UTF8
+)
+$postInstallHooks = [regex]::Matches(
+    $storageHooksText,
+    '(?s)!macro\s+NSIS_HOOK_POSTINSTALL\b(?<body>.*?)!macroend'
+)
+if ($postInstallHooks.Count -ne 1) {
+    throw "数据存储安装器脚本必须且只能声明一个 NSIS_HOOK_POSTINSTALL。"
+}
+$persistCallCount = ([regex]::Matches(
+    $postInstallHooks[0].Groups['body'].Value,
+    '(?m)^\s*Call\s+PetalDeskPersistStoragePath\s*$'
+)).Count
+if ($persistCallCount -ne 1) {
+    throw "NSIS_HOOK_POSTINSTALL 必须且只能调用一次 PetalDeskPersistStoragePath。"
 }
 
 $chromeExtensionId = Get-OptionalChromiumExtensionId -EnvironmentVariable "PETALDESK_CHROME_EXTENSION_ID"

@@ -33,7 +33,7 @@ async function renderNotesList() {
   };
   vi.spyOn(notesApi, "appInfo").mockResolvedValue({
     workspacePath: "E:/notes",
-    version: "0.3.3",
+    version: "0.3.4",
     defaultEditorMode: "typora",
   });
   vi.spyOn(notesApi, "listNotes").mockResolvedValue([note]);
@@ -55,7 +55,7 @@ async function renderActiveNote() {
   ]);
   vi.spyOn(notesApi, "appInfo").mockResolvedValue({
     workspacePath: "E:/notes",
-    version: "0.3.3",
+    version: "0.3.4",
     defaultEditorMode: "typora",
   });
   vi.spyOn(notesApi, "getNote").mockResolvedValue({

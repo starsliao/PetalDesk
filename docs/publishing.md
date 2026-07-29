@@ -14,7 +14,7 @@
 pnpm package:windows
 ```
 
-Version `0.3.3` keeps the selected region visible during long capture and makes
+Version `0.3.4` keeps the selected region visible during long capture and makes
 manual scrolling reliable across Explorer, Settings, desktop lists, document
 windows, and browsers. It observes real wheel input, captures at most every
 150 ms while scrolling, adds a settled frame after 250 ms, and keeps a low-rate
@@ -50,4 +50,4 @@ XPI. The unsigned ZIP must not be presented as an installable Firefox package.
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.3.3>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.3.4>

@@ -8,6 +8,12 @@
 ; Tauri includes installer hooks near the top of installer.nsi.
 !define PETALDESK_LANG_SIMPCHINESE 2052
 
+; Build probes override this directory so they exercise the same resolver and
+; persistence functions without reading or modifying the user's real pointer.
+!ifndef PETALDESK_STORAGE_POINTER_DIR
+!define PETALDESK_STORAGE_POINTER_DIR "$LOCALAPPDATA\PetalDesk"
+!endif
+
 Var PetalDeskStoragePath
 Var PetalDeskStoragePathInput
 Var PetalDeskStorageBrowseButton
@@ -122,8 +128,41 @@ Function PetalDeskResolveLegacyWorkspacePath
   Delete "$1"
 FunctionEnd
 
+; Strip Windows' internal extended-length namespace before a path reaches an
+; installer control, log line, or persisted pointer. Device namespace paths
+; are not valid PetalDesk data roots and remain rejected by the caller.
+Function PetalDeskNormalizeStoragePath
+  StrCpy $PetalDeskStoragePathError ""
+  StrCpy $0 "$PetalDeskStoragePath" 8
+  ${If} $0 == "\\?\UNC\"
+    StrCpy $0 "$PetalDeskStoragePath" "" 8
+    StrCpy $PetalDeskStoragePath "\\$0"
+    Return
+  ${EndIf}
+
+  StrCpy $0 "$PetalDeskStoragePath" 4
+  ${If} $0 == "\\?\"
+    StrCpy $1 "$PetalDeskStoragePath" "" 4
+    StrCpy $0 "$1" 1 1
+    StrCpy $2 "$1" 1 2
+    ${If} $0 != ":"
+      StrCpy $PetalDeskStoragePathError "invalid"
+      Return
+    ${EndIf}
+    ${If} $2 != "\"
+    ${AndIf} $2 != "/"
+      StrCpy $PetalDeskStoragePathError "invalid"
+      Return
+    ${EndIf}
+    StrCpy $PetalDeskStoragePath "$1"
+  ${ElseIf} $0 == "\\.\"
+    StrCpy $PetalDeskStoragePathError "invalid"
+  ${EndIf}
+FunctionEnd
+
 Function PetalDeskResolveStoragePath
   ${If} $PetalDeskStoragePath != ""
+    Call PetalDeskNormalizeStoragePath
     Return
   ${EndIf}
 
@@ -131,10 +170,10 @@ Function PetalDeskResolveStoragePath
 
   ; A new unified-storage pointer always wins. Only installations that do not
   ; have one may inherit the workspacePath from the legacy settings file.
-  IfFileExists "$LOCALAPPDATA\PetalDesk\storage-path.txt" 0 petaldesk_try_legacy_workspace
+  IfFileExists "${PETALDESK_STORAGE_POINTER_DIR}\storage-path.txt" 0 petaldesk_try_legacy_workspace
 
   ClearErrors
-  FileOpen $0 "$LOCALAPPDATA\PetalDesk\storage-path.txt" r
+  FileOpen $0 "${PETALDESK_STORAGE_POINTER_DIR}\storage-path.txt" r
   ${If} ${Errors}
     Goto petaldesk_storage_path_resolved
   ${EndIf}
@@ -152,6 +191,7 @@ Function PetalDeskResolveStoragePath
   Call PetalDeskResolveLegacyWorkspacePath
 
   petaldesk_storage_path_resolved:
+  Call PetalDeskNormalizeStoragePath
 FunctionEnd
 
 Function PetalDeskStoragePageCreate
@@ -228,24 +268,13 @@ FunctionEnd
 ; verifies that the installer can actually create the directory before the
 ; user proceeds.
 Function PetalDeskPrepareStoragePath
-  StrCpy $PetalDeskStoragePathError ""
-
   ; Normalize supported extended-length paths, then accept only a drive-rooted
   ; path (C:\...) or a normal UNC share (\\server\share\...). Root-relative,
   ; drive-relative, and device namespace paths are unsafe for a portable data
   ; root and must not be resolved against the installer's current directory.
-  StrCpy $0 "$PetalDeskStoragePath" 8
-  ${If} $0 == "\\?\UNC\"
-    StrCpy $0 "$PetalDeskStoragePath" "" 8
-    StrCpy $PetalDeskStoragePath "\\$0"
-  ${Else}
-    StrCpy $0 "$PetalDeskStoragePath" 4
-    ${If} $0 == "\\?\"
-      StrCpy $PetalDeskStoragePath "$PetalDeskStoragePath" "" 4
-    ${ElseIf} $0 == "\\.\"
-      StrCpy $PetalDeskStoragePathError "invalid"
-      Return
-    ${EndIf}
+  Call PetalDeskNormalizeStoragePath
+  ${If} $PetalDeskStoragePathError != ""
+    Return
   ${EndIf}
 
   StrCpy $0 "$PetalDeskStoragePath" 2
@@ -375,6 +404,14 @@ FunctionEnd
 
 Function PetalDeskPersistStoragePath
   Call PetalDeskResolveStoragePath
+  Call PetalDeskNormalizeStoragePath
+  ${If} $PetalDeskStoragePathError != ""
+    ${If} $LANGUAGE == ${PETALDESK_LANG_SIMPCHINESE}
+      Abort "飞花 - PetalDesk 数据存储路径无效。"
+    ${Else}
+      Abort "The data storage path for 飞花 - PetalDesk is invalid."
+    ${EndIf}
+  ${EndIf}
 
   ClearErrors
   CreateDirectory "$PetalDeskStoragePath"
@@ -387,7 +424,7 @@ Function PetalDeskPersistStoragePath
   ${EndIf}
 
   ClearErrors
-  CreateDirectory "$LOCALAPPDATA\PetalDesk"
+  CreateDirectory "${PETALDESK_STORAGE_POINTER_DIR}"
   ${If} ${Errors}
     ${If} $LANGUAGE == ${PETALDESK_LANG_SIMPCHINESE}
       Abort "无法创建飞花 - PetalDesk 本地配置目录。"
@@ -397,7 +434,7 @@ Function PetalDeskPersistStoragePath
   ${EndIf}
 
   ClearErrors
-  FileOpen $0 "$LOCALAPPDATA\PetalDesk\storage-path.txt" w
+  FileOpen $0 "${PETALDESK_STORAGE_POINTER_DIR}\storage-path.txt" w
   ${If} ${Errors}
     ${If} $LANGUAGE == ${PETALDESK_LANG_SIMPCHINESE}
       Abort "无法写入飞花 - PetalDesk 数据存储路径。"

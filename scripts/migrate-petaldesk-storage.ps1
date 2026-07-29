@@ -68,9 +68,21 @@ function Get-NormalizedPath {
         throw "路径不能为空。"
     }
 
-    $fullPath = [System.IO.Path]::GetFullPath(
-        [Environment]::ExpandEnvironmentVariables($Path.Trim())
-    )
+    $value = [Environment]::ExpandEnvironmentVariables($Path.Trim())
+    if ($value.StartsWith("\\?\UNC\", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $value = "\\" + $value.Substring(8)
+    }
+    elseif ($value.StartsWith("\\?\", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $value = $value.Substring(4)
+        if ($value -notmatch '^[A-Za-z]:[\\/]') {
+            throw "不支持的 Windows 扩展路径：$Path"
+        }
+    }
+    elseif ($value.StartsWith("\\.\", [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "设备命名空间路径不能作为飞花 - PetalDesk 数据存储：$Path"
+    }
+
+    $fullPath = [System.IO.Path]::GetFullPath($value)
     $root = [System.IO.Path]::GetPathRoot($fullPath)
     if (-not $fullPath.Equals($root, $pathComparison)) {
         $fullPath = $fullPath.TrimEnd(
@@ -621,6 +633,35 @@ function Test-StoragePointerMatches {
     }
 }
 
+function Test-StoragePointerIsCanonical {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$StorageRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $item = Get-Item -LiteralPath $Path -Force
+        if ($item.PSIsContainer -or
+            ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $false
+        }
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        if ($bytes.Length -lt 2 -or $bytes[0] -ne 0xFF -or $bytes[1] -ne 0xFE) {
+            return $false
+        }
+        $value = $utf16LeBom.GetString($bytes, 2, $bytes.Length - 2)
+        $expected = Get-NormalizedPath -Path $StorageRoot
+        return $value.Equals($expected, $pathComparison) -and
+            -not $value.StartsWith("\\?\", [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    catch {
+        return $false
+    }
+}
+
 function Copy-FileToLegacyArchive {
     param(
         [Parameter(Mandatory = $true)][string]$Source,
@@ -783,12 +824,14 @@ function Write-StoragePointer {
     [System.IO.Directory]::CreateDirectory($LocalRoot) | Out-Null
     Assert-DirectoryIsSafe -Path $LocalRoot -Description "旧 LocalAppData 目录"
     $destination = Join-Path $LocalRoot "storage-path.txt"
-    if (Test-StoragePointerMatches -Path $destination -StorageRoot $StorageRoot) {
+    if (Test-StoragePointerIsCanonical -Path $destination -StorageRoot $StorageRoot) {
         return $destination
     }
 
     $originallyExisted = Test-Path -LiteralPath $destination -PathType Leaf
-    if ($originallyExisted) {
+    $pointerMatches = Test-StoragePointerMatches -Path $destination -StorageRoot $StorageRoot
+    $requiresArchivedPointer = $originallyExisted -and -not $pointerMatches
+    if ($requiresArchivedPointer) {
         if ([string]::IsNullOrWhiteSpace($ArchivedPointer) -or
             -not (Test-Path -LiteralPath $ArchivedPointer -PathType Leaf)) {
             throw "替换旧路径指针前必须先将其归档到迁移备份目录。"
@@ -802,6 +845,7 @@ function Write-StoragePointer {
     $temporary = Join-Path $LocalRoot (".storage-path.{0}.tmp" -f [Guid]::NewGuid().ToString("N"))
     $displacedPointer = Join-Path $LocalRoot (".storage-path.displaced-{0}.tmp" -f `
             [Guid]::NewGuid().ToString("N"))
+    $keepDisplacedPointer = $false
     try {
         # 与安装器保持一致：UTF-16LE，并显式包含 FF FE BOM。
         [System.IO.File]::WriteAllText($temporary, $StorageRoot, $utf16LeBom)
@@ -816,16 +860,22 @@ function Write-StoragePointer {
 
         if ($originallyExisted) {
             [System.IO.File]::Replace($temporary, $destination, $displacedPointer, $true)
-            if ((Get-Sha256ForFile -Path $displacedPointer) -ne
-                (Get-Sha256ForFile -Path $ArchivedPointer)) {
-                throw "被替换的旧路径指针与迁移备份 SHA256 不一致。"
+            if ($requiresArchivedPointer) {
+                if ((Get-Sha256ForFile -Path $displacedPointer) -ne
+                    (Get-Sha256ForFile -Path $ArchivedPointer)) {
+                    throw "被替换的旧路径指针与迁移备份 SHA256 不一致。"
+                }
+            }
+            elseif (-not (Test-StoragePointerMatches -Path $displacedPointer `
+                        -StorageRoot $StorageRoot)) {
+                throw "等价路径指针格式修复前的安全副本校验失败。"
             }
         }
         else {
             [System.IO.File]::Move($temporary, $destination)
         }
 
-        if (-not (Test-StoragePointerMatches -Path $destination -StorageRoot $StorageRoot)) {
+        if (-not (Test-StoragePointerIsCanonical -Path $destination -StorageRoot $StorageRoot)) {
             throw "飞花 - PetalDesk 数据存储路径指针落盘后校验失败。"
         }
         if (Test-Path -LiteralPath $displacedPointer -PathType Leaf) {
@@ -836,10 +886,18 @@ function Write-StoragePointer {
     catch {
         $writeError = $_
         try {
-            Restore-StoragePointerFromArchive -Destination $destination `
-                -ArchivedPointer $ArchivedPointer -OriginallyExisted $originallyExisted
+            if ($requiresArchivedPointer -or -not $originallyExisted) {
+                Restore-StoragePointerFromArchive -Destination $destination `
+                    -ArchivedPointer $ArchivedPointer -OriginallyExisted $originallyExisted
+            }
+            elseif (Test-Path -LiteralPath $displacedPointer -PathType Leaf) {
+                Restore-StoragePointerFromArchive -Destination $destination `
+                    -ArchivedPointer $displacedPointer -OriginallyExisted $true
+                Remove-Item -LiteralPath $displacedPointer -Force
+            }
         }
         catch {
+            $keepDisplacedPointer = $true
             [void]$warnings.Add("路径指针回滚失败：$($_.Exception.Message)")
         }
         throw $writeError
@@ -849,7 +907,10 @@ function Write-StoragePointer {
             Remove-Item -LiteralPath $temporary -Force
         }
         if (Test-Path -LiteralPath $displacedPointer -PathType Leaf) {
-            if (-not [string]::IsNullOrWhiteSpace($ArchivedPointer) -and
+            if (-not $requiresArchivedPointer -and -not $keepDisplacedPointer) {
+                Remove-Item -LiteralPath $displacedPointer -Force
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace($ArchivedPointer) -and
                 (Test-Path -LiteralPath $ArchivedPointer -PathType Leaf) -and
                 (Get-Sha256ForFile -Path $displacedPointer) -eq
                 (Get-Sha256ForFile -Path $ArchivedPointer)) {

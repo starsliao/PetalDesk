@@ -1412,6 +1412,8 @@ fn preserve_corrupt_note_order(path: &Path) {
 }
 
 fn prepare_workspace(path: &Path) -> AppResult<PathBuf> {
+    let path = normalize_storage_path(path)?;
+    let path = path.as_path();
     if path.as_os_str().is_empty() {
         return Err(AppError::invalid("飞花 - PetalDesk 数据存储路径不能为空"));
     }
@@ -1433,7 +1435,94 @@ fn prepare_workspace(path: &Path) -> AppResult<PathBuf> {
         fs::create_dir_all(internal.join(directory))
             .map_err(|error| AppError::io("创建飞花 - PetalDesk 数据存储目录", error))?;
     }
-    fs::canonicalize(path).map_err(|error| AppError::io("解析飞花 - PetalDesk 数据存储路径", error))
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| AppError::io("解析飞花 - PetalDesk 数据存储路径", error))?;
+    normalize_storage_path(&canonical)
+}
+
+fn normalize_storage_path(path: &Path) -> AppResult<PathBuf> {
+    let normalized = normalize_windows_display_path(path);
+    #[cfg(windows)]
+    if uses_unsupported_windows_namespace(&normalized) {
+        return Err(AppError::invalid(
+            "飞花 - PetalDesk 数据存储不支持 Windows 设备命名空间路径",
+        ));
+    }
+    Ok(normalized)
+}
+
+/// Windows returns extended-length paths (for example `\\?\C:\notes`) from
+/// `canonicalize`. They are useful for Win32 I/O, but are implementation
+/// details and should never be persisted or shown in the UI.
+#[cfg(windows)]
+fn normalize_windows_display_path(path: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    const SEPARATOR: u16 = b'\\' as u16;
+    const EXTENDED_PREFIX: &[u16] = &[SEPARATOR, SEPARATOR, b'?' as u16, SEPARATOR];
+    const UNC_PREFIX: &[u16] = &[
+        SEPARATOR,
+        SEPARATOR,
+        b'?' as u16,
+        SEPARATOR,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        SEPARATOR,
+    ];
+
+    fn starts_with_ascii_case_insensitive(value: &[u16], prefix: &[u16]) -> bool {
+        fn ascii_lowercase(unit: u16) -> u16 {
+            if (b'A' as u16..=b'Z' as u16).contains(&unit) {
+                unit + (b'a' - b'A') as u16
+            } else {
+                unit
+            }
+        }
+
+        value.len() >= prefix.len()
+            && value
+                .iter()
+                .zip(prefix)
+                .all(|(left, right)| ascii_lowercase(*left) == ascii_lowercase(*right))
+    }
+
+    let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if starts_with_ascii_case_insensitive(&encoded, UNC_PREFIX) {
+        let mut normalized = vec![SEPARATOR, SEPARATOR];
+        normalized.extend_from_slice(&encoded[UNC_PREFIX.len()..]);
+        return PathBuf::from(OsString::from_wide(&normalized));
+    }
+
+    if encoded.starts_with(EXTENDED_PREFIX) {
+        let local = &encoded[EXTENDED_PREFIX.len()..];
+        let is_drive_path = local.len() >= 3
+            && ((b'A' as u16..=b'Z' as u16).contains(&local[0])
+                || (b'a' as u16..=b'z' as u16).contains(&local[0]))
+            && local[1] == b':' as u16
+            && matches!(local[2], value if value == b'\\' as u16 || value == b'/' as u16);
+        if is_drive_path {
+            return PathBuf::from(OsString::from_wide(local));
+        }
+    }
+
+    path.to_path_buf()
+}
+
+#[cfg(windows)]
+fn uses_unsupported_windows_namespace(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let extended = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    let device = [b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16];
+    encoded.starts_with(&extended) || encoded.starts_with(&device)
+}
+
+#[cfg(not(windows))]
+fn normalize_windows_display_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 fn data_storage_config_path(root: &Path) -> PathBuf {
@@ -1578,7 +1667,7 @@ fn read_storage_pointer(path: &Path) -> AppResult<Option<PathBuf>> {
     if decoded.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(PathBuf::from(decoded)))
+        Ok(Some(normalize_storage_path(Path::new(decoded))?))
     }
 }
 
@@ -1603,7 +1692,8 @@ fn decode_utf16_pointer(bytes: &[u8], little_endian: bool) -> AppResult<String> 
 }
 
 fn write_storage_pointer(path: &Path, root: &Path) -> AppResult<()> {
-    let value = root.to_string_lossy();
+    let normalized = normalize_storage_path(root)?;
+    let value = normalized.to_string_lossy();
     if value.trim().is_empty() {
         return Err(AppError::invalid("飞花 - PetalDesk 数据存储路径不能为空"));
     }
@@ -2176,6 +2266,57 @@ mod tests {
         assert_eq!(read_storage_pointer(&pointer).unwrap(), Some(expected));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn normalizes_extended_windows_paths_for_display_and_storage() {
+        let root = TempDir::new().unwrap();
+        let pointer = root.path().join(STORAGE_POINTER_FILE);
+        let extended_drive = PathBuf::from(r"\\?\D:\StarsLiao\I_am\PetalDesk");
+        let display_drive = PathBuf::from(r"D:\StarsLiao\I_am\PetalDesk");
+
+        fs::write(&pointer, extended_drive.to_string_lossy().as_bytes()).unwrap();
+        assert_eq!(
+            read_storage_pointer(&pointer).unwrap(),
+            Some(display_drive.clone())
+        );
+
+        let mut utf16 = vec![0xff, 0xfe];
+        for unit in extended_drive.to_string_lossy().encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        fs::write(&pointer, utf16).unwrap();
+        assert_eq!(read_storage_pointer(&pointer).unwrap(), Some(display_drive));
+
+        assert_eq!(
+            normalize_windows_display_path(Path::new(r"\\?\UNC\server\share\PetalDesk")),
+            PathBuf::from(r"\\server\share\PetalDesk")
+        );
+        assert_eq!(
+            normalize_windows_display_path(Path::new(r"\\.\C:\PetalDesk")),
+            PathBuf::from(r"\\.\C:\PetalDesk")
+        );
+        assert!(normalize_storage_path(Path::new(r"\\.\C:\PetalDesk")).is_err());
+        assert!(normalize_storage_path(Path::new(
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\PetalDesk"
+        ))
+        .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn writing_storage_pointer_never_persists_extended_prefix() {
+        let root = TempDir::new().unwrap();
+        let pointer = root.path().join(STORAGE_POINTER_FILE);
+
+        write_storage_pointer(&pointer, Path::new(r"\\?\D:\StarsLiao\I_am\PetalDesk")).unwrap();
+
+        let bytes = fs::read(&pointer).unwrap();
+        assert!(bytes.starts_with(&[0xff, 0xfe]));
+        let decoded = decode_utf16_pointer(&bytes[2..], true).unwrap();
+        assert_eq!(decoded, r"D:\StarsLiao\I_am\PetalDesk");
+        assert!(!decoded.starts_with(r"\\?\"));
+    }
+
     #[test]
     fn workspace_resolution_prefers_current_configuration_and_reads_previous_locations() {
         let root = TempDir::new().unwrap();
@@ -2301,7 +2442,7 @@ mod tests {
 
         assert!(result.restart_required);
         assert_eq!(store.workspace_path(), original);
-        let prepared_target = fs::canonicalize(target).unwrap();
+        let prepared_target = normalize_windows_display_path(&fs::canonicalize(target).unwrap());
         assert_eq!(PathBuf::from(result.path), prepared_target);
         assert_eq!(
             read_storage_pointer(&root.path().join("app").join(STORAGE_POINTER_FILE)).unwrap(),

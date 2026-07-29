@@ -2,7 +2,7 @@
 
 > 把想法留在桌面，把文件留在自己手里。
 
-[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.3/PetalDesk_0.3.3_x64-setup.exe)
+[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.4/PetalDesk_0.3.4_x64-setup.exe)
 
 飞花 - PetalDesk 是一款 Windows 10/11 本地便签与效率工具。它启动快、界面安静，支持 Markdown 即时排版、纯文本、图片、搜索、回收站，以及几个随时可以唤起的小工具。没有账号、没有云端依赖，内容就是你目录里的 Markdown 文件。
 
@@ -60,7 +60,7 @@ PetalDesk/
 
 ## 安装与运行
 
-下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.3/PetalDesk_0.3.3_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。
+下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.4/PetalDesk_0.3.4_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。
 
 没有 WebView2 或下载权限时，安装器会明确提示失败原因，不会静默留下无法启动的程序。未签名构建可能显示“未知发布者”，这是 Windows 对代码签名的正常提示。
 

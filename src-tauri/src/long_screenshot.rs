@@ -359,6 +359,17 @@ fn wait_for_worker_done(job: &LongCaptureJob, timeout: Duration) -> bool {
     runtime.worker_done
 }
 
+fn complete_worker_after_cleanup(job: &LongCaptureJob, cleanup: impl FnOnce()) {
+    // `worker_done` means all cache/window cleanup is complete. Export waits
+    // without this lock, then reacquires it after the notification, so it can
+    // never race a canceled worker deleting the same files.
+    let _operation_guard = lock_unpoisoned(&job.operation_lock);
+    cleanup();
+    let mut runtime = lock_unpoisoned(&job.runtime);
+    runtime.worker_done = true;
+    job.wake.notify_all();
+}
+
 fn worker_shutdown_timeout_error() -> AppError {
     AppError::new(
         "long_capture_worker_shutdown_timeout",
@@ -1549,13 +1560,14 @@ fn cancel_long_capture_session_inner(
     app: &AppHandle,
     session_id: &str,
 ) -> AppResult<Option<LongCaptureStatus>> {
+    let screenshot_store = app.state::<ScreenshotStore>();
+    let _screenshot_start_guard = screenshot_store.lock_start();
     let store = app.state::<LongScreenshotStore>();
     store.request_pending_start_cancel(session_id);
     let Some(job) = store.job_for_session(session_id) else {
         // Idempotent owner recovery: status polling may discover that the job
         // has already been removed while the reusable screenshot WebView is
         // still hidden. Re-present the active owner even without a job.
-        let screenshot_store = app.state::<ScreenshotStore>();
         if let Some(session) = screenshot_store
             .active_session()
             .filter(|session| session.id == session_id)
@@ -3735,9 +3747,7 @@ fn capture_worker(app: AppHandle, job: Arc<LongCaptureJob>) {
     }
 
     match result {
-        Ok(WorkerStop::Cancel) => {
-            let _ = std::fs::remove_dir_all(&job.directory);
-        }
+        Ok(WorkerStop::Cancel) => {}
         Ok(WorkerStop::Finish) => {}
         Err(error) => {
             let (status, transitioned) = {
@@ -3779,18 +3789,22 @@ fn capture_worker(app: AppHandle, job: Arc<LongCaptureJob>) {
         }
     }
 
-    let (cleanup_requested, job_id) = {
-        let mut runtime = lock_unpoisoned(&job.runtime);
-        runtime.worker_done = true;
-        let cleanup_requested = should_cleanup_after_worker(&runtime);
-        let job_id = runtime.manifest.job_id.clone();
-        job.wake.notify_all();
-        (cleanup_requested, job_id)
-    };
-    restore_hidden_pin_windows(&app, &job.hidden_pin_labels);
-    if canceled || cleanup_requested {
-        clear_job_cache(&app.state::<LongScreenshotStore>(), &job_id);
-    }
+    complete_worker_after_cleanup(&job, || {
+        let (cleanup_requested, job_id) = {
+            let runtime = lock_unpoisoned(&job.runtime);
+            (
+                should_cleanup_after_worker(&runtime),
+                runtime.manifest.job_id.clone(),
+            )
+        };
+        restore_hidden_pin_windows(&app, &job.hidden_pin_labels);
+        if canceled || cleanup_requested {
+            clear_job_cache(&app.state::<LongScreenshotStore>(), &job_id);
+            // The store may already have stopped owning this job. Its cache is
+            // still private to the worker and must be gone before notifying.
+            let _ = std::fs::remove_dir_all(&job.directory);
+        }
+    });
 }
 
 fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<WorkerStop> {
@@ -7316,6 +7330,33 @@ mod tests {
         });
         assert!(wait_for_worker_done(&job, Duration::from_secs(1)));
         completed.join().unwrap();
+    }
+
+    #[test]
+    fn worker_done_is_not_observable_until_cleanup_finishes() {
+        let root = tempdir().unwrap();
+        let job = Arc::new(job_for_state(
+            root.path().join("worker-cleanup"),
+            LongCaptureState::Ready,
+        ));
+        let worker_job = Arc::clone(&job);
+        let (cleanup_started_tx, cleanup_started_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            complete_worker_after_cleanup(&worker_job, || {
+                cleanup_started_tx.send(()).unwrap();
+                continue_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            });
+        });
+
+        cleanup_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(job.operation_lock.try_lock().is_err());
+        assert!(!wait_for_worker_done(&job, Duration::from_millis(10)));
+        continue_tx.send(()).unwrap();
+        assert!(wait_for_worker_done(&job, Duration::from_secs(1)));
+        worker.join().unwrap();
     }
 
     #[test]

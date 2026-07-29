@@ -201,7 +201,7 @@ try {
     Assert-Equal -Expected 0 -Actual $unexpectedLocalFiles.Count `
         -Message "LocalAppData 根目录只保留当前指针、索引和日志"
 
-    # 安装器可能保留扩展路径前缀；它应与普通 TargetRoot 视为同一路径。
+    # 旧版本可能留下扩展路径前缀；迁移应视为同一路径并修复显示格式。
     $extendedPointerValue = "\\?\" + [System.IO.Path]::GetFullPath($inPlaceRoot)
     [System.IO.File]::WriteAllText(
         (Join-Path $inPlaceLocal "storage-path.txt"),
@@ -228,8 +228,10 @@ try {
         2,
         $savedExtendedPointerBytes.Length - 2
     )
-    Assert-Equal -Expected $extendedPointerValue -Actual $savedExtendedPointer `
-        -Message "等价的扩展前缀指针未被替换"
+    Assert-Equal -Expected ([System.IO.Path]::GetFullPath($inPlaceRoot)) `
+        -Actual $savedExtendedPointer -Message "等价的扩展前缀指针已改写为普通路径"
+    Assert-True -Condition (-not $savedExtendedPointer.StartsWith("\\?\")) `
+        -Message "迁移后的路径指针不包含 Windows 内部扩展前缀"
     Assert-Equal -Expected 1 -Actual @(Get-ChildItem -LiteralPath (Join-Path $inPlaceRoot `
             ".petaldesk\backups") -Directory -Filter "legacy-localappdata" -Recurse).Count `
         -Message "路径指针相同时幂等重跑不重复归档"
