@@ -361,6 +361,21 @@ foreach ($resource in $expectedBundleResources.GetEnumerator()) {
     }
 }
 
+if ($null -eq $chromeExtensionId) {
+    Write-Host "未设置 PETALDESK_CHROME_EXTENSION_ID；安装包将跳过 Chrome Native Messaging 注册。"
+}
+if ($null -eq $edgeExtensionId) {
+    Write-Host "未设置 PETALDESK_EDGE_EXTENSION_ID；安装包将跳过 Edge Native Messaging 注册。"
+}
+
+# A clean checkout does not have frontendDist yet. Build the Tauri app first so
+# generate_context! can resolve ../build when Cargo compiles the Native Host.
+if (-not $SkipAppBuild) {
+    Invoke-CheckedCommand -Command "pnpm.cmd" -Arguments @(
+        "tauri", "build", "--no-bundle", "--ci", "--no-sign"
+    ) -WorkingDirectory $projectRoot
+}
+
 Invoke-CheckedCommand -Command "cargo.exe" -Arguments @(
     "build",
     "--manifest-path", $manifestPath,
@@ -369,19 +384,6 @@ Invoke-CheckedCommand -Command "cargo.exe" -Arguments @(
 ) -WorkingDirectory $projectRoot
 if (-not (Test-Path -LiteralPath $nativeHostReleaseExe)) {
     throw "Native Messaging Host 构建后不存在：$nativeHostReleaseExe"
-}
-
-if ($null -eq $chromeExtensionId) {
-    Write-Host "未设置 PETALDESK_CHROME_EXTENSION_ID；安装包将跳过 Chrome Native Messaging 注册。"
-}
-if ($null -eq $edgeExtensionId) {
-    Write-Host "未设置 PETALDESK_EDGE_EXTENSION_ID；安装包将跳过 Edge Native Messaging 注册。"
-}
-
-if (-not $SkipAppBuild) {
-    Invoke-CheckedCommand -Command "pnpm.cmd" -Arguments @(
-        "tauri", "build", "--no-bundle", "--ci", "--no-sign"
-    ) -WorkingDirectory $projectRoot
 }
 
 # Tauri 负责生成与当前版本匹配的 NSIS 脚本。它会暂时给 Release EXE
