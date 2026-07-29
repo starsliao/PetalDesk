@@ -55,9 +55,9 @@ const OUTLINE_WINDOW_LABEL: &str = "screenshot-long-outline";
 const CONTROL_WINDOW_HEIGHT: u32 = 68;
 const CONTROL_WINDOW_MAX_WIDTH: u32 = 680;
 const MANUAL_SCROLL_STOP_CHECK_INTERVAL: Duration = Duration::from_millis(25);
-const MANUAL_SCROLL_ACTIVE_CAPTURE_INTERVAL: Duration = Duration::from_millis(150);
+const MANUAL_SCROLL_ACTIVE_CAPTURE_INTERVAL: Duration = Duration::from_millis(60);
 const MANUAL_SCROLL_SETTLE_AFTER: Duration = Duration::from_millis(250);
-const MANUAL_SCROLL_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(350);
+const MANUAL_SCROLL_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(60);
 const MANUAL_SCROLL_FEEDBACK_AFTER: Duration = Duration::from_secs(3);
 const MANUAL_SCROLL_UNMATCHED_PAUSE_AFTER: Duration = Duration::from_secs(4);
 const AUTO_SCROLL_END_CONFIRMATIONS: u8 = 3;
@@ -324,6 +324,7 @@ struct LongCaptureRuntime {
 struct LongCaptureJob {
     directory: PathBuf,
     target: CaptureTarget,
+    control_window_instance: Option<isize>,
     hidden_pin_labels: Vec<String>,
     browser: Option<BrowserCaptureContext>,
     operation_lock: Mutex<()>,
@@ -446,6 +447,18 @@ impl LongScreenshotStore {
         matches.then(|| current.take()).flatten()
     }
 
+    fn job_is_current(&self, expected: &LongCaptureJob) -> bool {
+        lock_unpoisoned(&self.job)
+            .as_ref()
+            .is_some_and(|current| std::ptr::eq(Arc::as_ptr(current), expected))
+    }
+
+    fn ensure_current_job(&self, expected: &LongCaptureJob) -> AppResult<()> {
+        self.job_is_current(expected)
+            .then_some(())
+            .ok_or_else(|| AppError::not_found("长截图任务不存在或已被替换"))
+    }
+
     fn begin_pending_start(&self, session_id: &str) -> AppResult<()> {
         let mut pending = lock_unpoisoned(&self.pending_start);
         if pending.is_some() {
@@ -520,15 +533,21 @@ impl LongScreenshotStore {
         self.control_destroyed.notify_all();
     }
 
-    fn consume_expected_control_destroy(&self, instance_id: Option<isize>) -> bool {
+    fn consume_expected_control_destroy(
+        &self,
+        instance_id: Option<isize>,
+        current_instance: Option<isize>,
+    ) -> bool {
         let mut tracker = lock_unpoisoned(&self.control_destroys);
         let instance_id = match instance_id {
             Some(instance_id) => instance_id,
-            None if tracker.expected.len() == 1 => *tracker
+            None if current_instance.is_none() && tracker.expected.len() == 1 => *tracker
                 .expected
                 .keys()
                 .next()
                 .expect("one expected control destroy"),
+            // Never guess while a replacement window is registered. A stale
+            // unidentifiable event must not consume that window's expectation.
             None => return false,
         };
         let Some(wait_for_completion) = tracker.expected.remove(&instance_id) else {
@@ -829,6 +848,7 @@ fn start_long_capture_registered_inner(
     request: StartLongCaptureRequest,
     session: crate::screenshot::ScreenshotSession,
 ) -> AppResult<LongCaptureStatus> {
+    purge_expired_annotation_exports(store);
     if store.pending_start_cancel_requested(&session.id) {
         return Err(pending_start_canceled_error());
     }
@@ -840,9 +860,17 @@ fn start_long_capture_registered_inner(
     )?;
     let requested_engine = request.engine;
 
-    let previous_job_id = {
-        let current = lock_unpoisoned(&store.job);
-        if let Some(job) = current.as_ref() {
+    let previous_job = lock_unpoisoned(&store.job).as_ref().cloned();
+    // A stale command can already hold an Arc to the completed job. Serialize
+    // replacement with that job's operation lock, then make every command
+    // revalidate ownership after taking the same lock.
+    let _previous_operation_guard = previous_job
+        .as_ref()
+        .map(|job| lock_unpoisoned(&job.operation_lock));
+    let previous_job_id = if let Some(job) = previous_job.as_ref() {
+        if !store.job_is_current(job) {
+            None
+        } else {
             let runtime = lock_unpoisoned(&job.runtime);
             if !runtime.worker_done {
                 return Err(AppError::new(
@@ -850,10 +878,21 @@ fn start_long_capture_registered_inner(
                     "已有长截图任务正在运行，请先完成或取消",
                 ));
             }
-            Some(runtime.manifest.job_id.clone())
-        } else {
-            None
+            let job_id = runtime.manifest.job_id.clone();
+            drop(runtime);
+            if lock_unpoisoned(&store.annotation_exports)
+                .values()
+                .any(|ticket| ticket.job_id == job_id)
+            {
+                return Err(AppError::new(
+                    "long_capture_busy",
+                    "长截图标注仍在导出，请等待导出完成或取消导出",
+                ));
+            }
+            Some(job_id)
         }
+    } else {
+        None
     };
     if let Some(previous_job_id) = previous_job_id {
         clear_job_cache(&store, &previous_job_id);
@@ -873,10 +912,14 @@ fn start_long_capture_registered_inner(
     // publishing the job, so a slow WebView startup never leaves the desktop
     // behind a hidden, non-responsive capture surface. Recreate it for every
     // job because the job id is part of the control page URL.
-    if let Err(error) = prepare_control_window(app, &target.monitor, target.bounds, &job_id) {
-        let _ = std::fs::remove_dir_all(&directory);
-        return Err(error);
-    }
+    let control_window_instance =
+        match prepare_control_window(app, &target.monitor, target.bounds, &job_id) {
+            Ok(instance) => instance,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&directory);
+                return Err(error);
+            }
+        };
     if let Err(error) = prepare_outline_window(app, &target.monitor, target.bounds) {
         let _ = close_control_window(app);
         let _ = std::fs::remove_dir_all(&directory);
@@ -958,6 +1001,7 @@ fn start_long_capture_registered_inner(
     let job = Arc::new(LongCaptureJob {
         directory,
         target,
+        control_window_instance,
         hidden_pin_labels,
         browser,
         operation_lock: Mutex::new(()),
@@ -1248,6 +1292,7 @@ fn pause_long_capture_inner(app: &AppHandle, job_id: &str) -> AppResult<LongCapt
     let store = app.state::<LongScreenshotStore>();
     let job = store.job(&job_id)?;
     let _operation_guard = lock_unpoisoned(&job.operation_lock);
+    store.ensure_current_job(&job)?;
     let status = {
         let mut runtime = lock_unpoisoned(&job.runtime);
         if runtime.manifest.state != LongCaptureState::Capturing {
@@ -1300,15 +1345,17 @@ fn resume_long_capture_inner(
     explicit_retry: bool,
 ) -> AppResult<LongCaptureStatus> {
     let store = app.state::<LongScreenshotStore>();
-    resume_or_retry(app, &store.job(job_id)?, explicit_retry)
+    resume_or_retry(app, &store, &store.job(job_id)?, explicit_retry)
 }
 
 fn resume_or_retry(
     app: &AppHandle,
+    store: &LongScreenshotStore,
     job: &Arc<LongCaptureJob>,
     explicit_retry: bool,
 ) -> AppResult<LongCaptureStatus> {
     let _operation_guard = lock_unpoisoned(&job.operation_lock);
+    store.ensure_current_job(job)?;
     {
         let runtime = lock_unpoisoned(&job.runtime);
         if runtime.manifest.state != LongCaptureState::Paused {
@@ -1364,6 +1411,7 @@ fn undo_long_capture_segment_inner(app: &AppHandle, job_id: &str) -> AppResult<L
     let store = app.state::<LongScreenshotStore>();
     let job = store.job(job_id)?;
     let _operation_guard = lock_unpoisoned(&job.operation_lock);
+    store.ensure_current_job(&job)?;
     let removed = {
         let mut runtime = lock_unpoisoned(&job.runtime);
         if runtime.manifest.state.is_terminal() {
@@ -1418,6 +1466,7 @@ fn finish_long_capture_inner(app: &AppHandle, job_id: &str) -> AppResult<LongCap
     let store = app.state::<LongScreenshotStore>();
     let job = store.job(job_id)?;
     let _operation_guard = lock_unpoisoned(&job.operation_lock);
+    store.ensure_current_job(&job)?;
     let (status, should_emit) = {
         let mut runtime = lock_unpoisoned(&job.runtime);
         if runtime.manifest.segments.is_empty() {
@@ -1501,16 +1550,17 @@ fn cancel_long_capture_session_inner(
     session_id: &str,
 ) -> AppResult<Option<LongCaptureStatus>> {
     let store = app.state::<LongScreenshotStore>();
-    let pending_canceled = store.request_pending_start_cancel(session_id);
+    store.request_pending_start_cancel(session_id);
     let Some(job) = store.job_for_session(session_id) else {
-        if pending_canceled {
-            let screenshot_store = app.state::<ScreenshotStore>();
-            if let Some(session) = screenshot_store
-                .active_session()
-                .filter(|session| session.id == session_id)
-            {
-                show_capture_overlay(app, &session.monitor)?;
-            }
+        // Idempotent owner recovery: status polling may discover that the job
+        // has already been removed while the reusable screenshot WebView is
+        // still hidden. Re-present the active owner even without a job.
+        let screenshot_store = app.state::<ScreenshotStore>();
+        if let Some(session) = screenshot_store
+            .active_session()
+            .filter(|session| session.id == session_id)
+        {
+            show_capture_overlay(app, &session.monitor)?;
         }
         return Ok(None);
     };
@@ -1530,6 +1580,7 @@ pub(crate) fn cancel_for_screenshot_session_end(
         return Ok(());
     };
     let _operation_guard = lock_unpoisoned(&job.operation_lock);
+    store.ensure_current_job(&job)?;
     let outcome = request_job_cancel(&job, "截图窗口已关闭，长截图已取消");
     let close_error = close_control_window(app).err();
     if outcome.cleanup_now {
@@ -1553,6 +1604,7 @@ fn cancel_long_capture_job_inner(
     job: &Arc<LongCaptureJob>,
 ) -> AppResult<LongCaptureStatus> {
     let _operation_guard = lock_unpoisoned(&job.operation_lock);
+    store.ensure_current_job(job)?;
     let outcome = request_job_cancel(job, "长截图已取消");
     let job_id = outcome.status.job_id.clone();
     let surface_result = switch_visible_surface(
@@ -1692,6 +1744,8 @@ fn prepare_long_capture_annotation_export_inner(
     let store = app.state::<LongScreenshotStore>();
     purge_expired_annotation_exports(&store);
     let job = store.job(job_id)?;
+    let _operation_guard = lock_unpoisoned(&job.operation_lock);
+    store.ensure_current_job(&job)?;
     let manifest = {
         let runtime = lock_unpoisoned(&job.runtime);
         if runtime.manifest.state != LongCaptureState::Ready {
@@ -1836,6 +1890,8 @@ fn finish_long_capture_annotation_export_inner(
     token: &str,
 ) -> AppResult<LongCaptureExportResult> {
     let store = app.state::<LongScreenshotStore>();
+    let screenshot_store = app.state::<ScreenshotStore>();
+    let _screenshot_start_guard = screenshot_store.lock_start();
     let job = {
         let tickets = lock_unpoisoned(&store.annotation_exports);
         Arc::clone(
@@ -1845,9 +1901,15 @@ fn finish_long_capture_annotation_export_inner(
                 .job,
         )
     };
+    {
+        let _operation_guard = lock_unpoisoned(&job.operation_lock);
+        store.ensure_current_job(&job)?;
+    }
     if !wait_for_worker_done(&job, WORKER_SHUTDOWN_TIMEOUT) {
         return Err(worker_shutdown_timeout_error());
     }
+    let _operation_guard = lock_unpoisoned(&job.operation_lock);
+    store.ensure_current_job(&job)?;
     purge_expired_annotation_exports(&store);
     let ticket = lock_unpoisoned(&store.annotation_exports)
         .remove(token)
@@ -1886,11 +1948,14 @@ fn finish_long_capture_annotation_export_inner(
             }
         }
     }
-    screenshot::finish_capture_after_cleanup(
+    screenshot::finish_capture_after_cleanup_locked(
         app,
-        &app.state::<ScreenshotStore>(),
+        &screenshot_store,
         &ticket.session_id,
-        || clear_job_cache(&app.state::<LongScreenshotStore>(), &ticket.job_id),
+        || {
+            store.request_pending_start_cancel(&ticket.session_id);
+            clear_job_cache(&store, &ticket.job_id);
+        },
     );
     Ok(result)
 }
@@ -1929,10 +1994,29 @@ pub async fn export_long_capture(
 
 fn export_long_capture_inner(
     app: &AppHandle,
-    job: &LongCaptureJob,
+    job: &Arc<LongCaptureJob>,
     action: ScreenshotExportAction,
     annotation_payload: Option<&Value>,
 ) -> AppResult<LongCaptureExportResult> {
+    let screenshot_store = app.state::<ScreenshotStore>();
+    let _screenshot_start_guard = screenshot_store.lock_start();
+    let store = app.state::<LongScreenshotStore>();
+    {
+        let _operation_guard = lock_unpoisoned(&job.operation_lock);
+        store.ensure_current_job(job)?;
+        let runtime = lock_unpoisoned(&job.runtime);
+        if runtime.manifest.state != LongCaptureState::Ready {
+            return Err(AppError::new(
+                "long_capture_not_ready",
+                "长截图尚未完成，不能导出",
+            ));
+        }
+    }
+    if !wait_for_worker_done(job, WORKER_SHUTDOWN_TIMEOUT) {
+        return Err(worker_shutdown_timeout_error());
+    }
+    let _operation_guard = lock_unpoisoned(&job.operation_lock);
+    store.ensure_current_job(job)?;
     let manifest = {
         let runtime = lock_unpoisoned(&job.runtime);
         if runtime.manifest.state != LongCaptureState::Ready {
@@ -1943,9 +2027,6 @@ fn export_long_capture_inner(
         }
         runtime.manifest.clone()
     };
-    if !wait_for_worker_done(job, WORKER_SHUTDOWN_TIMEOUT) {
-        return Err(worker_shutdown_timeout_error());
-    }
     validate_annotation_payload(annotation_payload, &manifest)?;
     let result = match action {
         ScreenshotExportAction::Save => {
@@ -1995,11 +2076,14 @@ fn export_long_capture_inner(
             }
         }
     };
-    screenshot::finish_capture_after_cleanup(
+    screenshot::finish_capture_after_cleanup_locked(
         app,
-        &app.state::<ScreenshotStore>(),
+        &screenshot_store,
         &manifest.session_id,
-        || clear_job_cache(&app.state::<LongScreenshotStore>(), &manifest.job_id),
+        || {
+            store.request_pending_start_cancel(&manifest.session_id);
+            clear_job_cache(&store, &manifest.job_id);
+        },
     );
     Ok(result)
 }
@@ -2874,7 +2958,7 @@ fn prepare_control_window(
     monitor: &MonitorBounds,
     selection: PhysicalRect,
     job_id: &str,
-) -> AppResult<()> {
+) -> AppResult<Option<isize>> {
     let (_, size, _) = control_window_geometry(monitor, selection);
     let _creation_guard = lock_unpoisoned(&CONTROL_WINDOW_CREATION_LOCK);
     if let Some(window) = app.get_webview_window(CONTROL_WINDOW_LABEL) {
@@ -2896,7 +2980,16 @@ fn prepare_control_window(
     .inner_size(f64::from(size.width), f64::from(size.height))
     .build()
     .map_err(|error| AppError::new("window_error", format!("创建长截图控制窗口失败: {error}")))?;
-    position_control_window(&window, monitor, selection)
+    position_control_window(&window, monitor, selection)?;
+    let instance_id = control_window_instance_id(&window);
+    #[cfg(windows)]
+    if instance_id.is_none() {
+        return Err(AppError::new(
+            "long_capture_control_missing",
+            "无法识别长截图控制窗口实例，请重新截图",
+        ));
+    }
+    Ok(instance_id)
 }
 
 fn prepare_outline_window(
@@ -3092,8 +3185,30 @@ fn control_window_instance_id(_window: &tauri::WebviewWindow<tauri::Wry>) -> Opt
     None
 }
 
-pub(crate) fn handle_control_window_close_requested(app: &AppHandle, label: &str) -> bool {
+pub(crate) fn handle_control_window_close_requested(
+    app: &AppHandle,
+    label: &str,
+    instance_id: Option<isize>,
+) -> bool {
     if label != CONTROL_WINDOW_LABEL {
+        return false;
+    }
+    let Some(store) = app.try_state::<LongScreenshotStore>() else {
+        return false;
+    };
+    let job = lock_unpoisoned(&store.job).as_ref().cloned();
+    let Some(job) = job else {
+        return false;
+    };
+    let current_instance = app
+        .get_webview_window(CONTROL_WINDOW_LABEL)
+        .as_ref()
+        .and_then(control_window_instance_id);
+    if !destroyed_control_window_matches_job(
+        instance_id,
+        job.control_window_instance,
+        current_instance,
+    ) {
         return false;
     }
     let app = app.clone();
@@ -3101,14 +3216,29 @@ pub(crate) fn handle_control_window_close_requested(app: &AppHandle, label: &str
         let Some(store) = app.try_state::<LongScreenshotStore>() else {
             return;
         };
-        let job = lock_unpoisoned(&store.job).as_ref().cloned();
-        if let Some(job) = job {
-            let _ = cancel_long_capture_job_inner(&app, &store, &job);
-        } else {
-            let _ = close_control_window(&app);
+        let _start_guard = lock_unpoisoned(&store.start_lock);
+        if !lock_unpoisoned(&store.job)
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &job))
+        {
+            return;
         }
+        let _ = cancel_long_capture_job_inner(&app, &store, &job);
     });
     true
+}
+
+fn destroyed_control_window_matches_job(
+    destroyed_instance: Option<isize>,
+    job_instance: Option<isize>,
+    current_instance: Option<isize>,
+) -> bool {
+    match (destroyed_instance, job_instance) {
+        (Some(destroyed), Some(owner)) => destroyed == owner,
+        (Some(_), None) => false,
+        (None, Some(_)) => current_instance.is_none(),
+        (None, None) => current_instance.is_none(),
+    }
 }
 
 pub(crate) fn handle_control_window_destroyed(
@@ -3122,13 +3252,24 @@ pub(crate) fn handle_control_window_destroyed(
     let Some(store) = app.try_state::<LongScreenshotStore>() else {
         return true;
     };
-    if store.consume_expected_control_destroy(instance_id) {
+    let current_instance = app
+        .get_webview_window(CONTROL_WINDOW_LABEL)
+        .as_ref()
+        .and_then(control_window_instance_id);
+    if store.consume_expected_control_destroy(instance_id, current_instance) {
         return true;
     }
     let job = lock_unpoisoned(&store.job).as_ref().cloned();
     let Some(job) = job else {
         return true;
     };
+    if !destroyed_control_window_matches_job(
+        instance_id,
+        job.control_window_instance,
+        current_instance,
+    ) {
+        return true;
+    }
     if !should_cancel_after_control_destroy(job.status().state) {
         // Finishing intentionally destroys the controller. Even if Windows no
         // longer exposes its HWND to the event callback, a completed capture
@@ -3140,6 +3281,13 @@ pub(crate) fn handle_control_window_destroyed(
         let Some(store) = app.try_state::<LongScreenshotStore>() else {
             return;
         };
+        let _start_guard = lock_unpoisoned(&store.start_lock);
+        if !lock_unpoisoned(&store.job)
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &job))
+        {
+            return;
+        }
         let status = job.status();
         let active_session = app.state::<ScreenshotStore>().active_session();
         let session_is_active = screenshot_session_owns_job(
@@ -4410,15 +4558,15 @@ fn accept_scrolled_frame(
     let strip = crop_rows(frame, strip_start, allowed_rows)?;
     atomic_write(&job.directory.join(&frame_file), &encode_png(frame)?)?;
     atomic_write(&job.directory.join(&strip_file), &encode_png(&strip)?)?;
-    if fixed_bottom > 0 {
-        write_fixed_bottom(job, frame, fixed_bottom)?;
-    }
 
     let mut runtime = lock_unpoisoned(&job.runtime);
     if runtime.generation != generation || runtime.manifest.state != LongCaptureState::Capturing {
         let _ = std::fs::remove_file(job.directory.join(&frame_file));
         let _ = std::fs::remove_file(job.directory.join(&strip_file));
         return Ok(false);
+    }
+    if fixed_bottom > 0 {
+        write_fixed_bottom(job, frame, fixed_bottom)?;
     }
     runtime.manifest.segments.push(LongCaptureSegment {
         index,
@@ -6915,6 +7063,7 @@ mod tests {
                 control_overlaps_roi: false,
                 scroll_windows: None,
             },
+            control_window_instance: None,
             hidden_pin_labels: Vec::new(),
             browser: None,
             operation_lock: Mutex::new(()),
@@ -7023,10 +7172,10 @@ mod tests {
         let waiter = std::thread::spawn(move || {
             waiter_store.wait_for_control_destroy(100, Duration::from_secs(1))
         });
-        assert!(store.consume_expected_control_destroy(Some(100)));
+        assert!(store.consume_expected_control_destroy(Some(100), Some(100)));
         assert!(waiter.join().unwrap());
-        assert!(!store.consume_expected_control_destroy(Some(100)));
-        assert!(!store.consume_expected_control_destroy(None));
+        assert!(!store.consume_expected_control_destroy(Some(100), None));
+        assert!(!store.consume_expected_control_destroy(None, None));
     }
 
     #[test]
@@ -7040,7 +7189,7 @@ mod tests {
             assert_eq!(tracker.expected.get(&200), Some(&false));
             assert!(!tracker.completed.contains(&200));
         }
-        assert!(store.consume_expected_control_destroy(Some(200)));
+        assert!(store.consume_expected_control_destroy(Some(200), None));
         let tracker = lock_unpoisoned(&store.control_destroys);
         assert!(!tracker.expected.contains_key(&200));
         assert!(!tracker.completed.contains(&200));
@@ -7051,7 +7200,7 @@ mod tests {
         let root = tempdir().unwrap();
         let store = test_store(root.path().to_path_buf());
         assert!(store.expect_control_destroy(250, true));
-        assert!(store.consume_expected_control_destroy(Some(250)));
+        assert!(store.consume_expected_control_destroy(Some(250), None));
         assert!(!store.expect_control_destroy(250, false));
         assert!(store.wait_for_control_destroy(250, Duration::from_millis(1)));
     }
@@ -7061,10 +7210,46 @@ mod tests {
         let root = tempdir().unwrap();
         let store = test_store(root.path().to_path_buf());
         assert!(store.expect_control_destroy(300, false));
-        assert!(store.consume_expected_control_destroy(Some(300)));
+        assert!(store.consume_expected_control_destroy(Some(300), None));
         let tracker = lock_unpoisoned(&store.control_destroys);
         assert!(!tracker.expected.contains_key(&300));
         assert!(!tracker.completed.contains(&300));
+    }
+
+    #[test]
+    fn unidentified_destroy_event_only_consumes_expected_when_no_replacement_exists() {
+        let root = tempdir().unwrap();
+        let store = test_store(root.path().to_path_buf());
+        assert!(store.expect_control_destroy(400, false));
+        assert!(!store.consume_expected_control_destroy(None, Some(401)));
+        assert!(lock_unpoisoned(&store.control_destroys)
+            .expected
+            .contains_key(&400));
+        assert!(store.consume_expected_control_destroy(Some(400), Some(400)));
+
+        assert!(store.expect_control_destroy(401, true));
+        assert!(store.consume_expected_control_destroy(None, None));
+        assert!(store.wait_for_control_destroy(401, Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn delayed_control_destroy_event_cannot_cancel_a_replacement_job() {
+        assert!(destroyed_control_window_matches_job(
+            Some(10),
+            Some(10),
+            Some(10)
+        ));
+        assert!(!destroyed_control_window_matches_job(
+            Some(10),
+            Some(11),
+            Some(11)
+        ));
+        assert!(!destroyed_control_window_matches_job(
+            None,
+            Some(11),
+            Some(11)
+        ));
+        assert!(destroyed_control_window_matches_job(None, Some(11), None));
     }
 
     #[test]
@@ -7208,6 +7393,7 @@ mod tests {
                 control_overlaps_roi: false,
                 scroll_windows: None,
             },
+            control_window_instance: None,
             hidden_pin_labels: Vec::new(),
             browser: None,
             operation_lock: Mutex::new(()),
@@ -7299,26 +7485,30 @@ mod tests {
             schedule.next_trigger(started),
             Some(ManualCaptureTrigger::ActiveScroll)
         );
-        schedule.observe_scroll(started + Duration::from_millis(100));
+        schedule.observe_scroll(started + Duration::from_millis(40));
         assert_eq!(
-            schedule.next_trigger(started + Duration::from_millis(149)),
+            schedule.next_trigger(started + Duration::from_millis(59)),
             None
         );
         assert_eq!(
-            schedule.next_trigger(started + Duration::from_millis(150)),
+            schedule.next_trigger(started + Duration::from_millis(60)),
             Some(ManualCaptureTrigger::ActiveScroll)
         );
         assert_eq!(
-            schedule.next_trigger(started + Duration::from_millis(300)),
+            schedule.next_trigger(started + Duration::from_millis(120)),
             Some(ManualCaptureTrigger::ActiveScroll)
+        );
+        assert_eq!(
+            schedule.next_trigger(started + Duration::from_millis(289)),
+            Some(ManualCaptureTrigger::ActiveScroll)
+        );
+        assert_eq!(
+            schedule.next_trigger(started + Duration::from_millis(290)),
+            Some(ManualCaptureTrigger::Settled)
         );
         assert_eq!(
             schedule.next_trigger(started + Duration::from_millis(349)),
             None
-        );
-        assert_eq!(
-            schedule.next_trigger(started + Duration::from_millis(350)),
-            Some(ManualCaptureTrigger::Settled)
         );
     }
 
@@ -7327,19 +7517,19 @@ mod tests {
         let started = Instant::now();
         let mut schedule = ManualCaptureSchedule::new(started);
         assert_eq!(
-            schedule.next_trigger(started + Duration::from_millis(349)),
+            schedule.next_trigger(started + Duration::from_millis(59)),
             None
         );
         assert_eq!(
-            schedule.next_trigger(started + Duration::from_millis(350)),
+            schedule.next_trigger(started + Duration::from_millis(60)),
             Some(ManualCaptureTrigger::FallbackPoll)
         );
         assert_eq!(
-            schedule.next_trigger(started + Duration::from_millis(699)),
+            schedule.next_trigger(started + Duration::from_millis(119)),
             None
         );
         assert_eq!(
-            schedule.next_trigger(started + Duration::from_millis(700)),
+            schedule.next_trigger(started + Duration::from_millis(120)),
             Some(ManualCaptureTrigger::FallbackPoll)
         );
     }
@@ -8435,6 +8625,7 @@ mod tests {
                 control_overlaps_roi: false,
                 scroll_windows: None,
             },
+            control_window_instance: None,
             hidden_pin_labels: Vec::new(),
             browser: None,
             operation_lock: Mutex::new(()),
@@ -8529,5 +8720,62 @@ mod tests {
         assert!(lock_unpoisoned(&store.annotation_exports).contains_key("current-export"));
         assert!(job_directory.is_dir());
         assert!(export_directory.is_dir());
+    }
+
+    #[test]
+    fn stale_job_reference_is_rejected_after_replacement() {
+        let root = tempdir().unwrap();
+        let old_job = Arc::new(job_for_state(
+            root.path().join("old-job"),
+            LongCaptureState::Ready,
+        ));
+        let new_job = Arc::new(job_for_state(
+            root.path().join("new-job"),
+            LongCaptureState::Capturing,
+        ));
+        let store = test_store(root.path().to_path_buf());
+
+        *lock_unpoisoned(&store.job) = Some(Arc::clone(&old_job));
+        assert!(store.ensure_current_job(&old_job).is_ok());
+        *lock_unpoisoned(&store.job) = Some(Arc::clone(&new_job));
+
+        assert_eq!(
+            store.ensure_current_job(&old_job).unwrap_err().code,
+            "not_found"
+        );
+        assert!(store.ensure_current_job(&new_job).is_ok());
+    }
+
+    #[test]
+    fn expired_annotation_export_is_removed_before_job_replacement() {
+        let root = tempdir().unwrap();
+        let export_directory = root.path().join("expired-export");
+        std::fs::create_dir_all(&export_directory).unwrap();
+        let job = Arc::new(job_for_state(
+            root.path().join("ready-job"),
+            LongCaptureState::Ready,
+        ));
+        let store = test_store(root.path().to_path_buf());
+        lock_unpoisoned(&store.annotation_exports).insert(
+            "expired".to_string(),
+            LongCaptureAnnotationExportTicket {
+                job,
+                job_id: "ready-job".to_string(),
+                session_id: "session".to_string(),
+                action: ScreenshotExportAction::Save,
+                save_path: None,
+                directory: export_directory.clone(),
+                width: 1,
+                height: 1,
+                strip_height: 1,
+                next_y: 0,
+                issued_at: Instant::now() - ANNOTATION_EXPORT_TICKET_TTL - Duration::from_secs(1),
+            },
+        );
+
+        purge_expired_annotation_exports(&store);
+
+        assert!(lock_unpoisoned(&store.annotation_exports).is_empty());
+        assert!(!export_directory.exists());
     }
 }

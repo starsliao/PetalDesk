@@ -726,7 +726,78 @@ describe("ScreenshotTool", () => {
 
     await waitFor(() => expect(api.getLongCaptureStatus).toHaveBeenCalledWith("long-1"), { timeout: 2_500 });
     await waitFor(() => expect(rendered.getByText("长截图任务已结束，请重新开始。")).toBeInTheDocument());
+    expect(api.cancelLongCaptureSession).toHaveBeenCalledWith("session-1");
+    expect(api.cancelLongCapture).not.toHaveBeenCalled();
     expect(rendered.queryByRole("button", { name: "暂停长截图" })).not.toBeInTheDocument();
+    expect(rendered.getByRole("button", { name: "长截图" })).toBeEnabled();
+  });
+
+  it("recovers immediately when polling reports that the active job was replaced", async () => {
+    const api = mockApi();
+    api.getLongCaptureStatus.mockRejectedValue(new Error("长截图任务不存在或已被替换"));
+    api.cancelLongCapture.mockRejectedValue(new Error("长截图任务不存在或已被替换"));
+    const rendered = render(ScreenshotTool, { api, longPollIntervalMs: 10 });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
+
+    await waitFor(() => expect(rendered.getByText("长截图任务已失效，请重新开始。")).toBeInTheDocument());
+    expect(api.getLongCaptureStatus).toHaveBeenCalledOnce();
+    expect(api.cancelLongCaptureSession).toHaveBeenCalledWith("session-1");
+    expect(api.cancelLongCapture).not.toHaveBeenCalled();
+    expect(rendered.queryByRole("button", { name: "暂停长截图" })).not.toBeInTheDocument();
+    expect(rendered.getByRole("button", { name: "长截图" })).toBeEnabled();
+  });
+
+  it("bounds generic polling failures and restores the normal editor", async () => {
+    const api = mockApi();
+    api.getLongCaptureStatus.mockRejectedValue(new Error("IPC connection failed"));
+    const rendered = render(ScreenshotTool, {
+      api,
+      longPollIntervalMs: 10,
+      longPollRetryLimit: 2,
+    });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
+
+    await waitFor(() => expect(api.getLongCaptureStatus).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(rendered.getByText("无法连接长截图任务，已恢复普通截图。")).toBeInTheDocument());
+    expect(api.cancelLongCaptureSession).toHaveBeenCalledWith("session-1");
+    expect(api.cancelLongCapture).not.toHaveBeenCalled();
+    expect(rendered.queryByRole("button", { name: "暂停长截图" })).not.toBeInTheDocument();
+    expect(rendered.getByRole("button", { name: "长截图" })).toBeEnabled();
+  });
+
+  it("times out a stalled status request and eventually restores the normal editor", async () => {
+    const api = mockApi();
+    api.getLongCaptureStatus.mockImplementation(() => new Promise(() => undefined));
+    const rendered = render(ScreenshotTool, {
+      api,
+      longPollIntervalMs: 10,
+      longPollTimeoutMs: 20,
+      longPollRetryLimit: 2,
+    });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
+
+    await waitFor(() => expect(api.getLongCaptureStatus).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(rendered.getByText("无法连接长截图任务，已恢复普通截图。")).toBeInTheDocument());
+    expect(api.cancelLongCaptureSession).toHaveBeenCalledWith("session-1");
+    expect(api.cancelLongCapture).not.toHaveBeenCalled();
     expect(rendered.getByRole("button", { name: "长截图" })).toBeEnabled();
   });
 

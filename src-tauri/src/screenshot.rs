@@ -598,6 +598,15 @@ fn cancel_screenshot_capture_inner(app: &AppHandle, session_id: Option<&str>) ->
     // while canceling: closing the control window can dispatch callbacks that
     // read the active session.
     let _start_guard = store.lock_start();
+    cancel_screenshot_capture_locked(app, &store, session_id)
+}
+
+/// Cancels the active screenshot while the caller owns `ScreenshotStore::lock_start()`.
+fn cancel_screenshot_capture_locked(
+    app: &AppHandle,
+    store: &ScreenshotStore,
+    session_id: Option<&str>,
+) -> bool {
     let Some(closing_id) = store.active_session().map(|session| session.id) else {
         return false;
     };
@@ -863,31 +872,36 @@ pub fn close_pinned_screenshot(
     removed
 }
 
-fn spawn_capture_window_cleanup(app: &AppHandle, session_id: Option<String>, destroy_window: bool) {
+fn spawn_capture_window_cleanup(app: &AppHandle, session_id: Option<String>) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         if let Some(session_id) = session_id {
             let _ = cancel_screenshot_capture_inner(&app, Some(&session_id));
         }
-        if destroy_window {
-            if let Some(window) = app.get_webview_window(CAPTURE_WINDOW_LABEL) {
-                let _ = window.destroy();
-            }
-        }
     });
 }
 
-pub(crate) fn handle_window_close_requested(app: &AppHandle, label: &str) -> bool {
+pub(crate) fn handle_window_close_requested(
+    app: &AppHandle,
+    label: &str,
+    window_instance: Option<isize>,
+) -> bool {
     let store = app.state::<ScreenshotStore>();
     if label == CAPTURE_WINDOW_LABEL {
+        let current_instance = app
+            .get_webview_window(CAPTURE_WINDOW_LABEL)
+            .as_ref()
+            .and_then(capture_window_instance_id);
+        if !destroyed_window_matches_current(window_instance, current_instance) {
+            return false;
+        }
         let session_id = store.active_session().map(|session| session.id);
         let Some(session_id) = session_id else {
             return false;
         };
-        // Keep the window alive until its long-capture owner has observed
-        // cancellation. The caller prevents this close request; the worker
-        // performs the final destroy after clearing the ordinary session.
-        spawn_capture_window_cleanup(app, Some(session_id), true);
+        // The capture WebView is prewarmed and reused. Hiding it after owner
+        // cleanup also prevents a delayed destroy from removing a new session.
+        spawn_capture_window_cleanup(app, Some(session_id));
         true
     } else if let Some(pin_id) = label.strip_prefix(PIN_WINDOW_PREFIX) {
         lock_unpoisoned(&store.pins).remove(pin_id);
@@ -897,15 +911,56 @@ pub(crate) fn handle_window_close_requested(app: &AppHandle, label: &str) -> boo
     }
 }
 
-pub(crate) fn handle_window_destroyed(app: &AppHandle, label: &str) {
+fn destroyed_window_matches_current(
+    destroyed_instance: Option<isize>,
+    current_instance: Option<isize>,
+) -> bool {
+    match (destroyed_instance, current_instance) {
+        (Some(destroyed), Some(current)) => destroyed == current,
+        (None, Some(_)) => false,
+        (_, None) => true,
+    }
+}
+
+#[cfg(windows)]
+fn capture_window_instance_id(window: &tauri::WebviewWindow<tauri::Wry>) -> Option<isize> {
+    window.hwnd().ok().map(|handle| handle.0 as isize)
+}
+
+#[cfg(not(windows))]
+fn capture_window_instance_id(_window: &tauri::WebviewWindow<tauri::Wry>) -> Option<isize> {
+    None
+}
+
+pub(crate) fn handle_window_destroyed(
+    app: &AppHandle,
+    label: &str,
+    destroyed_instance: Option<isize>,
+) {
     let store = app.state::<ScreenshotStore>();
     if label == CAPTURE_WINDOW_LABEL {
-        let session_id = store.active_session().map(|session| session.id);
-        // `destroy()` bypasses CloseRequested. Run the same owner-first cleanup
-        // so a WebView crash or frontend fallback cannot orphan a long job.
-        if session_id.is_some() {
-            spawn_capture_window_cleanup(app, session_id, false);
-        }
+        let app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let store = app.state::<ScreenshotStore>();
+            // Wait out capture startup before comparing instances. Otherwise a
+            // late event from the previous WebView can land after the new
+            // session is published but before its window has been prepared.
+            let _start_guard = store.lock_start();
+            let current_instance = app
+                .get_webview_window(CAPTURE_WINDOW_LABEL)
+                .as_ref()
+                .and_then(capture_window_instance_id);
+            if !destroyed_window_matches_current(destroyed_instance, current_instance) {
+                return;
+            }
+            let Some(session_id) = store.active_session().map(|session| session.id) else {
+                return;
+            };
+            // `destroy()` bypasses CloseRequested. Keep the instance check and
+            // owner cleanup in one lifecycle critical section so this stale
+            // event cannot close a replacement window or session.
+            let _ = cancel_screenshot_capture_locked(&app, &store, Some(&session_id));
+        });
     } else if let Some(pin_id) = label.strip_prefix(PIN_WINDOW_PREFIX) {
         lock_unpoisoned(&store.pins).remove(pin_id);
     }
@@ -924,15 +979,15 @@ fn finish_capture_unlocked(app: &AppHandle, store: &ScreenshotStore, session_id:
     );
 }
 
-pub(crate) fn finish_capture_after_cleanup(
+/// Completes cleanup while the caller holds `ScreenshotStore::lock_start()`.
+/// Long screenshot export takes that lock before its job operation lock so it
+/// cannot deadlock with ordinary screenshot cancellation.
+pub(crate) fn finish_capture_after_cleanup_locked(
     app: &AppHandle,
     store: &ScreenshotStore,
     session_id: &str,
     cleanup: impl FnOnce(),
 ) {
-    // Screenshot startup uses the same lock. Keep long-job cleanup and session
-    // teardown indivisible so a shortcut cannot observe only one side removed.
-    let _start_guard = lock_unpoisoned(&store.start_lock);
     cleanup();
     finish_capture_unlocked(app, store, session_id);
 }
@@ -1723,5 +1778,14 @@ mod tests {
         );
         assert!(store.clear_session(Some("session-new")));
         assert!(store.active_session().is_none());
+    }
+
+    #[test]
+    fn delayed_destroy_event_cannot_target_a_replacement_capture_window() {
+        assert!(destroyed_window_matches_current(Some(10), Some(10)));
+        assert!(!destroyed_window_matches_current(Some(10), Some(11)));
+        assert!(!destroyed_window_matches_current(None, Some(11)));
+        assert!(destroyed_window_matches_current(Some(10), None));
+        assert!(destroyed_window_matches_current(None, None));
     }
 }

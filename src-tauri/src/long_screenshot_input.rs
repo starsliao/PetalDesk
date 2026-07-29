@@ -204,23 +204,20 @@ impl ScrollInputMonitor {
         let Some(worker) = self.worker.take() else {
             return Ok(());
         };
+        self.shared.running.store(false, Ordering::Release);
         let thread_id = self.thread_id.take().unwrap_or_default();
-        let post_error =
-            if thread_id != 0 && unsafe { PostThreadMessageW(thread_id, WM_QUIT, 0, 0) } == 0 {
-                Some(ScrollInputError::last_os_error("stop wheel hook thread"))
-            } else {
-                None
-            };
+        if thread_id != 0 {
+            // This is only a fast wake-up. The message loop also polls the
+            // running flag, so a failed post can never make `join` unbounded.
+            unsafe {
+                PostThreadMessageW(thread_id, WM_QUIT, 0, 0);
+            }
+        }
 
         let worker_result = worker.join().map_err(|_| {
             ScrollInputError::new("stop wheel hook thread", "wheel hook thread panicked")
         })?;
-        self.shared.running.store(false, Ordering::Release);
-        worker_result?;
-        if let Some(error) = post_error {
-            return Err(error);
-        }
-        Ok(())
+        worker_result
     }
 }
 
@@ -300,10 +297,11 @@ fn run_hook_thread(
     shared: Arc<SharedState>,
     ready: std::sync::mpsc::SyncSender<HookStartup>,
 ) -> Result<(), ScrollInputError> {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, PeekMessageW, SetWindowsHookExW, TranslateMessage, MSG,
-        PM_NOREMOVE, WH_MOUSE_LL,
+        DispatchMessageW, PeekMessageW, SetWindowsHookExW, TranslateMessage, MSG, PM_NOREMOVE,
+        PM_REMOVE, WH_MOUSE_LL, WM_QUIT,
     };
 
     let thread_id = unsafe { GetCurrentThreadId() };
@@ -314,40 +312,40 @@ fn run_hook_thread(
     }
 
     let _state_guard = ThreadStateGuard::install(Arc::clone(&shared));
-    let hook = unsafe {
-        SetWindowsHookExW(
-            WH_MOUSE_LL,
-            Some(low_level_mouse_proc),
-            std::ptr::null_mut(),
-            0,
-        )
-    };
+    let module = unsafe { GetModuleHandleW(std::ptr::null()) };
+    if module.is_null() {
+        let error = ScrollInputError::last_os_error("resolve wheel hook module");
+        let _ = ready.send(HookStartup::Failed(error.clone()));
+        return Err(error);
+    }
+    let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), module, 0) };
     if hook.is_null() {
         let error = ScrollInputError::last_os_error("install low-level wheel hook");
         let _ = ready.send(HookStartup::Failed(error.clone()));
         return Err(error);
     }
     let _hook_guard = HookGuard(hook);
-    let _running_guard = RunningGuard::new(shared);
+    let _running_guard = RunningGuard::new(Arc::clone(&shared));
     if ready.send(HookStartup::Ready(thread_id)).is_err() {
         return Ok(());
     }
 
-    loop {
-        let result = unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) };
-        if result == 0 {
-            return Ok(());
+    while shared.running.load(Ordering::Acquire) {
+        let has_message =
+            unsafe { PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) };
+        if has_message == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
         }
-        if result == -1 {
-            return Err(ScrollInputError::last_os_error(
-                "run low-level wheel hook message loop",
-            ));
+        if message.message == WM_QUIT {
+            break;
         }
         unsafe {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
     }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -444,6 +442,16 @@ mod tests {
         assert_eq!(wheel_delta(120_u32 << 16), 120);
         assert_eq!(wheel_delta((-120_i16 as u16 as u32) << 16), -120);
         assert_eq!(wheel_delta(0x1234), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hook_can_start_and_stop() {
+        let mut monitor = ScrollInputMonitor::start().expect("wheel hook should start");
+        assert!(monitor.is_running());
+        monitor.stop().expect("wheel hook should stop");
+        assert!(!monitor.is_running());
+        monitor.stop().expect("stopping twice should stay harmless");
     }
 
     #[cfg(not(windows))]

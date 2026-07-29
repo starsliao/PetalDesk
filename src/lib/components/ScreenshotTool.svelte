@@ -81,6 +81,9 @@
     api?: ScreenshotApi;
     loadTimeoutMs?: number;
     longStartTimeoutMs?: number;
+    longPollIntervalMs?: number;
+    longPollTimeoutMs?: number;
+    longPollRetryLimit?: number;
     oncomplete?: (result: ScreenshotExportResult) => void;
     oncancel?: () => void;
     onerror?: (message: string) => void;
@@ -133,6 +136,9 @@
     api = screenshotApi,
     loadTimeoutMs = 8_000,
     longStartTimeoutMs = 8_000,
+    longPollIntervalMs = 750,
+    longPollTimeoutMs = 3_000,
+    longPollRetryLimit = 3,
     oncomplete,
     oncancel,
     onerror,
@@ -231,6 +237,7 @@
   let longTileGeneration = 0;
   let longStartGeneration = 0;
   let longActiveJobId: string | null = null;
+  let longPollFailures = 0;
   const longTilePending = new Set<number>();
   const longDesiredTileYs = new Set<number>();
 
@@ -324,6 +331,7 @@
   function resetLongCapture(): void {
     longStartGeneration += 1;
     longActiveJobId = null;
+    longPollFailures = 0;
     longModeMenuOpen = false;
     pendingLongMode = "manual";
     choosingScrollAnchor = false;
@@ -338,6 +346,27 @@
     void tick().then(() => stageElement?.focus());
   }
 
+  function longCaptureJobIsGone(value: unknown): boolean {
+    const message = value instanceof Error ? value.message : String(value ?? "");
+    return /任务.*(?:不存在|已被替换|已结束)|(?:不存在|已被替换|已结束).*任务/.test(message);
+  }
+
+  function recoverFromLongStatusFailure(jobId: string, message: string): void {
+    if (longActiveJobId !== jobId) return;
+    const activeSessionId = session?.id;
+    resetLongCapture();
+    reportError(message);
+    if (!activeSessionId) return;
+    // Recover by owner rather than by the stale job id. The backend treats
+    // this as an idempotent request and also restores a hidden capture window
+    // when the long job has already disappeared.
+    void withTimeout(
+      api.cancelLongCaptureSession(activeSessionId),
+      5_000,
+      "恢复普通截图超时。",
+    ).catch(reportError);
+  }
+
   function scheduleLongStatusPoll(): void {
     if (longPollTimer) clearTimeout(longPollTimer);
     longPollTimer = undefined;
@@ -348,17 +377,29 @@
       || status.state === "ready" || status.state === "failed" || status.state === "canceled") return;
     longPollTimer = setTimeout(() => {
       longPollTimer = undefined;
-      void api.getLongCaptureStatus?.(currentJobId).then((next) => {
+      const statusRequest = api.getLongCaptureStatus?.(currentJobId);
+      if (!statusRequest) return;
+      void withTimeout(statusRequest, longPollTimeoutMs, "读取长截图状态超时。").then((next) => {
         if (generation !== longStartGeneration || longActiveJobId !== currentJobId) return;
+        longPollFailures = 0;
         if (next) applyLongCaptureStatus(next, generation);
         else {
-          resetLongCapture();
-          reportError("长截图任务已结束，请重新开始。");
+          recoverFromLongStatusFailure(currentJobId, "长截图任务已结束，请重新开始。");
         }
-      }).catch(() => {
-        if (generation === longStartGeneration && longActiveJobId === currentJobId) scheduleLongStatusPoll();
+      }).catch((value) => {
+        if (generation !== longStartGeneration || longActiveJobId !== currentJobId) return;
+        if (longCaptureJobIsGone(value)) {
+          recoverFromLongStatusFailure(currentJobId, "长截图任务已失效，请重新开始。");
+          return;
+        }
+        longPollFailures += 1;
+        if (longPollFailures >= Math.max(1, longPollRetryLimit)) {
+          recoverFromLongStatusFailure(currentJobId, "无法连接长截图任务，已恢复普通截图。");
+          return;
+        }
+        scheduleLongStatusPoll();
       });
-    }, 750);
+    }, Math.max(10, longPollIntervalMs));
   }
 
   function applyLongCaptureStatus(next: LongCaptureStatus, generation = longStartGeneration): void {

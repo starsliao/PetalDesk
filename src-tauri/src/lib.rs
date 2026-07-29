@@ -526,11 +526,19 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let app = window.app_handle().clone();
                 let label = window.label().to_string();
-                if long_screenshot::handle_control_window_close_requested(&app, &label) {
+                #[cfg(windows)]
+                let window_instance = window.hwnd().ok().map(|handle| handle.0 as isize);
+                #[cfg(not(windows))]
+                let window_instance = None;
+                if long_screenshot::handle_control_window_close_requested(
+                    &app,
+                    &label,
+                    window_instance,
+                ) {
                     api.prevent_close();
                     return;
                 }
-                if screenshot::handle_window_close_requested(&app, &label) {
+                if screenshot::handle_window_close_requested(&app, &label, window_instance) {
                     api.prevent_close();
                     return;
                 }
@@ -575,15 +583,11 @@ pub fn run() {
                 let app = window.app_handle().clone();
                 let label = window.label().to_string();
                 #[cfg(windows)]
-                let control_window_instance = window.hwnd().ok().map(|handle| handle.0 as isize);
+                let window_instance = window.hwnd().ok().map(|handle| handle.0 as isize);
                 #[cfg(not(windows))]
-                let control_window_instance = None;
-                long_screenshot::handle_control_window_destroyed(
-                    &app,
-                    &label,
-                    control_window_instance,
-                );
-                screenshot::handle_window_destroyed(&app, &label);
+                let window_instance = None;
+                long_screenshot::handle_control_window_destroyed(&app, &label, window_instance);
+                screenshot::handle_window_destroyed(&app, &label, window_instance);
             }
         })
         .invoke_handler(tauri::generate_handler![
