@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "飞花 - PetalDesk 长截图",
+  "version": "0.3.0",
+  "description": "飞花 - PetalDesk 浏览器长截图增强，支持 Chrome、Edge 和 Firefox。",
+  "permissions": [
+    "nativeMessaging",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": [
+      "shared/browser-api.js",
+      "background/native-bridge.js"
+    ]
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "shared/scroll-core.js",
+        "content/capture-session.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "petaldesk-capture@petaldesk.app",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": [
+          "websiteActivity"
+        ]
+      }
+    }
+  }
+}

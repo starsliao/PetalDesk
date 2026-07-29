@@ -1,0 +1,37 @@
+{
+  "ready": {
+    "protocolVersion": 1,
+    "type": "extension.ready",
+    "browser": "chrome",
+    "extensionVersion": "0.3.0",
+    "extensionId": "abcdefghijklmnopabcdefghijklmnop",
+    "capabilities": [
+      "prepare",
+      "start",
+      "step",
+      "status",
+      "restore",
+      "cancel"
+    ]
+  },
+  "command": {
+    "protocolVersion": 1,
+    "type": "command",
+    "id": "request-1",
+    "command": "status",
+    "tabId": 7,
+    "frameId": 0,
+    "payload": {}
+  },
+  "response": {
+    "protocolVersion": 1,
+    "type": "extension.response",
+    "id": "request-1",
+    "ok": true,
+    "result": {
+      "tabId": 7,
+      "frameId": 0,
+      "state": "idle"
+    }
+  }
+}

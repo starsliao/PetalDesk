@@ -1,9 +1,11 @@
 export { screenshotApi, pinnedScreenshotApi } from "./api";
 export { exportSelectionPng, exportSelectionPngOnMainThread } from "./export";
+export { exportAnnotatedLongCapture, planLongCaptureAnnotationStrips } from "./long-annotation-export";
 export * from "./export-protocol";
 export * from "./geometry";
 export * from "./history";
 export * from "./image";
+export * from "./long-capture";
 export * from "./render";
 export * from "./types";
 export * from "./window-geometry";

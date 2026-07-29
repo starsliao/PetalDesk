@@ -1,0 +1,12 @@
+{
+  "name": "@petaldesk/browser-extension",
+  "version": "0.3.0",
+  "private": true,
+  "description": "飞花 - PetalDesk long-capture browser extension for Chrome, Edge, and Firefox",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "package:firefox": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\\package-firefox.ps1",
+    "test": "node --test"
+  },
+  "license": "MIT"
+}

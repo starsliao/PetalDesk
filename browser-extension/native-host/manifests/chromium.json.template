@@ -1,0 +1,10 @@
+{
+  "name": "com.petaldesk.capture",
+  "description": "飞花 - PetalDesk browser capture native messaging host",
+  "path": "__PETALDESK_NATIVE_HOST_EXE__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://__CHROME_EXTENSION_ID__/",
+    "chrome-extension://__EDGE_EXTENSION_ID__/"
+  ]
+}

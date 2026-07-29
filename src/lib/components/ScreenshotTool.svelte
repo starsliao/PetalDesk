@@ -1,10 +1,12 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import {
+    ArrowLeft,
     ArrowRight,
     Bold,
     Copy,
     Eraser,
+    GalleryVerticalEnd,
     Highlighter,
     Italic,
     LoaderCircle,
@@ -14,11 +16,13 @@
     Save,
     ScanLine,
     Shapes,
+    Trash2,
     Type,
     Underline,
     Undo2,
     X,
   } from "@lucide/svelte";
+  import LongCaptureControl from "$lib/screenshot/LongCaptureControl.svelte";
   import {
     DEFAULT_TOOL_SETTINGS,
     annotationBounds,
@@ -28,8 +32,11 @@
     commitHistory,
     createHistory,
     decodePng,
+    drawAnnotationSelection,
     exportSelectionPng,
+    exportAnnotatedLongCapture,
     hitTestAnnotation,
+    longCaptureStatusFromEvent,
     matchesScreenshotWindow,
     moveRect,
     normalizeRect,
@@ -44,12 +51,17 @@
     translateAnnotation,
     undoHistory,
     validateFrameDimensions,
+    visibleLongCaptureTiles,
     type Annotation,
     type ColorFormat,
     type EffectAnnotation,
     type EraserAnnotation,
     type HistoryState,
     type LineAnnotation,
+    type LongCaptureCapability,
+    type LongCaptureMode,
+    type LongCaptureStatus,
+    type LongCaptureTileRange,
     type PathAnnotation,
     type Point,
     type Rect,
@@ -98,6 +110,22 @@
     capturedAt: number;
   }
 
+  interface LoadedLongTile extends LongCaptureTileRange {
+    image: ImageBitmap | HTMLImageElement;
+  }
+
+  interface LongTileRenderParams {
+    tile: LoadedLongTile;
+    width: number;
+    annotations: readonly Annotation[];
+    draft: Annotation | null;
+    selectedId: string | null;
+  }
+
+  type LongPreviewInteraction =
+    | { kind: "draw"; pointerId: number; origin: Point }
+    | { kind: "move"; pointerId: number; origin: Point; initial: Annotation };
+
   let {
     sessionId,
     api = screenshotApi,
@@ -134,12 +162,41 @@
   let toolbarWidth = $state(720);
   let toolbarHeight = $state(92);
   let toast = $state("");
+  let longCapability = $state<LongCaptureCapability | null>(null);
+  let longCapabilityLoaded = $state(false);
+  let longConfirmOpen = $state(false);
+  let choosingScrollAnchor = $state(false);
+  let longMode = $state<LongCaptureMode>("current");
+  let longStatus = $state<LongCaptureStatus | null>(null);
+  let longBusy = $state(false);
+  let longPreviewScrollTop = $state(0);
+  let longTiles = $state<Record<number, LoadedLongTile>>({});
+  let longHistory = $state<HistoryState<Annotation[]>>(createHistory([]));
+  let longPreviewAnnotations = $state<Annotation[] | null>(null);
+  let longDraft = $state<Annotation | null>(null);
+  let longTextDraft = $state<TextDraft | null>(null);
+  let longSelectedId = $state<string | null>(null);
+  let longActiveTool = $state<ScreenshotToolName | null>(null);
+  let longInteraction = $state<LongPreviewInteraction | null>(null);
 
   const frameBounds = $derived<Rect>({ x: 0, y: 0, width: session?.frameWidth ?? 0, height: session?.frameHeight ?? 0 });
   const annotations = $derived(previewAnnotations ?? history.present);
   const selectionLocked = $derived(history.present.length > 0 || draft !== null || textDraft !== null);
   const selectedAnnotation = $derived(selectedId ? annotations.find((item) => item.id === selectedId) ?? null : null);
   const selectedBounds = $derived(selectedAnnotation ? annotationBounds(selectedAnnotation) : null);
+  const longCaptureActive = $derived(choosingScrollAnchor || longConfirmOpen || longStatus !== null || longBusy);
+  const longPreviewScale = $derived(longStatus?.state === "ready" && longStatus.width > 0
+    ? Math.min(1, Math.max(0.05, (viewportWidth - 48) / longStatus.width))
+    : 1);
+  const longVisibleTiles = $derived(longStatus?.state === "ready"
+    ? visibleLongCaptureTiles({
+      totalHeight: longStatus.height,
+      scrollTop: longPreviewScrollTop,
+      viewportHeight: Math.max(1, viewportHeight - 58),
+      scale: longPreviewScale,
+    })
+    : []);
+  const longAnnotations = $derived(longPreviewAnnotations ?? longHistory.present);
 
   let stageElement = $state<HTMLDivElement>(undefined!);
   let displayCanvas = $state<HTMLCanvasElement>(undefined!);
@@ -147,9 +204,12 @@
   let magnifierCanvas = $state<HTMLCanvasElement>(undefined!);
   let toolbarElement = $state<HTMLDivElement>(undefined!);
   let textAreaElement = $state<HTMLTextAreaElement>(undefined!);
+  let longPreviewElement = $state<HTMLDivElement>(undefined!);
+  let longTextAreaElement = $state<HTMLTextAreaElement>(undefined!);
   let renderFrame: number | undefined;
   let preferenceTimer: ReturnType<typeof setTimeout> | undefined;
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
+  let longPollTimer: ReturnType<typeof setTimeout> | undefined;
   let geometryValidationTimer: ReturnType<typeof setTimeout> | undefined;
   let resizeObserver: ResizeObserver | undefined;
   let scheduleWindowGeometryValidation: (() => void) | undefined;
@@ -162,6 +222,11 @@
   let loadInFlight: Promise<void> | null = null;
   let loadQueued = false;
   let queuedSessionId: string | undefined;
+  let longTileGeneration = 0;
+  let longStartGeneration = 0;
+  let longActiveJobId: string | null = null;
+  const longTilePending = new Set<number>();
+  const longDesiredTileYs = new Set<number>();
 
   const doubleClickWindowMs = 900;
   const doubleClickDistance = 8;
@@ -211,6 +276,349 @@
     if (toastTimer) clearTimeout(toastTimer);
     toastTimer = setTimeout(() => (toast = ""), 1800);
   }
+
+  async function loadLongCaptureCapability(): Promise<void> {
+    if (!api.getLongCaptureCapability) {
+      longCapability = { available: false, reason: "当前版本未提供长截图采集接口。" };
+      longCapabilityLoaded = true;
+      return;
+    }
+    try {
+      longCapability = await api.getLongCaptureCapability();
+    } catch (value) {
+      longCapability = {
+        available: false,
+        reason: value instanceof Error ? value.message : "无法检查长截图可用性。",
+      };
+    } finally {
+      longCapabilityLoaded = true;
+    }
+  }
+
+  function clearLongTiles(): void {
+    longTileGeneration += 1;
+    longTilePending.clear();
+    longDesiredTileYs.clear();
+    for (const tile of Object.values(longTiles)) {
+      if ("close" in tile.image && typeof tile.image.close === "function") tile.image.close();
+    }
+    longTiles = {};
+  }
+
+  function resetLongAnnotations(): void {
+    longHistory = createHistory([]);
+    longPreviewAnnotations = null;
+    longDraft = null;
+    longTextDraft = null;
+    longSelectedId = null;
+    longActiveTool = null;
+    longInteraction = null;
+  }
+
+  function resetLongCapture(): void {
+    longStartGeneration += 1;
+    longActiveJobId = null;
+    choosingScrollAnchor = false;
+    longConfirmOpen = false;
+    longBusy = false;
+    longStatus = null;
+    longPreviewScrollTop = 0;
+    resetLongAnnotations();
+    if (longPollTimer) clearTimeout(longPollTimer);
+    longPollTimer = undefined;
+    clearLongTiles();
+    void tick().then(() => stageElement?.focus());
+  }
+
+  function scheduleLongStatusPoll(): void {
+    if (longPollTimer) clearTimeout(longPollTimer);
+    longPollTimer = undefined;
+    const status = longStatus;
+    const currentJobId = longActiveJobId;
+    const generation = longStartGeneration;
+    if (!status || !currentJobId || status.jobId !== currentJobId || !api.getLongCaptureStatus
+      || status.state === "ready" || status.state === "failed" || status.state === "canceled") return;
+    longPollTimer = setTimeout(() => {
+      longPollTimer = undefined;
+      void api.getLongCaptureStatus?.(currentJobId).then((next) => {
+        if (generation !== longStartGeneration || longActiveJobId !== currentJobId) return;
+        if (next) applyLongCaptureStatus(next, generation);
+        else {
+          resetLongCapture();
+          reportError("长截图任务已结束，请重新开始。");
+        }
+      }).catch(() => {
+        if (generation === longStartGeneration && longActiveJobId === currentJobId) scheduleLongStatusPoll();
+      });
+    }, 750);
+  }
+
+  function applyLongCaptureStatus(next: LongCaptureStatus, generation = longStartGeneration): void {
+    if (generation !== longStartGeneration || !longActiveJobId || next.jobId !== longActiveJobId) return;
+    if (!session || next.sessionId !== session.id) return;
+    if ((longStatus?.state === "ready" || longStatus?.state === "failed")
+      && next.state !== longStatus.state && next.state !== "canceled") return;
+    if (next.state === "canceled") {
+      resetLongCapture();
+      return;
+    }
+    const enteringPreview = next.state === "ready" && longStatus?.state !== "ready";
+    longStatus = next;
+    longBusy = false;
+    if (enteringPreview) {
+      longPreviewScrollTop = 0;
+      resetLongAnnotations();
+      void tick().then(() => {
+        if (longPreviewElement) longPreviewElement.scrollTop = 0;
+      });
+    }
+    scheduleLongStatusPoll();
+  }
+
+  function longCaptureEventJobId(payload: unknown): string | null {
+    if (!payload || typeof payload !== "object") return null;
+    const record = payload as Record<string, unknown>;
+    const value = record.status && typeof record.status === "object"
+      ? record.status as Record<string, unknown>
+      : record;
+    return typeof value.jobId === "string" ? value.jobId : null;
+  }
+
+  function handleLongCaptureEvent(payload: unknown, fallbackState?: LongCaptureStatus["state"]): void {
+    const currentJobId = longActiveJobId;
+    const generation = longStartGeneration;
+    if (!currentJobId || longCaptureEventJobId(payload) !== currentJobId || longStatus?.jobId !== currentJobId) return;
+    const next = longCaptureStatusFromEvent(payload, longStatus, fallbackState);
+    if (!next || next.jobId !== currentJobId) return;
+    applyLongCaptureStatus(next, generation);
+  }
+
+  function requestLongCapture(): void {
+    if (!selection || selection.width < 1 || selection.height < 1) return;
+    if (!longCapabilityLoaded || !longCapability?.available) {
+      showToast(longCapability?.reason || "长截图暂不可用");
+      return;
+    }
+    finishText(true);
+    if (history.present.length > 0 || draft) {
+      longConfirmOpen = true;
+      return;
+    }
+    choosingScrollAnchor = true;
+    activeTool = null;
+    selectedId = null;
+    hoverPoint = null;
+    hoverCss = null;
+  }
+
+  function confirmLongCapture(): void {
+    history = createHistory([]);
+    previewAnnotations = null;
+    draft = null;
+    textDraft = null;
+    selectedId = null;
+    activeTool = null;
+    longConfirmOpen = false;
+    choosingScrollAnchor = true;
+  }
+
+  async function startLongCapture(scrollAnchor: Point): Promise<void> {
+    if (!session || !selection || !api.startLongCapture) return;
+    const generation = ++longStartGeneration;
+    choosingScrollAnchor = false;
+    longBusy = true;
+    error = "";
+    try {
+      const status = await api.startLongCapture({
+        sessionId: session.id,
+        selection: roundRect(selection),
+        scrollAnchor: { x: Math.round(scrollAnchor.x), y: Math.round(scrollAnchor.y) },
+        scope: "selection",
+        mode: longMode,
+      });
+      if (generation !== longStartGeneration) {
+        if (api.cancelLongCapture) await api.cancelLongCapture(status.jobId).catch(() => undefined);
+        return;
+      }
+      longActiveJobId = status.jobId;
+      applyLongCaptureStatus(status, generation);
+    } catch (value) {
+      if (generation !== longStartGeneration) return;
+      longBusy = false;
+      choosingScrollAnchor = true;
+      reportError(value);
+    }
+  }
+
+  type LongControlAction = "pause" | "resume" | "retry" | "undo" | "finish";
+
+  async function runLongControl(action: LongControlAction): Promise<void> {
+    const status = longStatus;
+    if (!status || longBusy) return;
+    if (status.state === "failed" || status.state === "canceled" || status.state === "ready") return;
+    if ((action === "resume" || action === "retry") && status.state !== "paused") return;
+    if (action === "pause" && status.state !== "capturing") return;
+    if (action === "undo" && !status.canUndo) return;
+    if (action === "finish" && status.frameCount < 1) return;
+    const method = action === "pause" ? api.pauseLongCapture
+      : action === "resume" ? api.resumeLongCapture
+        : action === "retry" ? api.retryLongCapture
+          : action === "undo" ? api.undoLongCapture
+            : api.finishLongCapture;
+    if (!method) {
+      reportError("当前版本未提供对应的长截图控制接口。");
+      return;
+    }
+    longBusy = true;
+    error = "";
+    const generation = longStartGeneration;
+    try {
+      applyLongCaptureStatus(await method(status.jobId), generation);
+    } catch (value) {
+      if (generation !== longStartGeneration || longActiveJobId !== status.jobId) return;
+      longBusy = false;
+      reportError(value);
+    }
+  }
+
+  async function cancelLongCaptureToEditor(): Promise<void> {
+    const status = longStatus;
+    if (!status) {
+      resetLongCapture();
+      return;
+    }
+    if (!api.cancelLongCapture) {
+      reportError("当前版本未提供长截图取消接口。");
+      return;
+    }
+    longBusy = true;
+    error = "";
+    const generation = longStartGeneration;
+    try {
+      await api.cancelLongCapture(status.jobId);
+      if (generation === longStartGeneration && longActiveJobId === status.jobId) resetLongCapture();
+    } catch (value) {
+      if (generation !== longStartGeneration || longActiveJobId !== status.jobId) return;
+      longBusy = false;
+      reportError(value);
+    }
+  }
+
+  async function exportLongImage(action: "copy" | "save" | "pin"): Promise<void> {
+    const status = longStatus;
+    if (!status || status.state !== "ready" || longBusy) return;
+    if (!api.exportLongCapture) {
+      reportError("当前版本未提供长截图导出接口。");
+      return;
+    }
+    longBusy = true;
+    error = "";
+    const generation = longStartGeneration;
+    try {
+      finishLongText(true);
+      const result = longHistory.present.length > 0
+        ? await exportAnnotatedLongCapture(
+          api,
+          status.jobId,
+          action,
+          status.width,
+          status.height,
+          longHistory.present,
+        )
+        : await api.exportLongCapture(status.jobId, action);
+      if (generation === longStartGeneration && longActiveJobId === status.jobId && !result.canceled) oncomplete?.(result);
+    } catch (value) {
+      if (generation === longStartGeneration && longActiveJobId === status.jobId) reportError(value);
+    } finally {
+      if (generation === longStartGeneration && longActiveJobId === status.jobId) longBusy = false;
+    }
+  }
+
+  async function loadLongTile(jobId: string, range: LongCaptureTileRange, generation: number): Promise<void> {
+    if (!api.getLongCaptureTile || longTilePending.has(range.y)) return;
+    longTilePending.add(range.y);
+    try {
+      const png = await api.getLongCaptureTile(jobId, range.y, range.height);
+      const image = await decodePng(png);
+      if (generation !== longTileGeneration
+        || longStatus?.jobId !== jobId
+        || longStatus.state !== "ready"
+        || !longDesiredTileYs.has(range.y)) {
+        if ("close" in image && typeof image.close === "function") image.close();
+        return;
+      }
+      longTiles = { ...longTiles, [range.y]: { ...range, image } };
+    } catch (value) {
+      if (generation === longTileGeneration && longStatus?.jobId === jobId) reportError(value);
+    } finally {
+      longTilePending.delete(range.y);
+    }
+  }
+
+  function syncLongTiles(status: LongCaptureStatus, ranges: LongCaptureTileRange[]): void {
+    const keep = new Set(ranges.map((range) => range.y));
+    longDesiredTileYs.clear();
+    for (const y of keep) longDesiredTileYs.add(y);
+    let changed = false;
+    const retained: Record<number, LoadedLongTile> = {};
+    for (const [key, tile] of Object.entries(longTiles)) {
+      if (keep.has(Number(key))) retained[Number(key)] = tile;
+      else {
+        if ("close" in tile.image && typeof tile.image.close === "function") tile.image.close();
+        changed = true;
+      }
+    }
+    if (changed) longTiles = retained;
+    const generation = longTileGeneration;
+    for (const range of ranges) {
+      if (!retained[range.y] && !longTiles[range.y]) void loadLongTile(status.jobId, range, generation);
+    }
+  }
+
+  function renderLongTile(node: HTMLCanvasElement, initial: LongTileRenderParams) {
+    let params = initial;
+    let frame: number | undefined;
+    const paint = (): void => {
+      frame = undefined;
+      const { tile, width, annotations: committed, draft: pending, selectedId: selected } = params;
+      if (node.width !== width) node.width = width;
+      if (node.height !== tile.height) node.height = tile.height;
+      const context = node.getContext("2d", { willReadFrequently: true });
+      if (!context) return;
+      const candidates = pending ? [...committed, pending] : [...committed];
+      const visible = candidates.filter((annotation) => {
+        const bounds = annotationBounds(annotation);
+        return bounds.y + bounds.height >= tile.y && bounds.y <= tile.y + tile.height;
+      });
+      const shifted = visible.map((annotation) => translateAnnotation(annotation, { x: 0, y: -tile.y }));
+      renderComposite(context, tile.image, width, tile.height, shifted);
+      const selectedAnnotation = selected ? visible.find((annotation) => annotation.id === selected) : null;
+      if (selectedAnnotation) drawAnnotationSelection(
+        context,
+        translateAnnotation(selectedAnnotation, { x: 0, y: -tile.y }),
+      );
+    };
+    const schedule = (): void => {
+      if (frame !== undefined) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(paint);
+    };
+    schedule();
+    return {
+      update(next: LongTileRenderParams) {
+        params = next;
+        schedule();
+      },
+      destroy() {
+        if (frame !== undefined) cancelAnimationFrame(frame);
+      },
+    };
+  }
+
+  $effect(() => {
+    const status = longStatus;
+    const ranges = longVisibleTiles;
+    if (status?.state === "ready") untrack(() => syncLongTiles(status, ranges));
+  });
 
   function stagePoint(event: Pick<MouseEvent, "clientX" | "clientY">): Point {
     if (!session) return { x: 0, y: 0 };
@@ -472,6 +880,167 @@
     return null;
   }
 
+  function commitLongAnnotations(next: Annotation[]): void {
+    longHistory = commitHistory(longHistory, next);
+    longPreviewAnnotations = null;
+  }
+
+  function activateLongTool(tool: ScreenshotToolName): void {
+    finishLongText(true);
+    longActiveTool = longActiveTool === tool ? null : tool;
+    longSelectedId = null;
+  }
+
+  function longPreviewPoint(event: Pick<PointerEvent, "clientX" | "clientY" | "currentTarget">): Point {
+    const status = longStatus;
+    if (!status) return { x: 0, y: 0 };
+    const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    return clampPoint({
+      x: (event.clientX - rect.left) / Math.max(0.01, longPreviewScale),
+      y: (event.clientY - rect.top) / Math.max(0.01, longPreviewScale),
+    }, { x: 0, y: 0, width: status.width, height: status.height });
+  }
+
+  function hitLongAnnotation(point: Point): Annotation | null {
+    for (let index = longHistory.present.length - 1; index >= 0; index -= 1) {
+      const annotation = longHistory.present[index];
+      if (hitTestAnnotation(annotation, point)) return annotation;
+      const bounds = annotationBounds(annotation);
+      if (point.x >= bounds.x - 5 && point.x <= bounds.x + bounds.width + 5
+        && point.y >= bounds.y - 5 && point.y <= bounds.y + bounds.height + 5) return annotation;
+    }
+    return null;
+  }
+
+  function translateLongInside(annotation: Annotation, delta: Point): Annotation {
+    const status = longStatus;
+    if (!status) return annotation;
+    const bounds = annotationBounds(annotation);
+    return translateAnnotation(annotation, {
+      x: clamp(delta.x, -bounds.x, status.width - bounds.x - bounds.width),
+      y: clamp(delta.y, -bounds.y, status.height - bounds.y - bounds.height),
+    });
+  }
+
+  function updateLongDraft(point: Point): void {
+    if (!longDraft || longInteraction?.kind !== "draw") return;
+    if (longDraft.kind === "shape" || longDraft.kind === "text") {
+      longDraft = { ...longDraft, rect: roundRect(normalizeRect(longInteraction.origin, point)) };
+    } else if (longDraft.kind === "line") {
+      longDraft = { ...longDraft, to: point };
+    } else if (longDraft.kind === "pencil" || longDraft.kind === "marker") {
+      const last = longDraft.points.at(-1)!;
+      if (Math.hypot(point.x - last.x, point.y - last.y) >= 1.5) longDraft = { ...longDraft, points: [...longDraft.points, point] };
+    } else if ((longDraft.kind === "effect" || longDraft.kind === "eraser") && longDraft.mode === "rectangle") {
+      longDraft = { ...longDraft, rect: roundRect(normalizeRect(longInteraction.origin, point)) };
+    } else {
+      const last = longDraft.points.at(-1)!;
+      if (Math.hypot(point.x - last.x, point.y - last.y) >= 1.5) longDraft = { ...longDraft, points: [...longDraft.points, point] };
+    }
+  }
+
+  function handleLongPointerDown(event: PointerEvent): void {
+    if (!longStatus || longStatus.state !== "ready" || longBusy || longTextDraft || event.button !== 0) return;
+    const point = longPreviewPoint(event);
+    const element = event.currentTarget as HTMLElement;
+    element.setPointerCapture(event.pointerId);
+    if (longActiveTool) {
+      longDraft = createDraft(longActiveTool, point);
+      longInteraction = { kind: "draw", pointerId: event.pointerId, origin: point };
+      return;
+    }
+    const hit = hitLongAnnotation(point);
+    if (!hit) {
+      longSelectedId = null;
+      return;
+    }
+    longSelectedId = hit.id;
+    longPreviewAnnotations = [...longHistory.present];
+    longInteraction = { kind: "move", pointerId: event.pointerId, origin: point, initial: hit };
+  }
+
+  function handleLongPointerMove(event: PointerEvent): void {
+    if (!longInteraction || longInteraction.pointerId !== event.pointerId) return;
+    const point = longPreviewPoint(event);
+    if (longInteraction.kind === "draw") updateLongDraft(point);
+    else {
+      const moved = translateLongInside(longInteraction.initial, {
+        x: point.x - longInteraction.origin.x,
+        y: point.y - longInteraction.origin.y,
+      });
+      longPreviewAnnotations = longHistory.present.map((annotation) => annotation.id === moved.id ? moved : annotation);
+    }
+  }
+
+  function beginLongTextEditing(annotation: TextAnnotation): void {
+    const status = longStatus;
+    if (!status) return;
+    let rect = annotation.rect;
+    if (rect.width < 20 || rect.height < 20) {
+      rect = clampRect({ x: rect.x, y: rect.y, width: 280, height: 110 }, {
+        x: 0, y: 0, width: status.width, height: status.height,
+      }, 20);
+    }
+    longTextDraft = { annotation: { ...annotation, rect }, value: "" };
+    longDraft = null;
+    void tick().then(() => longTextAreaElement?.focus());
+  }
+
+  function finishLongText(save = true): void {
+    if (!longTextDraft) return;
+    const value = longTextDraft.value.trimEnd();
+    if (save && value.trim()) {
+      const annotation = { ...longTextDraft.annotation, text: value };
+      commitLongAnnotations([...longHistory.present, annotation]);
+      longSelectedId = annotation.id;
+    }
+    longTextDraft = null;
+    longDraft = null;
+  }
+
+  function handleLongPointerUp(event: PointerEvent): void {
+    if (!longInteraction || longInteraction.pointerId !== event.pointerId) return;
+    const element = event.currentTarget as HTMLElement;
+    if (element.hasPointerCapture(event.pointerId)) element.releasePointerCapture(event.pointerId);
+    if (longInteraction.kind === "draw" && longDraft) {
+      if (longDraft.kind === "text") beginLongTextEditing(longDraft);
+      else if (validDraft(longDraft)) {
+        commitLongAnnotations([...longHistory.present, longDraft]);
+        longSelectedId = longDraft.kind === "effect" || longDraft.kind === "eraser" ? null : longDraft.id;
+        longDraft = null;
+      } else longDraft = null;
+    } else if (longInteraction.kind === "move" && longPreviewAnnotations) {
+      commitLongAnnotations(longPreviewAnnotations);
+    }
+    longInteraction = null;
+  }
+
+  function handleLongPointerCancel(): void {
+    longDraft = null;
+    longPreviewAnnotations = null;
+    longInteraction = null;
+  }
+
+  function undoLongAnnotation(): void {
+    finishLongText(false);
+    longHistory = undoHistory(longHistory);
+    longSelectedId = null;
+    longPreviewAnnotations = null;
+  }
+
+  function redoLongAnnotation(): void {
+    finishLongText(false);
+    longHistory = redoHistory(longHistory);
+    longSelectedId = null;
+    longPreviewAnnotations = null;
+  }
+
+  function removeLongSelected(): void {
+    if (!longSelectedId) return;
+    commitLongAnnotations(longHistory.present.filter((annotation) => annotation.id !== longSelectedId));
+    longSelectedId = null;
+  }
+
   function startSelectionResize(event: PointerEvent, handle: ResizeHandle): void {
     if (!selection || busy || textDraft) return;
     event.preventDefault();
@@ -497,6 +1066,13 @@
   function handlePointerDown(event: PointerEvent): void {
     if (loading || busy || !session || event.button !== 0 || isUiTarget(event.target)) return;
     const point = stagePoint(event);
+    if (choosingScrollAnchor) {
+      event.preventDefault();
+      if (hitTestSelection(point)) void startLongCapture(point);
+      else showToast("请在选区内选择滚动位置");
+      return;
+    }
+    if (longCaptureActive) return;
     rememberDoubleClickSnapshot(event, point);
     if (textDraft) return;
     hoverPoint = null;
@@ -572,6 +1148,11 @@
   function handlePointerMove(event: PointerEvent): void {
     if (!session || loading) return;
     const point = stagePoint(event);
+    if (longCaptureActive) {
+      hoverPoint = null;
+      hoverCss = null;
+      return;
+    }
     if (doubleClickSnapshot
       && Math.hypot(event.clientX - doubleClickSnapshot.clientPoint.x, event.clientY - doubleClickSnapshot.clientPoint.y) > doubleClickDistance) {
       clearDoubleClickSnapshot();
@@ -751,6 +1332,59 @@
       }
       return;
     }
+    if (longConfirmOpen) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        longConfirmOpen = false;
+      }
+      return;
+    }
+    if (choosingScrollAnchor) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        resetLongCapture();
+      }
+      return;
+    }
+    if (longStatus || longBusy) {
+      if (longTextDraft) {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          finishLongText(false);
+        } else if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+          event.preventDefault();
+          finishLongText(true);
+        }
+      } else if (longStatus?.state === "ready" && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        if (event.shiftKey) redoLongAnnotation(); else undoLongAnnotation();
+      } else if (longStatus?.state === "ready" && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "y") {
+        event.preventDefault();
+        redoLongAnnotation();
+      } else if (longStatus?.state === "ready" && (event.key === "Delete" || event.key === "Backspace") && longSelectedId) {
+        event.preventDefault();
+        removeLongSelected();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        void cancelLongCaptureToEditor();
+      } else if (longStatus?.state === "ready" && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
+        event.preventDefault();
+        void exportLongImage("copy");
+      } else if (longStatus?.state === "ready" && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        void exportLongImage("save");
+      } else if (!longBusy && (event.code === "Space" || event.key === " ")) {
+        event.preventDefault();
+        if (longStatus?.state === "capturing") void runLongControl("pause");
+        else if (longStatus?.state === "paused") void runLongControl("resume");
+      } else if (!longBusy && event.key === "Enter" && longStatus
+        && longStatus.state !== "ready" && longStatus.state !== "failed" && longStatus.state !== "canceled"
+        && longStatus.frameCount > 0) {
+        event.preventDefault();
+        void runLongControl("finish");
+      }
+      return;
+    }
     if (busy) return;
     if (textDraft) {
       if (event.key === "Escape") {
@@ -793,7 +1427,7 @@
   }
 
   function handleDoubleClick(event: MouseEvent): void {
-    if (loading || busy || !session || isUiTarget(event.target)) return;
+    if (loading || busy || longCaptureActive || !session || isUiTarget(event.target)) return;
     const snapshot = doubleClickSnapshot;
     clearDoubleClickSnapshot();
     if (snapshot) restoreDoubleClickSnapshot(snapshot);
@@ -804,6 +1438,12 @@
   }
 
   function handleContextMenu(event: MouseEvent): void {
+    if (longCaptureActive) {
+      event.preventDefault();
+      event.stopPropagation();
+      void cancelLongCaptureToEditor();
+      return;
+    }
     const hasUsableSelection = !!selection && selection.width >= 1 && selection.height >= 1;
     const pointIsInsideSelection = hasUsableSelection && !!session && hitTestSelection(stagePoint(event));
     if (pointIsInsideSelection) return;
@@ -843,6 +1483,7 @@
   }
 
   function resetEditor(): void {
+    resetLongCapture();
     selection = null;
     history = createHistory([]);
     previewAnnotations = null;
@@ -1043,6 +1684,7 @@
     document.documentElement.classList.add("screenshot-tool-page");
     document.body.classList.add("screenshot-tool-page");
     resizeObserver = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(updateViewport);
+    void loadLongCaptureCapability();
 
     const recoverOnFocus = () => requestLoad();
     const recoverOnVisibility = () => {
@@ -1072,13 +1714,34 @@
           loading = false;
           reportError(message);
         });
+        const [longProgressCleanup, longPausedCleanup, longAttentionCleanup, longReadyCleanup, longFailedCleanup] = await Promise.all([
+          listen<unknown>("long_capture_progress", (event) => handleLongCaptureEvent(event.payload, "capturing")),
+          listen<unknown>("long_capture_paused", (event) => handleLongCaptureEvent(event.payload, "paused")),
+          listen<unknown>("long_capture_attention_required", (event) => handleLongCaptureEvent(event.payload, "paused")),
+          listen<unknown>("long_capture_ready", (event) => handleLongCaptureEvent(event.payload, "ready")),
+          listen<unknown>("long_capture_failed", (event) => handleLongCaptureEvent(event.payload, "failed")),
+        ]);
         if (componentDisposed) {
           readyCleanup();
           closedCleanup();
           errorCleanup();
+          longProgressCleanup();
+          longPausedCleanup();
+          longAttentionCleanup();
+          longReadyCleanup();
+          longFailedCleanup();
           return;
         }
-        eventCleanups.push(readyCleanup, closedCleanup, errorCleanup);
+        eventCleanups.push(
+          readyCleanup,
+          closedCleanup,
+          errorCleanup,
+          longProgressCleanup,
+          longPausedCleanup,
+          longAttentionCleanup,
+          longReadyCleanup,
+          longFailedCleanup,
+        );
         requestLoad(sessionId);
         const currentWindow = getCurrentWindow();
         scheduleWindowGeometryValidation = () => {
@@ -1139,8 +1802,10 @@
       if (renderFrame !== undefined) cancelAnimationFrame(renderFrame);
       if (preferenceTimer) clearTimeout(preferenceTimer);
       if (toastTimer) clearTimeout(toastTimer);
+      if (longPollTimer) clearTimeout(longPollTimer);
       if (geometryValidationTimer) clearTimeout(geometryValidationTimer);
       clearDoubleClickSnapshot();
+      clearLongTiles();
       scheduleWindowGeometryValidation = undefined;
       releaseSourceImage();
       document.documentElement.classList.remove("screenshot-tool-page");
@@ -1173,7 +1838,7 @@
     <svg class="selection-layer" viewBox={`0 0 ${session.frameWidth} ${session.frameHeight}`} preserveAspectRatio="none" aria-hidden="true">
       <path class="dim-mask" d={selectionPath()} fill-rule="evenodd"></path>
       <rect class="selection-border" x={selection.x} y={selection.y} width={selection.width} height={selection.height}></rect>
-      {#if !busy && !textDraft}
+      {#if !busy && !textDraft && !longCaptureActive}
         {#each Object.entries(selectionHandlePoints(selection)) as [handle, point]}
           <rect
             class={`resize-handle handle-${handle}`}
@@ -1188,7 +1853,7 @@
           ></rect>
         {/each}
       {/if}
-      {#if selectedBounds && selectedAnnotation}
+      {#if selectedBounds && selectedAnnotation && !longCaptureActive}
         <rect
           class="annotation-border"
           x={selectedBounds.x - 4}
@@ -1229,16 +1894,17 @@
       ></textarea>
     {/if}
 
-    <div
-      class="toolbar-dock ui-layer"
-      bind:this={toolbarElement}
-      style={toolbarStyle()}
-      onpointerdown={(event) => event.stopPropagation()}
-      onpointermove={(event) => event.stopPropagation()}
-      role="toolbar"
-      tabindex="-1"
-      aria-label="截图标注工具"
-    >
+    {#if !longCaptureActive}
+      <div
+        class="toolbar-dock ui-layer"
+        bind:this={toolbarElement}
+        style={toolbarStyle()}
+        onpointerdown={(event) => event.stopPropagation()}
+        onpointermove={(event) => event.stopPropagation()}
+        role="toolbar"
+        tabindex="-1"
+        aria-label="截图标注工具"
+      >
       <div class="primary-tools">
         <button class:active={activeTool === "shape"} type="button" title="矩形和椭圆" aria-label="形状" onclick={() => activateTool("shape")}><Shapes size={19} /></button>
         <button class:active={activeTool === "line"} type="button" title="线条和箭头" aria-label="线条和箭头" onclick={() => activateTool("line")}><ArrowRight size={19} /></button>
@@ -1247,6 +1913,13 @@
         <button class:active={activeTool === "effect"} type="button" title="马赛克和模糊" aria-label="马赛克和模糊" onclick={() => activateTool("effect")}><ScanLine size={19} /></button>
         <button class:active={activeTool === "text"} type="button" title="文字" aria-label="文字" onclick={() => activateTool("text")}><Type size={19} /></button>
         <button class:active={activeTool === "eraser"} type="button" title="橡皮擦" aria-label="橡皮擦" onclick={() => activateTool("eraser")}><Eraser size={19} /></button>
+        <button
+          type="button"
+          title={longCapability?.reason || "长截图"}
+          aria-label="长截图"
+          disabled={!longCapabilityLoaded || !longCapability?.available}
+          onclick={requestLongCapture}
+        ><GalleryVerticalEnd size={19} /></button>
         <span class="separator"></span>
         <button type="button" title="撤销 Ctrl+Z" aria-label="撤销" disabled={history.past.length === 0} onclick={undo}><Undo2 size={19} /></button>
         <button type="button" title="重做 Ctrl+Y" aria-label="重做" disabled={history.future.length === 0} onclick={redo}><Redo2 size={19} /></button>
@@ -1335,10 +2008,204 @@
           {/if}
         </div>
       {/if}
+      </div>
+    {/if}
+  {/if}
+
+  {#if choosingScrollAnchor}
+    <div class="long-anchor-bar ui-layer" role="toolbar" aria-label="长截图范围">
+      <strong>选择滚动位置</strong>
+      <div class="segmented" aria-label="长截图起点">
+        <button class:active={longMode === "current"} type="button" onclick={() => (longMode = "current")}>当前位置</button>
+        <button class:active={longMode === "top"} type="button" onclick={() => (longMode = "top")}>从顶部</button>
+        <button class:active={longMode === "manual"} type="button" onclick={() => (longMode = "manual")}>手动滚动</button>
+      </div>
+      <button class="icon-control" type="button" title="返回截图" aria-label="取消选择滚动位置" onclick={resetLongCapture}><X size={17} /></button>
     </div>
   {/if}
 
-  {#if hoverPoint && !interaction && !busy && !textDraft}
+  {#if longStatus && longStatus.state !== "ready"}
+    <LongCaptureControl
+      jobId={longStatus.jobId}
+      initialStatus={longStatus}
+      {api}
+      floating
+      monitor={false}
+      keyboardShortcuts={false}
+      cancelLabel="返回普通截图"
+      onstatus={applyLongCaptureStatus}
+      oncancel={resetLongCapture}
+      onerror={reportError}
+    />
+  {:else if longBusy && !longStatus}
+    <div class="long-progress ui-layer" role="status"><LoaderCircle class="spin" size={17} /><strong>长截图</strong><span class="long-stats">正在启动</span><button class="icon-control" type="button" title="取消 Esc" aria-label="取消长截图" onclick={() => void cancelLongCaptureToEditor()}><X size={17} /></button></div>
+  {/if}
+
+  {#if longConfirmOpen}
+    <div class="long-confirm-backdrop ui-layer">
+      <div class="long-confirm" role="alertdialog" aria-modal="true" aria-labelledby="long-confirm-title">
+        <strong id="long-confirm-title">清除标注并开始长截图？</strong>
+        <p>长截图开始前需要清除当前选区中的标注。</p>
+        <div>
+          <button type="button" onclick={() => (longConfirmOpen = false)}>保留标注</button>
+          <button class="confirm-action" type="button" onclick={confirmLongCapture}>清除并继续</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if longStatus?.state === "ready"}
+    <section class="long-preview ui-layer" aria-label="长截图预览">
+      <header>
+        <button class="icon-control" type="button" title="返回普通截图" aria-label="返回普通截图" disabled={longBusy} onclick={() => void cancelLongCaptureToEditor()}><ArrowLeft size={18} /></button>
+        <strong>长截图预览</strong>
+        <span>{longStatus.width.toLocaleString()} × {longStatus.height.toLocaleString()} px</span>
+        <div class="long-preview-actions">
+          <button type="button" title="置顶贴图" aria-label="置顶长截图" disabled={longBusy} onclick={() => void exportLongImage("pin")}><Pin size={18} /></button>
+          <button type="button" title="保存 Ctrl+S" aria-label="保存长截图" disabled={longBusy} onclick={() => void exportLongImage("save")}><Save size={18} /></button>
+          <button class="primary-action" type="button" title="复制 Ctrl+C" aria-label="复制长截图" disabled={longBusy} onclick={() => void exportLongImage("copy")}><Copy size={18} /></button>
+        </div>
+      </header>
+      <div class="long-annotation-tools" role="toolbar" aria-label="长截图标注工具">
+        <div class="long-tool-buttons">
+          <button class:active={longActiveTool === "shape"} type="button" title="形状" aria-label="长截图形状" onclick={() => activateLongTool("shape")}><Shapes size={18} /></button>
+          <button class:active={longActiveTool === "line"} type="button" title="线条和箭头" aria-label="长截图线条和箭头" onclick={() => activateLongTool("line")}><ArrowRight size={18} /></button>
+          <button class:active={longActiveTool === "pencil"} type="button" title="铅笔" aria-label="长截图铅笔" onclick={() => activateLongTool("pencil")}><Pencil size={18} /></button>
+          <button class:active={longActiveTool === "marker"} type="button" title="马克笔" aria-label="长截图马克笔" onclick={() => activateLongTool("marker")}><Highlighter size={18} /></button>
+          <button class:active={longActiveTool === "effect"} type="button" title="马赛克和模糊" aria-label="长截图马赛克和模糊" onclick={() => activateLongTool("effect")}><ScanLine size={18} /></button>
+          <button class:active={longActiveTool === "text"} type="button" title="文字" aria-label="长截图文字" onclick={() => activateLongTool("text")}><Type size={18} /></button>
+          <button class:active={longActiveTool === "eraser"} type="button" title="橡皮擦" aria-label="长截图橡皮擦" onclick={() => activateLongTool("eraser")}><Eraser size={18} /></button>
+          <span class="long-tool-separator"></span>
+          <button type="button" title="撤销 Ctrl+Z" aria-label="撤销长截图标注" disabled={longHistory.past.length === 0} onclick={undoLongAnnotation}><Undo2 size={18} /></button>
+          <button type="button" title="重做 Ctrl+Y" aria-label="重做长截图标注" disabled={longHistory.future.length === 0} onclick={redoLongAnnotation}><Redo2 size={18} /></button>
+          {#if longSelectedId}
+            <button type="button" title="删除 Delete" aria-label="删除长截图标注" onclick={removeLongSelected}><Trash2 size={18} /></button>
+          {/if}
+        </div>
+
+        {#if longActiveTool === "shape"}
+          <div class="segmented" aria-label="长截图形状类型">
+            <button class:active={toolSettings.shape === "rectangle"} type="button" onclick={() => updateSettings({ shape: "rectangle" })}>矩形</button>
+            <button class:active={toolSettings.shape === "ellipse"} type="button" onclick={() => updateSettings({ shape: "ellipse" })}>椭圆</button>
+          </div>
+        {:else if longActiveTool === "line"}
+          <div class="segmented" aria-label="长截图线条类型">
+            <button class:active={toolSettings.line === "line"} type="button" onclick={() => updateSettings({ line: "line" })}>直线</button>
+            <button class:active={toolSettings.line === "arrow"} type="button" onclick={() => updateSettings({ line: "arrow" })}>箭头</button>
+            <button class:active={toolSettings.line === "double-arrow"} type="button" onclick={() => updateSettings({ line: "double-arrow" })}>双箭头</button>
+          </div>
+        {:else if longActiveTool === "marker"}
+          <div class="segmented" aria-label="长截图笔头">
+            <button class:active={toolSettings.markerTip === "round"} type="button" onclick={() => updateSettings({ markerTip: "round" })}>圆头</button>
+            <button class:active={toolSettings.markerTip === "square"} type="button" onclick={() => updateSettings({ markerTip: "square" })}>方头</button>
+          </div>
+        {:else if longActiveTool === "effect"}
+          <div class="segmented" aria-label="长截图效果类型">
+            <button class:active={toolSettings.effect === "mosaic"} type="button" onclick={() => updateSettings({ effect: "mosaic" })}>马赛克</button>
+            <button class:active={toolSettings.effect === "blur"} type="button" onclick={() => updateSettings({ effect: "blur" })}>模糊</button>
+          </div>
+          <div class="segmented" aria-label="长截图效果范围">
+            <button class:active={toolSettings.effectMode === "brush"} type="button" onclick={() => updateSettings({ effectMode: "brush" })}>画笔</button>
+            <button class:active={toolSettings.effectMode === "rectangle"} type="button" onclick={() => updateSettings({ effectMode: "rectangle" })}>区域</button>
+          </div>
+        {:else if longActiveTool === "eraser"}
+          <div class="segmented" aria-label="长截图橡皮范围">
+            <button class:active={toolSettings.eraserMode === "brush"} type="button" onclick={() => updateSettings({ eraserMode: "brush" })}>画笔</button>
+            <button class:active={toolSettings.eraserMode === "rectangle"} type="button" onclick={() => updateSettings({ eraserMode: "rectangle" })}>区域</button>
+          </div>
+        {:else if longActiveTool === "text"}
+          <select aria-label="长截图字体" value={toolSettings.fontFamily} onchange={(event) => updateSettings({ fontFamily: event.currentTarget.value })}>
+            <option>Microsoft YaHei UI</option><option>SimSun</option><option>SimHei</option><option>Segoe UI</option>
+          </select>
+          <div class="long-text-toggles">
+            <button class:active={toolSettings.textBold} type="button" aria-label="长截图粗体" onclick={() => updateSettings({ textBold: !toolSettings.textBold })}><Bold size={15} /></button>
+            <button class:active={toolSettings.textItalic} type="button" aria-label="长截图斜体" onclick={() => updateSettings({ textItalic: !toolSettings.textItalic })}><Italic size={15} /></button>
+            <button class:active={toolSettings.textUnderline} type="button" aria-label="长截图下划线" onclick={() => updateSettings({ textUnderline: !toolSettings.textUnderline })}><Underline size={15} /></button>
+          </div>
+        {/if}
+
+        {#if longActiveTool && longActiveTool !== "effect" && longActiveTool !== "eraser"}
+          <div class="long-palette" aria-label="长截图颜色">
+            {#each colors as color}
+              <button
+                class:selected={(longActiveTool === "text" ? toolSettings.textColor : toolSettings.strokeColor) === color}
+                type="button"
+                style:background={color}
+                aria-label={`长截图颜色 ${color}`}
+                onclick={() => updateSettings(longActiveTool === "text" ? { textColor: color } : { strokeColor: color })}
+              ></button>
+            {/each}
+          </div>
+        {/if}
+
+        {#if longActiveTool === "shape" || longActiveTool === "line"}
+          <label><span>线宽</span><input type="range" min="1" max="20" value={toolSettings.strokeWidth} oninput={(event) => updateSettings({ strokeWidth: Number(event.currentTarget.value) }, false)} /></label>
+        {:else if longActiveTool === "pencil"}
+          <label><span>粗细</span><input type="range" min="1" max="30" value={toolSettings.pencilWidth} oninput={(event) => updateSettings({ pencilWidth: Number(event.currentTarget.value) }, false)} /></label>
+        {:else if longActiveTool === "marker"}
+          <label><span>粗细</span><input type="range" min="6" max="64" value={toolSettings.markerWidth} oninput={(event) => updateSettings({ markerWidth: Number(event.currentTarget.value) }, false)} /></label>
+        {:else if longActiveTool === "effect"}
+          <label><span>范围</span><input type="range" min="8" max="100" value={toolSettings.effectSize} oninput={(event) => updateSettings({ effectSize: Number(event.currentTarget.value) }, false)} /></label>
+          <label><span>强度</span><input type="range" min="2" max="30" value={toolSettings.effectIntensity} oninput={(event) => updateSettings({ effectIntensity: Number(event.currentTarget.value) }, false)} /></label>
+        {:else if longActiveTool === "eraser"}
+          <label><span>大小</span><input type="range" min="8" max="100" value={toolSettings.eraserSize} oninput={(event) => updateSettings({ eraserSize: Number(event.currentTarget.value) }, false)} /></label>
+        {:else if longActiveTool === "text"}
+          <label><span>字号</span><input type="range" min="12" max="72" value={toolSettings.fontSize} oninput={(event) => updateSettings({ fontSize: Number(event.currentTarget.value) }, false)} /></label>
+        {/if}
+      </div>
+      <div
+        class="long-preview-scroll"
+        bind:this={longPreviewElement}
+        onscroll={(event) => (longPreviewScrollTop = event.currentTarget.scrollTop)}
+      >
+        <div
+          class="long-preview-content"
+          class:drawing={!!longActiveTool}
+          role="application"
+          aria-label="长截图标注画布"
+          tabindex="-1"
+          style={`width:${Math.max(1, longStatus.width * longPreviewScale)}px;height:${Math.max(1, longStatus.height * longPreviewScale)}px`}
+          onpointerdown={handleLongPointerDown}
+          onpointermove={handleLongPointerMove}
+          onpointerup={handleLongPointerUp}
+          onpointercancel={handleLongPointerCancel}
+        >
+          {#each longVisibleTiles as range (range.y)}
+            {#if longTiles[range.y]}
+              <canvas
+                use:renderLongTile={{
+                  tile: longTiles[range.y],
+                  width: longStatus.width,
+                  annotations: longAnnotations,
+                  draft: longDraft,
+                  selectedId: longSelectedId,
+                }}
+                aria-label={`长截图瓦片 ${range.y}`}
+                style={`top:${range.y * longPreviewScale}px;width:${longStatus.width * longPreviewScale}px;height:${range.height * longPreviewScale}px`}
+              ></canvas>
+            {:else}
+              <div class="long-tile-loading" style={`top:${range.y * longPreviewScale}px;height:${range.height * longPreviewScale}px`}><LoaderCircle class="spin" size={18} /></div>
+            {/if}
+          {/each}
+          {#if longTextDraft}
+            <textarea
+              class="long-text-editor"
+              bind:this={longTextAreaElement}
+              bind:value={longTextDraft.value}
+              style={`left:${longTextDraft.annotation.rect.x * longPreviewScale}px;top:${longTextDraft.annotation.rect.y * longPreviewScale}px;width:${longTextDraft.annotation.rect.width * longPreviewScale}px;height:${longTextDraft.annotation.rect.height * longPreviewScale}px;font-family:${longTextDraft.annotation.fontFamily};font-size:${Math.max(12, longTextDraft.annotation.fontSize * longPreviewScale)}px;color:${longTextDraft.annotation.color};font-weight:${longTextDraft.annotation.bold ? 700 : 400};font-style:${longTextDraft.annotation.italic ? "italic" : "normal"};text-decoration:${longTextDraft.annotation.underline ? "underline" : "none"}`}
+              aria-label="输入长截图标注文字"
+              placeholder="输入文字"
+              onblur={() => finishLongText(true)}
+              onpointerdown={(event) => event.stopPropagation()}
+            ></textarea>
+          {/if}
+        </div>
+      </div>
+      {#if longBusy}<div class="long-preview-busy"><LoaderCircle class="spin" size={17} />正在处理…</div>{/if}
+    </section>
+  {/if}
+
+  {#if hoverPoint && !interaction && !busy && !textDraft && !longCaptureActive}
     <div class="magnifier ui-layer" style={magnifierStyle()} aria-live="polite">
       <div class="magnified-pixels"><canvas bind:this={magnifierCanvas} width="132" height="108"></canvas><span></span></div>
       <div class="pixel-data">
@@ -1407,6 +2274,48 @@
   .text-toggles { display: inline-flex; }
   .text-toggles button { width: 29px; height: 29px; }
   .text-editor { position: absolute; z-index: 15; box-sizing: border-box; min-width: 36px; min-height: 26px; padding: 4px 6px; resize: none; color: #ff3b30; background: rgb(255 255 255 / 92%); border: 1px solid #0a84ff; outline: 1px solid #fff; overflow: hidden; user-select: text; }
+  .long-anchor-bar, .long-progress { position: absolute; z-index: 40; top: 12px; left: 50%; display: flex; box-sizing: border-box; min-height: 44px; max-width: calc(100vw - 24px); padding: 5px 7px 5px 11px; align-items: center; gap: 8px; color: #242424; background: rgb(250 250 250 / 98%); border: 1px solid rgb(0 0 0 / 25%); border-radius: 6px; box-shadow: 0 6px 20px rgb(0 0 0 / 28%); transform: translateX(-50%); cursor: default; font: 12px "Segoe UI", sans-serif; }
+  .long-anchor-bar strong, .long-progress strong { flex: 0 0 auto; font-size: 12px; }
+  .long-progress { min-width: min(540px, calc(100vw - 24px)); }
+  .long-stats { flex: 0 0 auto; color: #555; white-space: nowrap; }
+  .long-message { min-width: 0; max-width: 220px; color: #6b4d18; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .long-control-separator { width: 1px; height: 24px; margin-left: auto; background: #d2d2d2; }
+  .icon-control, .long-preview-actions button { display: grid; flex: 0 0 auto; width: 32px; height: 32px; padding: 0; place-items: center; color: #2d2d2d; background: transparent; border: 1px solid transparent; border-radius: 4px; }
+  .icon-control:hover:not(:disabled), .long-preview-actions button:hover:not(:disabled) { background: #e7e7e7; border-color: #d0d0d0; }
+  .icon-control:disabled, .long-preview-actions button:disabled { opacity: .42; }
+  .icon-control.finish-control, .long-preview-actions button.primary-action { color: #fff; background: #0067c0; border-color: #005a9e; }
+  .long-confirm-backdrop { position: absolute; z-index: 90; inset: 0; display: grid; padding: 16px; place-items: center; background: rgb(0 0 0 / 42%); cursor: default; }
+  .long-confirm { width: min(360px, calc(100vw - 32px)); box-sizing: border-box; padding: 18px; color: #242424; background: #fff; border: 1px solid #c8c8c8; border-radius: 7px; box-shadow: 0 10px 30px rgb(0 0 0 / 30%); font: 13px/1.45 "Segoe UI", sans-serif; }
+  .long-confirm > strong { display: block; font-size: 16px; }
+  .long-confirm p { margin: 8px 0 18px; color: #666; }
+  .long-confirm > div { display: flex; justify-content: flex-end; gap: 8px; }
+  .long-confirm button { min-height: 32px; padding: 5px 11px; color: #242424; background: #fff; border: 1px solid #b9b9b9; border-radius: 4px; }
+  .long-confirm button.confirm-action { color: #fff; background: #0067c0; border-color: #005a9e; }
+  .long-preview { position: absolute; z-index: 70; inset: 0; display: grid; grid-template-rows: 50px 46px minmax(0, 1fr); color: #242424; background: #1d1d1d; cursor: default; }
+  .long-preview > header { display: flex; min-width: 0; padding: 0 10px; align-items: center; gap: 9px; background: #fafafa; border-bottom: 1px solid #c8c8c8; box-shadow: 0 2px 8px rgb(0 0 0 / 22%); }
+  .long-preview > header > strong { font-size: 13px; }
+  .long-preview > header > span { color: #666; font: 12px "Segoe UI", sans-serif; white-space: nowrap; }
+  .long-preview-actions { display: flex; margin-left: auto; gap: 3px; }
+  .long-annotation-tools { display: flex; min-width: 0; padding: 5px 8px; align-items: center; gap: 8px; background: #f4f4f4; border-bottom: 1px solid #cfcfcf; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin; }
+  .long-tool-buttons, .long-text-toggles { display: flex; flex: 0 0 auto; align-items: center; gap: 2px; }
+  .long-tool-buttons > button, .long-text-toggles button { display: grid; width: 32px; height: 32px; padding: 0; place-items: center; color: #2d2d2d; background: transparent; border: 1px solid transparent; border-radius: 4px; }
+  .long-tool-buttons > button:hover:not(:disabled), .long-text-toggles button:hover { background: #e4e4e4; border-color: #ccc; }
+  .long-tool-buttons > button.active, .long-text-toggles button.active { color: #fff; background: #0067c0; border-color: #005a9e; }
+  .long-tool-buttons > button:disabled { opacity: .38; }
+  .long-tool-separator { width: 1px; height: 24px; margin: 0 3px; background: #ccc; }
+  .long-annotation-tools select { flex: 0 0 auto; height: 29px; max-width: 150px; background: #fff; border: 1px solid #bbb; border-radius: 4px; }
+  .long-annotation-tools label { display: flex; flex: 0 0 auto; align-items: center; gap: 5px; color: #4c4c4c; font-size: 12px; white-space: nowrap; }
+  .long-annotation-tools label input { width: 82px; accent-color: #0067c0; }
+  .long-palette { display: flex; flex: 0 0 auto; gap: 4px; }
+  .long-palette button { width: 19px; height: 19px; padding: 0; border: 1px solid rgb(0 0 0 / 28%); border-radius: 50%; box-shadow: inset 0 0 0 1px rgb(255 255 255 / 45%); }
+  .long-palette button.selected { box-shadow: 0 0 0 2px #f4f4f4, 0 0 0 4px #0067c0; }
+  .long-preview-scroll { min-width: 0; min-height: 0; padding: 16px 0 28px; overflow: auto; scrollbar-gutter: stable; }
+  .long-preview-content { position: relative; margin: 0 auto; overflow: hidden; background: #f4f4f4; box-shadow: 0 4px 20px rgb(0 0 0 / 45%); touch-action: none; }
+  .long-preview-content.drawing { cursor: crosshair; }
+  .long-preview-content canvas, .long-tile-loading { position: absolute; left: 0; display: block; }
+  .long-tile-loading { display: grid; width: 100%; place-items: center; color: #777; background: #ededed; }
+  .long-text-editor { position: absolute; z-index: 3; box-sizing: border-box; min-width: 36px; min-height: 26px; padding: 4px 6px; resize: none; color: #ff3b30; background: rgb(255 255 255 / 94%); border: 1px solid #0a84ff; outline: 1px solid #fff; overflow: hidden; user-select: text; }
+  .long-preview-busy { position: absolute; z-index: 2; top: 62px; left: 50%; display: flex; padding: 7px 11px; align-items: center; gap: 7px; color: #fff; background: rgb(22 22 22 / 92%); border-radius: 4px; transform: translateX(-50%); font: 12px "Segoe UI", sans-serif; }
   .magnifier { position: absolute; z-index: 30; width: 152px; padding: 7px; color: #f7f7f7; background: rgb(20 20 20 / 94%); border: 1px solid rgb(255 255 255 / 35%); border-radius: 5px; box-shadow: 0 5px 18px rgb(0 0 0 / 35%); font: 12px/1.35 "Segoe UI", sans-serif; pointer-events: none; }
   .magnified-pixels { position: relative; width: 132px; height: 108px; margin: 0 auto; overflow: hidden; border: 1px solid #777; }
   .magnified-pixels canvas { display: block; width: 132px; height: 108px; }
@@ -1418,8 +2327,9 @@
   .status-overlay.error-state { text-align: center; } .status-overlay.error-state strong { font-size: 17px; } .status-overlay.error-state span { max-width: 420px; color: #ccc; }
   .error-actions { display: flex; gap: 8px; }
   .status-overlay button { min-width: 76px; padding: 7px 13px; color: #222; background: #fff; border: 0; border-radius: 4px; }
-  .busy-indicator, .toast, .error-toast { position: absolute; z-index: 60; left: 50%; display: flex; padding: 8px 12px; align-items: center; gap: 7px; color: #fff; background: rgb(22 22 22 / 92%); border: 1px solid rgb(255 255 255 / 25%); border-radius: 4px; box-shadow: 0 5px 16px rgb(0 0 0 / 28%); transform: translateX(-50%); font: 12px "Segoe UI", sans-serif; }
+  .busy-indicator, .toast, .error-toast { position: absolute; z-index: 110; left: 50%; display: flex; padding: 8px 12px; align-items: center; gap: 7px; color: #fff; background: rgb(22 22 22 / 92%); border: 1px solid rgb(255 255 255 / 25%); border-radius: 4px; box-shadow: 0 5px 16px rgb(0 0 0 / 28%); transform: translateX(-50%); font: 12px "Segoe UI", sans-serif; }
   .busy-indicator { top: 18px; } .toast { bottom: 24px; } .error-toast { bottom: 24px; max-width: min(540px, calc(100vw - 32px)); background: rgb(150 34 27 / 96%); }
   .spin { animation: spin .8s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
-  @media (max-width: 800px) { .toolbar-dock { width: calc(100vw - 16px); } .primary-tools, .tool-options { overflow-x: auto; } }
+  @media (max-width: 800px) { .toolbar-dock { width: calc(100vw - 16px); } .primary-tools, .tool-options { overflow-x: auto; } .long-progress, .long-anchor-bar { width: calc(100vw - 24px); min-width: 0; overflow-x: auto; } .long-message { display: none; } }
+  @media (max-width: 520px) { .long-preview > header > span { display: none; } }
 </style>

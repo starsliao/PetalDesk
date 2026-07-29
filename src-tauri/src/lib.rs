@@ -1,6 +1,9 @@
+pub mod browser_bridge;
+pub mod browser_native_host;
 mod commands;
 mod error;
 mod gantt;
+mod long_screenshot;
 mod models;
 mod reminders;
 mod screenshot;
@@ -8,6 +11,7 @@ mod storage;
 mod timer;
 
 use crate::gantt::GanttStore;
+use crate::long_screenshot::LongScreenshotStore;
 use crate::reminders::ReminderStore;
 use crate::screenshot::ScreenshotStore;
 use crate::storage::WorkspaceStore;
@@ -27,6 +31,7 @@ const OPEN_TIMER_MENU_ID: &str = "open-tool:timer";
 const OPEN_REMINDER_MENU_ID: &str = "open-tool:reminder";
 const OPEN_GANTT_MENU_ID: &str = "open-tool:gantt";
 const OPEN_SCREENSHOT_MENU_ID: &str = "open-tool:screenshot";
+const ABOUT_MENU_ID: &str = "about";
 const MAX_TRAY_NOTE_TITLE_CHARS: usize = 80;
 static ACTIVATION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static INITIAL_ACTIVATION_SCHEDULED: AtomicBool = AtomicBool::new(false);
@@ -105,6 +110,50 @@ fn tool_from_tray_menu_id(menu_id: &str) -> Option<models::ToolName> {
         _ => None,
     }
 }
+
+fn about_message(last_updated: Option<SystemTime>) -> String {
+    let last_updated = last_updated
+        .map(chrono::DateTime::<chrono::Local>::from)
+        .map(|value| value.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "未知".to_string());
+    format!(
+        "名称：飞花 - PetalDesk\r\n版本：{}\r\n最后更新时间：{last_updated}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn show_about_dialog() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND,
+    };
+
+    let last_updated = std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|metadata| metadata.modified().ok());
+    let message = about_message(last_updated);
+    let message = message
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let title = "关于飞花 - PetalDesk"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_about_dialog() {}
 
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -275,10 +324,11 @@ fn build_tray_menu(app: &tauri::AppHandle) -> Result<Menu<tauri::Wry>, Box<dyn s
     tools.append(&gantt)?;
     tools.append(&screenshot)?;
     let new_note = MenuItem::with_id(app, "new-note", "新建便签", true, None::<&str>)?;
+    let about = MenuItem::with_id(app, ABOUT_MENU_ID, "关于", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     Ok(Menu::with_items(
         app,
-        &[&show, &note_list, &tools, &new_note, &quit],
+        &[&show, &note_list, &tools, &new_note, &about, &quit],
     )?)
 }
 
@@ -347,7 +397,11 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_main_window(app),
             "new-note" => spawn_create_note(app),
-            "quit" => app.exit(0),
+            ABOUT_MENU_ID => show_about_dialog(),
+            "quit" => {
+                long_screenshot::shutdown(app);
+                app.exit(0);
+            }
             id => {
                 if let Some(tool) = tool_from_tray_menu_id(id) {
                     spawn_open_tool(app, tool);
@@ -427,6 +481,8 @@ pub fn run() {
         TimerStore::load(&data_storage_path).expect("无法初始化飞花 - PetalDesk 计时器");
     let screenshot_store =
         ScreenshotStore::load(&data_storage_path).expect("无法初始化飞花 - PetalDesk 截图工具");
+    let long_screenshot_store = LongScreenshotStore::load(&data_storage_path)
+        .expect("无法初始化飞花 - PetalDesk 长截图工具");
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(
             |app, _arguments, _cwd| {
@@ -444,6 +500,7 @@ pub fn run() {
         .manage(gantt_store)
         .manage(timer_store)
         .manage(screenshot_store)
+        .manage(long_screenshot_store)
         .on_page_load(|webview, payload| {
             if webview.label() == "main"
                 && payload.event() == tauri::webview::PageLoadEvent::Finished
@@ -549,17 +606,34 @@ pub fn run() {
             screenshot::copy_pinned_screenshot,
             screenshot::save_pinned_screenshot,
             screenshot::close_pinned_screenshot,
+            long_screenshot::get_long_capture_capability,
+            long_screenshot::start_long_capture,
+            long_screenshot::pause_long_capture,
+            long_screenshot::resume_long_capture,
+            long_screenshot::retry_long_capture_segment,
+            long_screenshot::undo_long_capture_segment,
+            long_screenshot::finish_long_capture,
+            long_screenshot::cancel_long_capture,
+            long_screenshot::get_long_capture_status,
+            long_screenshot::get_long_capture_tile,
+            long_screenshot::export_long_capture,
+            long_screenshot::prepare_long_capture_annotation_export,
+            long_screenshot::upload_long_capture_annotation_strip,
+            long_screenshot::finish_long_capture_annotation_export,
+            long_screenshot::cancel_long_capture_annotation_export,
         ])
         .build(tauri::generate_context!())
         .expect("无法启动飞花 - PetalDesk 应用");
 
-    app.run(|_app, event| match event {
+    app.run(|app, event| match event {
         RunEvent::Ready => {
             trace_activation("run_event:ready");
         }
         RunEvent::ExitRequested { api, code, .. } => {
             if code.is_none() {
                 api.prevent_exit();
+            } else {
+                long_screenshot::shutdown(app);
             }
         }
         _ => {}
@@ -619,5 +693,13 @@ mod tests {
         assert_eq!(tool_from_tray_menu_id("open-tool:Gantt"), None);
         assert_eq!(tool_from_tray_menu_id("timer"), None);
         assert_eq!(tool_from_tray_menu_id("gantt"), None);
+    }
+
+    #[test]
+    fn about_message_contains_product_version_and_time_fallback() {
+        let message = about_message(None);
+        assert!(message.contains("名称：飞花 - PetalDesk"));
+        assert!(message.contains(&format!("版本：{}", env!("CARGO_PKG_VERSION"))));
+        assert!(message.contains("最后更新时间：未知"));
     }
 }

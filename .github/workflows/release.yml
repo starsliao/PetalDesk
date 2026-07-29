@@ -15,6 +15,31 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Validate release versions
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if (-not $tag.StartsWith("v") -or $tag.Length -le 1) {
+            throw "Release tag must use the vX.Y.Z form: $tag"
+          }
+          $expected = $tag.Substring(1)
+          $cargo = Get-Content "src-tauri/Cargo.toml" -Raw
+          $cargoVersion = [regex]::Match($cargo, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          $versions = [ordered]@{
+            "package.json" = (Get-Content "package.json" -Raw | ConvertFrom-Json).version
+            "src-tauri/Cargo.toml" = $cargoVersion
+            "src-tauri/tauri.conf.json" = (Get-Content "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json).version
+            "browser-extension/package.json" = (Get-Content "browser-extension/package.json" -Raw | ConvertFrom-Json).version
+            "browser-extension/manifest/chromium.json" = (Get-Content "browser-extension/manifest/chromium.json" -Raw | ConvertFrom-Json).version
+            "browser-extension/manifest/firefox.json" = (Get-Content "browser-extension/manifest/firefox.json" -Raw | ConvertFrom-Json).version
+          }
+          foreach ($entry in $versions.GetEnumerator()) {
+            if ([string]::IsNullOrWhiteSpace($entry.Value) -or $entry.Value -ne $expected) {
+              throw "$($entry.Key) version '$($entry.Value)' does not match tag '$tag'."
+            }
+          }
+          Write-Host "All release versions match $tag."
+
       - name: Install pnpm
         uses: pnpm/action-setup@v6
         with:
@@ -38,7 +63,27 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build Windows installer
+        env:
+          PETALDESK_CHROME_EXTENSION_ID: ${{ secrets.PETALDESK_CHROME_EXTENSION_ID }}
+          PETALDESK_EDGE_EXTENSION_ID: ${{ secrets.PETALDESK_EDGE_EXTENSION_ID }}
         run: pnpm package:windows
+
+      - name: Build Firefox extension package
+        shell: pwsh
+        env:
+          AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: |
+          $signArguments = @()
+          $hasIssuer = -not [string]::IsNullOrWhiteSpace($env:AMO_JWT_ISSUER)
+          $hasSecret = -not [string]::IsNullOrWhiteSpace($env:AMO_JWT_SECRET)
+          if ($hasIssuer -ne $hasSecret) {
+            throw "Configure both AMO_JWT_ISSUER and AMO_JWT_SECRET, or neither."
+          }
+          if ($hasIssuer) {
+            $signArguments += "-Sign"
+          }
+          & ".\browser-extension\scripts\package-firefox.ps1" @signArguments
 
       - name: Publish release asset
         shell: pwsh
@@ -46,20 +91,45 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ github.ref_name }}"
-          $assets = @(
+          $installers = @(
             Get-ChildItem `
               -Path "src-tauri/target/release/bundle/nsis" `
               -Filter "PetalDesk_*_x64-setup.exe" `
               -File
           )
-          if ($assets.Count -ne 1) {
-            throw "Expected one Windows installer, found $($assets.Count)."
+          if ($installers.Count -ne 1) {
+            throw "Expected one Windows installer, found $($installers.Count)."
           }
-          $asset = $assets[0].FullName
+          $firefoxArchives = @(
+            Get-ChildItem `
+              -Path "browser-extension/dist/artifacts" `
+              -Filter "PetalDesk_Firefox_AMO-upload_*.zip" `
+              -File
+          )
+          if ($firefoxArchives.Count -ne 1) {
+            throw "Expected one Firefox AMO upload archive, found $($firefoxArchives.Count)."
+          }
+          $signedFirefoxPackages = @(
+            Get-ChildItem `
+              -Path "browser-extension/dist/signed" `
+              -Filter "PetalDesk_Firefox_*-signed.xpi" `
+              -File `
+              -ErrorAction SilentlyContinue
+          )
+          if ($signedFirefoxPackages.Count -gt 1) {
+            throw "Expected at most one signed Firefox XPI, found $($signedFirefoxPackages.Count)."
+          }
+          $assets = @(
+            $installers[0].FullName
+            $firefoxArchives[0].FullName
+          )
+          if ($signedFirefoxPackages.Count -eq 1) {
+            $assets += $signedFirefoxPackages[0].FullName
+          }
           $version = $tag.TrimStart("v")
           gh release view $tag 2>$null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $asset --clobber
+            gh release upload $tag @assets --clobber
           } else {
-            gh release create $tag $asset --title "飞花 - PetalDesk $version" --generate-notes
+            gh release create $tag @assets --title "飞花 - PetalDesk $version" --generate-notes
           }

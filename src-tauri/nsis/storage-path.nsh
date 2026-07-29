@@ -425,9 +425,92 @@ Function PetalDeskPersistStoragePath
   ${EndIf}
 FunctionEnd
 
+Function PetalDeskShowNativeMessagingWarning
+  IfSilent petaldesk_native_warning_done 0
+  ClearErrors
+  ${GetOptions} $CMDLINE "/P" $4
+  ${If} ${Errors}
+    MessageBox MB_ICONEXCLAMATION|MB_OK "$3"
+  ${EndIf}
+  petaldesk_native_warning_done:
+FunctionEnd
+
+; Register the browser bridge after Tauri has copied the host and helper script.
+; Firefox uses a stable Gecko ID. Chromium registrations are compiled in only
+; when the release build provides the corresponding store extension ID.
+Function PetalDeskRegisterNativeMessagingHost
+  IfFileExists "$INSTDIR\petaldesk-browser-host.exe" 0 petaldesk_native_host_missing
+  IfFileExists "$INSTDIR\native-messaging\Register-PetalDeskNativeHost.ps1" 0 petaldesk_native_host_missing
+
+  StrCpy $0 '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\native-messaging\Register-PetalDeskNativeHost.ps1" -HostExecutable "$INSTDIR\petaldesk-browser-host.exe"'
+  !ifdef PETALDESK_CHROME_EXTENSION_ID
+    StrCpy $0 '$0 -ChromeExtensionId "${PETALDESK_CHROME_EXTENSION_ID}"'
+  !endif
+  !ifdef PETALDESK_EDGE_EXTENSION_ID
+    StrCpy $0 '$0 -EdgeExtensionId "${PETALDESK_EDGE_EXTENSION_ID}"'
+  !endif
+
+  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" $0'
+  Pop $1
+  Pop $2
+  ${If} $1 == 0
+    DetailPrint "PetalDesk Native Messaging host registered."
+  ${Else}
+    ; Browser enhancement is optional; a registration failure must not roll
+    ; back the desktop application installation.
+    DetailPrint "PetalDesk Native Messaging registration skipped or failed (exit $1): $2"
+    ${If} $LANGUAGE == ${PETALDESK_LANG_SIMPCHINESE}
+      StrCpy $3 "飞花 - PetalDesk 已安装，但 Firefox 浏览器增强注册失败。请重新运行安装器或查看安装日志。"
+    ${Else}
+      StrCpy $3 "PetalDesk was installed, but Firefox browser integration could not be registered. Run the installer again or review the installation log."
+    ${EndIf}
+    Call PetalDeskShowNativeMessagingWarning
+  ${EndIf}
+  Return
+
+  petaldesk_native_host_missing:
+    DetailPrint "PetalDesk Native Messaging host files are missing; browser enhancement was not registered."
+    ${If} $LANGUAGE == ${PETALDESK_LANG_SIMPCHINESE}
+      StrCpy $3 "飞花 - PetalDesk 已安装，但 Firefox 浏览器增强组件缺失。请重新运行安装器。"
+    ${Else}
+      StrCpy $3 "PetalDesk was installed, but the Firefox browser integration component is missing. Run the installer again."
+    ${EndIf}
+    Call PetalDeskShowNativeMessagingWarning
+FunctionEnd
+
+Function un.PetalDeskUnregisterNativeMessagingHost
+  DeleteRegKey HKCU "Software\Google\Chrome\NativeMessagingHosts\com.petaldesk.capture"
+  DeleteRegKey HKCU "Software\Microsoft\Edge\NativeMessagingHosts\com.petaldesk.capture"
+  DeleteRegKey HKCU "Software\Mozilla\NativeMessagingHosts\com.petaldesk.capture"
+
+  Delete "$LOCALAPPDATA\PetalDesk\NativeMessaging\com.petaldesk.capture.chrome.json"
+  Delete "$LOCALAPPDATA\PetalDesk\NativeMessaging\com.petaldesk.capture.edge.json"
+  Delete "$LOCALAPPDATA\PetalDesk\NativeMessaging\com.petaldesk.capture.chromium.json"
+  Delete "$LOCALAPPDATA\PetalDesk\NativeMessaging\com.petaldesk.capture.firefox.json"
+  RMDir "$LOCALAPPDATA\PetalDesk\NativeMessaging"
+FunctionEnd
+
+; Stop before file copying if Firefox still owns the long-lived Native Messaging
+; host. This hook intentionally changes no storage or browser registration state.
+!macro NSIS_HOOK_PREINSTALL
+  !insertmacro CheckIfAppIsRunning "petaldesk-browser-host.exe" "PetalDesk browser integration"
+!macroend
+
 ; Persist only after Tauri's running-app guard and application file/registry
-; writes have completed. Keeping this out of PREINSTALL prevents a cancelled
-; upgrade with PetalDesk still running from switching the next startup's data root.
+; writes have completed. Keeping persistence out of PREINSTALL prevents a
+; cancelled upgrade from switching the next startup's data root.
 !macro NSIS_HOOK_POSTINSTALL
   Call PetalDeskPersistStoragePath
+  Call PetalDeskRegisterNativeMessagingHost
+!macroend
+
+!macro NSIS_HOOK_PREUNINSTALL
+  ; Tauri expands this hook before its own running-app guard. Repeat that guard
+  ; here so cancelling the prompt cannot leave an installed app without browser
+  ; registration.
+  !insertmacro CheckIfAppIsRunning "${MAINBINARYNAME}.exe" "${PETALDESK_DISPLAYNAME}"
+  ; Firefox keeps the Native Messaging port open. Use Tauri's normal process
+  ; prompt so an interactive uninstall never kills an active capture silently.
+  !insertmacro CheckIfAppIsRunning "petaldesk-browser-host.exe" "PetalDesk browser integration"
+  Call un.PetalDeskUnregisterNativeMessagingHost
 !macroend

@@ -1,9 +1,10 @@
 [package]
 name = "petaldesk"
-version = "0.2.1"
+version = "0.3.0"
 description = "飞花 - PetalDesk local Markdown notes and desktop tools"
 authors = ["飞花 - PetalDesk contributors"]
 edition = "2021"
+default-run = "petaldesk"
 
 [features]
 # Production builds must serve the bundled frontend through Tauri's custom
@@ -53,6 +54,9 @@ windows-sys = { version = "0.60", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_DataExchange",
   "Win32_System_Memory",
+  "Win32_System_Threading",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
 ] }
 

@@ -25,6 +25,7 @@
   type NoteEditorComponent = typeof import("$lib/components/NoteEditor.svelte").default;
   type GanttToolComponent = typeof import("$lib/components/GanttTool.svelte").default;
   type ScreenshotToolComponent = typeof import("$lib/components/ScreenshotTool.svelte").default;
+  type LongCaptureControlComponent = typeof import("$lib/screenshot/LongCaptureControl.svelte").default;
   type PinnedScreenshotComponent = typeof import("$lib/components/PinnedScreenshot.svelte").default;
 
   type MainView = "notes" | "trash";
@@ -37,6 +38,7 @@
   const routeSearch =
     typeof window !== "undefined" ? new URLSearchParams(window.location.search) : null;
   const screenshotPinId = routeSearch?.get("screenshotPin") ?? null;
+  const longCaptureControlId = routeSearch?.get("longControl") ?? null;
   const requestedTool = routeSearch?.get("tool") ?? null;
   const toolName: ToolName | null = parseToolName(requestedTool);
   const isToolWindow = toolName !== null || screenshotPinId !== null;
@@ -44,6 +46,7 @@
   let initialized = $state(false);
   let GanttTool = $state<GanttToolComponent | null>(null);
   let ScreenshotTool = $state<ScreenshotToolComponent | null>(null);
+  let LongCaptureControl = $state<LongCaptureControlComponent | null>(null);
   let PinnedScreenshot = $state<PinnedScreenshotComponent | null>(null);
   let fatalError = $state("");
   let appInfo = $state<AppInfo | null>(null);
@@ -703,6 +706,10 @@
         void import("$lib/components/PinnedScreenshot.svelte").then((module) => {
           if (!disposed) PinnedScreenshot = module.default;
         });
+      } else if (toolName === "screenshot" && longCaptureControlId) {
+        void import("$lib/screenshot/LongCaptureControl.svelte").then((module) => {
+          if (!disposed) LongCaptureControl = module.default;
+        });
       } else if (toolName === "screenshot") {
         void import("$lib/components/ScreenshotTool.svelte").then((module) => {
           if (!disposed) ScreenshotTool = module.default;
@@ -757,7 +764,9 @@
           : toolName === "gantt"
             ? "任务甘特图 - 飞花 - PetalDesk"
             : toolName === "screenshot"
-              ? "截图 - 飞花 - PetalDesk"
+              ? longCaptureControlId
+                ? "长截图控制 - 飞花 - PetalDesk"
+                : "截图 - 飞花 - PetalDesk"
               : noteId
                 ? `${activeTitle} - 飞花 - PetalDesk`
                 : "飞花 - PetalDesk"}</title>
@@ -770,6 +779,16 @@
     {:else}
       <div class="tool-loading transparent-loading" aria-busy="true">
         <LoaderCircle class="spinner" size={20} aria-hidden="true" />
+      </div>
+    {/if}
+  </main>
+{:else if toolName === "screenshot" && longCaptureControlId}
+  <main class="long-capture-control-window">
+    {#if LongCaptureControl}
+      <LongCaptureControl jobId={longCaptureControlId} />
+    {:else}
+      <div class="tool-loading screenshot-loading" aria-busy="true">
+        <LoaderCircle class="spinner" size={18} aria-hidden="true" />
       </div>
     {/if}
   </main>
@@ -972,6 +991,7 @@
   }
 
   .screenshot-tool-window,
+  .long-capture-control-window,
   .pinned-screenshot-window {
     width: 100vw;
     height: 100vh;
@@ -984,6 +1004,14 @@
   .screenshot-loading {
     color: #ffffff;
     background: #111111;
+  }
+
+  .long-capture-control-window {
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    color: #242424;
+    background: #fafafa;
   }
 
   .pinned-screenshot-window,

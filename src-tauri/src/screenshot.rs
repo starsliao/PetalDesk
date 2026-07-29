@@ -234,7 +234,7 @@ impl ScreenshotStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = settings;
     }
 
-    fn update_last_save_directory(&self, path: &Path) -> AppResult<()> {
+    pub(crate) fn update_last_save_directory(&self, path: &Path) -> AppResult<()> {
         let Some(parent) = path.parent() else {
             return Err(AppError::invalid("截图保存路径没有父目录"));
         };
@@ -245,7 +245,7 @@ impl ScreenshotStore {
         Ok(())
     }
 
-    fn active_session(&self) -> Option<ScreenshotSession> {
+    pub(crate) fn active_session(&self) -> Option<ScreenshotSession> {
         lock_unpoisoned(&self.session)
             .as_ref()
             .map(|session| session.meta.clone())
@@ -728,6 +728,40 @@ pub fn copy_pinned_screenshot(store: State<'_, ScreenshotStore>, pin_id: String)
     write_png_to_clipboard(&png, &decoded)
 }
 
+pub(crate) fn copy_png_bytes(png: &[u8]) -> AppResult<()> {
+    let decoded = decode_png(png)?;
+    write_png_to_clipboard(png, &decoded)
+}
+
+pub(crate) fn pin_png_bytes(
+    app: AppHandle,
+    png: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> AppResult<String> {
+    if width > 32_767 || height > 32_767 {
+        return Err(AppError::new(
+            "long_capture_pin_limit",
+            "长图边长超过置顶贴图限制，请保存原图",
+        ));
+    }
+    checked_rgba_len(width, height)?;
+    let pin_id = Uuid::new_v4().to_string();
+    lock_unpoisoned(&app.state::<ScreenshotStore>().pins).insert(
+        pin_id.clone(),
+        PinnedScreenshot {
+            png: Arc::new(png),
+            width,
+            height,
+        },
+    );
+    if let Err(error) = open_pin_window(app.clone(), &pin_id) {
+        lock_unpoisoned(&app.state::<ScreenshotStore>().pins).remove(&pin_id);
+        return Err(error);
+    }
+    Ok(pin_id)
+}
+
 #[tauri::command]
 pub async fn save_pinned_screenshot(
     app: AppHandle,
@@ -788,8 +822,10 @@ pub(crate) fn handle_window_closed(app: &AppHandle, label: &str) {
     }
 }
 
-fn finish_capture(app: &AppHandle, store: &ScreenshotStore, session_id: &str) {
-    store.clear_session(Some(session_id));
+pub(crate) fn finish_capture(app: &AppHandle, store: &ScreenshotStore, session_id: &str) {
+    if !store.clear_session(Some(session_id)) {
+        return;
+    }
     if let Some(window) = app.get_webview_window(CAPTURE_WINDOW_LABEL) {
         let _ = window.hide();
     }
@@ -866,7 +902,7 @@ fn capture_window_is_visible(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
-fn prepare_capture_window(app: &AppHandle, monitor: &MonitorBounds) -> AppResult<()> {
+pub(crate) fn prepare_capture_window(app: &AppHandle, monitor: &MonitorBounds) -> AppResult<()> {
     ensure_capture_window(app)?;
     let window = app
         .get_webview_window(CAPTURE_WINDOW_LABEL)
@@ -881,7 +917,7 @@ fn prepare_capture_window(app: &AppHandle, monitor: &MonitorBounds) -> AppResult
     Ok(())
 }
 
-fn present_capture_window(app: &AppHandle) -> AppResult<()> {
+pub(crate) fn present_capture_window(app: &AppHandle) -> AppResult<()> {
     let window = app
         .get_webview_window(CAPTURE_WINDOW_LABEL)
         .ok_or_else(|| AppError::new("window_error", "截图窗口尚未准备完成"))?;

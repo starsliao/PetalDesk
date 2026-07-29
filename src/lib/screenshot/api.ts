@@ -2,14 +2,20 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   DEFAULT_TOOL_SETTINGS,
   type ColorFormat,
+  type LongCaptureCapability,
+  type LongCaptureStatus,
   type PinnedScreenshotApi,
+  type PreparedLongCaptureAnnotationExport,
   type ScreenshotApi,
+  type ScreenshotExportAction,
   type ScreenshotExportRequest,
   type ScreenshotExportResult,
   type ScreenshotSession,
   type ScreenshotSettings,
+  type StartLongCaptureRequest,
   type ToolSettings,
 } from "./types";
+import { normalizeLongCaptureCapability, normalizeLongCaptureStatus } from "./long-capture";
 
 interface BackendError {
   code?: string;
@@ -57,6 +63,14 @@ function normalizedSettings(value: ScreenshotSettings): ScreenshotSettings {
     colorFormat: value.colorFormat === "rgb" ? "rgb" : "hex",
     toolParameters: { ...DEFAULT_TOOL_SETTINGS, ...(value.toolParameters ?? {}) },
   };
+}
+
+async function longCaptureControl(name: string, jobId: string): Promise<LongCaptureStatus> {
+  const status = await command<LongCaptureStatus | null>(name, { jobId });
+  if (status) return normalizeLongCaptureStatus(status);
+  const current = await command<LongCaptureStatus | null>("get_long_capture_status", { jobId });
+  if (!current) throw new Error("长截图任务不存在或已结束。");
+  return normalizeLongCaptureStatus(current);
 }
 
 export const screenshotApi: ScreenshotApi = {
@@ -109,6 +123,84 @@ export const screenshotApi: ScreenshotApi = {
     } catch (error) {
       throw new Error(errorMessage(error));
     }
+  },
+
+  async getLongCaptureCapability(): Promise<LongCaptureCapability> {
+    const value = await command<LongCaptureCapability & { supported?: boolean }>("get_long_capture_capability");
+    return normalizeLongCaptureCapability(value);
+  },
+
+  async startLongCapture(request: StartLongCaptureRequest): Promise<LongCaptureStatus> {
+    return normalizeLongCaptureStatus(await command<LongCaptureStatus>("start_long_capture", { request }));
+  },
+
+  async pauseLongCapture(jobId: string): Promise<LongCaptureStatus> {
+    return longCaptureControl("pause_long_capture", jobId);
+  },
+
+  async resumeLongCapture(jobId: string): Promise<LongCaptureStatus> {
+    return longCaptureControl("resume_long_capture", jobId);
+  },
+
+  async retryLongCapture(jobId: string): Promise<LongCaptureStatus> {
+    return longCaptureControl("retry_long_capture_segment", jobId);
+  },
+
+  async undoLongCapture(jobId: string): Promise<LongCaptureStatus> {
+    return longCaptureControl("undo_long_capture_segment", jobId);
+  },
+
+  async finishLongCapture(jobId: string): Promise<LongCaptureStatus> {
+    return longCaptureControl("finish_long_capture", jobId);
+  },
+
+  async cancelLongCapture(jobId: string): Promise<LongCaptureStatus> {
+    return longCaptureControl("cancel_long_capture", jobId);
+  },
+
+  async getLongCaptureStatus(jobId: string): Promise<LongCaptureStatus | null> {
+    const status = await command<LongCaptureStatus | null>("get_long_capture_status", { jobId });
+    return status ? normalizeLongCaptureStatus(status) : null;
+  },
+
+  async getLongCaptureTile(jobId: string, y: number, height: number): Promise<Uint8Array> {
+    try {
+      return binary(await invoke<ArrayBuffer | Uint8Array | number[]>("get_long_capture_tile", { jobId, y, height }));
+    } catch (error) {
+      throw new Error(errorMessage(error));
+    }
+  },
+
+  async exportLongCapture(jobId: string, action: ScreenshotExportAction): Promise<ScreenshotExportResult> {
+    return command<ScreenshotExportResult>("export_long_capture", { jobId, action });
+  },
+
+  async prepareLongCaptureAnnotationExport(
+    jobId: string,
+    action: ScreenshotExportAction,
+  ): Promise<PreparedLongCaptureAnnotationExport> {
+    return command<PreparedLongCaptureAnnotationExport>("prepare_long_capture_annotation_export", { jobId, action });
+  },
+
+  async uploadLongCaptureAnnotationStrip(ticket: string, y: number, png: Uint8Array): Promise<void> {
+    try {
+      await invoke<void>("upload_long_capture_annotation_strip", png, {
+        headers: {
+          "x-petaldesk-long-export-token": ticket,
+          "x-petaldesk-long-export-y": String(y),
+        },
+      });
+    } catch (error) {
+      throw new Error(errorMessage(error));
+    }
+  },
+
+  async finishLongCaptureAnnotationExport(ticket: string): Promise<ScreenshotExportResult> {
+    return command<ScreenshotExportResult>("finish_long_capture_annotation_export", { ticket });
+  },
+
+  async cancelLongCaptureAnnotationExport(ticket: string): Promise<void> {
+    await command<void>("cancel_long_capture_annotation_export", { ticket });
   },
 };
 

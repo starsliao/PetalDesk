@@ -190,6 +190,49 @@ export interface ScreenshotExportResult {
   canceled?: boolean;
 }
 
+export type LongCaptureEngine = "browserEnhanced" | "uiAutomation" | "wheel" | "manual";
+export type LongCaptureState = "preparing" | "capturing" | "paused" | "ready" | "failed" | "canceled";
+export type LongCaptureMode = "current" | "top" | "manual";
+export type LongCaptureScope = "selection";
+
+export interface LongCaptureCapability {
+  available: boolean;
+  supported?: boolean;
+  reason?: string | null;
+  engines?: LongCaptureEngine[];
+  preferredEngine?: LongCaptureEngine | null;
+  platform?: string;
+  maxHeight?: number;
+  maxPixels?: number;
+  tileHeight?: number;
+}
+
+export interface StartLongCaptureRequest {
+  sessionId: string;
+  selection: Rect;
+  scrollAnchor: Point;
+  scope: LongCaptureScope;
+  mode: LongCaptureMode;
+}
+
+export interface LongCaptureStatus {
+  jobId: string;
+  sessionId: string;
+  state: LongCaptureState;
+  engine: LongCaptureEngine;
+  frameCount: number;
+  width: number;
+  height: number;
+  message?: string | null;
+  canUndo: boolean;
+}
+
+export interface PreparedLongCaptureAnnotationExport {
+  canceled: boolean;
+  ticket?: string | null;
+  stripHeight: number;
+}
+
 export interface ScreenshotApi {
   getSession(sessionId?: string): Promise<ScreenshotSession | null>;
   getFrame(sessionId: string): Promise<Uint8Array>;
@@ -199,6 +242,24 @@ export interface ScreenshotApi {
   setShortcut(shortcut: string): Promise<ScreenshotSettings>;
   saveToolSettings(settings: ToolSettings, colorFormat: ColorFormat): Promise<void>;
   exportPng(request: ScreenshotExportRequest, png: Uint8Array): Promise<ScreenshotExportResult>;
+  getLongCaptureCapability(): Promise<LongCaptureCapability>;
+  startLongCapture(request: StartLongCaptureRequest): Promise<LongCaptureStatus>;
+  pauseLongCapture(jobId: string): Promise<LongCaptureStatus>;
+  resumeLongCapture(jobId: string): Promise<LongCaptureStatus>;
+  retryLongCapture(jobId: string): Promise<LongCaptureStatus>;
+  undoLongCapture(jobId: string): Promise<LongCaptureStatus>;
+  finishLongCapture(jobId: string): Promise<LongCaptureStatus>;
+  cancelLongCapture(jobId: string): Promise<LongCaptureStatus>;
+  getLongCaptureStatus(jobId: string): Promise<LongCaptureStatus | null>;
+  getLongCaptureTile(jobId: string, y: number, height: number): Promise<Uint8Array>;
+  exportLongCapture(jobId: string, action: ScreenshotExportAction): Promise<ScreenshotExportResult>;
+  prepareLongCaptureAnnotationExport(
+    jobId: string,
+    action: ScreenshotExportAction,
+  ): Promise<PreparedLongCaptureAnnotationExport>;
+  uploadLongCaptureAnnotationStrip(ticket: string, y: number, png: Uint8Array): Promise<void>;
+  finishLongCaptureAnnotationExport(ticket: string): Promise<ScreenshotExportResult>;
+  cancelLongCaptureAnnotationExport(ticket: string): Promise<void>;
 }
 
 export interface PinnedScreenshotApi {
