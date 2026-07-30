@@ -2,7 +2,7 @@
 
 > 把想法留在桌面，把文件留在自己手里。
 
-[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.4/PetalDesk_0.3.4_x64-setup.exe)
+[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.5/PetalDesk_0.3.5_x64-setup.exe)
 
 飞花 - PetalDesk 是一款 Windows 10/11 本地便签与效率工具。它启动快、界面安静，支持 Markdown 即时排版、纯文本、图片、搜索、回收站，以及几个随时可以唤起的小工具。没有账号、没有云端依赖，内容就是你目录里的 Markdown 文件。
 
@@ -34,7 +34,7 @@
 - 截图：默认 `F1`，单显示器手动框选，标注、马赛克、模糊、复制、保存和置顶贴图；选区内双击即可复制，选区外右键直接取消。
 - 长截图：默认由用户在原窗口中手动滚动并实时拼接，支持暂停、重试、回退和完整标注；自动滚动作为高级模式保留，浏览器扩展可增强 Chrome、Edge 与 Firefox 长页面的滚动定位和拼接稳定性。
 
-长截图的默认操作只有三步：按 `F1` 框选固定区域并点击工具栏中的长截图按钮；冻结遮罩消失后，直接在露出的资源管理器、系统设置、表格列表、浏览器或其他原窗口中向下滚动；控制条帧数增长后，点击“完成”。无需再次点击选区，普通 Windows 窗口也不需要安装浏览器扩展。采集会跟随真实滚动连续取帧，并在停止滚动后补一张稳定帧；空闲等待不会自动结束。需要自动滚动时，从长截图按钮旁的小箭头选择自动模式，再点击选区内真正会滚动的正文区域。
+长截图的默认操作只有三步：按 `F1` 框选固定区域并点击工具栏中的长截图按钮；冻结画面切回原窗口后，选区外仍保留暗色遮罩，直接在选区内向下滚动；控制条帧数增长后，点击“完成”。无需再次点击选区，普通 Windows 窗口也不需要安装浏览器扩展。向上滚动只会回看已捕获内容，不会反向写入长图；重新向下越过已捕获末尾后会自动继续拼接。采集会跟随真实滚动连续取帧，并在停止滚动后补一张稳定帧；空闲等待不会自动结束。需要自动滚动时，从长截图按钮旁的小箭头选择自动模式，再点击选区内真正会滚动的正文区域。
 
 ## 数据真正属于你
 
@@ -60,7 +60,7 @@ PetalDesk/
 
 ## 安装与运行
 
-下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.4/PetalDesk_0.3.4_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。
+下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.5/PetalDesk_0.3.5_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。
 
 没有 WebView2 或下载权限时，安装器会明确提示失败原因，不会静默留下无法启动的程序。未签名构建可能显示“未知发布者”，这是 Windows 对代码签名的正常提示。
 

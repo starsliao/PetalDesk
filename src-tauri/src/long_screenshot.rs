@@ -62,7 +62,6 @@ const MANUAL_SCROLL_FEEDBACK_AFTER: Duration = Duration::from_secs(3);
 const MANUAL_SCROLL_UNMATCHED_PAUSE_AFTER: Duration = Duration::from_secs(4);
 const AUTO_SCROLL_END_CONFIRMATIONS: u8 = 3;
 const AUTO_SCROLL_INITIAL_DELTA: i32 = 30;
-const OUTLINE_MARGIN_LOGICAL: f64 = 6.0;
 const MATCH_GRID_COLUMNS: usize = 8;
 const MATCH_GRID_ROWS: usize = 6;
 const MATCH_MIN_TEXTURED_BLOCKS: usize = 8;
@@ -1966,6 +1965,7 @@ fn finish_long_capture_annotation_export_inner(
         &ticket.session_id,
         || {
             store.request_pending_start_cancel(&ticket.session_id);
+            let _ = destroy_outline_window(app);
             clear_job_cache(&store, &ticket.job_id);
         },
     );
@@ -2094,6 +2094,7 @@ fn export_long_capture_inner(
         &manifest.session_id,
         || {
             store.request_pending_start_cancel(&manifest.session_id);
+            let _ = destroy_outline_window(app);
             clear_job_cache(&store, &manifest.job_id);
         },
     );
@@ -2820,28 +2821,166 @@ fn control_window_geometry(
 
 fn outline_window_geometry(
     monitor: &MonitorBounds,
-    selection: PhysicalRect,
+    _selection: PhysicalRect,
 ) -> (PhysicalPosition<i32>, PhysicalSize<u32>) {
-    let scale = if monitor.scale_factor.is_finite() && monitor.scale_factor > 0.0 {
-        monitor.scale_factor
-    } else {
-        1.0
-    };
-    // CSS paints at most five logical pixels inward from the outline window.
-    // Keep a sixth pixel outside the ROI so CAPTUREBLT never sees the border,
-    // including at high DPI and on monitors with negative coordinates.
-    let margin = ((OUTLINE_MARGIN_LOGICAL * scale).ceil() as u32).max(6);
-    let margin_i32 = i32::try_from(margin).unwrap_or(i32::MAX);
     (
-        PhysicalPosition::new(
-            selection.x.saturating_sub(margin_i32),
-            selection.y.saturating_sub(margin_i32),
-        ),
-        PhysicalSize::new(
-            selection.width.saturating_add(margin.saturating_mul(2)),
-            selection.height.saturating_add(margin.saturating_mul(2)),
-        ),
+        PhysicalPosition::new(monitor.x, monitor.y),
+        PhysicalSize::new(monitor.width, monitor.height),
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OutlineSelectionPercentages {
+    left: f64,
+    top: f64,
+    width: f64,
+    height: f64,
+}
+
+fn outline_selection_percentages(
+    monitor: &MonitorBounds,
+    selection: PhysicalRect,
+) -> OutlineSelectionPercentages {
+    let monitor_width = i64::from(monitor.width.max(1));
+    let monitor_height = i64::from(monitor.height.max(1));
+    let left = (i64::from(selection.x) - i64::from(monitor.x)).clamp(0, monitor_width);
+    let top = (i64::from(selection.y) - i64::from(monitor.y)).clamp(0, monitor_height);
+    let right = (i64::from(selection.x) + i64::from(selection.width) - i64::from(monitor.x))
+        .clamp(left, monitor_width);
+    let bottom = (i64::from(selection.y) + i64::from(selection.height) - i64::from(monitor.y))
+        .clamp(top, monitor_height);
+    OutlineSelectionPercentages {
+        left: left as f64 * 100.0 / monitor_width as f64,
+        top: top as f64 * 100.0 / monitor_height as f64,
+        width: (right - left) as f64 * 100.0 / monitor_width as f64,
+        height: (bottom - top) as f64 * 100.0 / monitor_height as f64,
+    }
+}
+
+fn outline_window_url(monitor: &MonitorBounds, selection: PhysicalRect) -> String {
+    let geometry = outline_selection_percentages(monitor, selection);
+    format!(
+        "?tool=screenshot&longOutline=1&outlineLeft={:.8}&outlineTop={:.8}&outlineWidth={:.8}&outlineHeight={:.8}",
+        geometry.left, geometry.top, geometry.width, geometry.height
+    )
+}
+
+fn update_outline_window_content(
+    window: &tauri::WebviewWindow<tauri::Wry>,
+    monitor: &MonitorBounds,
+    selection: PhysicalRect,
+) -> AppResult<()> {
+    let geometry = outline_selection_percentages(monitor, selection);
+    let right = geometry.left + geometry.width;
+    let bottom = geometry.top + geometry.height;
+    let script = format!(
+        r#"(() => {{
+          const outline = document.querySelector('[data-testid="long-capture-outline"]');
+          if (!outline) return;
+          outline.dataset.outlineLeft = '{left:.8}';
+          outline.dataset.outlineTop = '{top:.8}';
+          outline.dataset.outlineWidth = '{width:.8}';
+          outline.dataset.outlineHeight = '{height:.8}';
+          outline.style.setProperty('--outline-left', '{left:.8}%');
+          outline.style.setProperty('--outline-top', '{top:.8}%');
+          outline.style.setProperty('--outline-width', '{width:.8}%');
+          outline.style.setProperty('--outline-height', '{height:.8}%');
+          outline.querySelector('path')?.setAttribute(
+            'd',
+            'M0 0H100V100H0Z M{left:.8} {top:.8}V{bottom:.8}H{right:.8}V{top:.8}Z'
+          );
+        }})()"#,
+        left = geometry.left,
+        top = geometry.top,
+        width = geometry.width,
+        height = geometry.height,
+        right = right,
+        bottom = bottom,
+    );
+    window
+        .eval(&script)
+        .map_err(|error| AppError::new("window_error", format!("更新长截图遮罩选区失败: {error}")))
+}
+
+#[cfg(windows)]
+fn configure_outline_window_region(
+    window: &tauri::WebviewWindow<tauri::Wry>,
+    monitor: &MonitorBounds,
+    selection: PhysicalRect,
+) -> AppResult<()> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        CombineRgn, CreateRectRgn, DeleteObject, SetWindowRgn, RGN_DIFF,
+    };
+
+    let monitor_width = i32::try_from(monitor.width)
+        .map_err(|_| AppError::invalid("长截图显示器宽度超出支持范围"))?;
+    let monitor_height = i32::try_from(monitor.height)
+        .map_err(|_| AppError::invalid("长截图显示器高度超出支持范围"))?;
+    let left = selection
+        .x
+        .saturating_sub(monitor.x)
+        .clamp(0, monitor_width);
+    let top = selection
+        .y
+        .saturating_sub(monitor.y)
+        .clamp(0, monitor_height);
+    let right = i64::from(selection.x)
+        .saturating_add(i64::from(selection.width))
+        .saturating_sub(i64::from(monitor.x))
+        .clamp(i64::from(left), i64::from(monitor_width)) as i32;
+    let bottom = i64::from(selection.y)
+        .saturating_add(i64::from(selection.height))
+        .saturating_sub(i64::from(monitor.y))
+        .clamp(i64::from(top), i64::from(monitor_height)) as i32;
+
+    let full_region = unsafe { CreateRectRgn(0, 0, monitor_width, monitor_height) };
+    if full_region.is_null() {
+        return Err(AppError::new("window_error", "创建长截图遮罩区域失败"));
+    }
+    let selection_region = unsafe { CreateRectRgn(left, top, right, bottom) };
+    if selection_region.is_null() {
+        unsafe {
+            let _ = DeleteObject(full_region);
+        }
+        return Err(AppError::new("window_error", "创建长截图透明选区失败"));
+    }
+    let combined = unsafe { CombineRgn(full_region, full_region, selection_region, RGN_DIFF) };
+    unsafe {
+        let _ = DeleteObject(selection_region);
+    }
+    if combined == 0 {
+        unsafe {
+            let _ = DeleteObject(full_region);
+        }
+        return Err(AppError::new("window_error", "设置长截图透明选区失败"));
+    }
+
+    let hwnd = window.hwnd().map_err(|error| {
+        unsafe {
+            let _ = DeleteObject(full_region);
+        }
+        AppError::new(
+            "window_error",
+            format!("读取长截图遮罩窗口句柄失败: {error}"),
+        )
+    })?;
+    if unsafe { SetWindowRgn(hwnd.0, full_region, 1) } == 0 {
+        unsafe {
+            let _ = DeleteObject(full_region);
+        }
+        return Err(AppError::new("window_error", "应用长截图透明选区失败"));
+    }
+    // SetWindowRgn owns the region after a successful call.
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn configure_outline_window_region(
+    _window: &tauri::WebviewWindow<tauri::Wry>,
+    _monitor: &MonitorBounds,
+    _selection: PhysicalRect,
+) -> AppResult<()> {
+    Ok(())
 }
 
 fn control_overlap_in_roi(target: &CaptureTarget) -> Option<PhysicalRect> {
@@ -3010,13 +3149,13 @@ fn prepare_outline_window(
     selection: PhysicalRect,
 ) -> AppResult<()> {
     let _creation_guard = lock_unpoisoned(&CONTROL_WINDOW_CREATION_LOCK);
-    let window = if let Some(window) = app.get_webview_window(OUTLINE_WINDOW_LABEL) {
-        window
+    let (window, reused) = if let Some(window) = app.get_webview_window(OUTLINE_WINDOW_LABEL) {
+        (window, true)
     } else {
-        WebviewWindowBuilder::new(
+        let window = WebviewWindowBuilder::new(
             app,
             OUTLINE_WINDOW_LABEL,
-            WebviewUrl::App("?tool=screenshot&longOutline=1".into()),
+            WebviewUrl::App(outline_window_url(monitor, selection).into()),
         )
         .title("长截图范围 - 飞花 - PetalDesk")
         .decorations(false)
@@ -3027,11 +3166,12 @@ fn prepare_outline_window(
         .skip_taskbar(true)
         .focused(false)
         .visible(false)
-        .inner_size(320.0, 200.0)
+        .inner_size(f64::from(monitor.width), f64::from(monitor.height))
         .build()
         .map_err(|error| {
             AppError::new("window_error", format!("创建长截图选区边框失败: {error}"))
-        })?
+        })?;
+        (window, false)
     };
     let (position, size) = outline_window_geometry(monitor, selection);
     configure_control_window_no_activate(&window)?;
@@ -3039,7 +3179,12 @@ fn prepare_outline_window(
         .set_ignore_cursor_events(true)
         .and_then(|_| window.set_position(position))
         .and_then(|_| window.set_size(size))
-        .map_err(|error| AppError::new("window_error", format!("定位长截图选区边框失败: {error}")))
+        .map_err(|error| AppError::new("window_error", format!("定位长截图遮罩失败: {error}")))?;
+    configure_outline_window_region(&window, monitor, selection)?;
+    if reused {
+        update_outline_window_content(&window, monitor, selection)?;
+    }
+    Ok(())
 }
 
 fn show_outline_window(app: &AppHandle, job: &LongCaptureJob) -> AppResult<()> {
@@ -3057,6 +3202,20 @@ fn hide_outline_window(app: &AppHandle) -> AppResult<()> {
         })?;
     }
     Ok(())
+}
+
+fn destroy_outline_window(app: &AppHandle) -> AppResult<()> {
+    let Some(window) = app.get_webview_window(OUTLINE_WINDOW_LABEL) else {
+        return Ok(());
+    };
+    let hide_error = window.hide().err();
+    window.destroy().map_err(|error| {
+        let detail = hide_error.map_or_else(
+            || error.to_string(),
+            |hide_error| format!("{error}；隐藏窗口时也失败: {hide_error}"),
+        );
+        AppError::new("window_error", format!("关闭长截图遮罩失败: {detail}"))
+    })
 }
 
 fn show_control_window(app: &AppHandle, job: &LongCaptureJob) -> AppResult<()> {
@@ -3107,11 +3266,21 @@ fn hide_control_window(app: &AppHandle) -> AppResult<()> {
 }
 
 fn close_control_window(app: &AppHandle) -> AppResult<()> {
-    let outline_error = hide_outline_window(app).err();
-    if let Some(window) = app.get_webview_window(CONTROL_WINDOW_LABEL) {
-        destroy_control_window_instance(app, &window, "关闭长截图控制窗口")?;
+    let outline_error = destroy_outline_window(app).err();
+    let control_error = app
+        .get_webview_window(CONTROL_WINDOW_LABEL)
+        .and_then(|window| {
+            destroy_control_window_instance(app, &window, "关闭长截图控制窗口").err()
+        });
+    match (control_error, outline_error) {
+        (Some(control_error), Some(outline_error)) => Err(append_recovery_error(
+            control_error,
+            "关闭长截图遮罩也失败",
+            &outline_error,
+        )),
+        (Some(error), None) | (None, Some(error)) => Err(error),
+        (None, None) => Ok(()),
     }
-    outline_error.map_or(Ok(()), Err)
 }
 
 fn destroy_control_window_instance(
@@ -3871,6 +4040,7 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
     let mut low_confidence_count = 0_u8;
     let mut wheel_delta_units = AUTO_SCROLL_INITIAL_DELTA;
     let mut fixed_bottom_tracker = FixedBottomTracker::default();
+    let mut returning_from_upward_navigation = false;
 
     loop {
         let checkpoint = match wait_for_worker(job) {
@@ -3887,6 +4057,7 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
             no_motion_count = 0;
             low_confidence_count = 0;
             fixed_bottom_tracker = FixedBottomTracker::default();
+            returning_from_upward_navigation = false;
         } else if checkpoint.retry_current {
             needs_scroll = false;
             low_confidence_count = 0;
@@ -3946,7 +4117,7 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
                 }
             }
         }
-        let (current, detected_overlap) = if manual_scrolling && needs_scroll {
+        let (current, detected_scroll) = if manual_scrolling && needs_scroll {
             wait_for_manual_scroll(
                 app,
                 job,
@@ -3954,6 +4125,7 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
                 checkpoint.generation,
                 manual_input.as_ref(),
                 &mut manual_input_snapshot,
+                returning_from_upward_navigation,
             )?
         } else {
             (capture_job_roi(app, job, true)?, None)
@@ -3962,10 +4134,31 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
             continue;
         }
 
+        if matches!(detected_scroll, Some(ManualScrollDetection::Up)) {
+            // Upward movement is navigation over content that has already
+            // been captured. Keep the accepted tail and all stitch metadata
+            // untouched so scrolling down past it can resume safely.
+            returning_from_upward_navigation = true;
+            no_motion_count = 0;
+            low_confidence_count = 0;
+            needs_scroll = true;
+            update_message(
+                job,
+                checkpoint.generation,
+                "正在回看已捕获内容；请向下滚动到最新位置后继续捕获",
+            )?;
+            emit_progress(app, job);
+            continue;
+        }
+
         // Try the stronger displacement estimator first. A small scroll in a
         // sparse or mostly blank window can have a tiny whole-frame average
         // difference while still exposing valid new rows.
-        let overlap = detected_overlap.or_else(|| find_vertical_overlap(&previous, &current));
+        let overlap = match detected_scroll {
+            Some(ManualScrollDetection::Down(overlap)) => Some(overlap),
+            Some(ManualScrollDetection::Up) => None,
+            None => find_vertical_overlap(&previous, &current),
+        };
         let stationary_score = sampled_frame_difference(&previous, &current);
         if overlap.is_none() && stationary_score <= 2.25 {
             no_motion_count = if browser_step.is_some_and(|step| step.at_bottom && !step.moved) {
@@ -4064,6 +4257,7 @@ fn run_capture_worker(app: &AppHandle, job: &Arc<LongCaptureJob>) -> AppResult<W
             );
         }
         previous = current;
+        returning_from_upward_navigation = false;
         needs_scroll = true;
         low_confidence_count = 0;
         emit_progress(app, job);
@@ -4125,6 +4319,89 @@ enum ManualCaptureTrigger {
     ActiveScroll,
     Settled,
     FallbackPoll,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerticalScrollDirection {
+    Down,
+    Up,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DirectedOverlap {
+    direction: VerticalScrollDirection,
+    overlap: OverlapMatch,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ManualScrollDetection {
+    Down(OverlapMatch),
+    Up,
+}
+
+fn vertical_scroll_direction(delta: i64) -> Option<VerticalScrollDirection> {
+    // WM_MOUSEWHEEL uses a positive delta for scrolling up and a negative
+    // delta for scrolling down.
+    match delta.cmp(&0) {
+        std::cmp::Ordering::Less => Some(VerticalScrollDirection::Down),
+        std::cmp::Ordering::Greater => Some(VerticalScrollDirection::Up),
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
+fn vertical_scroll_direction_since(
+    previous: ScrollInputSnapshot,
+    current: ScrollInputSnapshot,
+) -> Option<VerticalScrollDirection> {
+    (current.vertical_events != previous.vertical_events)
+        .then(|| current.vertical_delta.wrapping_sub(previous.vertical_delta))
+        .and_then(vertical_scroll_direction)
+}
+
+fn find_directed_vertical_overlap(
+    previous: &Frame,
+    current: &Frame,
+    direction_hint: Option<VerticalScrollDirection>,
+) -> Option<DirectedOverlap> {
+    if direction_hint != Some(VerticalScrollDirection::Up) {
+        if let Some(overlap) = find_vertical_overlap(previous, current) {
+            return Some(DirectedOverlap {
+                direction: VerticalScrollDirection::Down,
+                overlap,
+            });
+        }
+    }
+
+    // Reversing the frame order recognizes content moving back toward the
+    // already accepted tail. This is navigation only and must never append.
+    find_vertical_overlap(current, previous).map(|overlap| DirectedOverlap {
+        direction: VerticalScrollDirection::Up,
+        overlap,
+    })
+}
+
+fn detect_manual_scroll(
+    previous: &Frame,
+    current: &Frame,
+    direction_hint: Option<VerticalScrollDirection>,
+    visible_movement: bool,
+) -> Option<ManualScrollDetection> {
+    match find_directed_vertical_overlap(previous, current, direction_hint) {
+        Some(DirectedOverlap {
+            direction: VerticalScrollDirection::Down,
+            overlap,
+        }) => Some(ManualScrollDetection::Down(overlap)),
+        Some(DirectedOverlap {
+            direction: VerticalScrollDirection::Up,
+            ..
+        }) => Some(ManualScrollDetection::Up),
+        None if direction_hint == Some(VerticalScrollDirection::Up) && visible_movement => {
+            // A large upward jump may leave no reliable overlap. The signed
+            // wheel input is still enough to reject it as appendable content.
+            Some(ManualScrollDetection::Up)
+        }
+        None => None,
+    }
 }
 
 #[derive(Debug)]
@@ -4191,12 +4468,15 @@ fn wait_for_manual_scroll(
     generation: u64,
     input: Option<&ScrollInputMonitor>,
     observed_input: &mut ScrollInputSnapshot,
-) -> AppResult<(Frame, Option<OverlapMatch>)> {
+    returning_from_upward_navigation: bool,
+) -> AppResult<(Frame, Option<ManualScrollDetection>)> {
     let mut input_available = input.is_some_and(ScrollInputMonitor::is_running);
     update_message(
         job,
         generation,
-        if input_available {
+        if returning_from_upward_navigation {
+            "正在回看已捕获内容；请继续向下滚动以恢复捕获"
+        } else if input_available {
             "等待在选区内滚动"
         } else {
             "等待内容滚动（兼容检测模式）"
@@ -4208,6 +4488,7 @@ fn wait_for_manual_scroll(
     let mut unmatched_motion = ManualUnmatchedMotion::default();
     let mut movement_seen = false;
     let mut feedback_for_movement = None;
+    let mut wheel_direction_hint = None;
     loop {
         if !iteration_is_current(job, generation) {
             return Ok((previous.clone(), None));
@@ -4217,10 +4498,12 @@ fn wait_for_manual_scroll(
         input_available = input.is_some_and(ScrollInputMonitor::is_running);
         if let Some(input) = input.filter(|input| input.is_running()) {
             let snapshot = input.snapshot();
+            let direction = vertical_scroll_direction_since(*observed_input, snapshot);
             let received_vertical_wheel =
                 snapshot.vertical_events != observed_input.vertical_events;
             *observed_input = snapshot;
             if received_vertical_wheel && cursor_inside_capture_bounds(job) {
+                wheel_direction_hint = direction;
                 schedule.observe_scroll(now);
             }
         }
@@ -4231,7 +4514,9 @@ fn wait_for_manual_scroll(
                 update_message(
                     job,
                     generation,
-                    if input_available {
+                    if returning_from_upward_navigation {
+                        "请继续向下滚动；回到已捕获末尾后会自动继续拼接"
+                    } else if input_available {
                         "请在选区内向下滚动；也支持键盘和拖动滚动条"
                     } else {
                         "正在兼容检测画面变化；请滚动、按翻页键或拖动滚动条"
@@ -4253,19 +4538,36 @@ fn wait_for_manual_scroll(
             visual_change.is_some_and(SparseFrameChange::is_match_probe_candidate);
         let visible_movement =
             visual_change.is_some_and(SparseFrameChange::is_visible_movement_candidate);
-        let overlap = (trigger != ManualCaptureTrigger::FallbackPoll || match_probe_change)
-            .then(|| find_vertical_overlap(previous, &candidate))
+        let detected_scroll = (trigger != ManualCaptureTrigger::FallbackPoll || match_probe_change)
+            .then(|| {
+                detect_manual_scroll(previous, &candidate, wheel_direction_hint, visible_movement)
+            })
             .flatten();
-        if let Some(overlap) = overlap {
-            if !job.target.control_overlaps_roi {
-                return Ok((candidate, Some(overlap)));
+        if let Some(detected_scroll) = detected_scroll {
+            if matches!(detected_scroll, ManualScrollDetection::Up)
+                || !job.target.control_overlaps_roi
+            {
+                return Ok((candidate, Some(detected_scroll)));
             }
             let clean = capture_job_roi(app, job, false)?;
-            if let Some(overlap) = find_vertical_overlap(previous, &clean) {
-                return Ok((clean, Some(overlap)));
+            let direction_hint = match detected_scroll {
+                ManualScrollDetection::Down(_) => Some(VerticalScrollDirection::Down),
+                ManualScrollDetection::Up => Some(VerticalScrollDirection::Up),
+            };
+            let clean_movement = sparse_frame_change(previous, &clean)
+                .is_some_and(SparseFrameChange::is_visible_movement_candidate);
+            if let Some(clean_detection) =
+                detect_manual_scroll(previous, &clean, direction_hint, clean_movement)
+            {
+                return Ok((clean, Some(clean_detection)));
             }
         }
-        if unmatched_motion.observe(Instant::now(), visible_movement) {
+        if returning_from_upward_navigation {
+            // The current viewport may be far above the accepted tail. Keep
+            // waiting until that tail re-enters the selection instead of
+            // pausing merely because no direct overlap is currently visible.
+            unmatched_motion.observe(Instant::now(), false);
+        } else if unmatched_motion.observe(Instant::now(), visible_movement) {
             pause_for_attention(
                 app,
                 job,
@@ -4280,7 +4582,9 @@ fn wait_for_manual_scroll(
                 update_message(
                     job,
                     generation,
-                    if movement_seen {
+                    if returning_from_upward_navigation && movement_seen {
+                        "仍在回看范围；请继续向下滚动到最新捕获位置"
+                    } else if movement_seen {
                         "已检测到画面滚动，但还没有可靠接缝；请放慢滚动或向上回滚少量内容"
                     } else {
                         "已收到滚轮，但选区内容没有变化；请确认鼠标位于真正可滚动的内容上"
@@ -7147,7 +7451,7 @@ mod tests {
     }
 
     #[test]
-    fn outline_window_border_stays_outside_the_selected_pixels() {
+    fn outline_window_covers_monitor_and_preserves_selection_geometry() {
         let selection = PhysicalRect {
             x: -2_200,
             y: 120,
@@ -7163,16 +7467,17 @@ mod tests {
                 scale_factor,
             };
             let (position, size) = outline_window_geometry(&monitor, selection);
-            let right = i64::from(position.x) + i64::from(size.width);
-            let bottom = i64::from(position.y) + i64::from(size.height);
-            let selection_right = i64::from(selection.x) + i64::from(selection.width);
-            let selection_bottom = i64::from(selection.y) + i64::from(selection.height);
-            let maximum_painted_extent = (5.0 * scale_factor).ceil() as i64;
+            assert_eq!(position, PhysicalPosition::new(monitor.x, monitor.y));
+            assert_eq!(size, PhysicalSize::new(monitor.width, monitor.height));
 
-            assert!(i64::from(selection.x - position.x) > maximum_painted_extent);
-            assert!(i64::from(selection.y - position.y) > maximum_painted_extent);
-            assert!(right - selection_right > maximum_painted_extent);
-            assert!(bottom - selection_bottom > maximum_painted_extent);
+            let geometry = outline_selection_percentages(&monitor, selection);
+            assert!((geometry.left - 14.0625).abs() < f64::EPSILON);
+            assert!((geometry.top - 8.333_333_333_333_334).abs() < 1e-10);
+            assert!((geometry.width - 46.875).abs() < f64::EPSILON);
+            assert!((geometry.height - 55.555_555_555_555_56).abs() < 1e-10);
+            let url = outline_window_url(&monitor, selection);
+            assert!(url.contains("outlineLeft=14.06250000"));
+            assert!(url.contains("outlineWidth=46.87500000"));
         }
     }
 
@@ -7517,6 +7822,41 @@ mod tests {
     }
 
     #[test]
+    fn vertical_wheel_delta_uses_windows_scroll_direction() {
+        assert_eq!(
+            vertical_scroll_direction(-120),
+            Some(VerticalScrollDirection::Down)
+        );
+        assert_eq!(
+            vertical_scroll_direction(120),
+            Some(VerticalScrollDirection::Up)
+        );
+        assert_eq!(vertical_scroll_direction(0), None);
+
+        let initial = ScrollInputSnapshot::default();
+        let down = ScrollInputSnapshot {
+            sequence: 1,
+            vertical_events: 1,
+            vertical_delta: -120,
+            ..ScrollInputSnapshot::default()
+        };
+        let up = ScrollInputSnapshot {
+            sequence: 2,
+            vertical_events: 2,
+            vertical_delta: 0,
+            ..ScrollInputSnapshot::default()
+        };
+        assert_eq!(
+            vertical_scroll_direction_since(initial, down),
+            Some(VerticalScrollDirection::Down)
+        );
+        assert_eq!(
+            vertical_scroll_direction_since(down, up),
+            Some(VerticalScrollDirection::Up)
+        );
+    }
+
+    #[test]
     fn manual_capture_schedule_throttles_active_frames_and_adds_a_settled_frame() {
         let started = Instant::now();
         let mut schedule = ManualCaptureSchedule::new(started);
@@ -7731,6 +8071,65 @@ mod tests {
             "confidence={}",
             matched.confidence
         );
+    }
+
+    #[test]
+    fn directed_overlap_treats_upward_scroll_as_navigation_only() {
+        let earlier = patterned_frame(320, 240, 40);
+        let accepted_tail = patterned_frame(320, 240, 105);
+
+        let upward = find_directed_vertical_overlap(
+            &accepted_tail,
+            &earlier,
+            Some(VerticalScrollDirection::Up),
+        )
+        .expect("upward navigation should be recognized in reverse frame order");
+        assert_eq!(upward.direction, VerticalScrollDirection::Up);
+        assert_eq!(upward.overlap.displacement, 65);
+
+        let without_wheel_hint = find_directed_vertical_overlap(&accepted_tail, &earlier, None)
+            .expect("keyboard or scrollbar navigation should detect reverse movement");
+        assert_eq!(without_wheel_hint.direction, VerticalScrollDirection::Up);
+        assert_eq!(without_wheel_hint.overlap.displacement, 65);
+
+        let returning_down = find_directed_vertical_overlap(
+            &accepted_tail,
+            &earlier,
+            Some(VerticalScrollDirection::Down),
+        )
+        .expect("downward input before reaching the accepted tail remains navigation");
+        assert_eq!(returning_down.direction, VerticalScrollDirection::Up);
+    }
+
+    #[test]
+    fn upward_hint_never_classifies_newer_content_as_appendable() {
+        let previous = patterned_frame(320, 240, 40);
+        let newer = patterned_frame(320, 240, 105);
+
+        assert!(find_directed_vertical_overlap(
+            &previous,
+            &newer,
+            Some(VerticalScrollDirection::Up),
+        )
+        .is_none());
+
+        let downward =
+            find_directed_vertical_overlap(&previous, &newer, Some(VerticalScrollDirection::Down))
+                .expect("downward movement should remain appendable");
+        assert_eq!(downward.direction, VerticalScrollDirection::Down);
+        assert_eq!(downward.overlap.displacement, 65);
+
+        let far_previous = patterned_frame(640, 540, 0);
+        let far_current = patterned_frame(640, 540, 450);
+        assert!(matches!(
+            detect_manual_scroll(
+                &far_previous,
+                &far_current,
+                Some(VerticalScrollDirection::Up),
+                true,
+            ),
+            Some(ManualScrollDetection::Up)
+        ));
     }
 
     #[test]

@@ -14,14 +14,12 @@
 pnpm package:windows
 ```
 
-Version `0.3.4` keeps the selected region visible during long capture and makes
-manual scrolling reliable across Explorer, Settings, desktop lists, document
-windows, and browsers. It observes real wheel input, captures at most every
-150 ms while scrolling, adds a settled frame after 250 ms, and keeps a low-rate
-visual fallback for keyboard, touchpad, and scrollbar movement. Native block,
-narrow-column, and phase-correlation candidates are verified against source
-pixels before a strip is accepted. It also preserves fixed bottom chrome once,
-and fixes control-window, screenshot-session, and worker-shutdown races.
+Version `0.3.5` keeps the dimmed screen and transparent selection visible while
+manual long capture is active. Upward scrolling is treated as navigation over
+already captured content and can no longer append a reversed strip; capture
+resumes automatically after scrolling down beyond the accepted tail. Terminal
+and export cleanup now destroy the mask window so it cannot remain on the
+desktop after the capture ends.
 
 The package always includes and registers the Firefox Native Messaging host.
 Set `PETALDESK_CHROME_EXTENSION_ID` and/or `PETALDESK_EDGE_EXTENSION_ID` to the
@@ -50,4 +48,4 @@ XPI. The unsigned ZIP must not be presented as an installable Firefox package.
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.3.4>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.3.5>

@@ -34,12 +34,61 @@
     title: string;
     source: "list" | "active";
   };
+  type LongCaptureOutlineRect = {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+  };
+
+  const defaultLongCaptureOutlineRect: LongCaptureOutlineRect = {
+    left: 0,
+    top: 0,
+    width: 100,
+    height: 100,
+  };
+
+  function outlinePercent(search: URLSearchParams | null, name: string, fallback: number): number {
+    const raw = search?.get(name);
+    if (raw === null || raw === undefined || raw.trim() === "") return fallback;
+    const value = Number(raw);
+    if (!Number.isFinite(value)) return fallback;
+    return Math.min(100, Math.max(0, value));
+  }
+
+  function parseLongCaptureOutlineRect(search: URLSearchParams | null): LongCaptureOutlineRect {
+    const left = outlinePercent(search, "outlineLeft", defaultLongCaptureOutlineRect.left);
+    const top = outlinePercent(search, "outlineTop", defaultLongCaptureOutlineRect.top);
+    const width = Math.min(
+      outlinePercent(search, "outlineWidth", defaultLongCaptureOutlineRect.width),
+      100 - left,
+    );
+    const height = Math.min(
+      outlinePercent(search, "outlineHeight", defaultLongCaptureOutlineRect.height),
+      100 - top,
+    );
+    return { left, top, width, height };
+  }
+
+  function longCaptureOutlineMaskPath(rect: LongCaptureOutlineRect): string {
+    const right = rect.left + rect.width;
+    const bottom = rect.top + rect.height;
+    return `M0 0H100V100H0Z M${rect.left} ${rect.top}V${bottom}H${right}V${rect.top}Z`;
+  }
 
   const routeSearch =
     typeof window !== "undefined" ? new URLSearchParams(window.location.search) : null;
   const screenshotPinId = routeSearch?.get("screenshotPin") ?? null;
   const longCaptureControlId = routeSearch?.get("longControl") ?? null;
   const longCaptureOutlineId = routeSearch?.get("longOutline") ?? null;
+  const longCaptureOutlineRect = parseLongCaptureOutlineRect(routeSearch);
+  const longCaptureOutlinePath = longCaptureOutlineMaskPath(longCaptureOutlineRect);
+  const longCaptureOutlineStyle = [
+    `--outline-left:${longCaptureOutlineRect.left}%`,
+    `--outline-top:${longCaptureOutlineRect.top}%`,
+    `--outline-width:${longCaptureOutlineRect.width}%`,
+    `--outline-height:${longCaptureOutlineRect.height}%`,
+  ].join(";");
   const requestedTool = routeSearch?.get("tool") ?? null;
   const toolName: ToolName | null = parseToolName(requestedTool);
   const isToolWindow =
@@ -787,7 +836,21 @@
     {/if}
   </main>
 {:else if longCaptureOutlineId}
-  <main class="long-capture-outline-window" data-testid="long-capture-outline" aria-hidden="true"></main>
+  <main
+    class="long-capture-outline-window"
+    data-testid="long-capture-outline"
+    data-outline-left={longCaptureOutlineRect.left}
+    data-outline-top={longCaptureOutlineRect.top}
+    data-outline-width={longCaptureOutlineRect.width}
+    data-outline-height={longCaptureOutlineRect.height}
+    style={longCaptureOutlineStyle}
+    aria-hidden="true"
+  >
+    <svg class="long-capture-outline-mask" viewBox="0 0 100 100" preserveAspectRatio="none">
+      <path d={longCaptureOutlinePath} fill-rule="evenodd"></path>
+    </svg>
+    <div class="long-capture-outline-border"></div>
+  </main>
 {:else if toolName === "screenshot" && longCaptureControlId}
   <main class="long-capture-control-window">
     <!-- Keep focus on the target app so wheel and keyboard input reach its scroll area. -->
@@ -1026,14 +1089,34 @@
     pointer-events: none;
   }
 
-  .long-capture-outline-window::before {
+  .long-capture-outline-mask {
     position: absolute;
-    inset: 2px;
-    border: 2px solid #00a2ff;
+    inset: 0;
+    display: block;
+    width: 100%;
+    height: 100%;
+    overflow: visible;
+    pointer-events: none;
+  }
+
+  .long-capture-outline-mask path {
+    fill: rgb(0 0 0 / 50%);
+    pointer-events: none;
+  }
+
+  .long-capture-outline-border {
+    position: absolute;
+    box-sizing: border-box;
+    top: var(--outline-top);
+    left: var(--outline-left);
+    width: var(--outline-width);
+    height: var(--outline-height);
+    background: transparent;
+    outline: 2px solid #00a2ff;
+    outline-offset: 0;
     box-shadow:
-      0 0 0 1px rgb(0 0 0 / 72%),
-      inset 0 0 0 1px rgb(255 255 255 / 92%);
-    content: "";
+      0 0 0 1px rgb(0 0 0 / 78%),
+      0 0 5px rgb(0 162 255 / 48%);
     pointer-events: none;
   }
 

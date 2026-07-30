@@ -149,7 +149,11 @@ describe("tool pages", () => {
 
   it("renders a transparent long-capture outline without initializing application content", async () => {
     vi.resetModules();
-    window.history.replaceState({}, "", "/?tool=screenshot&longOutline=long-42");
+    window.history.replaceState(
+      {},
+      "",
+      "/?tool=screenshot&longOutline=long-42&outlineLeft=12.5&outlineTop=8&outlineWidth=70&outlineHeight=60",
+    );
     const [{ render }, { notesApi }, { default: Page }] = await Promise.all([
       import("@testing-library/svelte"),
       import("$lib/bridge"),
@@ -162,12 +166,34 @@ describe("tool pages", () => {
     const outline = rendered.getByTestId("long-capture-outline");
     expect(outline).toBeInTheDocument();
     expect(outline).toHaveTextContent("");
-    expect(outline.childElementCount).toBe(0);
+    expect(outline).toHaveAttribute("data-outline-left", "12.5");
+    expect(outline).toHaveAttribute("data-outline-top", "8");
+    expect(outline).toHaveAttribute("data-outline-width", "70");
+    expect(outline).toHaveAttribute("data-outline-height", "60");
+    expect(outline).toHaveStyle({
+      "--outline-left": "12.5%",
+      "--outline-top": "8%",
+      "--outline-width": "70%",
+      "--outline-height": "60%",
+    });
+    const mask = outline.querySelector(".long-capture-outline-mask");
+    expect(mask).toHaveAttribute("viewBox", "0 0 100 100");
+    expect(mask?.querySelector("path")).toHaveAttribute(
+      "d",
+      "M0 0H100V100H0Z M12.5 8V68H82.5V8Z",
+    );
+    expect(outline.querySelector(".long-capture-outline-border")).toBeInTheDocument();
     expect(document.title).toBe("长截图范围 - 飞花 - PetalDesk");
     expect(document.documentElement).toHaveClass("transparent-tool-page");
     expect(document.body).toHaveClass("transparent-tool-page");
     expect(pageSource).toMatch(
       /\.long-capture-outline-window\s*\{[^}]*position:\s*fixed;[^}]*background:\s*transparent;[^}]*pointer-events:\s*none;/,
+    );
+    expect(pageSource).toMatch(
+      /\.long-capture-outline-mask path\s*\{[^}]*fill:\s*rgb\(0 0 0 \/ 50%\);[^}]*pointer-events:\s*none;/,
+    );
+    expect(pageSource).toMatch(
+      /\.long-capture-outline-border\s*\{[^}]*background:\s*transparent;[^}]*outline:\s*2px solid #00a2ff;[^}]*pointer-events:\s*none;/,
     );
     expect(pageSource).toMatch(
       /:global\(html\.transparent-tool-page\),\s*:global\(body\.transparent-tool-page\)\s*\{[^}]*background:\s*transparent\s*!important;/,
@@ -181,5 +207,30 @@ describe("tool pages", () => {
     activeUnmount = null;
     expect(document.documentElement).not.toHaveClass("transparent-tool-page");
     expect(document.body).not.toHaveClass("transparent-tool-page");
+  }, 60_000);
+
+  it("clamps long-capture outline percentages and safely falls back for invalid values", async () => {
+    vi.resetModules();
+    window.history.replaceState(
+      {},
+      "",
+      "/?tool=screenshot&longOutline=long-invalid&outlineLeft=invalid&outlineTop=-25&outlineWidth=140&outlineHeight=Infinity",
+    );
+    const [{ render }, { default: Page }] = await Promise.all([
+      import("@testing-library/svelte"),
+      import("./+page.svelte"),
+    ]);
+    const rendered = render(Page);
+    activeUnmount = () => rendered.unmount();
+
+    const outline = rendered.getByTestId("long-capture-outline");
+    expect(outline).toHaveAttribute("data-outline-left", "0");
+    expect(outline).toHaveAttribute("data-outline-top", "0");
+    expect(outline).toHaveAttribute("data-outline-width", "100");
+    expect(outline).toHaveAttribute("data-outline-height", "100");
+    expect(outline.querySelector("path")).toHaveAttribute(
+      "d",
+      "M0 0H100V100H0Z M0 0V100H100V0Z",
+    );
   }, 60_000);
 });
