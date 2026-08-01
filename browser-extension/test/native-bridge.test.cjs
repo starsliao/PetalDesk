@@ -46,7 +46,7 @@ function loadBridge(family = "chrome") {
       return port;
     },
     getManifest() {
-      return { version: "0.3.8" };
+      return { version: "0.3.9" };
     },
   };
   const callbackTabs = {

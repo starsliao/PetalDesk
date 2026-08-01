@@ -5,6 +5,7 @@ mod error;
 mod gantt;
 mod long_screenshot;
 mod long_screenshot_input;
+mod mfa;
 mod models;
 mod phase_match;
 mod reminders;
@@ -16,6 +17,7 @@ mod window_activation;
 
 use crate::gantt::GanttStore;
 use crate::long_screenshot::LongScreenshotStore;
+use crate::mfa::MfaStore;
 use crate::reminders::ReminderStore;
 use crate::screenshot::ScreenshotStore;
 use crate::storage::WorkspaceStore;
@@ -34,6 +36,7 @@ const OPEN_NOTE_MENU_PREFIX: &str = "open-note:";
 const OPEN_TIMER_MENU_ID: &str = "open-tool:timer";
 const OPEN_REMINDER_MENU_ID: &str = "open-tool:reminder";
 const OPEN_GANTT_MENU_ID: &str = "open-tool:gantt";
+const OPEN_MFA_MENU_ID: &str = "open-tool:mfa";
 const OPEN_SCREENSHOT_MENU_ID: &str = "open-tool:screenshot";
 const ABOUT_MENU_ID: &str = "about";
 const MAX_TRAY_NOTE_TITLE_CHARS: usize = 80;
@@ -124,6 +127,7 @@ fn tool_from_tray_menu_id(menu_id: &str) -> Option<models::ToolName> {
         OPEN_TIMER_MENU_ID => Some(models::ToolName::Timer),
         OPEN_REMINDER_MENU_ID => Some(models::ToolName::Reminder),
         OPEN_GANTT_MENU_ID => Some(models::ToolName::Gantt),
+        OPEN_MFA_MENU_ID => Some(models::ToolName::Mfa),
         OPEN_SCREENSHOT_MENU_ID => Some(models::ToolName::Screenshot),
         _ => None,
     }
@@ -304,6 +308,9 @@ fn spawn_open_tool(app: &tauri::AppHandle, tool: models::ToolName) {
         models::ToolName::Gantt => {
             let _ = commands::open_gantt_window_inner(&app, &app.state());
         }
+        models::ToolName::Mfa => {
+            let _ = commands::open_mfa_window_inner(&app, &app.state());
+        }
         models::ToolName::Screenshot => {
             let _ = screenshot::start_capture_inner(&app);
         }
@@ -350,6 +357,7 @@ fn build_tray_menu(app: &tauri::AppHandle) -> Result<Menu<tauri::Wry>, Box<dyn s
     let timer = MenuItem::with_id(app, OPEN_TIMER_MENU_ID, "计时器", true, None::<&str>)?;
     let reminder = MenuItem::with_id(app, OPEN_REMINDER_MENU_ID, "提醒", true, None::<&str>)?;
     let gantt = MenuItem::with_id(app, OPEN_GANTT_MENU_ID, "任务甘特图", true, None::<&str>)?;
+    let mfa = MenuItem::with_id(app, OPEN_MFA_MENU_ID, "MFA 验证器", true, None::<&str>)?;
     let screenshot_label = format!(
         "截图({})",
         app.state::<ScreenshotStore>().settings().shortcut
@@ -364,6 +372,7 @@ fn build_tray_menu(app: &tauri::AppHandle) -> Result<Menu<tauri::Wry>, Box<dyn s
     tools.append(&timer)?;
     tools.append(&reminder)?;
     tools.append(&gantt)?;
+    tools.append(&mfa)?;
     tools.append(&screenshot)?;
     let new_note = MenuItem::with_id(app, "new-note", "新建便签", true, None::<&str>)?;
     let about = MenuItem::with_id(app, ABOUT_MENU_ID, "关于", true, None::<&str>)?;
@@ -443,6 +452,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             "quit" => {
                 let app = app.clone();
                 tauri::async_runtime::spawn_blocking(move || {
+                    app.state::<MfaStore>().lock();
                     long_screenshot::shutdown(&app);
                     app.exit(0);
                 });
@@ -528,6 +538,8 @@ pub fn run() {
         ScreenshotStore::load(&data_storage_path).expect("无法初始化飞花 - PetalDesk 截图工具");
     let long_screenshot_store = LongScreenshotStore::load(&data_storage_path)
         .expect("无法初始化飞花 - PetalDesk 长截图工具");
+    let mfa_store =
+        MfaStore::load(&data_storage_path).expect("无法初始化飞花 - PetalDesk MFA 验证器");
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(
             |app, _arguments, _cwd| {
@@ -546,6 +558,7 @@ pub fn run() {
         .manage(timer_store)
         .manage(screenshot_store)
         .manage(long_screenshot_store)
+        .manage(mfa_store)
         .on_page_load(|webview, payload| {
             if webview.label() == "main"
                 && payload.event() == tauri::webview::PageLoadEvent::Finished
@@ -628,6 +641,18 @@ pub fn run() {
                 let window_instance = None;
                 long_screenshot::handle_control_window_destroyed(&app, &label, window_instance);
                 screenshot::handle_window_destroyed(&app, &label, window_instance);
+                if label == commands::MFA_WINDOW_LABEL {
+                    // Invalidate queued reveal/copy/file workers synchronously;
+                    // the blocking zeroize/clipboard cleanup follows off the
+                    // event loop and is epoch-guarded against a quick reopen.
+                    let closing_epoch = app.state::<MfaStore>().deactivate();
+                    let mfa_app = app.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        mfa_app
+                            .state::<MfaStore>()
+                            .clear_deactivated_state(closing_epoch);
+                    });
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -661,6 +686,19 @@ pub fn run() {
             gantt::reorder_gantt_tasks,
             timer::get_timer_data,
             timer::save_timer_data,
+            mfa::get_mfa_status,
+            mfa::list_mfa_entries,
+            mfa::scan_mfa_screen_qr,
+            mfa::preview_mfa_qr_image,
+            mfa::preview_mfa_uri,
+            mfa::preview_mfa_manual,
+            mfa::commit_mfa_import,
+            mfa::cancel_mfa_import,
+            mfa::update_mfa_entry,
+            mfa::delete_mfa_entry,
+            mfa::reveal_mfa_code,
+            mfa::copy_mfa_code,
+            mfa::lock_mfa_vault,
             screenshot::get_screenshot_settings,
             screenshot::set_screenshot_shortcut,
             screenshot::update_screenshot_settings,
@@ -695,13 +733,15 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("无法启动飞花 - PetalDesk 应用");
 
-    app.run(|_app, event| match event {
+    app.run(|app, event| match event {
         RunEvent::Ready => {
             trace_activation("run_event:ready");
         }
         RunEvent::ExitRequested { api, code, .. } => {
             if code.is_none() {
                 api.prevent_exit();
+            } else {
+                app.state::<MfaStore>().lock();
             }
             // Explicit quit and restart paths finish long-capture cleanup on a
             // worker thread before requesting process exit. Repeating that
@@ -786,16 +826,23 @@ mod tests {
             Some(models::ToolName::Gantt)
         );
         assert_eq!(
+            tool_from_tray_menu_id(OPEN_MFA_MENU_ID),
+            Some(models::ToolName::Mfa)
+        );
+        assert_eq!(
             tool_from_tray_menu_id(OPEN_SCREENSHOT_MENU_ID),
             Some(models::ToolName::Screenshot)
         );
         assert_eq!(tool_from_tray_menu_id("open-tool:../timer"), None);
         assert_eq!(tool_from_tray_menu_id("open-tool:../reminder"), None);
         assert_eq!(tool_from_tray_menu_id("open-tool:../gantt"), None);
+        assert_eq!(tool_from_tray_menu_id("open-tool:../mfa"), None);
         assert_eq!(tool_from_tray_menu_id("open-tool:Timer"), None);
         assert_eq!(tool_from_tray_menu_id("open-tool:Gantt"), None);
+        assert_eq!(tool_from_tray_menu_id("open-tool:Mfa"), None);
         assert_eq!(tool_from_tray_menu_id("timer"), None);
         assert_eq!(tool_from_tray_menu_id("gantt"), None);
+        assert_eq!(tool_from_tray_menu_id("mfa"), None);
     }
 
     #[test]

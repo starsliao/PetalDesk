@@ -838,6 +838,7 @@ impl WorkspaceStore {
             "timer" => (Self::TIMER_MIN_WIDTH, Self::TIMER_MIN_HEIGHT),
             "reminder" => (440.0, 360.0),
             "gantt" => (Self::GANTT_MIN_WIDTH, Self::GANTT_MIN_HEIGHT),
+            "mfa" => (400.0, 360.0),
             _ => (240.0, 160.0),
         };
         let valid = state.x.is_finite()
@@ -1713,7 +1714,7 @@ pub(crate) fn validate_note_id(id: &str) -> AppResult<()> {
 }
 
 fn validate_window_label(label: &str) -> AppResult<()> {
-    if matches!(label, "main" | "timer" | "reminder" | "gantt") {
+    if matches!(label, "main" | "timer" | "reminder" | "gantt" | "mfa") {
         return Ok(());
     }
     if let Some(id) = label.strip_prefix("note-") {
@@ -3113,6 +3114,33 @@ mod tests {
                     y: 0.0,
                     width: WorkspaceStore::GANTT_MIN_WIDTH,
                     height: WorkspaceStore::GANTT_MIN_HEIGHT - 1.0,
+                    maximized: false,
+                }
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn persists_mfa_window_state_with_a_safe_minimum_size() {
+        let (_root, store) = store();
+        let mfa = WindowState {
+            x: 96.0,
+            y: 80.0,
+            width: 520.0,
+            height: 640.0,
+            maximized: false,
+        };
+
+        store.save_window_state("mfa", mfa.clone()).unwrap();
+        assert_eq!(store.window_state("mfa"), Some(mfa));
+        assert!(store
+            .save_window_state(
+                "mfa",
+                WindowState {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 399.0,
+                    height: 360.0,
                     maximized: false,
                 }
             )

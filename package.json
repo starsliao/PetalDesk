@@ -1,6 +1,6 @@
 {
   "name": "petaldesk",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "description": "飞花 - PetalDesk: Windows-first local Markdown notes and desktop tools",
   "type": "module",
   "scripts": {

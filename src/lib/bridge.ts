@@ -374,7 +374,7 @@ export const notesApi = {
     if (isTauriRuntime()) return command<AppInfo>("get_app_info");
     return {
       workspacePath: "浏览器演示数据",
-      version: "0.3.8",
+      version: "0.3.9",
       defaultEditorMode: readBrowserDefaultEditorMode(),
       recoveredDrafts: 0,
     };
@@ -592,7 +592,9 @@ export const notesApi = {
           ? "popup,width=560,height=620"
           : tool === "gantt"
             ? "popup,width=980,height=600"
-            : `popup,width=${Math.max(640, screen.availWidth)},height=${Math.max(480, screen.availHeight)}`;
+            : tool === "mfa"
+              ? "popup,width=520,height=640"
+              : `popup,width=${Math.max(640, screen.availWidth)},height=${Math.max(480, screen.availHeight)}`;
     window.open(url, `petaldesk-tool-${tool}`, dimensions);
   },
 

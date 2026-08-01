@@ -6,12 +6,13 @@
     ScanLine,
     Search,
     Settings,
+    ShieldCheck,
     Timer,
     Trash2,
     Wrench,
     X,
   } from "@lucide/svelte";
-  import type { ToolName } from "$lib/tools";
+  import { TOOL_MENU_ITEMS, toolMenuItemLabel, type ToolName } from "$lib/tools";
   import EmptyState from "./EmptyState.svelte";
   import NoteCard from "./NoteCard.svelte";
   import type { NoteListItem } from "./types";
@@ -237,22 +238,22 @@
             </button>
             {#if toolsOpen}
               <div class="tools-menu" role="menu" aria-label="小工具">
-                <button type="button" role="menuitem" onclick={() => void openTool("timer")}>
-                  <Timer size={15} aria-hidden="true" />
-                  <span>计时器</span>
-                </button>
-                <button type="button" role="menuitem" onclick={() => void openTool("reminder")}>
-                  <Bell size={15} aria-hidden="true" />
-                  <span>提醒</span>
-                </button>
-                <button type="button" role="menuitem" onclick={() => void openTool("gantt")}>
-                  <ChartGantt size={15} aria-hidden="true" />
-                  <span>任务甘特图</span>
-                </button>
-                <button type="button" role="menuitem" onclick={() => void openTool("screenshot")}>
-                  <ScanLine size={15} aria-hidden="true" />
-                  <span>截图({screenshotShortcut})</span>
-                </button>
+                {#each TOOL_MENU_ITEMS as item (item.name)}
+                  <button type="button" role="menuitem" onclick={() => void openTool(item.name)}>
+                    {#if item.name === "timer"}
+                      <Timer size={15} aria-hidden="true" />
+                    {:else if item.name === "reminder"}
+                      <Bell size={15} aria-hidden="true" />
+                    {:else if item.name === "gantt"}
+                      <ChartGantt size={15} aria-hidden="true" />
+                    {:else if item.name === "mfa"}
+                      <ShieldCheck size={15} aria-hidden="true" />
+                    {:else}
+                      <ScanLine size={15} aria-hidden="true" />
+                    {/if}
+                    <span>{toolMenuItemLabel(item, screenshotShortcut)}</span>
+                  </button>
+                {/each}
               </div>
             {/if}
           </div>

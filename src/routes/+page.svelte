@@ -25,6 +25,7 @@
 
   type NoteEditorComponent = typeof import("$lib/components/NoteEditor.svelte").default;
   type GanttToolComponent = typeof import("$lib/components/GanttTool.svelte").default;
+  type MfaToolComponent = typeof import("$lib/components/MfaTool.svelte").default;
   type ScreenshotToolComponent = typeof import("$lib/components/ScreenshotTool.svelte").default;
   type PinnedScreenshotComponent = typeof import("$lib/components/PinnedScreenshot.svelte").default;
 
@@ -96,6 +97,7 @@
 
   let initialized = $state(false);
   let GanttTool = $state<GanttToolComponent | null>(null);
+  let MfaTool = $state<MfaToolComponent | null>(null);
   let ScreenshotTool = $state<ScreenshotToolComponent | null>(null);
   let PinnedScreenshot = $state<PinnedScreenshotComponent | null>(null);
   let fatalError = $state("");
@@ -771,6 +773,10 @@
         void import("$lib/components/GanttTool.svelte").then((module) => {
           if (!disposed) GanttTool = module.default;
         });
+      } else if (toolName === "mfa") {
+        void import("$lib/components/MfaTool.svelte").then((module) => {
+          if (!disposed) MfaTool = module.default;
+        });
       }
       return () => {
         disposed = true;
@@ -820,13 +826,15 @@
           ? "提醒 - 飞花 - PetalDesk"
           : toolName === "gantt"
             ? "任务甘特图 - 飞花 - PetalDesk"
-            : toolName === "screenshot"
-              ? longCaptureControlId
-                ? "长截图控制 - 飞花 - PetalDesk"
-                : "截图 - 飞花 - PetalDesk"
-              : noteId
-                ? `${activeTitle} - 飞花 - PetalDesk`
-                : "飞花 - PetalDesk"}</title>
+            : toolName === "mfa"
+              ? "MFA 验证器 - 飞花 - PetalDesk"
+              : toolName === "screenshot"
+                ? longCaptureControlId
+                  ? "长截图控制 - 飞花 - PetalDesk"
+                  : "截图 - 飞花 - PetalDesk"
+                : noteId
+                  ? `${activeTitle} - 飞花 - PetalDesk`
+                  : "飞花 - PetalDesk"}</title>
 </svelte:head>
 
 {#if screenshotPinId}
@@ -882,6 +890,16 @@
   <main class="gantt-tool-window">
     {#if GanttTool}
       <GanttTool />
+    {:else}
+      <div class="tool-loading" aria-busy="true">
+        <LoaderCircle class="spinner" size={20} aria-hidden="true" />
+      </div>
+    {/if}
+  </main>
+{:else if toolName === "mfa"}
+  <main class="mfa-tool-window">
+    {#if MfaTool}
+      <MfaTool />
     {:else}
       <div class="tool-loading" aria-busy="true">
         <LoaderCircle class="spinner" size={20} aria-hidden="true" />
@@ -1048,7 +1066,8 @@
   }
 
   .reminder-tool-window,
-  .gantt-tool-window {
+  .gantt-tool-window,
+  .mfa-tool-window {
     width: 100vw;
     height: 100vh;
     min-width: 0;

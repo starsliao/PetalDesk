@@ -15,6 +15,7 @@ pub enum ToolName {
     Timer,
     Reminder,
     Gantt,
+    Mfa,
     Screenshot,
 }
 

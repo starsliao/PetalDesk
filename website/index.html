@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="飞花 - PetalDesk 是一款 Windows 本地便签与效率工具，支持 Markdown、纯文本、截图与长截图、计时器、提醒和任务甘特图。"
+      content="飞花 - PetalDesk 是一款 Windows 本地便签与效率工具，支持 Markdown、纯文本、截图与长截图、计时器、提醒、任务甘特图和本地 MFA 验证器。"
     />
     <meta name="theme-color" content="#f7f7f5" />
     <link rel="icon" href="./assets/app-icon.svg" type="image/svg+xml" />
@@ -599,7 +599,7 @@
 
       .tool-list {
         display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-template-columns: repeat(5, minmax(0, 1fr));
         margin-bottom: 38px;
         border-top: 1px solid #5b5c60;
         border-bottom: 1px solid #5b5c60;
@@ -635,7 +635,8 @@
       .tool-item:nth-child(1)::after,
       .tool-item:nth-child(2)::after,
       .tool-item:nth-child(3)::after,
-      .tool-item:nth-child(4)::after {
+      .tool-item:nth-child(4)::after,
+      .tool-item:nth-child(5)::after {
         position: absolute;
         top: -1px;
         right: 20px;
@@ -658,6 +659,10 @@
 
       .tool-item:nth-child(4)::after {
         background: #5ba0d0;
+      }
+
+      .tool-item:nth-child(5)::after {
+        background: #9a7bd0;
       }
 
       .screenshot-figure {
@@ -882,7 +887,8 @@
           border-top-width: 6px;
         }
 
-        .tool-item:nth-child(3) {
+        .tool-item:nth-child(3),
+        .tool-item:nth-child(5) {
           border-left: 0;
           border-top: 1px solid #5b5c60;
         }
@@ -1272,9 +1278,9 @@
           </a>
           <a
             class="nav-download"
-            href="https://github.com/starsliao/PetalDesk/releases/download/v0.3.8/PetalDesk_0.3.8_x64-setup.exe"
+            href="https://github.com/starsliao/PetalDesk/releases/download/v0.3.9/PetalDesk_0.3.9_x64-setup.exe"
             download
-          >下载 0.3.8</a>
+          >下载 0.3.9</a>
         </div>
       </nav>
     </header>
@@ -1291,9 +1297,9 @@
             <div class="hero-actions">
               <a
                 class="primary-action"
-                href="https://github.com/starsliao/PetalDesk/releases/download/v0.3.8/PetalDesk_0.3.8_x64-setup.exe"
+                href="https://github.com/starsliao/PetalDesk/releases/download/v0.3.9/PetalDesk_0.3.9_x64-setup.exe"
                 download
-              >下载 Windows 版 0.3.8</a>
+              >下载 Windows 版 0.3.9</a>
               <a class="secondary-action" href="#notes">查看功能</a>
             </div>
           </div>
@@ -1398,7 +1404,7 @@
               </h2>
             </div>
             <p class="section-intro">
-              从托盘或便签窗口随时打开。计时、提醒、任务规划、截图和长截图各自专注，不把主界面变成拥挤的控制台。
+              从托盘或便签窗口随时打开。计时、提醒、任务规划、MFA 验证与截图各自专注，不把主界面变成拥挤的控制台。
             </p>
           </div>
 
@@ -1420,6 +1426,11 @@
             </article>
             <article class="tool-item">
               <span class="tool-number">04</span>
+              <h3>MFA 验证器</h3>
+              <p>TOTP 默认隐藏，支持屏幕二维码扫描与双击安全复制，密钥由当前 Windows 用户加密保护。</p>
+            </article>
+            <article class="tool-item">
+              <span class="tool-number">05</span>
               <h3>截图与长截图</h3>
               <p>框选后直接标注、复制、保存或贴图；长截图保留选区遮罩，在原窗口中滚动并稳定拼接。</p>
             </article>
@@ -1466,7 +1477,7 @@
               </h2>
             </div>
             <p class="section-intro">
-              飞花 - PetalDesk 把便签、附件、设置和小工具数据统一放进“飞花 - PetalDesk 数据存储”。换电脑时复制整个目录，再指定它即可继续使用。
+              飞花 - PetalDesk 把便签、附件、设置和小工具数据统一放进“飞花 - PetalDesk 数据存储”。普通数据换电脑时复制整个目录即可；MFA 保险库额外绑定当前 Windows 用户。
             </p>
           </div>
 
@@ -1482,8 +1493,8 @@
               <li>
                 <span class="data-point-number">02</span>
                 <div>
-                  <strong>一个目录完成迁移</strong>
-                  <p>复制完整的飞花 - PetalDesk 数据存储目录，在新电脑安装时或设置中选择该路径。</p>
+                  <strong>普通数据一个目录完成迁移</strong>
+                  <p>复制完整数据目录并重新指定路径即可；MFA 密钥不会降级为明文，跨电脑或 Windows 用户后无法解密。</p>
                 </div>
               </li>
               <li>
@@ -1509,6 +1520,7 @@
    │     ├─ meta.json
    │     └─ assets/
    ├─ tools/
+   │  └─ mfa/ (DPAPI 加密保险库)
    ├─ state/
    │  ├─ note-order.json
    │  └─ windows.json
@@ -1536,9 +1548,9 @@
           <div class="install-actions">
             <a
               class="download-action"
-              href="https://github.com/starsliao/PetalDesk/releases/download/v0.3.8/PetalDesk_0.3.8_x64-setup.exe"
+              href="https://github.com/starsliao/PetalDesk/releases/download/v0.3.9/PetalDesk_0.3.9_x64-setup.exe"
               download
-            >下载飞花 - PetalDesk 0.3.8</a>
+            >下载飞花 - PetalDesk 0.3.9</a>
             <div class="download-meta">Windows 10 / 11 · x64 · 联网安装包</div>
           </div>
         </div>

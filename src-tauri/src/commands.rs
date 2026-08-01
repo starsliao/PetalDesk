@@ -9,6 +9,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder
 pub(crate) const TIMER_WINDOW_LABEL: &str = "timer";
 pub(crate) const REMINDER_WINDOW_LABEL: &str = "reminder";
 pub(crate) const GANTT_WINDOW_LABEL: &str = "gantt";
+pub(crate) const MFA_WINDOW_LABEL: &str = "mfa";
 const TIMER_DEFAULT_WIDTH: f64 = 320.0;
 const TIMER_DEFAULT_HEIGHT: f64 = 140.0;
 const TIMER_MIN_VISIBLE_WIDTH: f64 = 48.0;
@@ -22,6 +23,7 @@ static NOTE_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 static TIMER_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 static REMINDER_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 static GANTT_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
+static MFA_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 
 const SLOW_BACKGROUND_OPERATION: Duration = Duration::from_secs(2);
 
@@ -180,6 +182,7 @@ pub async fn set_data_storage_path(
 #[tauri::command]
 pub async fn restart_app(app: AppHandle) -> AppResult<()> {
     tauri::async_runtime::spawn_blocking(move || {
+        app.state::<crate::mfa::MfaStore>().lock();
         crate::long_screenshot::shutdown(&app);
         app.restart()
     })
@@ -368,6 +371,7 @@ pub async fn open_tool_window(app: AppHandle, tool: ToolName) -> AppResult<Strin
         ToolName::Timer => open_timer_window_inner(&app, &app.state()),
         ToolName::Reminder => open_reminder_window_inner(&app, &app.state()),
         ToolName::Gantt => open_gantt_window_inner(&app, &app.state()),
+        ToolName::Mfa => open_mfa_window_inner(&app, &app.state()),
         ToolName::Screenshot => crate::screenshot::start_capture_inner(&app)
             .map(|_| crate::screenshot::CAPTURE_WINDOW_LABEL.to_string()),
     })
@@ -600,6 +604,85 @@ pub fn open_gantt_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppRe
         .map_err(|error| AppError::new("window_error", format!("创建任务甘特图失败: {error}")))?;
     let _ = window.set_focus();
     Ok(GANTT_WINDOW_LABEL.to_string())
+}
+
+pub fn open_mfa_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResult<String> {
+    let _creation_guard = lock_window_creation(&MFA_WINDOW_CREATION_LOCK);
+    if let Some(window) = app.get_webview_window(MFA_WINDOW_LABEL) {
+        window.show().map_err(|error| {
+            AppError::new("window_error", format!("显示 MFA 验证器失败: {error}"))
+        })?;
+        let _ = window.unminimize();
+        app.state::<crate::mfa::MfaStore>().activate();
+        let protected = protect_mfa_window(&window);
+        app.state::<crate::mfa::MfaStore>()
+            .set_capture_excluded(protected);
+        let _ = window.set_focus();
+        return Ok(MFA_WINDOW_LABEL.to_string());
+    }
+
+    let url = WebviewUrl::App("?tool=mfa".into());
+    let mut builder = WebviewWindowBuilder::new(app, MFA_WINDOW_LABEL, url)
+        .title("MFA 验证器 - 飞花 - PetalDesk")
+        .decorations(false)
+        .resizable(true)
+        .inner_size(520.0, 640.0)
+        .min_inner_size(400.0, 360.0)
+        .skip_taskbar(false);
+    if let Some(state) = store.window_state(MFA_WINDOW_LABEL) {
+        builder = builder
+            .position(state.x, state.y)
+            .inner_size(state.width, state.height)
+            .maximized(state.maximized);
+    } else {
+        builder = builder.center();
+    }
+    // Activate before building: WebView2 can finish loading quickly enough to
+    // invoke `get_mfa_status` before `build` returns on a warm start.
+    let mfa_store = app.state::<crate::mfa::MfaStore>();
+    mfa_store.activate();
+    let window = match builder.build() {
+        Ok(window) => window,
+        Err(error) => {
+            let closing_epoch = mfa_store.deactivate();
+            mfa_store.clear_deactivated_state(closing_epoch);
+            return Err(AppError::new(
+                "window_error",
+                format!("创建 MFA 验证器失败: {error}"),
+            ));
+        }
+    };
+    let protected = protect_mfa_window(&window);
+    app.state::<crate::mfa::MfaStore>()
+        .set_capture_excluded(protected);
+    let _ = window.set_focus();
+    Ok(MFA_WINDOW_LABEL.to_string())
+}
+
+#[cfg(windows)]
+fn protect_mfa_window(window: &tauri::WebviewWindow) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowDisplayAffinity;
+
+    // WDA_EXCLUDEFROMCAPTURE is available on current Windows 10/11. Older
+    // builds may reject it, in which case WDA_MONITOR still hides the content
+    // from the common capture path. Protection is best effort so an OS policy
+    // limitation never prevents the user from opening their vault.
+    const WDA_MONITOR: u32 = 0x0000_0001;
+    const WDA_EXCLUDEFROMCAPTURE: u32 = 0x0000_0011;
+    if let Ok(hwnd) = window.hwnd() {
+        unsafe {
+            if SetWindowDisplayAffinity(hwnd.0, WDA_EXCLUDEFROMCAPTURE) != 0 {
+                return true;
+            }
+            return SetWindowDisplayAffinity(hwnd.0, WDA_MONITOR) != 0;
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+fn protect_mfa_window(_window: &tauri::WebviewWindow) -> bool {
+    false
 }
 
 #[tauri::command]

@@ -2,9 +2,9 @@
 
 > 把想法留在桌面，把文件留在自己手里。
 
-[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.8/PetalDesk_0.3.8_x64-setup.exe)
+[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.9/PetalDesk_0.3.9_x64-setup.exe)
 
-飞花 - PetalDesk 是一款 Windows 10/11 本地便签与效率工具。它启动快、界面安静，支持 Markdown 即时排版、纯文本、图片、搜索、回收站，以及几个随时可以唤起的小工具。没有账号、没有云端依赖，内容就是你目录里的 Markdown 文件。
+飞花 - PetalDesk 是一款 Windows 10/11 本地便签与效率工具。它启动快、界面安静，支持 Markdown 即时排版、纯文本、图片、搜索、回收站，以及截图、任务规划和本地 MFA 验证器等随时可以唤起的小工具。没有账号、没有云端依赖，内容保留在你的本地数据目录中。
 
 <p align="center">
   <img src="website/assets/screenshots/main-window-0.2.1.png" alt="飞花 - PetalDesk 主界面" width="860" />
@@ -31,6 +31,7 @@
 - 计时器：透明电子管数字、暂停/重置记录、透明度、位置和大小记忆。
 - 提醒：一次、间隔、日/周/月/年周期，到点发送 Windows 通知。
 - 任务甘特图：任务排序、进度筛选、时间条拖动、小时级时间轴缩放。
+- MFA 验证器：支持标准 `TOTP` 单账户、屏幕二维码扫描、图片/链接/手动导入、默认隐藏验证码与双击安全复制；密钥使用当前 Windows 用户的 DPAPI 加密保护。
 - 截图：默认 `F1`，单显示器手动框选，标注、马赛克、模糊、复制、保存和置顶贴图；选区内双击即可复制，选区外右键直接取消。
 - 长截图：默认由用户在原窗口中手动滚动并实时拼接，支持暂停、重试、回退和完整标注；自动滚动作为高级模式保留，浏览器扩展可增强 Chrome、Edge 与 Firefox 长页面的滚动定位和拼接稳定性。
 
@@ -38,7 +39,7 @@
 
 ## 数据真正属于你
 
-安装时可以选择“飞花 - PetalDesk 数据存储”，默认位置是用户“文档”目录下的 `PetalDesk`。迁移到新电脑时，复制整个目录，再在安装器或设置中指定它即可。
+安装时可以选择“飞花 - PetalDesk 数据存储”，默认位置是用户“文档”目录下的 `PetalDesk`。便签、附件、设置和普通小工具数据迁移到新电脑时，复制整个目录，再在安装器或设置中指定它即可。
 
 ```text
 PetalDesk/
@@ -50,6 +51,7 @@ PetalDesk/
    ├─ config.json
    ├─ state/
    ├─ tools/
+   │  └─ mfa/              # DPAPI 保护的加密保险库
    ├─ backups/
    ├─ journal/
    ├─ trash/
@@ -58,9 +60,11 @@ PetalDesk/
 
 `note.md` 是正文唯一真相，图片使用便签目录内 `assets/` 的相对路径。Markdown 图片和受控的 HTML `<img>` 标签都经过相同的本地资源映射；脚本、事件属性、任意本地路径和远程图片不会被加载。搜索索引可以重建，不会成为迁移或恢复的前置条件。旧版本布局可用 [`scripts/migrate-petaldesk-storage.ps1`](scripts/migrate-petaldesk-storage.ps1) 迁移。
 
+MFA 是唯一的迁移例外：保险库虽然也位于统一数据目录，但解密密钥绑定当前 Windows 用户。把目录复制到另一台电脑或另一个 Windows 用户后，原 MFA 账户无法解密；飞花不会为迁移便利降级为明文，也不会静默覆盖无法解密的保险库。迁移前请先在各服务中重新绑定或准备恢复码。
+
 ## 安装与运行
 
-下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.8/PetalDesk_0.3.8_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。
+下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.9/PetalDesk_0.3.9_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。
 
 没有 WebView2 或下载权限时，安装器会明确提示失败原因，不会静默留下无法启动的程序。未签名构建可能显示“未知发布者”，这是 Windows 对代码签名的正常提示。
 
@@ -89,7 +93,7 @@ pnpm tauri dev
 pnpm dev
 ```
 
-浏览器模式使用独立的 `localStorage` 演示数据，不会读写桌面版数据目录。
+浏览器模式不会读写桌面版数据目录；便签等演示数据可以使用独立的 `localStorage`，MFA 验证器只使用内存模拟数据，也不会保存输入的密钥。
 
 常用检查：
 

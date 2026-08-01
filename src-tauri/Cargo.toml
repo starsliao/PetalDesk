@@ -1,6 +1,6 @@
 [package]
 name = "petaldesk"
-version = "0.3.8"
+version = "0.3.9"
 description = "飞花 - PetalDesk local Markdown notes and desktop tools"
 authors = ["飞花 - PetalDesk contributors"]
 edition = "2021"
@@ -37,14 +37,24 @@ notify-rust = "=4.17.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
+data-encoding = "2.9"
 dirs = "6"
+getrandom = "0.3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 infer = "0.19"
 mime_guess = "2"
 pulldown-cmark = "0.13"
+percent-encoding = "2.3"
+quircs = "0.10.3"
 rusqlite = { version = "0.37", features = ["bundled"] }
 rustfft = "6.4"
 sha2 = "0.10"
+totp-rs = { version = "5.7.2", features = ["zeroize"] }
+url = "2.5"
 uuid = { version = "1", features = ["v4", "serde"] }
+zeroize = { version = "1.8", features = ["derive"] }
 png = "0.17"
 rfd = { version = "=0.16.0", default-features = false, features = ["common-controls-v6"] }
 
@@ -53,6 +63,7 @@ windows-sys = { version = "0.60", features = [
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",
+  "Win32_Security_Cryptography",
   "Win32_Storage_FileSystem",
   "Win32_System_DataExchange",
   "Win32_System_LibraryLoader",
@@ -64,6 +75,7 @@ windows-sys = { version = "0.60", features = [
 ] }
 
 [dev-dependencies]
+qrcode = { version = "0.14.1", default-features = false, features = ["image"] }
 tempfile = "3"
 
 [profile.release]
