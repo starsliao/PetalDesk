@@ -192,6 +192,30 @@ afterEach(() => {
 });
 
 describe("ScreenshotTool", () => {
+  it("uses a move cursor only over a movable selection and preserves resize cursors", async () => {
+    const api = mockApi();
+    const rendered = render(ScreenshotTool, { api });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalledWith("session-1"));
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+
+    await fireEvent.pointerMove(stage, { clientX: 300, clientY: 250 });
+    expect(stage).toHaveClass("selection-movable");
+
+    const northHandle = rendered.container.querySelector<SVGRectElement>(".resize-handle.handle-n");
+    const southeastHandle = rendered.container.querySelector<SVGRectElement>(".resize-handle.handle-se");
+    expect(northHandle).not.toBeNull();
+    expect(southeastHandle).not.toBeNull();
+    expect(northHandle).toHaveClass("handle-n");
+    expect(southeastHandle).toHaveClass("handle-se");
+
+    await fireEvent.pointerMove(stage, { clientX: 700, clientY: 500 });
+    expect(stage).not.toHaveClass("selection-movable");
+  });
+
   it("keeps the native window hidden until the screenshot frame is painted", async () => {
     const api = mockApi();
     let resolveFrame: ((frame: Uint8Array) => void) | undefined;

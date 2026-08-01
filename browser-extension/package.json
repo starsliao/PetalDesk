@@ -1,6 +1,6 @@
 {
   "name": "@petaldesk/browser-extension",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "private": true,
   "description": "飞花 - PetalDesk long-capture browser extension for Chrome, Edge, and Firefox",
   "scripts": {

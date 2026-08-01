@@ -4,7 +4,11 @@ export {
   insertHorizontalRule,
   insertImageMarkdown,
 } from "./format";
-export { renderMarkdown } from "./markdown";
+export {
+  extractLocalImagePaths,
+  isSupportedHtmlImageTag,
+  renderMarkdown,
+} from "./markdown";
 export type {
   AssetImporter,
   AssetInsertDetail,

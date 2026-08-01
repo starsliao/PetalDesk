@@ -35,6 +35,7 @@
   } from "@lucide/svelte";
   import {
     applyInlineFormat,
+    isSupportedHtmlImageTag,
     insertHorizontalRule,
     insertImageMarkdown,
     renderMarkdown,
@@ -429,6 +430,16 @@
             }
             case "Image":
               if (!active) {
+                ranges.push(
+                  Decoration.replace({
+                    widget: new MarkdownImageWidget(readSource(), urls, node.from),
+                  }).range(node.from, node.to),
+                );
+                return false;
+              }
+              break;
+            case "HTMLTag":
+              if (!active && isSupportedHtmlImageTag(readSource())) {
                 ranges.push(
                   Decoration.replace({
                     widget: new MarkdownImageWidget(readSource(), urls, node.from),
@@ -985,4 +996,5 @@
   :global(.md-typora-table-widget tbody tr:last-child > td) { border-bottom: 0; }
   :global(.md-typora-table-widget .md-align-center) { text-align: center; }
   :global(.md-typora-table-widget .md-align-right) { text-align: right; }
+  :global(.md-typora-table-widget img) { display: block; max-width: min(100%, 720px); height: auto; object-fit: contain; }
 </style>

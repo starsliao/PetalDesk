@@ -11,6 +11,8 @@ mod reminders;
 mod screenshot;
 mod storage;
 mod timer;
+#[cfg(windows)]
+mod window_activation;
 
 use crate::gantt::GanttStore;
 use crate::long_screenshot::LongScreenshotStore;

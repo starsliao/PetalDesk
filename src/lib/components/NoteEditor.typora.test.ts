@@ -327,4 +327,37 @@ describe("NoteEditor Typora mode", () => {
     expect(view!.state.selection.main.head).toBe(tableMarkdown.indexOf("| 名称"));
     expect(view!.hasFocus).toBe(true);
   });
+
+  it("renders safe HTML images in an inactive table and restores their source for editing", async () => {
+    let view: EditorView | undefined;
+    const tableMarkdown = [
+      "光标行",
+      "",
+      "| 功能 | 截图 |",
+      "| --- | --- |",
+      '| 甘特图 | <img src="assets/gantt.png" alt="任务甘特图" width="500" /> |',
+    ].join("\n");
+    const { container } = render(NoteEditor, {
+      value: tableMarkdown,
+      mode: "typora",
+      assetUrls: { "assets/gantt.png": "data:image/png;base64,Z2FudHQ=" },
+      onready: (detail) => {
+        view = detail.view;
+      },
+    });
+
+    await waitFor(() => expect(view).toBeDefined());
+    const widget = await waitFor(() => {
+      const element = container.querySelector<HTMLElement>(".md-typora-table-widget");
+      const image = element?.querySelector<HTMLImageElement>('img[alt="任务甘特图"]');
+      expect(image).toBeInTheDocument();
+      expect(image).toHaveAttribute("width", "500");
+      return element!;
+    });
+
+    await fireEvent.mouseDown(widget, { button: 0 });
+    await waitFor(() => expect(container.querySelector(".md-typora-table-widget")).not.toBeInTheDocument());
+    expect(view!.state.doc.toString()).toBe(tableMarkdown);
+    expect(container.textContent).toContain('<img src="assets/gantt.png" alt="任务甘特图" width="500" />');
+  });
 });

@@ -96,7 +96,7 @@ describe("browser note styles", () => {
   });
 
   it("defaults to Typora mode and persists a new global selection", async () => {
-    expect((await notesApi.appInfo()).version).toBe("0.3.6");
+    expect((await notesApi.appInfo()).version).toBe("0.3.7");
     expect((await notesApi.appInfo()).defaultEditorMode).toBe("typora");
 
     await expect(notesApi.setDefaultEditorMode("plain")).resolves.toBe("plain");
@@ -196,6 +196,26 @@ describe("browser note styles", () => {
 
     const item = (await notesApi.listNotes()).find((candidate) => candidate.id === note.id)!;
     expect(item.excerpt).toBe("源码标题 预览正文 高亮内容 链接");
+  });
+
+  it("shows HTML images as preview content without leaking raw tags", async () => {
+    const note = await notesApi.createNote();
+    await notesApi.commitNote({
+      id: note.id,
+      baseRevision: note.revision,
+      markdown: [
+        '<img src="assets/cover.png" alt="封面" width="500" onerror="alert(1)">',
+        "",
+        "<strong>正文</strong>",
+        '<script data-secret="hidden">steal()</script>',
+      ].join("\n"),
+      metaPatch: { title: "HTML 图片", editorMode: "typora" },
+    });
+
+    const item = (await notesApi.listNotes()).find((candidate) => candidate.id === note.id)!;
+    expect(item.excerpt).toBe("[图片] 正文");
+    expect(item.excerpt).not.toContain("onerror");
+    expect(item.excerpt).not.toContain("steal");
   });
 
   it("rejects unsafe external link protocols", async () => {

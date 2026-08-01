@@ -14,14 +14,11 @@
 pnpm package:windows
 ```
 
-Version `0.3.6` fixes long-residency UI freezes by moving filesystem, SQLite,
-clipboard and window-construction work away from Tauri's event loop. Screenshot
-save dialogs are now owned by the capture window, temporarily lower topmost
-surfaces, and never wait while holding long-capture lifecycle locks. Shortcut
-registration is independent from screenshot-window prewarming, retries failed
-registrations every 30 seconds, and performs a healthy rebind every 5 minutes.
-Markdown/GFM tables render in both sanitized preview output and the
-Typora-style editor.
+Version `0.3.7` supports sanitized HTML image tags inside Markdown notes and
+GFM table cells while preserving the local `assets/` boundary. It also makes
+the screenshot window activate immediately when a PetalDesk window owns the
+foreground, and shows a four-way move cursor over a movable screenshot
+selection without changing resize-handle cursors.
 
 The package always includes and registers the Firefox Native Messaging host.
 Set `PETALDESK_CHROME_EXTENSION_ID` and/or `PETALDESK_EDGE_EXTENSION_ID` to the
@@ -50,4 +47,4 @@ XPI. The unsigned ZIP must not be presented as an installable Firefox package.
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.3.6>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.3.7>

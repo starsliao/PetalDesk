@@ -20,6 +20,18 @@ interface MarkdownInlineState {
   push(type: string, tag: string, nesting: -1 | 0 | 1): MarkdownTokens[number];
 }
 
+interface HtmlImageAttributes {
+  src: string;
+  alt?: string;
+  title?: string;
+  width?: string;
+  height?: string;
+}
+
+type MarkdownToken = ReturnType<MarkdownIt["parse"]>[number];
+
+const HTML_IMAGE_ATTRIBUTES = new Set(["src", "alt", "title", "width", "height"]);
+
 function escapedAt(source: string, position: number): boolean {
   let backslashes = 0;
   for (let index = position - 1; index >= 0 && source[index] === "\\"; index -= 1) {
@@ -95,10 +107,123 @@ function resolveImageSource(
   return null;
 }
 
+function parseHtmlImageTag(source: string): HtmlImageAttributes | null {
+  const tag = source.trim();
+  const opening = /^<img\b/i.exec(tag);
+  if (!opening) return null;
+
+  const attributes: Partial<HtmlImageAttributes> = {};
+  let position = opening[0].length;
+
+  while (position < tag.length) {
+    while (/\s/.test(tag[position] ?? "")) position += 1;
+
+    if (tag[position] === ">") {
+      position += 1;
+      break;
+    }
+    if (tag[position] === "/" && tag[position + 1] === ">") {
+      position += 2;
+      break;
+    }
+
+    const nameMatch = /^[A-Za-z_:][A-Za-z0-9:._-]*/.exec(tag.slice(position));
+    if (!nameMatch) return null;
+    const name = nameMatch[0].toLowerCase();
+    position += nameMatch[0].length;
+    while (/\s/.test(tag[position] ?? "")) position += 1;
+
+    let value = "";
+    if (tag[position] === "=") {
+      position += 1;
+      while (/\s/.test(tag[position] ?? "")) position += 1;
+      const quote = tag[position];
+      if (quote === '"' || quote === "'") {
+        const end = tag.indexOf(quote, position + 1);
+        if (end < 0) return null;
+        value = tag.slice(position + 1, end);
+        position = end + 1;
+      } else {
+        const valueMatch = /^[^\s"'=<>`]+/.exec(tag.slice(position));
+        if (!valueMatch) return null;
+        value = valueMatch[0];
+        position += value.length;
+      }
+    }
+
+    if (HTML_IMAGE_ATTRIBUTES.has(name)) {
+      attributes[name as keyof HtmlImageAttributes] = value;
+    }
+  }
+
+  if (position !== tag.length || !attributes.src) return null;
+  return attributes as HtmlImageAttributes;
+}
+
+export function isSupportedHtmlImageTag(source: string): boolean {
+  return parseHtmlImageTag(source) !== null;
+}
+
+function safeImageDimension(value: string | undefined): string | undefined {
+  if (!value || !/^\d{1,5}$/.test(value)) return undefined;
+  const dimension = Number(value);
+  return dimension >= 1 && dimension <= 4096 ? String(dimension) : undefined;
+}
+
+function renderImage(
+  parser: MarkdownIt,
+  rawSource: string,
+  rawAlt: string,
+  rawTitle: string | null,
+  assetUrls: Readonly<Record<string, string>>,
+  dimensions: Pick<HtmlImageAttributes, "width" | "height"> = {},
+): string {
+  const source = resolveImageSource(rawSource, assetUrls);
+  const alt = parser.utils.escapeHtml(rawAlt || "图片");
+
+  if (!source) {
+    return `<span class="md-image-placeholder" data-path="${parser.utils.escapeHtml(rawSource)}" role="img" aria-label="${alt}">🖼 ${alt}</span>`;
+  }
+
+  const titleAttribute = rawTitle ? ` title="${parser.utils.escapeHtml(rawTitle)}"` : "";
+  const width = safeImageDimension(dimensions.width);
+  const height = safeImageDimension(dimensions.height);
+  const widthAttribute = width ? ` width="${width}"` : "";
+  const heightAttribute = height ? ` height="${height}"` : "";
+  return `<img src="${parser.utils.escapeHtml(source)}" alt="${alt}"${titleAttribute}${widthAttribute}${heightAttribute} loading="lazy" decoding="async">`;
+}
+
+function renderSafeHtmlImage(
+  parser: MarkdownIt,
+  source: string,
+  assetUrls: Readonly<Record<string, string>>,
+): string | null {
+  const attributes = parseHtmlImageTag(source);
+  if (!attributes) return null;
+  const imageSource = parser.utils.unescapeAll(attributes.src.trim());
+  const alt = parser.utils.unescapeAll(attributes.alt ?? "图片");
+  const title = attributes.title === undefined
+    ? null
+    : parser.utils.unescapeAll(attributes.title);
+  return renderImage(parser, imageSource, alt, title, assetUrls, attributes);
+}
+
+function localAssetPath(source: string): string | null {
+  const normalized = normalizeAssetPath(source);
+  const segments = normalized.split("/");
+  return segments[0]?.toLowerCase() === "assets"
+    && segments.length === 2
+    && Boolean(segments[1])
+    && segments[1] !== ".."
+    && segments[1] !== "."
+    ? normalized
+    : null;
+}
+
 function createRenderer(assetUrls: Readonly<Record<string, string>>): MarkdownIt {
   const parser = new MarkdownIt({
     breaks: true,
-    html: false,
+    html: true,
     linkify: true,
     typographer: false,
   });
@@ -136,16 +261,24 @@ function createRenderer(assetUrls: Readonly<Record<string, string>>): MarkdownIt
   parser.renderer.rules.image = (tokens, index) => {
     const token = tokens[index];
     const rawSource = token.attrGet("src") ?? "";
-    const source = resolveImageSource(rawSource, assetUrls);
-    const alt = parser.utils.escapeHtml(token.content || "图片");
-    const title = token.attrGet("title");
+    return renderImage(
+      parser,
+      rawSource,
+      token.content || "图片",
+      token.attrGet("title"),
+      assetUrls,
+    );
+  };
 
-    if (!source) {
-      return `<span class="md-image-placeholder" data-path="${parser.utils.escapeHtml(rawSource)}" role="img" aria-label="${alt}">🖼 ${alt}</span>`;
-    }
+  parser.renderer.rules.html_inline = (tokens, index) => {
+    const source = tokens[index].content;
+    return renderSafeHtmlImage(parser, source, assetUrls) ?? parser.utils.escapeHtml(source);
+  };
 
-    const titleAttribute = title ? ` title="${parser.utils.escapeHtml(title)}"` : "";
-    return `<img src="${parser.utils.escapeHtml(source)}" alt="${alt}"${titleAttribute} loading="lazy" decoding="async">`;
+  parser.renderer.rules.html_block = (tokens, index) => {
+    const source = tokens[index].content;
+    const image = renderSafeHtmlImage(parser, source, assetUrls);
+    return image ? `${image}\n` : parser.utils.escapeHtml(source);
   };
 
   for (const ruleName of ["th_open", "td_open"] as const) {
@@ -159,6 +292,32 @@ function createRenderer(assetUrls: Readonly<Record<string, string>>): MarkdownIt
   }
 
   return parser;
+}
+
+export function extractLocalImagePaths(markdown: string): string[] {
+  const parser = createRenderer({});
+  const paths = new Set<string>();
+
+  const visit = (tokens: readonly MarkdownToken[]): void => {
+    for (const token of tokens) {
+      let source: string | null = null;
+      if (token.type === "image") {
+        source = token.attrGet("src");
+      } else if (token.type === "html_inline" || token.type === "html_block") {
+        const attributes = parseHtmlImageTag(token.content);
+        source = attributes ? parser.utils.unescapeAll(attributes.src.trim()) : null;
+      }
+
+      if (source) {
+        const path = localAssetPath(source);
+        if (path) paths.add(path);
+      }
+      if (token.children) visit(token.children);
+    }
+  };
+
+  visit(parser.parse(markdown, {}));
+  return [...paths];
 }
 
 export function renderMarkdown(
@@ -213,6 +372,7 @@ export function renderMarkdown(
       "decoding",
       "disabled",
       "href",
+      "height",
       "loading",
       "rel",
       "role",
@@ -220,6 +380,7 @@ export function renderMarkdown(
       "target",
       "title",
       "type",
+      "width",
     ],
     ALLOW_DATA_ATTR: true,
   });

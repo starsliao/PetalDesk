@@ -28,6 +28,7 @@ const MAX_IMAGE_PIXELS: u64 = 40_000_000;
 const EXPORT_TICKET_TTL: Duration = Duration::from_secs(5 * 60);
 const SHORTCUT_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const SHORTCUT_HEALTHY_REFRESH_POLLS: u32 = 10;
+const CAPTURE_PRESENT_TIMEOUT: Duration = Duration::from_secs(5);
 static CAPTURE_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 static PIN_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1437,16 +1438,163 @@ pub(crate) fn prepare_capture_window(app: &AppHandle, monitor: &MonitorBounds) -
     Ok(())
 }
 
+trait CaptureWindowActivation {
+    fn show_for_capture(&self) -> AppResult<()>;
+    fn unminimize_for_capture(&self) -> AppResult<()>;
+    fn focus_for_capture(&self) -> AppResult<()>;
+    fn ensure_foreground_for_capture(&self) -> AppResult<()>;
+}
+
+impl CaptureWindowActivation for WebviewWindow {
+    fn show_for_capture(&self) -> AppResult<()> {
+        self.show()
+            .map_err(|error| AppError::new("window_error", format!("显示截图窗口失败: {error}")))
+    }
+
+    fn unminimize_for_capture(&self) -> AppResult<()> {
+        self.unminimize()
+            .map_err(|error| AppError::new("window_error", format!("恢复截图窗口失败: {error}")))
+    }
+
+    fn focus_for_capture(&self) -> AppResult<()> {
+        self.set_focus()
+            .map_err(|error| AppError::new("window_error", format!("聚焦截图窗口失败: {error}")))
+    }
+
+    fn ensure_foreground_for_capture(&self) -> AppResult<()> {
+        ensure_capture_window_foreground(self)
+    }
+}
+
+fn present_capture_window_steps(window: &impl CaptureWindowActivation) -> AppResult<()> {
+    window.show_for_capture()?;
+    window.unminimize_for_capture()?;
+    window.focus_for_capture()?;
+    window.ensure_foreground_for_capture()
+}
+
+fn ensure_foreground_with(
+    mut is_foreground: impl FnMut() -> bool,
+    activate_directly: impl FnOnce() -> AppResult<()>,
+    activate_with_input_attachment: impl FnOnce() -> AppResult<()>,
+) -> AppResult<()> {
+    if is_foreground() {
+        return Ok(());
+    }
+    activate_directly()?;
+    if is_foreground() {
+        return Ok(());
+    }
+    activate_with_input_attachment()?;
+    if is_foreground() {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            "window_activation_failed",
+            "Windows 未能激活截图窗口，请重试截图",
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn ensure_capture_window_foreground(window: &WebviewWindow) -> AppResult<()> {
+    use crate::window_activation::ThreadInputAttachment;
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsWindow,
+        SetForegroundWindow,
+    };
+
+    let hwnd = window
+        .hwnd()
+        .map_err(|error| AppError::new("window_error", format!("读取截图窗口句柄失败: {error}")))?;
+    let hwnd = hwnd.0 as *mut std::ffi::c_void;
+    if unsafe { IsWindow(hwnd) } == 0 {
+        return Err(AppError::new("window_error", "截图窗口句柄已失效"));
+    }
+
+    let activate_directly = || {
+        unsafe {
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetActiveWindow(hwnd);
+            let _ = SetFocus(hwnd);
+        }
+        Ok(())
+    };
+    let activate_with_input_attachment = || {
+        // Re-check before attaching: the normal activation above often wins
+        // as soon as Windows processes the foreground request.
+        if unsafe { GetForegroundWindow() } == hwnd {
+            return Ok(());
+        }
+        let current_thread = unsafe { GetCurrentThreadId() };
+        let foreground = unsafe { GetForegroundWindow() };
+        let foreground_thread = if foreground.is_null() {
+            0
+        } else {
+            unsafe { GetWindowThreadProcessId(foreground, std::ptr::null_mut()) }
+        };
+        let _foreground_attachment = ThreadInputAttachment::attach(
+            current_thread,
+            foreground_thread,
+            "连接截图前台输入线程",
+        )?;
+        unsafe {
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetActiveWindow(hwnd);
+            let _ = SetFocus(hwnd);
+        }
+        Ok(())
+    };
+
+    ensure_foreground_with(
+        || unsafe { GetForegroundWindow() } == hwnd,
+        activate_directly,
+        activate_with_input_attachment,
+    )
+}
+
+#[cfg(not(windows))]
+fn ensure_capture_window_foreground(_window: &WebviewWindow) -> AppResult<()> {
+    Ok(())
+}
+
 pub(crate) fn present_capture_window(app: &AppHandle) -> AppResult<()> {
     let window = app
         .get_webview_window(CAPTURE_WINDOW_LABEL)
         .ok_or_else(|| AppError::new("window_error", "截图窗口尚未准备完成"))?;
-    window
-        .show()
-        .map_err(|error| AppError::new("window_error", format!("显示截图窗口失败: {error}")))?;
-    let _ = window.unminimize();
-    let _ = window.set_focus();
-    Ok(())
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let should_present = Arc::new(AtomicBool::new(true));
+    let main_thread_should_present = should_present.clone();
+    app.run_on_main_thread(move || {
+        let result = if main_thread_should_present.load(Ordering::Acquire) {
+            present_capture_window_steps(&window)
+        } else {
+            Err(AppError::new(
+                "window_activation_canceled",
+                "截图窗口显示请求已超时取消",
+            ))
+        };
+        let _ = sender.send(result);
+    })
+    .map_err(|error| AppError::new("window_error", format!("调度截图窗口到主线程失败: {error}")))?;
+
+    match receiver.recv_timeout(CAPTURE_PRESENT_TIMEOUT) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            should_present.store(false, Ordering::Release);
+            Err(AppError::new(
+                "window_activation_timeout",
+                "等待截图窗口显示超时，请重试截图",
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(AppError::new("window_error", "截图窗口主线程任务意外结束"))
+        }
+    }
 }
 
 fn open_pin_window(app: AppHandle, pin_id: &str) -> AppResult<String> {
@@ -1964,7 +2112,141 @@ fn write_png_to_clipboard(_png: &[u8], _decoded: &DecodedPng) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
     use tempfile::tempdir;
+
+    struct FakeCaptureWindow {
+        operations: RefCell<Vec<&'static str>>,
+        fail_at: Option<&'static str>,
+    }
+
+    impl FakeCaptureWindow {
+        fn new(fail_at: Option<&'static str>) -> Self {
+            Self {
+                operations: RefCell::new(Vec::new()),
+                fail_at,
+            }
+        }
+
+        fn run(&self, operation: &'static str) -> AppResult<()> {
+            self.operations.borrow_mut().push(operation);
+            if self.fail_at == Some(operation) {
+                Err(AppError::new("window_error", format!("{operation} failed")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl CaptureWindowActivation for FakeCaptureWindow {
+        fn show_for_capture(&self) -> AppResult<()> {
+            self.run("show")
+        }
+
+        fn unminimize_for_capture(&self) -> AppResult<()> {
+            self.run("unminimize")
+        }
+
+        fn focus_for_capture(&self) -> AppResult<()> {
+            self.run("focus")
+        }
+
+        fn ensure_foreground_for_capture(&self) -> AppResult<()> {
+            self.run("foreground")
+        }
+    }
+
+    #[test]
+    fn capture_window_presentation_runs_every_step_in_strict_order() {
+        let window = FakeCaptureWindow::new(None);
+
+        present_capture_window_steps(&window).unwrap();
+
+        assert_eq!(
+            *window.operations.borrow(),
+            vec!["show", "unminimize", "focus", "foreground"]
+        );
+    }
+
+    #[test]
+    fn capture_window_presentation_stops_and_propagates_the_first_error() {
+        let window = FakeCaptureWindow::new(Some("unminimize"));
+
+        let error = present_capture_window_steps(&window).unwrap_err();
+
+        assert_eq!(error.code, "window_error");
+        assert!(error.message.contains("unminimize failed"));
+        assert_eq!(*window.operations.borrow(), vec!["show", "unminimize"]);
+    }
+
+    #[test]
+    fn foreground_activation_avoids_input_attachment_until_direct_activation_fails() {
+        let foreground = Cell::new(true);
+        let direct_calls = Cell::new(0);
+        let attached_calls = Cell::new(0);
+        ensure_foreground_with(
+            || foreground.get(),
+            || {
+                direct_calls.set(direct_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                attached_calls.set(attached_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(direct_calls.get(), 0);
+        assert_eq!(attached_calls.get(), 0);
+
+        foreground.set(false);
+        ensure_foreground_with(
+            || foreground.get(),
+            || {
+                direct_calls.set(direct_calls.get() + 1);
+                foreground.set(true);
+                Ok(())
+            },
+            || {
+                attached_calls.set(attached_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(direct_calls.get(), 1);
+        assert_eq!(attached_calls.get(), 0);
+    }
+
+    #[test]
+    fn foreground_activation_attaches_only_after_direct_activation_is_insufficient() {
+        let foreground = Cell::new(false);
+        let direct_calls = Cell::new(0);
+        let attached_calls = Cell::new(0);
+
+        ensure_foreground_with(
+            || foreground.get(),
+            || {
+                direct_calls.set(direct_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                attached_calls.set(attached_calls.get() + 1);
+                foreground.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(direct_calls.get(), 1);
+        assert_eq!(attached_calls.get(), 1);
+    }
+
+    #[test]
+    fn foreground_activation_reports_failure_after_both_attempts() {
+        let error = ensure_foreground_with(|| false, || Ok(()), || Ok(())).unwrap_err();
+
+        assert_eq!(error.code, "window_activation_failed");
+    }
 
     #[derive(Clone)]
     struct FakeTopmostWindow {

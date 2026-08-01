@@ -182,16 +182,33 @@ function noteColorFromId(id: string): NoteColor {
   return noteColorForSeed(Number.isFinite(entropy) ? entropy : 0);
 }
 
+function stripHtmlForExcerpt(value: string): string {
+  if (typeof DOMParser === "undefined") {
+    return value
+      .replace(/<(script|style|template)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, " ")
+      .replace(/<img\b[^>]*>/gi, " [图片] ")
+      .replace(/<[^>]+>/g, " ");
+  }
+
+  const document = new DOMParser().parseFromString(value, "text/html");
+  document.querySelectorAll("script, style, template").forEach((element) => element.remove());
+  document.querySelectorAll("img").forEach((image) => {
+    image.replaceWith(document.createTextNode(" [图片] "));
+  });
+  return document.body.textContent ?? "";
+}
+
 function titleFromMarkdown(markdown: string): string {
   const first = markdown
     .split(/\r?\n/)
+    .map((line) => stripHtmlForExcerpt(line))
     .map((line) => line.replace(/^\s{0,3}(?:#{1,6}|[-*+]>?)\s+/, "").trim())
-    .find((line) => Boolean(line) && !/^!\[[^\]]*\]\([^)]*\)$/.test(line));
+    .find((line) => Boolean(line) && line !== "[图片]" && !/^!\[[^\]]*\]\([^)]*\)$/.test(line));
   return first || "无标题便签";
 }
 
 function excerptFromMarkdown(markdown: string): string {
-  return markdown
+  return stripHtmlForExcerpt(markdown)
     .replace(/==(?=\S)([^\n]*?\S)==/g, "$1")
     .replace(/!\[[^\]]*\]\([^)]*\)/g, "[图片]")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
@@ -357,7 +374,7 @@ export const notesApi = {
     if (isTauriRuntime()) return command<AppInfo>("get_app_info");
     return {
       workspacePath: "浏览器演示数据",
-      version: "0.3.6",
+      version: "0.3.7",
       defaultEditorMode: readBrowserDefaultEditorMode(),
       recoveredDrafts: 0,
     };

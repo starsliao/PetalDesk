@@ -195,6 +195,15 @@
   const selectedAnnotation = $derived(selectedId ? annotations.find((item) => item.id === selectedId) ?? null : null);
   const selectedBounds = $derived(selectedAnnotation ? annotationBounds(selectedAnnotation) : null);
   const longCaptureActive = $derived(choosingScrollAnchor || longConfirmOpen || longStatus !== null || longBusy);
+  const selectionMoveCursor = $derived(
+    !loading
+      && !busy
+      && !longCaptureActive
+      && !selectionLocked
+      && !activeTool
+      && (interaction?.kind === "move-selection"
+        || (!interaction && hoverPoint !== null && hitTestSelection(hoverPoint))),
+  );
   const longPreviewScale = $derived(longStatus?.state === "ready" && longStatus.width > 0
     ? Math.min(1, Math.max(0.05, (viewportWidth - 48) / longStatus.width))
     : 1);
@@ -1904,6 +1913,7 @@
 
 <div
   class="screenshot-tool"
+  class:selection-movable={selectionMoveCursor}
   data-testid="screenshot-tool"
   bind:this={stageElement}
   role="application"
@@ -2345,6 +2355,7 @@
   :global(html.screenshot-tool-page), :global(body.screenshot-tool-page) { width: 100%; height: 100%; padding: 0; margin: 0; overflow: hidden; background: #000; }
   :global(body.screenshot-tool-page) { user-select: none; }
   .screenshot-tool { position: fixed; z-index: 0; inset: 0; width: 100%; height: 100%; overflow: hidden; color: #f8f8f8; background: #000; outline: none; cursor: crosshair; touch-action: none; }
+  .screenshot-tool.selection-movable { cursor: move; }
   .capture-canvas { position: absolute; z-index: 0; inset: 0; display: block; width: 100%; height: 100%; }
   .source-canvas { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
   .selection-layer { position: absolute; z-index: 2; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }

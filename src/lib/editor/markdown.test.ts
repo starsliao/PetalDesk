@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { renderMarkdown } from "./markdown";
+import { extractLocalImagePaths, renderMarkdown } from "./markdown";
 
 describe("renderMarkdown", () => {
   it("renders the supported Markdown blocks", () => {
@@ -93,5 +93,76 @@ describe("renderMarkdown", () => {
     expect(table?.querySelector("th:nth-child(2)")?.classList.contains("md-align-center")).toBe(true);
     expect(table?.querySelector("th:nth-child(3)")?.classList.contains("md-align-right")).toBe(true);
     expect(table?.querySelector("[style]")).toBeNull();
+  });
+
+  it("renders safe HTML images inside GFM table cells", () => {
+    const markdown = [
+      "| 任务甘特图 | 截图与长截图 |",
+      "| --- | --- |",
+      '| <img src="assets/gantt.png" alt="任务甘特图" width="500" /> | <img src="assets/screenshot.png" alt="截图工具" width="500" /> |',
+    ].join("\n");
+    const html = renderMarkdown(markdown, {
+      assetUrls: {
+        "assets/gantt.png": "data:image/png;base64,Z2FudHQ=",
+        "assets/screenshot.png": "data:image/png;base64,c2NyZWVuc2hvdA==",
+      },
+    });
+    const document = new DOMParser().parseFromString(html, "text/html");
+    const images = document.querySelectorAll<HTMLImageElement>("tbody td img");
+
+    expect(images).toHaveLength(2);
+    expect(images[0]?.getAttribute("alt")).toBe("任务甘特图");
+    expect(images[0]?.getAttribute("width")).toBe("500");
+    expect(images[1]?.getAttribute("alt")).toBe("截图工具");
+    expect(images[1]?.getAttribute("loading")).toBe("lazy");
+  });
+
+  it("keeps HTML images on the existing local asset boundary", () => {
+    const html = renderMarkdown([
+      '<img src="assets/example.png" alt="安全图片" width="500" onerror="alert(1)" style="position:fixed">',
+      '<img src="https://example.com/tracker.png" alt="远程图片">',
+      '<img src="file:///C:/secret.png" alt="本地文件">',
+    ].join("\n\n"), {
+      assetUrls: { "assets/example.png": "data:image/png;base64,aGVsbG8=" },
+    });
+    const document = new DOMParser().parseFromString(html, "text/html");
+    const image = document.querySelector<HTMLImageElement>("img");
+
+    expect(document.querySelectorAll("img")).toHaveLength(1);
+    expect(image?.getAttribute("alt")).toBe("安全图片");
+    expect(image?.getAttribute("width")).toBe("500");
+    expect(image?.hasAttribute("onerror")).toBe(false);
+    expect(image?.hasAttribute("style")).toBe(false);
+    expect(document.querySelectorAll(".md-image-placeholder")).toHaveLength(2);
+    expect(document.querySelector('img[src^="file:"]')).toBeNull();
+    expect(document.querySelector('img[src^="https:"]')).toBeNull();
+  });
+
+  it("escapes unsupported raw HTML and removes invalid image dimensions", () => {
+    const html = renderMarkdown([
+      '<div onclick="alert(1)">不支持的 HTML</div>',
+      '<img src="assets/example.png" width="100%" height="99999">',
+    ].join("\n\n"), {
+      assetUrls: { "assets/example.png": "data:image/png;base64,aGVsbG8=" },
+    });
+    const document = new DOMParser().parseFromString(html, "text/html");
+    const image = document.querySelector<HTMLImageElement>("img");
+
+    expect(document.querySelector("div[onclick]")).toBeNull();
+    expect(document.body.textContent).toContain('<div onclick="alert(1)">不支持的 HTML</div>');
+    expect(image?.hasAttribute("width")).toBe(false);
+    expect(image?.hasAttribute("height")).toBe(false);
+  });
+
+  it("collects Markdown and HTML note assets without accepting path traversal", () => {
+    const paths = extractLocalImagePaths([
+      "![Markdown](assets/markdown.png)",
+      '<img src="assets/table.png?cache=1" width="500">',
+      '<img src="assets/nested/blocked.png">',
+      '<img src="assets/../meta.json">',
+      '<img src="https://example.com/remote.png">',
+    ].join("\n\n"));
+
+    expect(paths).toEqual(["assets/markdown.png", "assets/table.png"]);
   });
 });

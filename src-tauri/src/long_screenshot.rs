@@ -6921,37 +6921,13 @@ fn resolve_scroll_target_windows(_anchor: PhysicalPoint) -> Option<ScrollTargetW
 
 #[cfg(windows)]
 fn focus_scroll_target(target: &CaptureTarget) -> AppResult<()> {
-    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use crate::window_activation::ThreadInputAttachment;
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsWindow,
         SetForegroundWindow,
     };
-
-    struct ThreadInputAttachment {
-        source: u32,
-        target: u32,
-    }
-
-    impl ThreadInputAttachment {
-        fn attach(source: u32, target: u32) -> AppResult<Option<Self>> {
-            if source == 0 || target == 0 || source == target {
-                return Ok(None);
-            }
-            if unsafe { AttachThreadInput(source, target, 1) } == 0 {
-                return Err(last_windows_error("连接长截图目标输入线程"));
-            }
-            Ok(Some(Self { source, target }))
-        }
-    }
-
-    impl Drop for ThreadInputAttachment {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = AttachThreadInput(self.source, self.target, 0);
-            }
-        }
-    }
 
     set_cursor_position(target.scroll_anchor)?;
     let Some(windows) = target.scroll_windows else {
@@ -6987,11 +6963,12 @@ fn focus_scroll_target(target: &CaptureTarget) -> AppResult<()> {
         ));
     }
 
-    let _foreground_attachment = ThreadInputAttachment::attach(current_thread, foreground_thread)?;
+    let _foreground_attachment =
+        ThreadInputAttachment::attach(current_thread, foreground_thread, "连接长截图前台输入线程")?;
     let _target_attachment = if foreground_thread == target_thread {
         None
     } else {
-        ThreadInputAttachment::attach(current_thread, target_thread)?
+        ThreadInputAttachment::attach(current_thread, target_thread, "连接长截图目标输入线程")?
     };
     unsafe {
         let _ = BringWindowToTop(root);

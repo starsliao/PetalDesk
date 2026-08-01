@@ -3,7 +3,7 @@
     "protocolVersion": 1,
     "type": "extension.ready",
     "browser": "chrome",
-    "extensionVersion": "0.3.6",
+    "extensionVersion": "0.3.7",
     "extensionId": "abcdefghijklmnopabcdefghijklmnop",
     "capabilities": [
       "prepare",

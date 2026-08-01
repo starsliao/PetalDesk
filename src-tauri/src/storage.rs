@@ -1792,26 +1792,11 @@ fn title_from_markdown(markdown: &str) -> String {
     markdown
         .lines()
         .map(str::trim)
-        .find(|line| {
-            !(line.is_empty()
-                || line.starts_with("![") && line.contains("](") && line.ends_with(')'))
-        })
-        .map(|line| {
-            line.trim_start_matches('#')
-                .trim_start_matches(|character: char| {
-                    character == '-'
-                        || character == '*'
-                        || character == '+'
-                        || character.is_whitespace()
-                })
-                .trim_start_matches("[ ]")
-                .trim_start_matches("[x]")
-                .trim()
-                .chars()
-                .take(80)
-                .collect::<String>()
-        })
-        .filter(|title| !title.is_empty())
+        .filter(|line| !line.is_empty())
+        .map(markdown_to_plain_text)
+        .map(|line| strip_highlight_markers(&line))
+        .map(|line| line.trim().chars().take(80).collect::<String>())
+        .find(|title| !title.is_empty() && title != "[图片]")
         .unwrap_or_else(|| "无标题便签".to_string())
 }
 
@@ -1857,9 +1842,11 @@ fn excerpt_from_plain_text(text: &str) -> String {
 }
 
 fn markdown_to_plain_text(markdown: &str) -> String {
-    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let options =
+        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES;
     let mut plain = String::new();
     let mut image_depth = 0_u32;
+    let mut suppressed_html_tag = None;
     for event in Parser::new_ext(markdown, options) {
         match event {
             Event::Start(Tag::Image { .. }) => {
@@ -1869,9 +1856,13 @@ fn markdown_to_plain_text(markdown: &str) -> String {
                 push_plain_boundary(&mut plain);
             }
             Event::End(TagEnd::Image) => image_depth = image_depth.saturating_sub(1),
-            Event::Text(text) | Event::Code(text) if image_depth == 0 => plain.push_str(&text),
-            Event::Html(text) | Event::InlineHtml(text) if image_depth == 0 => {
+            Event::Text(text) | Event::Code(text)
+                if image_depth == 0 && suppressed_html_tag.is_none() =>
+            {
                 plain.push_str(&text)
+            }
+            Event::Html(text) | Event::InlineHtml(text) if image_depth == 0 => {
+                append_html_visible_text(&mut plain, &text, &mut suppressed_html_tag)
             }
             Event::SoftBreak | Event::HardBreak | Event::Rule => push_plain_boundary(&mut plain),
             Event::End(
@@ -1879,12 +1870,120 @@ fn markdown_to_plain_text(markdown: &str) -> String {
                 | TagEnd::Heading(_)
                 | TagEnd::BlockQuote(_)
                 | TagEnd::CodeBlock
-                | TagEnd::Item,
+                | TagEnd::Item
+                | TagEnd::TableCell
+                | TagEnd::TableRow,
             ) => push_plain_boundary(&mut plain),
             _ => {}
         }
     }
     plain.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn append_html_visible_text(target: &mut String, html: &str, suppressed_tag: &mut Option<String>) {
+    let mut cursor = 0;
+    while let Some(relative_start) = html[cursor..].find('<') {
+        let start = cursor + relative_start;
+        if suppressed_tag.is_none() {
+            target.push_str(&html[cursor..start]);
+        }
+
+        if html[start..].starts_with("<!--") {
+            let Some(relative_end) = html[start + 4..].find("-->") else {
+                return;
+            };
+            cursor = start + 4 + relative_end + 3;
+            continue;
+        }
+
+        let Some(end) = find_html_tag_end(html, start + 1) else {
+            if suppressed_tag.is_none() {
+                target.push_str(&html[start..]);
+            }
+            return;
+        };
+        let tag = html[start + 1..end].trim();
+        let closing = tag.starts_with('/');
+        let tag_body = tag.strip_prefix('/').unwrap_or(tag).trim_start();
+        let tag_name = tag_body
+            .split(|character: char| {
+                character.is_whitespace() || character == '/' || character == '>'
+            })
+            .next()
+            .unwrap_or_default();
+
+        if let Some(hidden) = suppressed_tag.as_deref() {
+            if closing && tag_name.eq_ignore_ascii_case(hidden) {
+                *suppressed_tag = None;
+            }
+            cursor = end + 1;
+            continue;
+        }
+
+        if !closing && tag_name.eq_ignore_ascii_case("img") {
+            push_plain_boundary(target);
+            target.push_str("[图片]");
+            push_plain_boundary(target);
+        } else if !closing
+            && !tag.trim_end().ends_with('/')
+            && matches_ignore_ascii_case(tag_name, &["script", "style", "template"])
+        {
+            *suppressed_tag = Some(tag_name.to_ascii_lowercase());
+        } else if matches_ignore_ascii_case(
+            tag_name,
+            &[
+                "br",
+                "div",
+                "figure",
+                "figcaption",
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                "h5",
+                "h6",
+                "hr",
+                "li",
+                "ol",
+                "p",
+                "pre",
+                "table",
+                "tbody",
+                "td",
+                "tfoot",
+                "th",
+                "thead",
+                "tr",
+                "ul",
+            ],
+        ) {
+            push_plain_boundary(target);
+        }
+        cursor = end + 1;
+    }
+
+    if suppressed_tag.is_none() {
+        target.push_str(&html[cursor..]);
+    }
+}
+
+fn find_html_tag_end(html: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, character) in html[start..].char_indices() {
+        match (quote, character) {
+            (Some(expected), actual) if expected == actual => quote = None,
+            (None, '\'' | '"') => quote = Some(character),
+            (None, '>') => return Some(start + offset),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn matches_ignore_ascii_case(value: &str, candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
 }
 
 fn push_plain_boundary(target: &mut String) {
@@ -2805,6 +2904,25 @@ mod tests {
     }
 
     #[test]
+    fn handles_html_image_lines_in_titles_and_excerpts() {
+        let markdown = r#"<img src="assets/x.png" alt="示例" width="500" />
+
+<strong>正文标题</strong>"#;
+
+        assert_eq!(title_from_markdown(markdown), "正文标题");
+        assert_eq!(excerpt_from_markdown(markdown), "[图片] 正文标题");
+    }
+
+    #[test]
+    fn markdown_table_excerpt_keeps_visible_cells_without_source_pipes() {
+        let markdown = r#"| 名称 | 预览 |
+| --- | --- |
+| 甘特图 | <img src="assets/gantt.png" alt="任务甘特图" width="500" /> |"#;
+
+        assert_eq!(excerpt_from_markdown(markdown), "名称 预览 甘特图 [图片]");
+    }
+
+    #[test]
     fn remembers_only_windows_left_open() {
         let (_root, store) = store();
         let first = store.create_note().unwrap();
@@ -3151,6 +3269,20 @@ mod tests {
             "### 标题\n\n- [x] **完成** ==高亮== [链接](https://example.com)\n- `代码`\n\n---";
 
         assert_eq!(excerpt_from_markdown(markdown), "标题 完成 高亮 链接 代码");
+    }
+
+    #[test]
+    fn markdown_excerpt_omits_html_tags_and_dangerous_attributes() {
+        let markdown = r#"<div class="card" onclick="steal()">可见文字</div>
+<img src="assets/x.png" alt="示例" width="500" onerror="steal()" />
+<script data-secret="hidden">steal()</script>"#;
+
+        let excerpt = excerpt_from_markdown(markdown);
+        assert_eq!(excerpt, "可见文字 [图片]");
+        assert!(!excerpt.contains('<'));
+        assert!(!excerpt.contains("onclick"));
+        assert!(!excerpt.contains("onerror"));
+        assert!(!excerpt.contains("steal"));
     }
 
     #[test]

@@ -19,7 +19,7 @@
     type NoteSnapshot,
     type TrashItem,
   } from "$lib/bridge";
-  import type { EditorMode } from "$lib/editor";
+  import { extractLocalImagePaths, type EditorMode } from "$lib/editor";
   import { screenshotApi, type ScreenshotSettings } from "$lib/screenshot";
   import { parseToolName, type ToolName } from "$lib/tools";
 
@@ -218,9 +218,7 @@
 
   async function hydrateAssetUrls(markdown: string): Promise<void> {
     if (!noteId) return;
-    const paths = [...markdown.matchAll(/!\[[^\]]*\]\((assets\/[^)\s]+)(?:\s+"[^"]*")?\)/g)].map(
-      (match) => match[1],
-    );
+    const paths = extractLocalImagePaths(markdown);
     const next: Record<string, string> = {};
     await Promise.all(
       [...new Set(paths)].map(async (path) => {
