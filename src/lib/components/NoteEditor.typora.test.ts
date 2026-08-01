@@ -226,6 +226,138 @@ describe("NoteEditor Typora mode", () => {
     expect(onopenlink).toHaveBeenCalledWith("https://example.com/path?q=1");
   });
 
+  it("opens safe Markdown links and bare URLs from the right-click menu", async () => {
+    const onopenlink = vi.fn();
+    const { container, getByRole, queryByRole } = render(NoteEditor, {
+      value: "光标行\n\n[官网](https://example.com/docs) 和 https://example.org/path。",
+      mode: "typora",
+      onopenlink,
+    });
+
+    const links = await waitFor(() => {
+      const elements = container.querySelectorAll<HTMLElement>(".cm-typora-link[data-link-url]");
+      expect(elements).toHaveLength(2);
+      return elements;
+    });
+
+    await fireEvent.contextMenu(links[0], {
+      clientX: window.innerWidth + 200,
+      clientY: window.innerHeight + 200,
+    });
+    const menu = getByRole("menu", { name: "链接操作" });
+    const action = getByRole("menuitem", { name: "跳转（Ctrl+左键）" });
+    const left = Number.parseFloat(menu.style.left);
+    const top = Number.parseFloat(menu.style.top);
+    expect(left).toBeGreaterThanOrEqual(6);
+    expect(left + 176).toBeLessThanOrEqual(window.innerWidth - 6);
+    expect(top).toBeGreaterThanOrEqual(6);
+    expect(top + 42).toBeLessThanOrEqual(window.innerHeight - 6);
+
+    await fireEvent.click(action);
+    expect(onopenlink).toHaveBeenLastCalledWith("https://example.com/docs");
+    expect(queryByRole("menu", { name: "链接操作" })).not.toBeInTheDocument();
+
+    await fireEvent.contextMenu(links[1], { clientX: 80, clientY: 90 });
+    await fireEvent.click(getByRole("menuitem", { name: "跳转（Ctrl+左键）" }));
+    expect(onopenlink).toHaveBeenLastCalledWith("https://example.org/path");
+    expect(onopenlink).toHaveBeenCalledTimes(2);
+  });
+
+  it("opens a safe link from an inactive rendered table through the right-click menu", async () => {
+    const onopenlink = vi.fn();
+    const { container, getByRole } = render(NoteEditor, {
+      value: [
+        "光标行",
+        "",
+        "| 名称 | 地址 |",
+        "| --- | --- |",
+        "| 官网 | [文档](https://example.com/table) |",
+      ].join("\n"),
+      mode: "typora",
+      onopenlink,
+    });
+
+    const link = await waitFor(() => {
+      const element = container.querySelector<HTMLAnchorElement>(
+        '.md-typora-table-widget a[href="https://example.com/table"]',
+      );
+      expect(element).toBeInTheDocument();
+      return element!;
+    });
+
+    await fireEvent.contextMenu(link, { clientX: 80, clientY: 90 });
+    await fireEvent.click(getByRole("menuitem", { name: "跳转（Ctrl+左键）" }));
+    expect(onopenlink).toHaveBeenCalledOnce();
+    expect(onopenlink).toHaveBeenCalledWith("https://example.com/table");
+  });
+
+  it("does not show the link menu for ordinary text, unsafe protocols, or source mode", async () => {
+    const onopenlink = vi.fn();
+    const { container, getByRole, queryByRole } = render(NoteEditor, {
+      value: "普通文字\n\n[危险](javascript:alert(1)) 和 [安全](https://example.com)",
+      mode: "typora",
+      onopenlink,
+    });
+
+    const unsafeLink = await waitFor(() => {
+      const element = container.querySelector<HTMLElement>(".cm-typora-link:not([data-link-url])");
+      expect(element).toBeInTheDocument();
+      return element!;
+    });
+    const ordinaryText = container.querySelector<HTMLElement>(".cm-line")!;
+
+    await fireEvent.contextMenu(ordinaryText);
+    expect(queryByRole("menu", { name: "链接操作" })).not.toBeInTheDocument();
+    await fireEvent.contextMenu(unsafeLink);
+    expect(queryByRole("menu", { name: "链接操作" })).not.toBeInTheDocument();
+
+    await fireEvent.click(getByRole("button", { name: "切换源码模式" }));
+    await waitFor(() => expect(container.querySelector(".note-editor")).toHaveClass("is-source"));
+    await fireEvent.contextMenu(container.querySelectorAll<HTMLElement>(".cm-line").item(2));
+    expect(queryByRole("menu", { name: "链接操作" })).not.toBeInTheDocument();
+    expect(onopenlink).not.toHaveBeenCalled();
+  });
+
+  it("keeps the link menu available while read-only and closes it on dismissal events", async () => {
+    const onopenlink = vi.fn();
+    const { container, getByRole, queryByRole } = render(NoteEditor, {
+      value: "[官网](https://example.com)",
+      mode: "typora",
+      readonly: true,
+      onopenlink,
+    });
+
+    const link = await waitFor(() => {
+      const element = container.querySelector<HTMLElement>(".cm-typora-link[data-link-url]");
+      expect(element).toBeInTheDocument();
+      return element!;
+    });
+    const openMenu = async () => {
+      await fireEvent.contextMenu(link, { clientX: 40, clientY: 50 });
+      expect(getByRole("menuitem", { name: "跳转（Ctrl+左键）" })).toBeInTheDocument();
+    };
+
+    await openMenu();
+    await fireEvent.click(getByRole("menuitem", { name: "跳转（Ctrl+左键）" }));
+    expect(onopenlink).toHaveBeenCalledWith("https://example.com");
+
+    await openMenu();
+    await fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(queryByRole("menu", { name: "链接操作" })).not.toBeInTheDocument());
+
+    await openMenu();
+    await fireEvent.mouseDown(document.body);
+    await waitFor(() => expect(queryByRole("menu", { name: "链接操作" })).not.toBeInTheDocument());
+
+    await openMenu();
+    window.dispatchEvent(new Event("resize"));
+    await waitFor(() => expect(queryByRole("menu", { name: "链接操作" })).not.toBeInTheDocument());
+
+    await openMenu();
+    window.dispatchEvent(new Event("blur"));
+    await waitFor(() => expect(queryByRole("menu", { name: "链接操作" })).not.toBeInTheDocument());
+  });
+
   it("shows a hand cursor for safe links only while Ctrl is held", async () => {
     const { container } = render(NoteEditor, {
       value: "https://example.com and [unsafe](javascript:alert(1))",

@@ -14,11 +14,9 @@
 pnpm package:windows
 ```
 
-Version `0.3.7` supports sanitized HTML image tags inside Markdown notes and
-GFM table cells while preserving the local `assets/` boundary. It also makes
-the screenshot window activate immediately when a PetalDesk window owns the
-foreground, and shows a four-way move cursor over a movable screenshot
-selection without changing resize-handle cursors.
+Version `0.3.8` adds a safe link context menu to Typora-style notes. Right-click
+an openable Markdown link or bare URL and choose `跳转（Ctrl+左键）`; unsafe
+protocols, plain text and source mode keep their normal context-menu behavior.
 
 The package always includes and registers the Firefox Native Messaging host.
 Set `PETALDESK_CHROME_EXTENSION_ID` and/or `PETALDESK_EDGE_EXTENSION_ID` to the
@@ -47,4 +45,4 @@ XPI. The unsigned ZIP must not be presented as an installable Firefox package.
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.3.7>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.3.8>

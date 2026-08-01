@@ -2,7 +2,7 @@
 
 > 把想法留在桌面，把文件留在自己手里。
 
-[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.7/PetalDesk_0.3.7_x64-setup.exe)
+[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.8/PetalDesk_0.3.8_x64-setup.exe)
 
 飞花 - PetalDesk 是一款 Windows 10/11 本地便签与效率工具。它启动快、界面安静，支持 Markdown 即时排版、纯文本、图片、搜索、回收站，以及几个随时可以唤起的小工具。没有账号、没有云端依赖，内容就是你目录里的 Markdown 文件。
 
@@ -13,7 +13,7 @@
 ## 一张便签，按你的方式记录
 
 - Markdown 与纯文本两种模式，每张便签可以独立选择；默认样式只影响新建便签。
-- Typora 风格的即时排版，支持标题、列表、任务清单、表格、链接、图片、代码、高亮和分隔线；表格中也可以使用安全的 `<img src="assets/..." width="500">` 图片标签。
+- Typora 风格的即时排版，支持标题、列表、任务清单、表格、链接、图片、代码、高亮和分隔线；链接可以 `Ctrl+左键` 或右键菜单跳转，表格中也可以使用安全的 `<img src="assets/..." width="500">` 图片标签。
 - 标题、颜色、置顶、只读、窗口位置和大小都可以单独保存。
 - 便签关闭后继续驻留托盘；双击托盘图标直接打开上次使用的便签，右键可打开列表。
 - 删除前二次确认，删除后进入回收站；正文支持撤回、重做和自动保存。
@@ -60,7 +60,7 @@ PetalDesk/
 
 ## 安装与运行
 
-下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.7/PetalDesk_0.3.7_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。
+下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.8/PetalDesk_0.3.8_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。
 
 没有 WebView2 或下载权限时，安装器会明确提示失败原因，不会静默留下无法启动的程序。未签名构建可能显示“未知发布者”，这是 Windows 对代码签名的正常提示。
 

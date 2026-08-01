@@ -85,7 +85,12 @@
   let importing = $state(false);
   let sourceMode = $state(false);
   let linkModifierActive = $state(false);
+  let linkContextMenu = $state<{ url: string; x: number; y: number } | null>(null);
   let previewAssetUrls: Readonly<Record<string, string>> = {};
+
+  const linkContextMenuWidth = 176;
+  const linkContextMenuHeight = 42;
+  const linkContextMenuMargin = 6;
 
   const modeCompartment = new Compartment();
   const readonlyCompartment = new Compartment();
@@ -669,7 +674,26 @@
   }
 
   function toggleSourceMode(): void {
-    if (mode === "typora" && !readonly) sourceMode = !sourceMode;
+    if (mode === "typora" && !readonly) {
+      linkContextMenu = null;
+      sourceMode = !sourceMode;
+    }
+  }
+
+  function openableLinkFromEvent(event: MouseEvent): string {
+    const target = event.target instanceof Element
+      ? event.target
+      : event.target instanceof Node
+        ? event.target.parentElement
+        : null;
+    const link = target?.closest<HTMLElement>(
+      ".cm-typora-link[data-link-url], .md-typora-table-widget a[href]",
+    );
+    if (!link || !editorHost.contains(link)) return "";
+
+    const rawUrl = link.dataset.linkUrl ?? link.getAttribute("href") ?? "";
+    const url = normalizeLinkUrl(rawUrl);
+    return url && isOpenableLink(url) ? url : "";
   }
 
   function handleEditorClick(event: MouseEvent): boolean {
@@ -683,19 +707,57 @@
       return false;
     }
 
-    const target = event.target instanceof Element
-      ? event.target
-      : event.target instanceof Node
-        ? event.target.parentElement
-        : null;
-    const link = target?.closest<HTMLElement>(".cm-typora-link[data-link-url]");
-    const url = link?.dataset.linkUrl ? normalizeLinkUrl(link.dataset.linkUrl) : "";
-    if (!url || !isOpenableLink(url)) return false;
+    const url = openableLinkFromEvent(event);
+    if (!url) return false;
 
     event.preventDefault();
     event.stopPropagation();
     onopenlink(url);
     return true;
+  }
+
+  function handleEditorContextMenu(event: MouseEvent): boolean {
+    if (mode !== "typora" || sourceMode || !onopenlink) {
+      linkContextMenu = null;
+      return false;
+    }
+
+    const url = openableLinkFromEvent(event);
+    if (!url) {
+      linkContextMenu = null;
+      return false;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    linkContextMenu = {
+      url,
+      x: Math.max(
+        linkContextMenuMargin,
+        Math.min(event.clientX, window.innerWidth - linkContextMenuWidth - linkContextMenuMargin),
+      ),
+      y: Math.max(
+        linkContextMenuMargin,
+        Math.min(event.clientY, window.innerHeight - linkContextMenuHeight - linkContextMenuMargin),
+      ),
+    };
+    return true;
+  }
+
+  function openContextMenuLink(): void {
+    const url = linkContextMenu?.url ?? "";
+    linkContextMenu = null;
+    if (url && isOpenableLink(url)) onopenlink?.(url);
+  }
+
+  function closeLinkContextMenu(): void {
+    linkContextMenu = null;
+  }
+
+  function closeLinkContextMenuOutside(event: MouseEvent): void {
+    const target = event.target;
+    if (target instanceof Element && target.closest(".link-context-menu")) return;
+    closeLinkContextMenu();
   }
 
   function updateLinkModifier(event: KeyboardEvent | MouseEvent): void {
@@ -704,6 +766,16 @@
 
   function clearLinkModifier(): void {
     linkModifierActive = false;
+  }
+
+  function handleWindowKeyDown(event: KeyboardEvent): void {
+    updateLinkModifier(event);
+    if (event.key === "Escape") closeLinkContextMenu();
+  }
+
+  function handleWindowBlur(): void {
+    clearLinkModifier();
+    closeLinkContextMenu();
   }
 
   async function importFiles(files: FileList | File[]): Promise<void> {
@@ -840,9 +912,13 @@
     editorHost.addEventListener("mousemove", updateLinkModifier);
     editorHost.addEventListener("mouseleave", clearLinkModifier);
     editorHost.addEventListener("blur", clearLinkModifier, true);
-    window.addEventListener("keydown", updateLinkModifier);
+    editorHost.addEventListener("contextmenu", handleEditorContextMenu);
+    document.addEventListener("mousedown", closeLinkContextMenuOutside, true);
+    window.addEventListener("keydown", handleWindowKeyDown);
     window.addEventListener("keyup", updateLinkModifier);
-    window.addEventListener("blur", clearLinkModifier);
+    window.addEventListener("blur", handleWindowBlur);
+    window.addEventListener("resize", closeLinkContextMenu);
+    window.visualViewport?.addEventListener("resize", closeLinkContextMenu);
     updateHistoryState();
     onready?.({ view });
 
@@ -857,9 +933,13 @@
       editorHost.removeEventListener("mousemove", updateLinkModifier);
       editorHost.removeEventListener("mouseleave", clearLinkModifier);
       editorHost.removeEventListener("blur", clearLinkModifier, true);
-      window.removeEventListener("keydown", updateLinkModifier);
+      editorHost.removeEventListener("contextmenu", handleEditorContextMenu);
+      document.removeEventListener("mousedown", closeLinkContextMenuOutside, true);
+      window.removeEventListener("keydown", handleWindowKeyDown);
       window.removeEventListener("keyup", updateLinkModifier);
-      window.removeEventListener("blur", clearLinkModifier);
+      window.removeEventListener("blur", handleWindowBlur);
+      window.removeEventListener("resize", closeLinkContextMenu);
+      window.visualViewport?.removeEventListener("resize", closeLinkContextMenu);
       view?.destroy();
       view = undefined;
     };
@@ -876,6 +956,7 @@
 
   $effect(() => {
     if (mode === "plain" || readonly) sourceMode = false;
+    if (mode !== "typora" || sourceMode) closeLinkContextMenu();
     if (view) {
       view.dispatch({ effects: modeCompartment.reconfigure(currentModeExtension(mode, sourceMode, readonly)) });
     }
@@ -931,6 +1012,18 @@
   {/if}
 
   <div class="editor-host" bind:this={editorHost}></div>
+  {#if linkContextMenu}
+    <div
+      class="link-context-menu"
+      role="menu"
+      tabindex="-1"
+      aria-label="链接操作"
+      style={`left: ${linkContextMenu.x}px; top: ${linkContextMenu.y}px;`}
+      oncontextmenu={(event) => event.preventDefault()}
+    >
+      <button type="button" role="menuitem" onclick={openContextMenuLink}>跳转（Ctrl+左键）</button>
+    </div>
+  {/if}
   <input
     class="file-input"
     bind:this={fileInput}
@@ -958,6 +1051,9 @@
   .importing { margin-left: auto; font-size: 12px; opacity: 0.65; }
   .editor-host { min-height: 0; flex: 1; overflow: hidden; }
   .file-input { display: none; }
+  .link-context-menu { position: fixed; z-index: 100; display: grid; box-sizing: border-box; width: 176px; max-width: calc(100vw - 12px); max-height: calc(100vh - 12px); padding: 4px; border: 1px solid color-mix(in srgb, var(--app-fg, #25231d), transparent 82%); border-radius: 7px; color: var(--app-fg, #25231d); background: var(--app-surface, #fff); box-shadow: 0 8px 22px rgb(0 0 0 / 18%); }
+  .link-context-menu button { display: flex; width: 100%; height: 32px; align-items: center; justify-content: flex-start; padding: 0 10px; border-radius: 4px; white-space: nowrap; }
+  .link-context-menu button:hover, .link-context-menu button:focus-visible { background: color-mix(in srgb, var(--app-fg, #25231d), transparent 92%); }
 
   :global(.cm-typora-hidden-mark) { display: inline-block; width: 0; height: 0; overflow: hidden; }
   :global(.cm-typora-source-mark) { color: var(--note-muted, rgba(37, 35, 29, 0.58)); font-weight: 500; }
