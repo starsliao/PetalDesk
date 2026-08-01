@@ -267,6 +267,12 @@
           if (payload.settings?.shortcut) screenshotShortcut = payload.settings.shortcut;
         }),
       );
+      desktopCleanups.push(
+        await listen<{ shortcut?: string; message?: string }>("screenshot_shortcut_error", ({ payload }) => {
+          const shortcut = payload.shortcut || screenshotShortcut;
+          showToast(payload.message || `截图快捷键 ${shortcut} 注册失败，请在设置中重试`);
+        }),
+      );
 
       if (noteId) {
         const windowHandle = getCurrentWindow();

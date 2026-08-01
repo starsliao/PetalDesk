@@ -1,6 +1,6 @@
 [package]
 name = "petaldesk"
-version = "0.3.5"
+version = "0.3.6"
 description = "飞花 - PetalDesk local Markdown notes and desktop tools"
 authors = ["飞花 - PetalDesk contributors"]
 edition = "2021"
@@ -46,6 +46,7 @@ rustfft = "6.4"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4", "serde"] }
 png = "0.17"
+rfd = { version = "=0.16.0", default-features = false, features = ["common-controls-v6"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [

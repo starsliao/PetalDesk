@@ -148,6 +148,16 @@ function createRenderer(assetUrls: Readonly<Record<string, string>>): MarkdownIt
     return `<img src="${parser.utils.escapeHtml(source)}" alt="${alt}"${titleAttribute} loading="lazy" decoding="async">`;
   };
 
+  for (const ruleName of ["th_open", "td_open"] as const) {
+    parser.renderer.rules[ruleName] = (tokens, index) => {
+      const token = tokens[index];
+      const alignment = /text-align\s*:\s*(left|center|right)/i.exec(token.attrGet("style") ?? "")?.[1]
+        ?.toLowerCase();
+      const alignmentClass = alignment ? ` class="md-align-${alignment}"` : "";
+      return `<${token.tag}${alignmentClass}>`;
+    };
+  }
+
   return parser;
 }
 
@@ -186,6 +196,12 @@ export function renderMarkdown(
       "s",
       "span",
       "strong",
+      "table",
+      "tbody",
+      "td",
+      "th",
+      "thead",
+      "tr",
       "ul",
     ],
     ALLOWED_ATTR: [

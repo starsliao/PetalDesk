@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 pub const TIMER_DATA_VERSION: u32 = 1;
 pub const TIMER_LOG_LIMIT: usize = 500;
@@ -105,8 +105,11 @@ pub fn get_timer_data(store: State<'_, TimerStore>) -> TimerData {
 }
 
 #[tauri::command]
-pub fn save_timer_data(store: State<'_, TimerStore>, data: TimerData) -> AppResult<TimerData> {
-    store.save(data)
+pub async fn save_timer_data(app: AppHandle, data: TimerData) -> AppResult<TimerData> {
+    crate::commands::run_background("保存计时器数据", move || {
+        app.state::<TimerStore>().save(data)
+    })
+    .await
 }
 
 const fn default_digit_opacity() -> f64 {

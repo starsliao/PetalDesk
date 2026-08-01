@@ -292,6 +292,23 @@ describe("ScreenshotTool", () => {
     expect(rendered.getByRole("button", { name: "保存截图" })).toBeEnabled();
   });
 
+  it("clears the ordinary screenshot busy state when saving fails", async () => {
+    const api = mockApi();
+    api.exportPng.mockRejectedValueOnce(new Error("保存窗口不可用"));
+    const rendered = render(ScreenshotTool, { api });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.click(rendered.getByRole("button", { name: "保存截图" }));
+
+    await waitFor(() => expect(rendered.getByText("保存窗口不可用")).toBeInTheDocument());
+    expect(rendered.getByRole("button", { name: "保存截图" })).toBeEnabled();
+    expect(rendered.getByRole("button", { name: "取消截图" })).toBeEnabled();
+  });
+
   it("starts manual long capture from the selection center and previews only visible image tiles", async () => {
     const api = mockApi();
     api.getLongCaptureStatus.mockResolvedValue(longStatus("paused"));
@@ -852,6 +869,30 @@ describe("ScreenshotTool", () => {
     await fireEvent.click(rendered.getByRole("button", { name: "复制长截图" }));
     await waitFor(() => expect(api.exportLongCapture).toHaveBeenCalledWith("long-1", "copy"));
     expect(api.prepareLongCaptureAnnotationExport).not.toHaveBeenCalled();
+  });
+
+  it("keeps a canceled long screenshot save editable", async () => {
+    vi.stubGlobal("__TAURI_INTERNALS__", {});
+    const api = mockApi();
+    api.exportLongCapture.mockResolvedValueOnce({ action: "save", canceled: true });
+    const rendered = render(ScreenshotTool, { api });
+    const stage = rendered.getByTestId("screenshot-tool");
+    await waitFor(() => expect(tauri.listeners.has("long_capture_ready")).toBe(true));
+    await waitFor(() => expect(api.getFrame).toHaveBeenCalled());
+
+    await fireEvent.pointerDown(stage, { button: 0, pointerId: 1, clientX: 100, clientY: 100 });
+    await fireEvent.pointerMove(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.pointerUp(stage, { pointerId: 1, clientX: 500, clientY: 400 });
+    await fireEvent.click(rendered.getByRole("button", { name: "长截图" }));
+    await waitFor(() => expect(api.startLongCapture).toHaveBeenCalled());
+
+    tauri.listeners.get("long_capture_ready")?.({ payload: longStatus("ready", { frameCount: 8, height: 6400 }) });
+    await waitFor(() => expect(rendered.getByRole("region", { name: "长截图预览" })).toBeInTheDocument());
+    await fireEvent.click(rendered.getByRole("button", { name: "保存长截图" }));
+
+    await waitFor(() => expect(api.exportLongCapture).toHaveBeenCalledWith("long-1", "save"));
+    expect(rendered.getByRole("button", { name: "保存长截图" })).toBeEnabled();
+    expect(rendered.getByRole("region", { name: "长截图预览" })).toBeInTheDocument();
   });
 
   it("keeps a terminal ready event when an older finish response arrives late", async () => {

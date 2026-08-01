@@ -5,10 +5,10 @@ use crate::error::{AppError, AppResult};
 use crate::long_screenshot_input::{ScrollInputMonitor, ScrollInputSnapshot};
 use crate::phase_match::phase_offset_rgba;
 use crate::screenshot::{
-    self, MonitorBounds, ScreenshotExportAction, ScreenshotStore, CAPTURE_WINDOW_LABEL,
+    self, MonitorBounds, ScreenshotExportAction, ScreenshotSaveKind, ScreenshotStore,
+    CAPTURE_WINDOW_LABEL,
 };
 use crate::storage::{atomic_write, atomic_write_json, INTERNAL_DATA_DIR};
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -22,7 +22,6 @@ use tauri::{
     AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl,
     WebviewWindowBuilder,
 };
-use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -1755,9 +1754,9 @@ fn prepare_long_capture_annotation_export_inner(
     let store = app.state::<LongScreenshotStore>();
     purge_expired_annotation_exports(&store);
     let job = store.job(job_id)?;
-    let _operation_guard = lock_unpoisoned(&job.operation_lock);
-    store.ensure_current_job(&job)?;
     let manifest = {
+        let _operation_guard = lock_unpoisoned(&job.operation_lock);
+        store.ensure_current_job(&job)?;
         let runtime = lock_unpoisoned(&job.runtime);
         if runtime.manifest.state != LongCaptureState::Ready {
             return Err(AppError::new(
@@ -1773,7 +1772,12 @@ fn prepare_long_capture_annotation_export_inner(
     }
 
     let save_path = if action == ScreenshotExportAction::Save {
-        let Some(path) = choose_long_capture_save_path(app)? else {
+        let Some(path) = screenshot::choose_screenshot_save_path(
+            app,
+            ScreenshotSaveKind::LongScreenshot,
+            Some(CAPTURE_WINDOW_LABEL),
+        )?
+        else {
             return Ok(PrepareLongCaptureAnnotationExportResult {
                 canceled: true,
                 ticket: None,
@@ -1785,6 +1789,17 @@ fn prepare_long_capture_annotation_export_inner(
         None
     };
 
+    // The native save dialog above can remain open for an arbitrary amount of
+    // time. Never hold the job operation lock while waiting for the user; once
+    // the dialog closes, revalidate the job before issuing an export ticket.
+    let _operation_guard = lock_unpoisoned(&job.operation_lock);
+    store.ensure_current_job(&job)?;
+    if lock_unpoisoned(&job.runtime).manifest.state != LongCaptureState::Ready {
+        return Err(AppError::new(
+            "long_capture_not_ready",
+            "长截图状态已经变化，请重新执行导出",
+        ));
+    }
     let token = Uuid::new_v4().to_string();
     let directory = store.cache_root.join(".annotation-exports").join(&token);
     std::fs::create_dir_all(&directory)
@@ -2010,8 +2025,6 @@ fn export_long_capture_inner(
     action: ScreenshotExportAction,
     annotation_payload: Option<&Value>,
 ) -> AppResult<LongCaptureExportResult> {
-    let screenshot_store = app.state::<ScreenshotStore>();
-    let _screenshot_start_guard = screenshot_store.lock_start();
     let store = app.state::<LongScreenshotStore>();
     {
         let _operation_guard = lock_unpoisoned(&job.operation_lock);
@@ -2027,6 +2040,31 @@ fn export_long_capture_inner(
     if !wait_for_worker_done(job, WORKER_SHUTDOWN_TIMEOUT) {
         return Err(worker_shutdown_timeout_error());
     }
+
+    let save_path = if action == ScreenshotExportAction::Save {
+        let Some(path) = screenshot::choose_screenshot_save_path(
+            app,
+            ScreenshotSaveKind::LongScreenshot,
+            Some(CAPTURE_WINDOW_LABEL),
+        )?
+        else {
+            return Ok(LongCaptureExportResult {
+                action,
+                saved_path: None,
+                pin_id: None,
+                canceled: true,
+            });
+        };
+        Some(path)
+    } else {
+        None
+    };
+
+    // Dialog interaction above must not own either lifecycle lock. Reacquire
+    // them in the documented order and reject a stale job before touching its
+    // cache or ending the ordinary screenshot session.
+    let screenshot_store = app.state::<ScreenshotStore>();
+    let _screenshot_start_guard = screenshot_store.lock_start();
     let _operation_guard = lock_unpoisoned(&job.operation_lock);
     store.ensure_current_job(job)?;
     let manifest = {
@@ -2042,14 +2080,9 @@ fn export_long_capture_inner(
     validate_annotation_payload(annotation_payload, &manifest)?;
     let result = match action {
         ScreenshotExportAction::Save => {
-            let Some(path) = choose_long_capture_save_path(app)? else {
-                return Ok(LongCaptureExportResult {
-                    action,
-                    saved_path: None,
-                    pin_id: None,
-                    canceled: true,
-                });
-            };
+            let path = save_path
+                .as_ref()
+                .ok_or_else(|| AppError::invalid("长截图导出缺少保存路径"))?;
             stream_manifest_png(&job.directory, &manifest, &path)?;
             LongCaptureExportResult {
                 action,
@@ -2141,44 +2174,6 @@ fn validate_annotation_payload(
         ));
     }
     Ok(())
-}
-
-fn choose_long_capture_save_path(app: &AppHandle) -> AppResult<Option<PathBuf>> {
-    let file_name = format!("PetalDesk长截图-{}.png", Utc::now().format("%Y%m%d-%H%M%S"));
-    let screenshot_store = app.state::<ScreenshotStore>();
-    let settings = screenshot_store.settings();
-    let mut dialog = app
-        .dialog()
-        .file()
-        .add_filter("PNG 图片", &["png"])
-        .set_title("保存长截图 - 飞花 - PetalDesk")
-        .set_file_name(file_name);
-    if let Some(directory) = settings
-        .last_save_directory
-        .as_deref()
-        .map(Path::new)
-        .filter(|path| path.is_dir())
-    {
-        dialog = dialog.set_directory(directory);
-    }
-    let Some(path) = dialog.blocking_save_file() else {
-        return Ok(None);
-    };
-    let mut path = path
-        .into_path()
-        .map_err(|error| AppError::invalid(format!("长截图保存路径无效: {error}")))?;
-    if path.extension().is_none() {
-        path.set_extension("png");
-    }
-    if !path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
-    {
-        return Err(AppError::invalid("长截图只能保存为 PNG 文件"));
-    }
-    screenshot_store.update_last_save_directory(&path)?;
-    Ok(Some(path))
 }
 
 fn annotation_strip_path(ticket: &LongCaptureAnnotationExportTicket, y: u32) -> PathBuf {

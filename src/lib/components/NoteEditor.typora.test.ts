@@ -287,4 +287,44 @@ describe("NoteEditor Typora mode", () => {
 
     expect(onopenlink).not.toHaveBeenCalled();
   });
+
+  it("renders an inactive GFM table and reveals its full source when clicked", async () => {
+    let view: EditorView | undefined;
+    const tableMarkdown = [
+      "光标行",
+      "",
+      "| 名称 | 状态 |",
+      "| :--- | ---: |",
+      "| 文档 | **完成** |",
+    ].join("\n");
+    const { container } = render(NoteEditor, {
+      value: tableMarkdown,
+      mode: "typora",
+      onready: (detail) => {
+        view = detail.view;
+      },
+    });
+
+    await waitFor(() => expect(view).toBeDefined());
+    const widget = await waitFor(() => {
+      const element = container.querySelector<HTMLElement>(".md-typora-table-widget");
+      expect(element).toBeInTheDocument();
+      expect(element?.querySelectorAll("thead th")).toHaveLength(2);
+      expect(element?.querySelector("tbody strong")?.textContent).toBe("完成");
+      expect(element?.querySelector("th:last-child")).toHaveClass("md-align-right");
+      return element!;
+    });
+
+    await fireEvent.mouseDown(widget, { button: 0 });
+
+    await waitFor(() => expect(container.querySelector(".md-typora-table-widget")).not.toBeInTheDocument());
+    const sourceLines = Array.from(container.querySelectorAll<HTMLElement>(".cm-line"), (line) => line.textContent);
+    expect(sourceLines).toEqual(expect.arrayContaining([
+      "| 名称 | 状态 |",
+      "| :--- | ---: |",
+      "| 文档 | **完成** |",
+    ]));
+    expect(view!.state.selection.main.head).toBe(tableMarkdown.indexOf("| 名称"));
+    expect(view!.hasFocus).toBe(true);
+  });
 });

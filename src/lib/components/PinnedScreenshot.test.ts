@@ -47,4 +47,20 @@ describe("PinnedScreenshot", () => {
     await waitFor(() => expect(api.close).toHaveBeenCalledWith("pin-1"));
     expect(onclose).toHaveBeenCalledOnce();
   });
+
+  it("restores pin controls after the save dialog is canceled", async () => {
+    const api = mockApi();
+    api.save.mockResolvedValueOnce({ canceled: true });
+    const rendered = render(PinnedScreenshot, { pinId: "pin-1", api });
+    await waitFor(() => expect(rendered.getByAltText("置顶截图")).toBeInTheDocument());
+    const root = rendered.getByTestId("pinned-screenshot");
+
+    await fireEvent.contextMenu(root, { clientX: 20, clientY: 20 });
+    await fireEvent.click(rendered.getByRole("menuitem", { name: /另存为/ }));
+    await waitFor(() => expect(api.save).toHaveBeenCalledWith("pin-1"));
+
+    await fireEvent.contextMenu(root, { clientX: 20, clientY: 20 });
+    await fireEvent.click(rendered.getByRole("menuitem", { name: /复制/ }));
+    await waitFor(() => expect(api.copy).toHaveBeenCalledWith("pin-1"));
+  });
 });

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 const DATE_FORMAT: &str = "%Y-%m-%d";
@@ -235,42 +235,42 @@ pub fn list_gantt_tasks(store: State<'_, GanttStore>) -> Vec<GanttTask> {
 }
 
 #[tauri::command]
-pub fn upsert_gantt_task(
+pub async fn upsert_gantt_task(
     app: AppHandle,
-    store: State<'_, GanttStore>,
     request: UpsertGanttTaskRequest,
 ) -> AppResult<GanttTask> {
-    let task = store.upsert(request)?;
-    let _ = app.emit(
-        "gantt_changed",
-        json!({ "id": task.id, "kind": "upserted", "task": task }),
-    );
-    Ok(task)
+    crate::commands::run_background("保存甘特图任务", move || {
+        let task = app.state::<GanttStore>().upsert(request)?;
+        let _ = app.emit(
+            "gantt_changed",
+            json!({ "id": task.id, "kind": "upserted", "task": task }),
+        );
+        Ok(task)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn delete_gantt_task(
-    app: AppHandle,
-    store: State<'_, GanttStore>,
-    task_id: String,
-) -> AppResult<()> {
-    store.delete(&task_id)?;
-    let _ = app.emit("gantt_changed", json!({ "id": task_id, "kind": "deleted" }));
-    Ok(())
+pub async fn delete_gantt_task(app: AppHandle, task_id: String) -> AppResult<()> {
+    crate::commands::run_background("删除甘特图任务", move || {
+        app.state::<GanttStore>().delete(&task_id)?;
+        let _ = app.emit("gantt_changed", json!({ "id": task_id, "kind": "deleted" }));
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn reorder_gantt_tasks(
-    app: AppHandle,
-    store: State<'_, GanttStore>,
-    ordered_ids: Vec<String>,
-) -> AppResult<()> {
-    store.reorder(ordered_ids.clone())?;
-    let _ = app.emit(
-        "gantt_changed",
-        json!({ "kind": "reordered", "orderedIds": ordered_ids }),
-    );
-    Ok(())
+pub async fn reorder_gantt_tasks(app: AppHandle, ordered_ids: Vec<String>) -> AppResult<()> {
+    crate::commands::run_background("调整甘特图任务顺序", move || {
+        app.state::<GanttStore>().reorder(ordered_ids.clone())?;
+        let _ = app.emit(
+            "gantt_changed",
+            json!({ "kind": "reordered", "orderedIds": ordered_ids }),
+        );
+        Ok(())
+    })
+    .await
 }
 
 fn validate_task_fields(

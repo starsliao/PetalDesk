@@ -2,7 +2,8 @@ use crate::error::{AppError, AppResult};
 use crate::models::*;
 use crate::storage::WorkspaceStore;
 use serde_json::json;
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 pub(crate) const TIMER_WINDOW_LABEL: &str = "timer";
@@ -14,15 +15,58 @@ const TIMER_MIN_VISIBLE_WIDTH: f64 = 48.0;
 const TIMER_MIN_VISIBLE_HEIGHT: f64 = 32.0;
 
 // Tauri's window registry does not reserve a label atomically between
-// `get_webview_window` and `WebviewWindowBuilder::build`. Serializing this
-// short creation path prevents rapid tray/single-instance activations from
-// constructing two native windows with the same label.
-static WINDOW_CREATION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+// `get_webview_window` and `WebviewWindowBuilder::build`. Keep independent
+// creation domains so a slow WebView2 controller cannot block every note,
+// tool and screenshot window in the process.
+static NOTE_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
+static TIMER_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
+static REMINDER_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
+static GANTT_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 
-pub(crate) fn lock_window_creation() -> MutexGuard<'static, ()> {
-    WINDOW_CREATION_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+const SLOW_BACKGROUND_OPERATION: Duration = Duration::from_secs(2);
+
+/// Tauri executes synchronous commands on its event-loop thread. Filesystem,
+/// SQLite and native window construction can block unpredictably on Windows,
+/// so keep those operations off the thread that owns clicks, tray events and
+/// global shortcuts.
+pub(crate) async fn run_background<T, F>(operation: &'static str, task: F) -> AppResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> AppResult<T> + Send + 'static,
+{
+    let started = Instant::now();
+    let result = tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "background_task_error",
+                format!("{operation}任务异常结束: {error}"),
+            )
+        })?;
+    let elapsed = started.elapsed();
+    if elapsed >= SLOW_BACKGROUND_OPERATION {
+        eprintln!("后台操作耗时过长: {operation} ({elapsed:?})");
+    }
+    result
+}
+
+#[cfg(test)]
+mod background_command_tests {
+    use super::*;
+
+    #[test]
+    fn blocking_command_work_does_not_run_on_the_caller_thread() {
+        let caller = std::thread::current().id();
+        let worker = tauri::async_runtime::block_on(run_background("测试后台任务", || {
+            Ok(std::thread::current().id())
+        }))
+        .unwrap();
+        assert_ne!(worker, caller);
+    }
+}
+
+fn lock_window_creation(lock: &'static Mutex<()>) -> MutexGuard<'static, ()> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -105,25 +149,32 @@ pub fn get_app_info(store: State<'_, WorkspaceStore>) -> AppInfo {
 }
 
 #[tauri::command]
-pub fn set_default_editor_mode(
+pub async fn set_default_editor_mode(
     app: AppHandle,
-    store: State<'_, WorkspaceStore>,
     default_editor_mode: String,
 ) -> AppResult<String> {
-    let default_editor_mode = store.set_default_editor_mode(&default_editor_mode)?;
-    let _ = app.emit(
-        "default_editor_mode_changed",
-        json!({ "mode": default_editor_mode.clone() }),
-    );
-    Ok(default_editor_mode)
+    run_background("设置默认编辑样式", move || {
+        let default_editor_mode = app
+            .state::<WorkspaceStore>()
+            .set_default_editor_mode(&default_editor_mode)?;
+        let _ = app.emit(
+            "default_editor_mode_changed",
+            json!({ "mode": default_editor_mode.clone() }),
+        );
+        Ok(default_editor_mode)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn set_data_storage_path(
-    store: State<'_, WorkspaceStore>,
+pub async fn set_data_storage_path(
+    app: AppHandle,
     path: String,
 ) -> AppResult<DataStorageChangeResult> {
-    store.set_data_storage_path(path)
+    run_background("设置数据存储路径", move || {
+        app.state::<WorkspaceStore>().set_data_storage_path(path)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -138,166 +189,189 @@ pub async fn restart_app(app: AppHandle) -> AppResult<()> {
 }
 
 #[tauri::command]
-pub fn list_notes(store: State<'_, WorkspaceStore>) -> AppResult<Vec<NoteSummary>> {
-    store.list_notes()
+pub async fn list_notes(app: AppHandle) -> AppResult<Vec<NoteSummary>> {
+    run_background("读取便签列表", move || {
+        app.state::<WorkspaceStore>().list_notes()
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn reorder_notes(
+pub async fn reorder_notes(
     app: AppHandle,
-    store: State<'_, WorkspaceStore>,
     ordered_ids: Vec<String>,
 ) -> AppResult<Vec<NoteSummary>> {
-    let notes = store.reorder_notes(ordered_ids)?;
-    let _ = app.emit("notes_reordered", json!({}));
-    crate::refresh_tray_menu(&app);
-    Ok(notes)
+    run_background("调整便签顺序", move || {
+        let notes = app.state::<WorkspaceStore>().reorder_notes(ordered_ids)?;
+        let _ = app.emit("notes_reordered", json!({}));
+        crate::refresh_tray_menu(&app);
+        Ok(notes)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn create_note(app: AppHandle, store: State<'_, WorkspaceStore>) -> AppResult<NoteSnapshot> {
-    let note = store.create_note()?;
-    let _ = app.emit("note_changed", json!({ "id": note.id, "kind": "created" }));
-    crate::refresh_tray_menu(&app);
-    Ok(note)
+pub async fn create_note(app: AppHandle) -> AppResult<NoteSnapshot> {
+    run_background("创建便签", move || {
+        let note = app.state::<WorkspaceStore>().create_note()?;
+        let _ = app.emit("note_changed", json!({ "id": note.id, "kind": "created" }));
+        crate::refresh_tray_menu(&app);
+        Ok(note)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn get_note(store: State<'_, WorkspaceStore>, note_id: String) -> AppResult<NoteSnapshot> {
-    store.get_note(&note_id)
+pub async fn get_note(app: AppHandle, note_id: String) -> AppResult<NoteSnapshot> {
+    run_background("读取便签", move || {
+        app.state::<WorkspaceStore>().get_note(&note_id)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn commit_note(
-    app: AppHandle,
-    store: State<'_, WorkspaceStore>,
-    request: CommitNoteRequest,
-) -> AppResult<CommitResult> {
-    let note_id = request.id.clone();
-    let tray_menu_changed =
-        request.meta_patch.title.is_some() || request.meta_patch.pinned.is_some();
-    match store.commit_note(request) {
-        Ok(result) => {
-            let _ = app.emit(
-                "note_changed",
-                json!({ "id": note_id, "kind": "committed", "revision": result.revision }),
-            );
-            if let Some(window) = app.get_webview_window(&format!("note-{note_id}")) {
-                if let Ok(snapshot) = store.get_note(&note_id) {
-                    let _ = window.set_always_on_top(snapshot.meta.pinned);
-                }
-            }
-            if tray_menu_changed {
-                crate::refresh_tray_menu(&app);
-            }
-            Ok(result)
-        }
-        Err(error) => {
-            if error.code == "revision_conflict" {
+pub async fn commit_note(app: AppHandle, request: CommitNoteRequest) -> AppResult<CommitResult> {
+    run_background("保存便签", move || {
+        let store = app.state::<WorkspaceStore>();
+        let note_id = request.id.clone();
+        let tray_menu_changed =
+            request.meta_patch.title.is_some() || request.meta_patch.pinned.is_some();
+        match store.commit_note(request) {
+            Ok(result) => {
                 let _ = app.emit(
-                    "conflict_detected",
-                    json!({ "id": note_id, "error": error.clone() }),
+                    "note_changed",
+                    json!({ "id": note_id, "kind": "committed", "revision": result.revision }),
                 );
+                if let Some(window) = app.get_webview_window(&format!("note-{note_id}")) {
+                    if let Ok(snapshot) = store.get_note(&note_id) {
+                        let _ = window.set_always_on_top(snapshot.meta.pinned);
+                    }
+                }
+                if tray_menu_changed {
+                    crate::refresh_tray_menu(&app);
+                }
+                Ok(result)
             }
-            Err(error)
+            Err(error) => {
+                if error.code == "revision_conflict" {
+                    let _ = app.emit(
+                        "conflict_detected",
+                        json!({ "id": note_id, "error": error.clone() }),
+                    );
+                }
+                Err(error)
+            }
         }
-    }
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn delete_note(
+pub async fn delete_note(app: AppHandle, note_id: String) -> AppResult<()> {
+    run_background("删除便签", move || {
+        let store = app.state::<WorkspaceStore>();
+        store.delete_note(&note_id)?;
+        store.set_note_window_open(&note_id, false)?;
+        if let Some(window) = app.get_webview_window(&format!("note-{note_id}")) {
+            let _ = window.destroy();
+        }
+        let _ = app.emit("note_changed", json!({ "id": note_id, "kind": "deleted" }));
+        crate::refresh_tray_menu(&app);
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_trash(app: AppHandle) -> AppResult<Vec<NoteSummary>> {
+    run_background("读取回收站", move || {
+        app.state::<WorkspaceStore>().list_trash()
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn restore_note(app: AppHandle, note_id: String) -> AppResult<NoteSnapshot> {
+    run_background("恢复便签", move || {
+        let note = app.state::<WorkspaceStore>().restore_note(&note_id)?;
+        let _ = app.emit("note_changed", json!({ "id": note_id, "kind": "restored" }));
+        crate::refresh_tray_menu(&app);
+        Ok(note)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn empty_trash(app: AppHandle) -> AppResult<()> {
+    run_background("清空回收站", move || {
+        app.state::<WorkspaceStore>().empty_trash()
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn import_asset(
     app: AppHandle,
-    store: State<'_, WorkspaceStore>,
-    note_id: String,
-) -> AppResult<()> {
-    store.delete_note(&note_id)?;
-    store.set_note_window_open(&note_id, false)?;
-    if let Some(window) = app.get_webview_window(&format!("note-{note_id}")) {
-        let _ = window.destroy();
-    }
-    let _ = app.emit("note_changed", json!({ "id": note_id, "kind": "deleted" }));
-    crate::refresh_tray_menu(&app);
-    Ok(())
-}
-
-#[tauri::command]
-pub fn list_trash(store: State<'_, WorkspaceStore>) -> AppResult<Vec<NoteSummary>> {
-    store.list_trash()
-}
-
-#[tauri::command]
-pub fn restore_note(
-    app: AppHandle,
-    store: State<'_, WorkspaceStore>,
-    note_id: String,
-) -> AppResult<NoteSnapshot> {
-    let note = store.restore_note(&note_id)?;
-    let _ = app.emit("note_changed", json!({ "id": note_id, "kind": "restored" }));
-    crate::refresh_tray_menu(&app);
-    Ok(note)
-}
-
-#[tauri::command]
-pub fn empty_trash(store: State<'_, WorkspaceStore>) -> AppResult<()> {
-    store.empty_trash()
-}
-
-#[tauri::command]
-pub fn import_asset(
-    app: AppHandle,
-    store: State<'_, WorkspaceStore>,
     note_id: String,
     file_name: String,
     bytes: Vec<u8>,
 ) -> AppResult<AssetResult> {
-    let asset = store.import_asset(&note_id, &file_name, &bytes)?;
-    let _ = app.emit(
-        "asset_imported",
-        json!({ "noteId": note_id, "asset": asset.clone() }),
-    );
-    Ok(asset)
+    run_background("导入便签图片", move || {
+        let asset = app
+            .state::<WorkspaceStore>()
+            .import_asset(&note_id, &file_name, &bytes)?;
+        let _ = app.emit(
+            "asset_imported",
+            json!({ "noteId": note_id, "asset": asset.clone() }),
+        );
+        Ok(asset)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn read_asset(
-    store: State<'_, WorkspaceStore>,
+pub async fn read_asset(
+    app: AppHandle,
     note_id: String,
     relative_path: String,
 ) -> AppResult<AssetContent> {
-    store.read_asset(&note_id, &relative_path)
+    run_background("读取便签图片", move || {
+        app.state::<WorkspaceStore>()
+            .read_asset(&note_id, &relative_path)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn search_notes(
-    store: State<'_, WorkspaceStore>,
+pub async fn search_notes(
+    app: AppHandle,
     query: String,
     limit: Option<u32>,
 ) -> AppResult<Vec<SearchResult>> {
-    store.search_notes(&query, limit)
+    run_background("搜索便签", move || {
+        app.state::<WorkspaceStore>().search_notes(&query, limit)
+    })
+    .await
 }
 
 #[tauri::command]
-pub async fn open_note_window(
-    app: AppHandle,
-    store: State<'_, WorkspaceStore>,
-    note_id: String,
-) -> AppResult<String> {
-    open_note_window_inner(&app, &store, &note_id)
+pub async fn open_note_window(app: AppHandle, note_id: String) -> AppResult<String> {
+    run_background("打开便签窗口", move || {
+        open_note_window_inner(&app, &app.state(), &note_id)
+    })
+    .await
 }
 
 #[tauri::command]
-pub async fn open_tool_window(
-    app: AppHandle,
-    store: State<'_, WorkspaceStore>,
-    tool: ToolName,
-) -> AppResult<String> {
-    match tool {
-        ToolName::Timer => open_timer_window_inner(&app, &store),
-        ToolName::Reminder => open_reminder_window_inner(&app, &store),
-        ToolName::Gantt => open_gantt_window_inner(&app, &store),
+pub async fn open_tool_window(app: AppHandle, tool: ToolName) -> AppResult<String> {
+    run_background("打开小工具窗口", move || match tool {
+        ToolName::Timer => open_timer_window_inner(&app, &app.state()),
+        ToolName::Reminder => open_reminder_window_inner(&app, &app.state()),
+        ToolName::Gantt => open_gantt_window_inner(&app, &app.state()),
         ToolName::Screenshot => crate::screenshot::start_capture_inner(&app)
             .map(|_| crate::screenshot::CAPTURE_WINDOW_LABEL.to_string()),
-    }
+    })
+    .await
 }
 
 pub fn open_note_window_inner(
@@ -306,7 +380,7 @@ pub fn open_note_window_inner(
     note_id: &str,
 ) -> AppResult<String> {
     crate::trace_activation(&format!("open_note:{note_id}:waiting_creation_lock"));
-    let _creation_guard = lock_window_creation();
+    let _creation_guard = lock_window_creation(&NOTE_WINDOW_CREATION_LOCK);
     crate::trace_activation(&format!("open_note:{note_id}:creation_lock_acquired"));
     let label = format!("note-{note_id}");
     if let Some(window) = app.get_webview_window(&label) {
@@ -354,7 +428,7 @@ pub fn open_note_window_inner(
 }
 
 pub fn open_timer_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResult<String> {
-    let _creation_guard = lock_window_creation();
+    let _creation_guard = lock_window_creation(&TIMER_WINDOW_CREATION_LOCK);
     if let Some(window) = app.get_webview_window(TIMER_WINDOW_LABEL) {
         window
             .show()
@@ -460,7 +534,7 @@ mod timer_window_tests {
 }
 
 pub fn open_reminder_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResult<String> {
-    let _creation_guard = lock_window_creation();
+    let _creation_guard = lock_window_creation(&REMINDER_WINDOW_CREATION_LOCK);
     if let Some(window) = app.get_webview_window(REMINDER_WINDOW_LABEL) {
         window
             .show()
@@ -492,7 +566,7 @@ pub fn open_reminder_window_inner(app: &AppHandle, store: &WorkspaceStore) -> Ap
 }
 
 pub fn open_gantt_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResult<String> {
-    let _creation_guard = lock_window_creation();
+    let _creation_guard = lock_window_creation(&GANTT_WINDOW_CREATION_LOCK);
     if let Some(window) = app.get_webview_window(GANTT_WINDOW_LABEL) {
         window.show().map_err(|error| {
             AppError::new("window_error", format!("显示任务甘特图失败: {error}"))
@@ -529,21 +603,21 @@ pub fn open_gantt_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppRe
 }
 
 #[tauri::command]
-pub fn close_note_window(
-    app: AppHandle,
-    store: State<'_, WorkspaceStore>,
-    note_id: String,
-) -> AppResult<()> {
-    store.set_note_window_open(&note_id, false)?;
-    crate::refresh_tray_menu(&app);
-    Ok(())
+pub async fn close_note_window(app: AppHandle, note_id: String) -> AppResult<()> {
+    run_background("关闭便签窗口", move || {
+        app.state::<WorkspaceStore>()
+            .set_note_window_open(&note_id, false)?;
+        crate::refresh_tray_menu(&app);
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn save_window_state(
-    store: State<'_, WorkspaceStore>,
-    label: String,
-    state: WindowState,
-) -> AppResult<()> {
-    store.save_window_state(&label, state)
+pub async fn save_window_state(app: AppHandle, label: String, state: WindowState) -> AppResult<()> {
+    run_background("保存窗口状态", move || {
+        app.state::<WorkspaceStore>()
+            .save_window_state(&label, state)
+    })
+    .await
 }

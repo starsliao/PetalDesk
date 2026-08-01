@@ -412,46 +412,51 @@ pub fn list_reminders(store: State<'_, ReminderStore>) -> Vec<Reminder> {
 }
 
 #[tauri::command]
-pub fn upsert_reminder(
+pub async fn upsert_reminder(
     app: AppHandle,
-    store: State<'_, ReminderStore>,
     request: UpsertReminderRequest,
 ) -> AppResult<Reminder> {
-    let reminder = store.upsert(request)?;
-    let _ = app.emit(
-        "reminder_changed",
-        json!({ "id": reminder.id, "kind": "upserted", "reminder": reminder }),
-    );
-    Ok(reminder)
+    crate::commands::run_background("保存提醒", move || {
+        let reminder = app.state::<ReminderStore>().upsert(request)?;
+        let _ = app.emit(
+            "reminder_changed",
+            json!({ "id": reminder.id, "kind": "upserted", "reminder": reminder }),
+        );
+        Ok(reminder)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn delete_reminder(
-    app: AppHandle,
-    store: State<'_, ReminderStore>,
-    reminder_id: String,
-) -> AppResult<()> {
-    store.delete(&reminder_id)?;
-    let _ = app.emit(
-        "reminder_changed",
-        json!({ "id": reminder_id, "kind": "deleted" }),
-    );
-    Ok(())
+pub async fn delete_reminder(app: AppHandle, reminder_id: String) -> AppResult<()> {
+    crate::commands::run_background("删除提醒", move || {
+        app.state::<ReminderStore>().delete(&reminder_id)?;
+        let _ = app.emit(
+            "reminder_changed",
+            json!({ "id": reminder_id, "kind": "deleted" }),
+        );
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn set_reminder_enabled(
+pub async fn set_reminder_enabled(
     app: AppHandle,
-    store: State<'_, ReminderStore>,
     reminder_id: String,
     enabled: bool,
 ) -> AppResult<Reminder> {
-    let reminder = store.set_enabled(&reminder_id, enabled)?;
-    let _ = app.emit(
-        "reminder_changed",
-        json!({ "id": reminder.id, "kind": "enabled", "reminder": reminder }),
-    );
-    Ok(reminder)
+    crate::commands::run_background("更新提醒状态", move || {
+        let reminder = app
+            .state::<ReminderStore>()
+            .set_enabled(&reminder_id, enabled)?;
+        let _ = app.emit(
+            "reminder_changed",
+            json!({ "id": reminder.id, "kind": "enabled", "reminder": reminder }),
+        );
+        Ok(reminder)
+    })
+    .await
 }
 
 pub fn start_scheduler(app: AppHandle) {

@@ -75,4 +75,23 @@ describe("renderMarkdown", () => {
       "",
     ]);
   });
+
+  it("keeps GFM table structure and safe column alignment", () => {
+    const html = renderMarkdown([
+      "| 名称 | 状态 | 备注 |",
+      "| :--- | :---: | ---: |",
+      "| 文档 | 完成 | **已发布** |",
+    ].join("\n"));
+    const document = new DOMParser().parseFromString(html, "text/html");
+    const table = document.querySelector("table");
+
+    expect(table).not.toBeNull();
+    expect(table?.querySelectorAll("thead th")).toHaveLength(3);
+    expect(table?.querySelectorAll("tbody td")).toHaveLength(3);
+    expect(table?.querySelector("tbody strong")?.textContent).toBe("已发布");
+    expect(table?.querySelector("th:nth-child(1)")?.classList.contains("md-align-left")).toBe(true);
+    expect(table?.querySelector("th:nth-child(2)")?.classList.contains("md-align-center")).toBe(true);
+    expect(table?.querySelector("th:nth-child(3)")?.classList.contains("md-align-right")).toBe(true);
+    expect(table?.querySelector("[style]")).toBeNull();
+  });
 });

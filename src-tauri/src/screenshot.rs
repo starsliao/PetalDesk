@@ -1,4 +1,3 @@
-use crate::commands::lock_window_creation;
 use crate::error::{AppError, AppResult};
 use crate::storage::{atomic_write, atomic_write_json, INTERNAL_DATA_DIR};
 use chrono::{SecondsFormat, Utc};
@@ -8,14 +7,14 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 use tauri::ipc::{InvokeBody, Request, Response};
 use tauri::{
-    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl,
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, State, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder,
 };
-use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use uuid::Uuid;
 
@@ -27,6 +26,10 @@ const EXPORT_TOKEN_HEADER: &str = "x-petaldesk-export-token";
 const MAX_PNG_BYTES: usize = 128 * 1024 * 1024;
 const MAX_IMAGE_PIXELS: u64 = 40_000_000;
 const EXPORT_TICKET_TTL: Duration = Duration::from_secs(5 * 60);
+const SHORTCUT_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const SHORTCUT_HEALTHY_REFRESH_POLLS: u32 = 10;
+static CAPTURE_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
+static PIN_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -116,6 +119,36 @@ pub enum ScreenshotExportAction {
     Pin,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScreenshotSaveKind {
+    Screenshot,
+    LongScreenshot,
+}
+
+impl ScreenshotSaveKind {
+    fn file_name(self) -> String {
+        let prefix = match self {
+            Self::Screenshot => "PetalDesk截图",
+            Self::LongScreenshot => "PetalDesk长截图",
+        };
+        format!("{prefix}-{}.png", Utc::now().format("%Y%m%d-%H%M%S"))
+    }
+
+    fn dialog_title(self) -> &'static str {
+        match self {
+            Self::Screenshot => "保存截图 - 飞花 - PetalDesk",
+            Self::LongScreenshot => "保存长截图 - 飞花 - PetalDesk",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Screenshot => "截图",
+            Self::LongScreenshot => "长截图",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PrepareScreenshotExportRequest {
@@ -171,7 +204,8 @@ pub struct ScreenshotStore {
     pins: Mutex<HashMap<String, PinnedScreenshot>>,
     export_tickets: Mutex<HashMap<String, ExportTicket>>,
     start_lock: Mutex<()>,
-    shortcut_change_lock: Mutex<()>,
+    settings_change_lock: Mutex<()>,
+    shortcut_retry_needed: AtomicBool,
 }
 
 impl ScreenshotStore {
@@ -212,7 +246,8 @@ impl ScreenshotStore {
             pins: Mutex::new(HashMap::new()),
             export_tickets: Mutex::new(HashMap::new()),
             start_lock: Mutex::new(()),
-            shortcut_change_lock: Mutex::new(()),
+            settings_change_lock: Mutex::new(()),
+            shortcut_retry_needed: AtomicBool::new(true),
         })
     }
 
@@ -238,6 +273,10 @@ impl ScreenshotStore {
         let Some(parent) = path.parent() else {
             return Err(AppError::invalid("截图保存路径没有父目录"));
         };
+        // Every settings update persists a complete snapshot. Serialize it
+        // with shortcut changes so an older save-directory snapshot cannot
+        // overwrite a newly registered shortcut.
+        let _change_guard = lock_unpoisoned(&self.settings_change_lock);
         let mut settings = self.settings();
         settings.last_save_directory = Some(parent.to_string_lossy().into_owned());
         self.persist_settings(&settings)?;
@@ -368,20 +407,26 @@ fn normalize_color_format(value: &str) -> AppResult<String> {
 pub fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // Both WebView construction and the global-shortcut manager synchronously
     // dispatch work to Tauri's event loop. Setup itself runs on that loop, so
-    // prewarm them from a worker after setup returns to avoid a channel deadlock.
-    let app = app.handle().clone();
+    // run them from workers after setup returns to avoid a channel deadlock.
+    // Registration must not wait for WebView2 prewarming: a slow or failed
+    // controller creation must never leave this process without its shortcut.
+    let shortcut_app = app.handle().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = ensure_capture_window(&app) {
-            eprintln!("无法预创建截图窗口: {error}");
-            let _ = app.emit("screenshot_capture_error", error);
-        }
-        let shortcut = app.state::<ScreenshotStore>().settings().shortcut;
-        if let Err(error) = register_screenshot_shortcut(&app, &shortcut) {
+        if let Err(error) = ensure_screenshot_shortcut_registered(&shortcut_app) {
+            let shortcut = shortcut_app.state::<ScreenshotStore>().settings().shortcut;
             eprintln!("无法注册截图快捷键 {shortcut}: {error}");
-            let _ = app.emit(
+            let _ = shortcut_app.emit(
                 "screenshot_shortcut_error",
                 serde_json::json!({ "shortcut": shortcut, "message": error.message }),
             );
+        }
+    });
+    spawn_screenshot_shortcut_health_check(app.handle());
+    let prewarm_app = app.handle().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = ensure_capture_window(&prewarm_app) {
+            eprintln!("无法预创建截图窗口: {error}");
+            let _ = prewarm_app.emit("screenshot_capture_error", error);
         }
     });
     Ok(())
@@ -391,6 +436,11 @@ fn register_screenshot_shortcut(app: &AppHandle, shortcut: &str) -> AppResult<()
     app.global_shortcut()
         .on_shortcut(shortcut, |app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
+                // Receiving the Win32 event is stronger evidence than the
+                // plugin's in-memory `is_registered` bookkeeping.
+                app.state::<ScreenshotStore>()
+                    .shortcut_retry_needed
+                    .store(false, Ordering::Release);
                 spawn_start_capture(app);
             }
         })
@@ -402,10 +452,164 @@ fn register_screenshot_shortcut(app: &AppHandle, shortcut: &str) -> AppResult<()
         })
 }
 
+fn ensure_screenshot_shortcut_registered(app: &AppHandle) -> AppResult<()> {
+    let store = app.state::<ScreenshotStore>();
+    let _change_guard = lock_unpoisoned(&store.settings_change_lock);
+    let shortcut = store.settings().shortcut;
+    // This only avoids asking the plugin to insert a duplicate entry. It does
+    // not prove that Windows still owns the underlying RegisterHotKey.
+    let result = if app.global_shortcut().is_registered(shortcut.as_str()) {
+        Ok(())
+    } else {
+        register_screenshot_shortcut(app, &shortcut)
+    };
+    store
+        .shortcut_retry_needed
+        .store(result.is_err(), Ordering::Release);
+    result
+}
+
+fn refresh_screenshot_shortcut_registration(app: &AppHandle) -> AppResult<()> {
+    let store = app.state::<ScreenshotStore>();
+    let _change_guard = lock_unpoisoned(&store.settings_change_lock);
+    let shortcut = store.settings().shortcut;
+    let result = refresh_shortcut_with(
+        &shortcut,
+        app.global_shortcut().is_registered(shortcut.as_str()),
+        || {
+            app.global_shortcut()
+                .unregister(shortcut.as_str())
+                .map_err(|error| error.to_string())
+        },
+        || register_screenshot_shortcut(app, &shortcut),
+    );
+    store
+        .shortcut_retry_needed
+        .store(result.is_err(), Ordering::Release);
+    result
+}
+
+fn refresh_shortcut_with(
+    shortcut: &str,
+    is_registered: bool,
+    unregister: impl FnOnce() -> Result<(), String>,
+    register: impl FnOnce() -> AppResult<()>,
+) -> AppResult<()> {
+    // `is_registered` reflects the plugin's in-process bookkeeping, while
+    // Windows may already have dropped RegisterHotKey after a shell or power
+    // transition. Even if unregister reports that stale OS state, registering
+    // again can repair it, so unregister is deliberately best effort here.
+    let unregister_error = is_registered.then(unregister).and_then(Result::err);
+    match register() {
+        Ok(()) => Ok(()),
+        Err(register_error) => {
+            if let Some(unregister_error) = unregister_error {
+                Err(AppError::new(
+                    "shortcut_refresh_failed",
+                    format!(
+                        "恢复截图快捷键 {shortcut} 失败；注销旧注册失败: {unregister_error}；重新注册失败: {}",
+                        register_error.message
+                    ),
+                ))
+            } else {
+                Err(register_error)
+            }
+        }
+    }
+}
+
+fn shortcut_health_check_due(retry_needed: bool, healthy_polls: u32) -> bool {
+    retry_needed || healthy_polls >= SHORTCUT_HEALTHY_REFRESH_POLLS
+}
+
+fn spawn_screenshot_shortcut_health_check(app: &AppHandle) {
+    let app = app.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("petaldesk-shortcut-health".to_string())
+        .spawn(move || {
+            let mut healthy_polls = 0_u32;
+            loop {
+                std::thread::sleep(SHORTCUT_HEALTH_POLL_INTERVAL);
+                let retry_needed = app
+                    .state::<ScreenshotStore>()
+                    .shortcut_retry_needed
+                    .load(Ordering::Acquire);
+                healthy_polls = if retry_needed {
+                    0
+                } else {
+                    healthy_polls.saturating_add(1)
+                };
+                if !shortcut_health_check_due(retry_needed, healthy_polls) {
+                    continue;
+                }
+                healthy_polls = 0;
+
+                // A forced unregister/register is the only meaningful probe:
+                // the plugin's `is_registered` value is only its own hashmap
+                // and cannot report whether Win32 silently lost the hotkey.
+                // Periodic failures stay out of the UI to avoid repeated toast
+                // messages; explicit setup/settings operations still report
+                // their errors to the user.
+                if let Err(error) = refresh_screenshot_shortcut_registration(&app) {
+                    let shortcut = app.state::<ScreenshotStore>().settings().shortcut;
+                    eprintln!("后台恢复截图快捷键 {shortcut} 失败: {error}");
+                }
+            }
+        });
+    if let Err(error) = spawn_result {
+        eprintln!("无法启动截图快捷键健康检查: {error}");
+    }
+}
+
+fn change_shortcut_with(
+    previous: &str,
+    shortcut: &str,
+    mut register: impl FnMut(&str) -> AppResult<()>,
+    mut unregister: impl FnMut(&str) -> Result<(), String>,
+    mut persist: impl FnMut() -> AppResult<()>,
+) -> AppResult<Option<String>> {
+    // Keep the old registration alive until Windows has accepted its
+    // replacement.
+    register(shortcut)?;
+
+    // A failed old-key unregister can mean that Win32 already lost it while
+    // the plugin still has a stale bookkeeping entry. The new key is proven
+    // usable, so continue committing the requested setting and report the
+    // cleanup issue only as a diagnostic warning.
+    let old_unregister_error = unregister(previous).err();
+
+    if let Err(persist_error) = persist() {
+        return match register(previous) {
+            Ok(()) => match unregister(shortcut) {
+                Ok(()) => Err(AppError::new(
+                    "shortcut_persist_failed",
+                    format!(
+                        "保存截图快捷键失败，已恢复原快捷键 {previous}: {persist_error}"
+                    ),
+                )),
+                Err(cleanup_error) => Err(AppError::new(
+                    "shortcut_rollback_cleanup_failed",
+                    format!(
+                        "保存截图快捷键失败，原快捷键 {previous} 已恢复，但无法停用新快捷键 {shortcut}；两个快捷键本次运行中可能都可用: {persist_error}; {cleanup_error}"
+                    ),
+                )),
+            },
+            Err(rollback_error) => Err(AppError::new(
+                "shortcut_rollback_failed",
+                format!(
+                    "保存截图快捷键失败，且无法恢复原快捷键 {previous}；已保留可用的新快捷键 {shortcut}: {persist_error}; {rollback_error}"
+                ),
+            )),
+        };
+    }
+
+    Ok(old_unregister_error)
+}
+
 pub(crate) fn spawn_start_capture(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        if let Err(error) = start_capture_inner(&app) {
+        if let Err(error) = start_capture_inner_impl(&app, false) {
             let _ = app.emit("screenshot_capture_error", error);
         }
     });
@@ -417,39 +621,55 @@ pub fn get_screenshot_settings(store: State<'_, ScreenshotStore>) -> ScreenshotS
 }
 
 #[tauri::command]
-pub fn set_screenshot_shortcut(
+pub async fn set_screenshot_shortcut(
     app: AppHandle,
-    store: State<'_, ScreenshotStore>,
     shortcut: String,
 ) -> AppResult<ScreenshotSettings> {
+    tauri::async_runtime::spawn_blocking(move || set_screenshot_shortcut_inner(&app, shortcut))
+        .await
+        .map_err(|error| {
+            AppError::new(
+                "shortcut_update_failed",
+                format!("更新截图快捷键任务异常结束: {error}"),
+            )
+        })?
+}
+
+fn set_screenshot_shortcut_inner(
+    app: &AppHandle,
+    shortcut: String,
+) -> AppResult<ScreenshotSettings> {
+    let store = app.state::<ScreenshotStore>();
     let shortcut = normalize_shortcut(&shortcut)?;
-    let _change_guard = lock_unpoisoned(&store.shortcut_change_lock);
+    let _change_guard = lock_unpoisoned(&store.settings_change_lock);
     let previous = store.settings();
     if shortcut.eq_ignore_ascii_case(&previous.shortcut) {
-        return Ok(previous);
+        drop(_change_guard);
+        refresh_screenshot_shortcut_registration(app)?;
+        return Ok(store.settings());
     }
 
-    // Keep the old registration alive until the new shortcut is known-good.
-    register_screenshot_shortcut(&app, &shortcut)?;
-    if let Err(error) = app.global_shortcut().unregister(previous.shortcut.as_str()) {
-        let _ = app.global_shortcut().unregister(shortcut.as_str());
-        return Err(AppError::new(
-            "shortcut_update_failed",
-            format!("无法停用原截图快捷键，已保留原设置: {error}"),
-        ));
-    }
     let mut updated = previous.clone();
     updated.shortcut = shortcut.clone();
-    if let Err(error) = store.persist_settings(&updated) {
-        let rollback = register_screenshot_shortcut(&app, &previous.shortcut);
-        let _ = app.global_shortcut().unregister(shortcut.as_str());
-        return match rollback {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(AppError::new(
-                "shortcut_rollback_failed",
-                format!("保存快捷键失败，且恢复原快捷键失败: {error}; {rollback_error}"),
-            )),
-        };
+    let transition = change_shortcut_with(
+        &previous.shortcut,
+        &shortcut,
+        |candidate| register_screenshot_shortcut(app, candidate),
+        |candidate| {
+            app.global_shortcut()
+                .unregister(candidate)
+                .map_err(|error| error.to_string())
+        },
+        || store.persist_settings(&updated),
+    );
+    store
+        .shortcut_retry_needed
+        .store(transition.is_err(), Ordering::Release);
+    if let Some(error) = transition? {
+        eprintln!(
+            "新截图快捷键 {shortcut} 已保存，但无法停用原快捷键 {}: {error}",
+            previous.shortcut
+        );
     }
     store.replace_settings(updated.clone());
     crate::refresh_tray_menu(&app);
@@ -461,25 +681,31 @@ pub fn set_screenshot_shortcut(
 }
 
 #[tauri::command]
-pub fn update_screenshot_settings(
+pub async fn update_screenshot_settings(
     app: AppHandle,
-    store: State<'_, ScreenshotStore>,
     patch: ScreenshotSettingsPatch,
 ) -> AppResult<ScreenshotSettings> {
-    let mut settings = store.settings();
-    if let Some(color_format) = patch.color_format {
-        settings.color_format = normalize_color_format(&color_format)?;
-    }
-    if let Some(tool_parameters) = patch.tool_parameters {
-        settings.tool_parameters = tool_parameters;
-    }
-    store.persist_settings(&settings)?;
-    store.replace_settings(settings.clone());
-    let _ = app.emit(
-        "screenshot_settings_changed",
-        serde_json::json!({ "settings": settings.clone() }),
-    );
-    Ok(settings)
+    crate::commands::run_background("保存截图偏好", move || {
+        let store = app.state::<ScreenshotStore>();
+        // Keep the full-snapshot write atomic with shortcut and save-directory
+        // changes; otherwise the last writer can restore stale fields.
+        let _change_guard = lock_unpoisoned(&store.settings_change_lock);
+        let mut settings = store.settings();
+        if let Some(color_format) = patch.color_format {
+            settings.color_format = normalize_color_format(&color_format)?;
+        }
+        if let Some(tool_parameters) = patch.tool_parameters {
+            settings.tool_parameters = tool_parameters;
+        }
+        store.persist_settings(&settings)?;
+        store.replace_settings(settings.clone());
+        let _ = app.emit(
+            "screenshot_settings_changed",
+            serde_json::json!({ "settings": settings.clone() }),
+        );
+        Ok(settings)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -490,6 +716,27 @@ pub async fn start_screenshot_capture(app: AppHandle) -> AppResult<ScreenshotSes
 }
 
 pub(crate) fn start_capture_inner(app: &AppHandle) -> AppResult<ScreenshotSession> {
+    start_capture_inner_impl(app, true)
+}
+
+fn start_capture_inner_impl(
+    app: &AppHandle,
+    refresh_shortcut: bool,
+) -> AppResult<ScreenshotSession> {
+    // Tray/menu capture remains usable even if Windows temporarily rejects the
+    // configured hotkey. Starting from a non-shortcut surface also gives the
+    // registration a bounded opportunity to recover after a startup conflict.
+    // A capture triggered by the shortcut itself already proves the Win32
+    // registration works and skips this extra rebind.
+    if refresh_shortcut {
+        if let Err(error) = refresh_screenshot_shortcut_registration(app) {
+            let shortcut = app.state::<ScreenshotStore>().settings().shortcut;
+            let _ = app.emit(
+                "screenshot_shortcut_error",
+                serde_json::json!({ "shortcut": shortcut, "message": error.message }),
+            );
+        }
+    }
     let store = app.state::<ScreenshotStore>();
     let _start_guard = lock_unpoisoned(&store.start_lock);
     if crate::long_screenshot::restore_active_long_capture_surface(app)? {
@@ -545,33 +792,34 @@ pub fn get_screenshot_session(store: State<'_, ScreenshotStore>) -> Option<Scree
 }
 
 #[tauri::command]
-pub fn get_screenshot_frame(
-    store: State<'_, ScreenshotStore>,
-    session_id: String,
-) -> AppResult<Response> {
-    // `Response` owns its body, so unwrap the Arc when we hold the only
-    // reference and fall back to a copy otherwise.
-    Ok(Response::new(
-        Arc::try_unwrap(store.session_png(&session_id)?).unwrap_or_else(|shared| (*shared).clone()),
-    ))
+pub async fn get_screenshot_frame(app: AppHandle, session_id: String) -> AppResult<Response> {
+    crate::commands::run_background("读取截图画面", move || {
+        // `Response` owns its body, so unwrap the Arc when we hold the only
+        // reference and fall back to a copy otherwise.
+        let png = app.state::<ScreenshotStore>().session_png(&session_id)?;
+        Ok(Response::new(
+            Arc::try_unwrap(png).unwrap_or_else(|shared| (*shared).clone()),
+        ))
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn present_screenshot_capture(
-    app: AppHandle,
-    store: State<'_, ScreenshotStore>,
-    session_id: String,
-) -> AppResult<()> {
-    let monitor = {
-        let session = lock_unpoisoned(&store.session);
-        session
-            .as_ref()
-            .filter(|active| active.meta.id == session_id)
-            .map(|active| active.meta.monitor.clone())
-            .ok_or_else(|| AppError::not_found("截图会话已结束或已被替换"))?
-    };
-    prepare_capture_window(&app, &monitor)?;
-    present_capture_window(&app)
+pub async fn present_screenshot_capture(app: AppHandle, session_id: String) -> AppResult<()> {
+    crate::commands::run_background("显示截图界面", move || {
+        let store = app.state::<ScreenshotStore>();
+        let monitor = {
+            let session = lock_unpoisoned(&store.session);
+            session
+                .as_ref()
+                .filter(|active| active.meta.id == session_id)
+                .map(|active| active.meta.monitor.clone())
+                .ok_or_else(|| AppError::not_found("截图会话已结束或已被替换"))?
+        };
+        prepare_capture_window(&app, &monitor)?;
+        present_capture_window(&app)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -659,14 +907,17 @@ fn prepare_screenshot_export_inner(
         .filter(|session| session.id == request.session_id)
         .ok_or_else(|| AppError::not_found("截图会话已结束或已被替换"))?;
     let save_path = if request.action == ScreenshotExportAction::Save {
-        let path = choose_png_save_path(app, &store.settings())?;
+        let path = choose_screenshot_save_path(
+            app,
+            ScreenshotSaveKind::Screenshot,
+            Some(CAPTURE_WINDOW_LABEL),
+        )?;
         let Some(path) = path else {
             return Ok(PrepareScreenshotExportResult {
                 canceled: true,
                 ticket: None,
             });
         };
-        store.update_last_save_directory(&path)?;
         Some(path)
     } else {
         None
@@ -679,16 +930,16 @@ fn prepare_screenshot_export_inner(
 }
 
 #[tauri::command]
-pub fn commit_screenshot_export(
+pub async fn commit_screenshot_export(
     app: AppHandle,
-    store: State<'_, ScreenshotStore>,
     request: Request<'_>,
 ) -> AppResult<ScreenshotExportResult> {
     let token = request
         .headers()
         .get(EXPORT_TOKEN_HEADER)
         .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| AppError::invalid("缺少截图导出凭证"))?;
+        .ok_or_else(|| AppError::invalid("缺少截图导出凭证"))?
+        .to_string();
     // One copy out of the IPC body is unavoidable; wrapping it here keeps the
     // pin path from making a second one.
     let png = match request.body() {
@@ -699,6 +950,18 @@ pub fn commit_screenshot_export(
             ))
         }
     };
+    crate::commands::run_background("提交截图导出", move || {
+        commit_screenshot_export_inner(&app, &token, png)
+    })
+    .await
+}
+
+fn commit_screenshot_export_inner(
+    app: &AppHandle,
+    token: &str,
+    png: Arc<Vec<u8>>,
+) -> AppResult<ScreenshotExportResult> {
+    let store = app.state::<ScreenshotStore>();
     let ticket = store.consume_ticket(token)?;
     let session = store
         .active_session()
@@ -749,42 +1012,47 @@ pub fn commit_screenshot_export(
     // Export ends the ordinary screenshot session. Reuse the owner-aware
     // teardown so a concurrently starting long capture is canceled before the
     // session disappears, and a stale export cannot affect a newer session.
-    let _ = cancel_screenshot_capture_inner(&app, Some(&ticket.session_id));
+    let _ = cancel_screenshot_capture_inner(app, Some(&ticket.session_id));
     Ok(result)
 }
 
 #[tauri::command]
-pub fn get_pinned_screenshot(
-    store: State<'_, ScreenshotStore>,
-    pin_id: String,
-) -> AppResult<Response> {
-    // Copy outside the lock: pins stay resident, so the Arc is always shared and
-    // a copy is unavoidable here, but it must not block other pin windows.
-    let png = {
-        let pins = lock_unpoisoned(&store.pins);
-        Arc::clone(
-            &pins
-                .get(&pin_id)
-                .ok_or_else(|| AppError::not_found("置顶截图不存在或已经关闭"))?
-                .png,
-        )
-    };
-    Ok(Response::new((*png).clone()))
+pub async fn get_pinned_screenshot(app: AppHandle, pin_id: String) -> AppResult<Response> {
+    crate::commands::run_background("读取置顶截图", move || {
+        let store = app.state::<ScreenshotStore>();
+        // Copy outside the lock: pins stay resident, so the Arc is always shared and
+        // a copy is unavoidable here, but it must not block other pin windows.
+        let png = {
+            let pins = lock_unpoisoned(&store.pins);
+            Arc::clone(
+                &pins
+                    .get(&pin_id)
+                    .ok_or_else(|| AppError::not_found("置顶截图不存在或已经关闭"))?
+                    .png,
+            )
+        };
+        Ok(Response::new((*png).clone()))
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn copy_pinned_screenshot(store: State<'_, ScreenshotStore>, pin_id: String) -> AppResult<()> {
-    let png = {
-        let pins = lock_unpoisoned(&store.pins);
-        Arc::clone(
-            &pins
-                .get(&pin_id)
-                .ok_or_else(|| AppError::not_found("置顶截图不存在或已经关闭"))?
-                .png,
-        )
-    };
-    let decoded = decode_png(&png)?;
-    write_png_to_clipboard(&png, &decoded)
+pub async fn copy_pinned_screenshot(app: AppHandle, pin_id: String) -> AppResult<()> {
+    crate::commands::run_background("复制置顶截图", move || {
+        let store = app.state::<ScreenshotStore>();
+        let png = {
+            let pins = lock_unpoisoned(&store.pins);
+            Arc::clone(
+                &pins
+                    .get(&pin_id)
+                    .ok_or_else(|| AppError::not_found("置顶截图不存在或已经关闭"))?
+                    .png,
+            )
+        };
+        let decoded = decode_png(&png)?;
+        write_png_to_clipboard(&png, &decoded)
+    })
+    .await
 }
 
 pub(crate) fn copy_png_bytes(png: &[u8]) -> AppResult<()> {
@@ -845,14 +1113,16 @@ fn save_pinned_screenshot_inner(
                 .png,
         )
     };
-    let Some(path) = choose_png_save_path(app, &store.settings())? else {
+    let parent_label = format!("{PIN_WINDOW_PREFIX}{pin_id}");
+    let Some(path) =
+        choose_screenshot_save_path(app, ScreenshotSaveKind::Screenshot, Some(&parent_label))?
+    else {
         return Ok(SavePinnedScreenshotResult {
             canceled: true,
             saved_path: None,
         });
     };
     atomic_write(&path, &png)?;
-    store.update_last_save_directory(&path)?;
     Ok(SavePinnedScreenshotResult {
         canceled: false,
         saved_path: Some(path.to_string_lossy().into_owned()),
@@ -860,16 +1130,17 @@ fn save_pinned_screenshot_inner(
 }
 
 #[tauri::command]
-pub fn close_pinned_screenshot(
-    app: AppHandle,
-    store: State<'_, ScreenshotStore>,
-    pin_id: String,
-) -> bool {
-    let removed = lock_unpoisoned(&store.pins).remove(&pin_id).is_some();
-    if let Some(window) = app.get_webview_window(&format!("{PIN_WINDOW_PREFIX}{pin_id}")) {
-        let _ = window.destroy();
-    }
-    removed
+pub async fn close_pinned_screenshot(app: AppHandle, pin_id: String) -> AppResult<bool> {
+    crate::commands::run_background("关闭置顶截图", move || {
+        let removed = lock_unpoisoned(&app.state::<ScreenshotStore>().pins)
+            .remove(&pin_id)
+            .is_some();
+        if let Some(window) = app.get_webview_window(&format!("{PIN_WINDOW_PREFIX}{pin_id}")) {
+            let _ = window.destroy();
+        }
+        Ok(removed)
+    })
+    .await
 }
 
 fn spawn_capture_window_cleanup(app: &AppHandle, session_id: Option<String>) {
@@ -992,17 +1263,90 @@ pub(crate) fn finish_capture_after_cleanup_locked(
     finish_capture_unlocked(app, store, session_id);
 }
 
-fn choose_png_save_path(
+trait TopmostWindow: Clone {
+    fn topmost_state(&self) -> Result<bool, String>;
+    fn set_topmost_state(&self, always_on_top: bool) -> Result<(), String>;
+}
+
+impl TopmostWindow for WebviewWindow {
+    fn topmost_state(&self) -> Result<bool, String> {
+        self.is_always_on_top().map_err(|error| error.to_string())
+    }
+
+    fn set_topmost_state(&self, always_on_top: bool) -> Result<(), String> {
+        self.set_always_on_top(always_on_top)
+            .map_err(|error| error.to_string())
+    }
+}
+
+struct AlwaysOnTopRestoreGuard<W: TopmostWindow> {
+    window: Option<W>,
+    restore_always_on_top: bool,
+}
+
+impl<W: TopmostWindow> AlwaysOnTopRestoreGuard<W> {
+    fn lower(window: Option<&W>) -> AppResult<Self> {
+        let Some(window) = window else {
+            return Ok(Self {
+                window: None,
+                restore_always_on_top: false,
+            });
+        };
+        let restore_always_on_top = window.topmost_state().map_err(|error| {
+            AppError::new("window_error", format!("读取截图窗口置顶状态失败: {error}"))
+        })?;
+        if restore_always_on_top {
+            window.set_topmost_state(false).map_err(|error| {
+                AppError::new(
+                    "window_error",
+                    format!("打开保存窗口前临时取消截图窗口置顶失败: {error}"),
+                )
+            })?;
+        }
+        Ok(Self {
+            window: Some(window.clone()),
+            restore_always_on_top,
+        })
+    }
+
+    fn restore(mut self) -> AppResult<()> {
+        if self.restore_always_on_top {
+            if let Some(window) = &self.window {
+                window.set_topmost_state(true).map_err(|error| {
+                    AppError::new("window_error", format!("恢复截图窗口置顶状态失败: {error}"))
+                })?;
+            }
+            self.restore_always_on_top = false;
+        }
+        Ok(())
+    }
+}
+
+impl<W: TopmostWindow> Drop for AlwaysOnTopRestoreGuard<W> {
+    fn drop(&mut self) {
+        if self.restore_always_on_top {
+            if let Some(window) = &self.window {
+                let _ = window.set_topmost_state(true);
+            }
+        }
+    }
+}
+
+pub(crate) fn choose_screenshot_save_path(
     app: &AppHandle,
-    settings: &ScreenshotSettings,
+    kind: ScreenshotSaveKind,
+    parent_label: Option<&str>,
 ) -> AppResult<Option<PathBuf>> {
-    let file_name = format!("PetalDesk截图-{}.png", Utc::now().format("%Y%m%d-%H%M%S"));
-    let mut dialog = app
-        .dialog()
-        .file()
+    let store = app.state::<ScreenshotStore>();
+    let settings = store.settings();
+    let parent_window = parent_label.and_then(|label| app.get_webview_window(label));
+    // All callers execute this helper on a blocking worker. Use rfd directly
+    // so opening the native dialog does not synchronously dispatch back to
+    // Tauri's event loop and then wait forever if that dispatch is rejected.
+    let mut dialog = rfd::FileDialog::new()
         .add_filter("PNG 图片", &["png"])
-        .set_title("保存截图 - 飞花 - PetalDesk")
-        .set_file_name(file_name);
+        .set_title(kind.dialog_title())
+        .set_file_name(kind.file_name());
     if let Some(directory) = settings
         .last_save_directory
         .as_deref()
@@ -1011,12 +1355,24 @@ fn choose_png_save_path(
     {
         dialog = dialog.set_directory(directory);
     }
-    let Some(path) = dialog.blocking_save_file() else {
+    if let Some(parent) = &parent_window {
+        dialog = dialog.set_parent(parent);
+    }
+    let selected = {
+        // The capture and pin windows are normally topmost. A native dialog
+        // without an owner can be created behind them and look like a hung
+        // export, so bind it to the invoking window and lower that window only
+        // while the modal dialog is alive. The guard restores the prior state
+        // for success, cancellation, and path-validation errors.
+        let topmost_guard = AlwaysOnTopRestoreGuard::lower(parent_window.as_ref())?;
+        let selected = dialog.save_file();
+        topmost_guard.restore()?;
+        selected
+    };
+    let Some(path) = selected else {
         return Ok(None);
     };
-    let mut path = path
-        .into_path()
-        .map_err(|error| AppError::invalid(format!("截图保存路径无效: {error}")))?;
+    let mut path = path;
     if path.extension().is_none() {
         path.set_extension("png");
     }
@@ -1025,8 +1381,12 @@ fn choose_png_save_path(
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
     {
-        return Err(AppError::invalid("截图只能保存为 PNG 文件"));
+        return Err(AppError::invalid(format!(
+            "{}只能保存为 PNG 文件",
+            kind.display_name()
+        )));
     }
+    store.update_last_save_directory(&path)?;
     Ok(Some(path))
 }
 
@@ -1034,7 +1394,7 @@ fn ensure_capture_window(app: &AppHandle) -> AppResult<()> {
     if app.get_webview_window(CAPTURE_WINDOW_LABEL).is_some() {
         return Ok(());
     }
-    let _creation_guard = lock_window_creation();
+    let _creation_guard = lock_unpoisoned(&CAPTURE_WINDOW_CREATION_LOCK);
     if app.get_webview_window(CAPTURE_WINDOW_LABEL).is_some() {
         return Ok(());
     }
@@ -1090,7 +1450,7 @@ pub(crate) fn present_capture_window(app: &AppHandle) -> AppResult<()> {
 }
 
 fn open_pin_window(app: AppHandle, pin_id: &str) -> AppResult<String> {
-    let _creation_guard = lock_window_creation();
+    let _creation_guard = lock_unpoisoned(&PIN_WINDOW_CREATION_LOCK);
     let label = format!("{PIN_WINDOW_PREFIX}{pin_id}");
     if let Some(window) = app.get_webview_window(&label) {
         let _ = window.show();
@@ -1605,6 +1965,273 @@ fn write_png_to_clipboard(_png: &[u8], _decoded: &DecodedPng) -> AppResult<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[derive(Clone)]
+    struct FakeTopmostWindow {
+        state: Arc<AtomicBool>,
+        transitions: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl FakeTopmostWindow {
+        fn new(always_on_top: bool) -> Self {
+            Self {
+                state: Arc::new(AtomicBool::new(always_on_top)),
+                transitions: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl TopmostWindow for FakeTopmostWindow {
+        fn topmost_state(&self) -> Result<bool, String> {
+            Ok(self.state.load(Ordering::SeqCst))
+        }
+
+        fn set_topmost_state(&self, always_on_top: bool) -> Result<(), String> {
+            self.state.store(always_on_top, Ordering::SeqCst);
+            lock_unpoisoned(&self.transitions).push(always_on_top);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn save_dialog_guard_restores_topmost_window_on_every_exit_path() {
+        let explicit_window = FakeTopmostWindow::new(true);
+        let guard = AlwaysOnTopRestoreGuard::lower(Some(&explicit_window)).unwrap();
+        assert!(!explicit_window.state.load(Ordering::SeqCst));
+        guard.restore().unwrap();
+        assert!(explicit_window.state.load(Ordering::SeqCst));
+        assert_eq!(
+            *lock_unpoisoned(&explicit_window.transitions),
+            vec![false, true]
+        );
+
+        let window = FakeTopmostWindow::new(true);
+        {
+            let _guard = AlwaysOnTopRestoreGuard::lower(Some(&window)).unwrap();
+            assert!(!window.state.load(Ordering::SeqCst));
+        }
+        assert!(window.state.load(Ordering::SeqCst));
+        assert_eq!(*lock_unpoisoned(&window.transitions), vec![false, true]);
+
+        let ordinary_window = FakeTopmostWindow::new(false);
+        drop(AlwaysOnTopRestoreGuard::lower(Some(&ordinary_window)).unwrap());
+        assert!(!ordinary_window.state.load(Ordering::SeqCst));
+        assert!(lock_unpoisoned(&ordinary_window.transitions).is_empty());
+    }
+
+    #[test]
+    fn save_dialog_kind_uses_distinct_png_names_and_titles() {
+        let screenshot_name = ScreenshotSaveKind::Screenshot.file_name();
+        let long_name = ScreenshotSaveKind::LongScreenshot.file_name();
+        assert!(screenshot_name.starts_with("PetalDesk截图-"));
+        assert!(long_name.starts_with("PetalDesk长截图-"));
+        assert!(screenshot_name.ends_with(".png"));
+        assert!(long_name.ends_with(".png"));
+        assert_eq!(
+            ScreenshotSaveKind::Screenshot.dialog_title(),
+            "保存截图 - 飞花 - PetalDesk"
+        );
+        assert_eq!(
+            ScreenshotSaveKind::LongScreenshot.dialog_title(),
+            "保存长截图 - 飞花 - PetalDesk"
+        );
+    }
+
+    #[test]
+    fn shortcut_refresh_registers_even_when_unregister_fails() {
+        let unregister_called = AtomicBool::new(false);
+        let register_called = AtomicBool::new(false);
+        let result = refresh_shortcut_with(
+            "F1",
+            true,
+            || {
+                unregister_called.store(true, Ordering::SeqCst);
+                Err("Windows registration was already lost".to_string())
+            },
+            || {
+                register_called.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(unregister_called.load(Ordering::SeqCst));
+        assert!(register_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn shortcut_refresh_preserves_unregister_and_register_errors() {
+        let error = refresh_shortcut_with(
+            "Ctrl+F1",
+            true,
+            || Err("unregister failed".to_string()),
+            || Err(AppError::new("shortcut_conflict", "register failed")),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "shortcut_refresh_failed");
+        assert!(error.message.contains("Ctrl+F1"));
+        assert!(error.message.contains("unregister failed"));
+        assert!(error.message.contains("register failed"));
+    }
+
+    #[test]
+    fn shortcut_refresh_skips_unregister_when_plugin_has_no_registration() {
+        let unregister_called = AtomicBool::new(false);
+        let result = refresh_shortcut_with(
+            "F1",
+            false,
+            || {
+                unregister_called.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            || Ok(()),
+        );
+
+        assert!(result.is_ok());
+        assert!(!unregister_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn shortcut_health_check_retries_failures_and_periodically_rebinds_healthy_keys() {
+        assert!(shortcut_health_check_due(true, 0));
+        assert!(shortcut_health_check_due(true, 1));
+        assert!(!shortcut_health_check_due(
+            false,
+            SHORTCUT_HEALTHY_REFRESH_POLLS - 1
+        ));
+        assert!(shortcut_health_check_due(
+            false,
+            SHORTCUT_HEALTHY_REFRESH_POLLS
+        ));
+    }
+
+    #[test]
+    fn shortcut_change_commits_new_key_when_old_key_cannot_be_unregistered() {
+        let operations = Mutex::new(Vec::<String>::new());
+        let warning = change_shortcut_with(
+            "F1",
+            "Ctrl+F1",
+            |shortcut| {
+                lock_unpoisoned(&operations).push(format!("register:{shortcut}"));
+                Ok(())
+            },
+            |shortcut| {
+                lock_unpoisoned(&operations).push(format!("unregister:{shortcut}"));
+                Err("old key was already lost by Windows".to_string())
+            },
+            || {
+                lock_unpoisoned(&operations).push("persist".to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            warning.as_deref(),
+            Some("old key was already lost by Windows")
+        );
+        assert_eq!(
+            *lock_unpoisoned(&operations),
+            vec!["register:Ctrl+F1", "unregister:F1", "persist"]
+        );
+    }
+
+    #[test]
+    fn shortcut_change_keeps_new_key_when_persistence_and_old_key_recovery_fail() {
+        let operations = Mutex::new(Vec::<String>::new());
+        let error = change_shortcut_with(
+            "F1",
+            "Ctrl+F1",
+            |shortcut| {
+                lock_unpoisoned(&operations).push(format!("register:{shortcut}"));
+                if shortcut == "F1" {
+                    Err(AppError::new("shortcut_conflict", "old key unavailable"))
+                } else {
+                    Ok(())
+                }
+            },
+            |shortcut| {
+                lock_unpoisoned(&operations).push(format!("unregister:{shortcut}"));
+                Ok(())
+            },
+            || Err(AppError::new("io_error", "disk full")),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "shortcut_rollback_failed");
+        assert!(error.message.contains("已保留可用的新快捷键 Ctrl+F1"));
+        assert_eq!(
+            *lock_unpoisoned(&operations),
+            vec!["register:Ctrl+F1", "unregister:F1", "register:F1"]
+        );
+    }
+
+    #[test]
+    fn shortcut_change_removes_new_key_only_after_old_key_recovery_succeeds() {
+        let operations = Mutex::new(Vec::<String>::new());
+        let error = change_shortcut_with(
+            "F1",
+            "Ctrl+F1",
+            |shortcut| {
+                lock_unpoisoned(&operations).push(format!("register:{shortcut}"));
+                Ok(())
+            },
+            |shortcut| {
+                lock_unpoisoned(&operations).push(format!("unregister:{shortcut}"));
+                Ok(())
+            },
+            || Err(AppError::new("io_error", "disk full")),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "shortcut_persist_failed");
+        assert!(error.message.contains("已恢复原快捷键 F1"));
+        assert_eq!(
+            *lock_unpoisoned(&operations),
+            vec![
+                "register:Ctrl+F1",
+                "unregister:F1",
+                "register:F1",
+                "unregister:Ctrl+F1"
+            ]
+        );
+    }
+
+    #[test]
+    fn shortcut_change_reports_when_recovered_old_key_cannot_clean_up_new_key() {
+        let operations = Mutex::new(Vec::<String>::new());
+        let error = change_shortcut_with(
+            "F1",
+            "Ctrl+F1",
+            |shortcut| {
+                lock_unpoisoned(&operations).push(format!("register:{shortcut}"));
+                Ok(())
+            },
+            |shortcut| {
+                lock_unpoisoned(&operations).push(format!("unregister:{shortcut}"));
+                if shortcut == "Ctrl+F1" {
+                    Err("new-key cleanup failed".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            || Err(AppError::new("io_error", "disk full")),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "shortcut_rollback_cleanup_failed");
+        assert!(error.message.contains("两个快捷键本次运行中可能都可用"));
+        assert_eq!(
+            *lock_unpoisoned(&operations),
+            vec![
+                "register:Ctrl+F1",
+                "unregister:F1",
+                "register:F1",
+                "unregister:Ctrl+F1"
+            ]
+        );
+    }
 
     #[test]
     fn defaults_and_persists_settings_under_the_data_root() {

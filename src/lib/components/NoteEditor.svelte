@@ -278,6 +278,42 @@
     }
   }
 
+  class MarkdownTableWidget extends WidgetType {
+    readonly markdownSource: string;
+    readonly urls: Readonly<Record<string, string>>;
+    readonly from: number;
+
+    constructor(
+      markdownSource: string,
+      urls: Readonly<Record<string, string>>,
+      from: number,
+    ) {
+      super();
+      this.markdownSource = markdownSource;
+      this.urls = urls;
+      this.from = from;
+    }
+
+    eq(other: MarkdownTableWidget): boolean {
+      return this.markdownSource === other.markdownSource && this.urls === other.urls && this.from === other.from;
+    }
+
+    toDOM(view: EditorView): HTMLElement {
+      const element = document.createElement("div");
+      element.className = "md-typora-table-widget";
+      const template = document.createElement("template");
+      template.innerHTML = renderMarkdown(this.markdownSource, { assetUrls: this.urls });
+      const table = template.content.querySelector("table");
+      if (table) {
+        element.append(table);
+      } else {
+        element.textContent = this.markdownSource;
+      }
+      element.addEventListener("mousedown", (event) => moveCursorToWidget(view, this.from, event));
+      return element;
+    }
+  }
+
   function typoraPreviewExtension(
     urls: Readonly<Record<string, string>>,
     revealActiveLines: boolean,
@@ -332,8 +368,8 @@
       syntaxTree(state).iterate({
         enter(node) {
           const parentName = node.node.parent?.name;
-          // Only five of the branches below need the node text; slicing it up
-          // front allocated a string for every node in the document instead.
+          // Only some branches below need the node text; slicing it up front
+          // allocated a string for every node in the document instead.
           let sourceCache: string | undefined;
           const readSource = (): string => (sourceCache ??= state.sliceDoc(node.from, node.to));
           const active = touchesActiveLine(node.from, node.to);
@@ -346,6 +382,18 @@
           }
 
           switch (node.name) {
+            case "Table":
+              if (!active) {
+                ranges.push(
+                  Decoration.replace({
+                    widget: new MarkdownTableWidget(readSource(), urls, node.from),
+                    block: true,
+                  }).range(node.from, node.to),
+                );
+              }
+              // A table is edited as one source block. Skipping its descendants
+              // prevents inline formatting in inactive rows from hiding syntax.
+              return false;
             case "Highlight": {
               const marks = node.node.getChildren("HighlightMark");
               if (marks.length === 2 && marks[0].to < marks[1].from) {
@@ -928,4 +976,13 @@
   :global(.md-typora-image-widget) { display: inline-block; box-sizing: border-box; width: 100%; padding: 0.35em 0; vertical-align: top; }
   :global(.md-typora-image-widget img) { display: block; max-width: min(100%, 720px); max-height: 60vh; margin: 0 auto; border-radius: 8px; object-fit: contain; }
   :global(.md-typora-image-widget .md-image-placeholder) { display: inline-flex; align-items: center; max-width: 100%; border: 1px dashed var(--note-rule, color-mix(in srgb, var(--note-fg), transparent 70%)); border-radius: 7px; padding: 0.45em 0.65em; color: var(--note-muted, rgba(37, 35, 29, 0.62)); font-size: 0.9em; }
+  :global(.md-typora-table-widget) { box-sizing: border-box; width: 100%; overflow-x: auto; padding: 0.35em 0; cursor: text; }
+  :global(.md-typora-table-widget table) { width: 100%; min-width: max-content; border-spacing: 0; border-collapse: separate; border: 1px solid var(--note-rule, color-mix(in srgb, var(--note-fg), transparent 76%)); border-radius: 6px; overflow: hidden; font-size: 0.94em; line-height: 1.45; }
+  :global(.md-typora-table-widget th), :global(.md-typora-table-widget td) { min-width: 5.5em; padding: 0.48em 0.65em; border-right: 1px solid var(--note-rule, color-mix(in srgb, var(--note-fg), transparent 82%)); border-bottom: 1px solid var(--note-rule, color-mix(in srgb, var(--note-fg), transparent 82%)); text-align: left; vertical-align: top; }
+  :global(.md-typora-table-widget th) { background: var(--note-code-bg, color-mix(in srgb, var(--note-fg), transparent 91%)); font-weight: 700; }
+  :global(.md-typora-table-widget tbody tr:nth-child(even)) { background: color-mix(in srgb, var(--note-fg), transparent 96%); }
+  :global(.md-typora-table-widget tr > :last-child) { border-right: 0; }
+  :global(.md-typora-table-widget tbody tr:last-child > td) { border-bottom: 0; }
+  :global(.md-typora-table-widget .md-align-center) { text-align: center; }
+  :global(.md-typora-table-widget .md-align-right) { text-align: right; }
 </style>

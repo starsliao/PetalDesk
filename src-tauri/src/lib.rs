@@ -20,9 +20,9 @@ use crate::storage::WorkspaceStore;
 use crate::timer::TimerStore;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tauri::menu::{Menu, MenuItem, Submenu};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
@@ -35,7 +35,9 @@ const OPEN_GANTT_MENU_ID: &str = "open-tool:gantt";
 const OPEN_SCREENSHOT_MENU_ID: &str = "open-tool:screenshot";
 const ABOUT_MENU_ID: &str = "about";
 const MAX_TRAY_NOTE_TITLE_CHARS: usize = 80;
+const ACTIVATION_FALLBACK_DELAY: Duration = Duration::from_secs(2);
 static ACTIVATION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static ACTIVATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 static INITIAL_ACTIVATION_SCHEDULED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default)]
@@ -53,6 +55,18 @@ impl Drop for ActivationInFlightGuard {
     fn drop(&mut self) {
         ACTIVATION_IN_FLIGHT.store(false, Ordering::Release);
     }
+}
+
+fn next_activation_generation(generation: &AtomicU64) -> u64 {
+    generation.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+}
+
+fn activation_fallback_is_current(
+    in_flight: &AtomicBool,
+    generation: &AtomicU64,
+    expected_generation: u64,
+) -> bool {
+    in_flight.load(Ordering::Acquire) && generation.load(Ordering::Acquire) == expected_generation
 }
 
 pub(crate) fn trace_activation(message: &str) {
@@ -209,14 +223,26 @@ fn show_first_note_or_main(app: &tauri::AppHandle) {
 // WebView must be built on a worker thread or its synchronous channel deadlocks.
 fn spawn_show_last_note_or_main(app: &tauri::AppHandle) {
     trace_activation("activation:request");
+    let generation = next_activation_generation(&ACTIVATION_GENERATION);
     if ACTIVATION_IN_FLIGHT
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
         trace_activation("activation:coalesced");
+        let app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || show_main_window(&app));
         return;
     }
     let app = app.clone();
+    let fallback_app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(ACTIVATION_FALLBACK_DELAY);
+        if activation_fallback_is_current(&ACTIVATION_IN_FLIGHT, &ACTIVATION_GENERATION, generation)
+        {
+            trace_activation("activation:fallback_main");
+            show_main_window(&fallback_app);
+        }
+    });
     tauri::async_runtime::spawn_blocking(move || {
         let _in_flight = ActivationInFlightGuard;
         trace_activation("activation:worker_start");
@@ -227,14 +253,26 @@ fn spawn_show_last_note_or_main(app: &tauri::AppHandle) {
 
 fn spawn_show_first_note_or_main(app: &tauri::AppHandle) {
     trace_activation("activation_first:request");
+    let generation = next_activation_generation(&ACTIVATION_GENERATION);
     if ACTIVATION_IN_FLIGHT
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
         trace_activation("activation_first:coalesced");
+        let app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || show_main_window(&app));
         return;
     }
     let app = app.clone();
+    let fallback_app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(ACTIVATION_FALLBACK_DELAY);
+        if activation_fallback_is_current(&ACTIVATION_IN_FLIGHT, &ACTIVATION_GENERATION, generation)
+        {
+            trace_activation("activation_first:fallback_main");
+            show_main_window(&fallback_app);
+        }
+    });
     tauri::async_runtime::spawn_blocking(move || {
         let _in_flight = ActivationInFlightGuard;
         trace_activation("activation_first:worker_start");
@@ -675,6 +713,37 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_fallback_only_runs_for_the_current_in_flight_request() {
+        let in_flight = AtomicBool::new(true);
+        let generation = AtomicU64::new(0);
+        let first = next_activation_generation(&generation);
+        assert!(activation_fallback_is_current(
+            &in_flight,
+            &generation,
+            first
+        ));
+
+        let second = next_activation_generation(&generation);
+        assert!(!activation_fallback_is_current(
+            &in_flight,
+            &generation,
+            first
+        ));
+        assert!(activation_fallback_is_current(
+            &in_flight,
+            &generation,
+            second
+        ));
+
+        in_flight.store(false, Ordering::Release);
+        assert!(!activation_fallback_is_current(
+            &in_flight,
+            &generation,
+            second
+        ));
+    }
 
     #[test]
     fn tray_note_labels_are_single_line_and_bounded() {

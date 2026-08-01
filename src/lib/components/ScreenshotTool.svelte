@@ -1389,15 +1389,13 @@
         { framePng: sourcePng },
       );
       const result = await api.exportPng({ sessionId: session.id, action }, png);
-      if (result.canceled) {
-        busy = false;
-        return;
-      }
+      if (result.canceled) return;
       if (preferenceTimer) clearTimeout(preferenceTimer);
       await api.saveToolSettings({ ...toolSettings }, colorFormat).catch(() => undefined);
       oncomplete?.(result);
     } catch (value) {
       reportError(value);
+    } finally {
       busy = false;
     }
   }
