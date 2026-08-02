@@ -688,6 +688,8 @@ pub fn run() {
             timer::save_timer_data,
             mfa::get_mfa_status,
             mfa::list_mfa_entries,
+            mfa::configure_mfa_recovery_password,
+            mfa::unlock_mfa_with_recovery_password,
             mfa::scan_mfa_screen_qr,
             mfa::preview_mfa_qr_image,
             mfa::preview_mfa_uri,

@@ -12,6 +12,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock, TryLockError};
 use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
@@ -22,6 +23,7 @@ const BACKUP_LIMIT: usize = 5;
 /// directory several times per second while typing. Keep the safety net but
 /// charge it at most once per interval per note.
 const BACKUP_MIN_INTERVAL: Duration = Duration::from_secs(180);
+const EXTERNAL_FULL_HASH_INTERVAL: Duration = Duration::from_secs(60);
 const DATA_CONFIG_SCHEMA_VERSION: u32 = 1;
 const NOTE_ORDER_SCHEMA_VERSION: u32 = 1;
 const STORAGE_POINTER_FILE: &str = "storage-path.txt";
@@ -70,10 +72,23 @@ fn note_order_schema_version() -> u32 {
 
 /// Cheap identity of `note.md` on disk. Comparing this avoids reading and
 /// hashing note bodies on every external-change poll.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
     modified: Option<SystemTime>,
     len: u64,
+}
+
+#[derive(Clone, Copy)]
+struct VerifiedFileStamp {
+    stamp: FileStamp,
+    verified_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchIndexState {
+    content_hash: String,
+    title: String,
+    updated_at: String,
 }
 
 impl FileStamp {
@@ -103,12 +118,15 @@ pub struct WorkspaceStore {
     mutation_lock: Mutex<()>,
     note_order_lock: Mutex<()>,
     /// `note.md` stamps already known to match the recorded `contentHash`.
-    external_scan_cache: Mutex<HashMap<String, FileStamp>>,
+    external_scan_cache: Mutex<HashMap<String, VerifiedFileStamp>>,
     /// Last time each note was snapshotted into `backups/`.
     backup_clock: Mutex<HashMap<String, Instant>>,
     /// Long-lived FTS connection. Reopening it per write re-ran the pragmas and
     /// the `CREATE VIRTUAL TABLE` probe every time.
     index_connection: Mutex<Option<Connection>>,
+    /// Search is derived data. Failed updates are retried before the next search
+    /// or startup sync without making an authoritative note save fail.
+    index_needs_sync: AtomicBool,
 }
 
 impl WorkspaceStore {
@@ -151,6 +169,7 @@ impl WorkspaceStore {
             external_scan_cache: Mutex::new(HashMap::new()),
             backup_clock: Mutex::new(HashMap::new()),
             index_connection: Mutex::new(None),
+            index_needs_sync: AtomicBool::new(true),
         };
         store.save_data_storage_config()?;
         store.save_storage_pointer()?;
@@ -158,7 +177,8 @@ impl WorkspaceStore {
             .startup_recovery
             .write()
             .expect("startup recovery lock poisoned") = store.recover_journals()?;
-        store.rebuild_index()?;
+        store.migrate_notes_on_startup()?;
+        store.sync_index_best_effort();
         Ok(store)
     }
 
@@ -175,6 +195,7 @@ impl WorkspaceStore {
             external_scan_cache: Mutex::new(HashMap::new()),
             backup_clock: Mutex::new(HashMap::new()),
             index_connection: Mutex::new(None),
+            index_needs_sync: AtomicBool::new(true),
         })
     }
 
@@ -257,7 +278,7 @@ impl WorkspaceStore {
 
     fn list_notes_with_order_locked(&self) -> AppResult<Vec<NoteSummary>> {
         let (notes, directory_ids) = self.scan_notes()?;
-        let ordered_ids = self.reconcile_note_order_locked(&notes, &directory_ids)?;
+        let ordered_ids = self.reconcile_note_order_locked(&notes, &directory_ids, false)?;
         Ok(notes_in_order(notes, &ordered_ids))
     }
 
@@ -265,6 +286,7 @@ impl WorkspaceStore {
         &self,
         notes: &[NoteSummary],
         active_ids: &HashSet<String>,
+        persist_changes: bool,
     ) -> AppResult<Vec<String>> {
         let path = self.note_order_path();
         let mut changed = false;
@@ -287,7 +309,9 @@ impl WorkspaceStore {
                     filtered
                 }
                 Err(_) => {
-                    preserve_corrupt_note_order(&path);
+                    if persist_changes {
+                        preserve_corrupt_note_order(&path);
+                    }
                     changed = true;
                     legacy_note_order(notes)
                 }
@@ -328,7 +352,7 @@ impl WorkspaceStore {
             ordered_ids.extend(missing);
         }
 
-        if changed {
+        if changed && persist_changes {
             self.save_note_order_locked(&ordered_ids)?;
         }
         Ok(ordered_ids)
@@ -346,7 +370,7 @@ impl WorkspaceStore {
 
     fn refresh_note_order_locked(&self) -> AppResult<Vec<String>> {
         let (notes, directory_ids) = self.scan_notes()?;
-        self.reconcile_note_order_locked(&notes, &directory_ids)
+        self.reconcile_note_order_locked(&notes, &directory_ids, true)
     }
 
     fn scan_notes(&self) -> AppResult<(Vec<NoteSummary>, HashSet<String>)> {
@@ -368,7 +392,7 @@ impl WorkspaceStore {
                 continue;
             }
             directory_ids.insert(id.clone());
-            if let Ok(snapshot) = self.read_snapshot(&id, true) {
+            if let Ok(snapshot) = self.read_snapshot(&id, false) {
                 notes.push(summary_from_snapshot(&snapshot));
             }
         }
@@ -419,9 +443,13 @@ impl WorkspaceStore {
             .expect("workspace mutation lock poisoned");
         let note_uuid = Uuid::new_v4();
         let id = note_uuid.to_string();
-        let note_dir = self.note_dir(&id)?;
-        fs::create_dir_all(note_dir.join("assets"))
-            .map_err(|error| AppError::io("创建便签目录", error))?;
+        let workspace = self.workspace_path();
+        let note_dir =
+            ensure_managed_subdirectory(&workspace, &[INTERNAL_DATA_DIR, "notes", id.as_str()])?;
+        ensure_managed_subdirectory(
+            &workspace,
+            &[INTERNAL_DATA_DIR, "notes", id.as_str(), "assets"],
+        )?;
         let now = now();
         let markdown = String::new();
         let meta = NoteMeta {
@@ -446,19 +474,22 @@ impl WorkspaceStore {
                 .expect("note order lock poisoned");
             self.refresh_note_order_locked()?;
         }
-        self.index_note(&id, &markdown, &meta)?;
+        self.index_note_best_effort(&id, &markdown, &meta);
         Ok(NoteSnapshot {
             id,
             revision: 0,
+            content_hash: meta.content_hash.clone(),
             markdown,
             meta,
         })
     }
 
     pub fn get_note(&self, id: &str) -> AppResult<NoteSnapshot> {
-        let snapshot = self.read_snapshot(id, true)?;
-        self.index_note(id, &snapshot.markdown, &snapshot.meta)?;
-        Ok(snapshot)
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .expect("workspace mutation lock poisoned");
+        self.read_snapshot(id, true)
     }
 
     pub fn commit_note(&self, request: CommitNoteRequest) -> AppResult<CommitResult> {
@@ -470,12 +501,18 @@ impl WorkspaceStore {
         validate_color_patch(request.meta_patch.color.as_deref())?;
         validate_editor_mode_patch(request.meta_patch.editor_mode.as_deref())?;
         let current = self.read_snapshot(&request.id, true)?;
-        if request.base_revision != current.revision {
+        let content_baseline_changed = request
+            .base_content_hash
+            .as_deref()
+            .is_some_and(|hash| hash != current.content_hash);
+        if request.base_revision != current.revision || content_baseline_changed {
             let conflict_path = self.write_conflict_copy(&request.id, &request.markdown)?;
             return Err(
                 AppError::new("revision_conflict", "便签已在其他位置修改").with_details(json!({
                     "expectedRevision": request.base_revision,
                     "actualRevision": current.revision,
+                    "expectedContentHash": request.base_content_hash,
+                    "actualContentHash": current.content_hash,
                     "conflictPath": conflict_path.to_string_lossy(),
                 })),
             );
@@ -500,7 +537,7 @@ impl WorkspaceStore {
         let persisted = (|| -> AppResult<(String, NoteMeta, PathBuf)> {
             self.backup_current_throttled(&current)?;
             let saved_at = now();
-            let mut meta = current.meta;
+            let mut meta = current.meta.clone();
             if let Some(title) = request.meta_patch.title {
                 meta.title = normalize_title(&title);
             }
@@ -516,12 +553,16 @@ impl WorkspaceStore {
             if let Some(read_only) = request.meta_patch.read_only {
                 meta.read_only = read_only;
             }
-            meta.revision = meta.revision.saturating_add(1);
+            meta.revision = meta
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| AppError::new("revision_overflow", "便签数据版本已达到上限"))?;
             meta.updated_at = saved_at.clone();
             meta.content_hash = content_hash(request.markdown.as_bytes());
             let journal = JournalEntry {
                 note_id: request.id.clone(),
                 base_revision: request.base_revision,
+                base_content_hash: Some(current.content_hash.clone()),
                 new_revision: meta.revision,
                 markdown: request.markdown.clone(),
                 meta: meta.clone(),
@@ -529,6 +570,16 @@ impl WorkspaceStore {
             };
             let journal_path = self.journal_path(&request.id)?;
             atomic_write_json(&journal_path, &journal)?;
+            if !self.disk_note_matches_snapshot(&request.id, &current) {
+                let conflict_path = self.write_conflict_copy(&request.id, &request.markdown)?;
+                let _ = remove_file_if_exists(&journal_path);
+                return Err(AppError::new("revision_conflict", "便签已在其他位置修改")
+                    .with_details(json!({
+                        "expectedRevision": request.base_revision,
+                        "expectedContentHash": request.base_content_hash,
+                        "conflictPath": conflict_path.to_string_lossy(),
+                    })));
+            }
             atomic_write(&note_dir.join("note.md"), request.markdown.as_bytes())?;
             atomic_write_json(&note_dir.join("meta.json"), &meta)?;
             Ok((saved_at, meta, journal_path))
@@ -546,14 +597,17 @@ impl WorkspaceStore {
                 return Err(error);
             }
         };
-        remove_file_if_exists(&journal_path)?;
-        self.index_note(&request.id, &request.markdown, &meta)?;
+        // The note and metadata are already durable. A stale journal is safe:
+        // startup recovery recognizes the committed target and retries cleanup.
+        let _ = remove_file_if_exists(&journal_path);
+        self.index_note_best_effort(&request.id, &request.markdown, &meta);
         // Our own write is by definition in sync with the hash we just stored,
         // so stamp it now instead of letting the poller re-read and re-hash it.
         self.remember_clean_note(&request.id, &note_dir.join("note.md"));
         Ok(CommitResult {
             revision: meta.revision,
             saved_at,
+            content_hash: meta.content_hash,
         })
     }
 
@@ -566,6 +620,7 @@ impl WorkspaceStore {
         if !source.is_dir() {
             return Err(AppError::not_found("便签不存在"));
         }
+        verify_direct_managed_directory(&source, "便签目录")?;
         let destination = self.trash_dir().join(id);
         if destination.exists() {
             return Err(AppError::new("trash_conflict", "回收站中已有同名便签"));
@@ -579,10 +634,7 @@ impl WorkspaceStore {
                 .expect("note order lock poisoned");
             self.refresh_note_order_locked()?;
         }
-        self.with_index(|connection| {
-            connection.execute("DELETE FROM note_search WHERE id = ?1", params![id])?;
-            Ok(())
-        })?;
+        self.remove_indexed_note_best_effort(id);
         Ok(())
     }
 
@@ -602,12 +654,14 @@ impl WorkspaceStore {
             let markdown = fs::read_to_string(entry.path().join("note.md")).unwrap_or_default();
             let meta_path = entry.path().join("meta.json");
             if let Ok(mut meta) = read_json::<NoteMeta>(&meta_path) {
-                if migrate_note_meta(&mut meta, &markdown) {
-                    atomic_write_json(&meta_path, &meta)?;
+                if validate_supported_note_schema(&meta).is_err() {
+                    continue;
                 }
+                migrate_note_meta(&mut meta, &markdown);
                 notes.push(summary_from_snapshot(&NoteSnapshot {
                     id: id.clone(),
                     revision: meta.revision,
+                    content_hash: meta.content_hash.clone(),
                     markdown,
                     meta,
                 }));
@@ -627,6 +681,12 @@ impl WorkspaceStore {
         if !source.is_dir() {
             return Err(AppError::not_found("回收站中没有该便签"));
         }
+        verify_direct_managed_directory(&source, "回收站便签目录")?;
+        let source_meta: NoteMeta = read_json(&source.join("meta.json"))?;
+        if source_meta.id != id {
+            return Err(AppError::new("invalid_data", "便签元数据 ID 不匹配"));
+        }
+        validate_supported_note_schema(&source_meta)?;
         let destination = self.note_dir(id)?;
         if destination.exists() {
             return Err(AppError::new(
@@ -643,7 +703,7 @@ impl WorkspaceStore {
                 .expect("note order lock poisoned");
             self.refresh_note_order_locked()?;
         }
-        self.index_note(id, &snapshot.markdown, &snapshot.meta)?;
+        self.index_note_best_effort(id, &snapshot.markdown, &snapshot.meta);
         Ok(snapshot)
     }
 
@@ -660,6 +720,7 @@ impl WorkspaceStore {
                     .map_err(|error| AppError::io("读取回收站条目", error))?
                     .path();
                 if path.is_dir() {
+                    verify_direct_managed_directory(&path, "回收站便签目录")?;
                     fs::remove_dir_all(&path)
                         .map_err(|error| AppError::io("清空回收站目录", error))?;
                 } else {
@@ -707,10 +768,14 @@ impl WorkspaceStore {
         if !note_dir.join("meta.json").is_file() || !note_dir.join("note.md").is_file() {
             return Err(AppError::not_found("便签不存在"));
         }
+        verify_direct_managed_directory(&note_dir, "便签目录")?;
         let asset_id = content_hash(bytes);
         let file = format!("{asset_id}.{extension}");
-        let assets_dir = note_dir.join("assets");
-        fs::create_dir_all(&assets_dir).map_err(|error| AppError::io("创建图片目录", error))?;
+        let workspace = self.workspace_path();
+        let assets_dir = ensure_managed_subdirectory(
+            &workspace,
+            &[INTERNAL_DATA_DIR, "notes", note_id, "assets"],
+        )?;
         let destination = assets_dir.join(&file);
         if !destination.exists() {
             atomic_write(&destination, bytes)?;
@@ -752,17 +817,22 @@ impl WorkspaceStore {
                 .take(limit as usize)
                 .collect());
         }
+        if self.index_needs_sync.load(Ordering::Acquire) {
+            self.sync_index_best_effort();
+        }
         let indexed_rows = match self.query_index(query, limit) {
             Ok(rows) => rows,
             Err(_) => {
+                self.reset_index_connection();
                 remove_sqlite_files(&self.index_path());
-                self.rebuild_index()?;
+                self.index_needs_sync.store(true, Ordering::Release);
+                self.sync_index()?;
                 self.query_index(query, limit)?
             }
         };
         let mut results = Vec::new();
         for (id, snippet) in indexed_rows {
-            if let Ok(snapshot) = self.read_snapshot(&id, true) {
+            if let Ok(snapshot) = self.read_snapshot(&id, false) {
                 results.push(SearchResult {
                     note: summary_from_snapshot(&snapshot),
                     snippet,
@@ -926,8 +996,8 @@ impl WorkspaceStore {
             // Fast path: an unchanged mtime/size pair means the body still
             // matches the hash we verified earlier, so skip the read entirely.
             let markdown_path = note_path.join("note.md");
-            let stamp = FileStamp::of(&markdown_path);
-            if let Some(stamp) = stamp {
+            let stamp_before = FileStamp::of(&markdown_path);
+            if let Some(stamp) = stamp_before {
                 if stamp.is_trustworthy() {
                     let cached = self
                         .external_scan_cache
@@ -935,7 +1005,10 @@ impl WorkspaceStore {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .get(&id)
                         .copied();
-                    if cached == Some(stamp) {
+                    if cached.is_some_and(|cached| {
+                        cached.stamp == stamp
+                            && cached.verified_at.elapsed() < EXTERNAL_FULL_HASH_INTERVAL
+                    }) {
                         continue;
                     }
                 }
@@ -945,6 +1018,9 @@ impl WorkspaceStore {
                 Ok(meta) => meta,
                 Err(_) => continue,
             };
+            if validate_supported_note_schema(&meta).is_err() {
+                continue;
+            }
             let markdown = match fs::read(&markdown_path) {
                 Ok(markdown) => markdown,
                 Err(_) => continue,
@@ -952,9 +1028,15 @@ impl WorkspaceStore {
             if meta.content_hash == content_hash(&markdown) {
                 // Re-stamp after reading so a write that landed mid-read is not
                 // mistaken for clean on the next poll.
-                if let Some(stamp) = FileStamp::of(&markdown_path) {
-                    if stamp.is_trustworthy() && Some(stamp) == FileStamp::of(&markdown_path) {
-                        clean.push((id, stamp));
+                if let Some(stamp_after) = FileStamp::of(&markdown_path) {
+                    if stamp_after.is_trustworthy() && Some(stamp_after) == stamp_before {
+                        clean.push((
+                            id,
+                            VerifiedFileStamp {
+                                stamp: stamp_after,
+                                verified_at: Instant::now(),
+                            },
+                        ));
                     }
                 }
                 continue;
@@ -1001,7 +1083,7 @@ impl WorkspaceStore {
                 continue;
             }
             let snapshot = self.read_snapshot(&id, true)?;
-            self.index_note(&id, &snapshot.markdown, &snapshot.meta)?;
+            self.index_note_best_effort(&id, &snapshot.markdown, &snapshot.meta);
             // `read_snapshot` rewrote `contentHash` to match the file, so the
             // current stamp is a valid clean marker for later polls.
             self.remember_clean_note(&id, &markdown_path);
@@ -1023,10 +1105,7 @@ impl WorkspaceStore {
             let mut journal = match read_json::<JournalEntry>(&path) {
                 Ok(journal) => journal,
                 Err(_) => {
-                    let destination =
-                        path.with_extension(format!("corrupt-{}.json", Uuid::new_v4()));
-                    fs::rename(&path, &destination)
-                        .map_err(|error| AppError::io("隔离损坏的恢复日志", error))?;
+                    let destination = quarantine_recovery_journal(&path);
                     recovered.push(RecoveredDraft {
                         note_id: entry.file_name().to_string_lossy().into_owned(),
                         status: "corrupt".to_string(),
@@ -1035,15 +1114,71 @@ impl WorkspaceStore {
                     continue;
                 }
             };
-            validate_note_id(&journal.note_id)?;
-            migrate_note_meta(&mut journal.meta, &journal.markdown);
+            if validate_recovery_journal(&mut journal, &path).is_err() {
+                let note_id = journal.note_id.clone();
+                let destination = quarantine_recovery_journal(&path);
+                recovered.push(RecoveredDraft {
+                    note_id,
+                    status: "corrupt".to_string(),
+                    recovered_path: Some(destination.to_string_lossy().into_owned()),
+                });
+                continue;
+            }
             let note_dir = self.note_dir(&journal.note_id)?;
-            fs::create_dir_all(note_dir.join("assets"))
-                .map_err(|error| AppError::io("创建恢复便签目录", error))?;
-            let existing_revision = read_json::<NoteMeta>(&note_dir.join("meta.json"))
-                .map(|meta| meta.revision)
-                .unwrap_or(0);
-            if existing_revision <= journal.base_revision {
+            if note_dir.exists()
+                && verify_direct_managed_directory(&note_dir, "恢复便签目录").is_err()
+            {
+                let conflict_path = match self.write_journal_conflict_copy(&journal) {
+                    Ok(conflict_path) => {
+                        let _ = remove_file_if_exists(&path);
+                        conflict_path
+                    }
+                    Err(_) => path.clone(),
+                };
+                recovered.push(RecoveredDraft {
+                    note_id: journal.note_id.clone(),
+                    status: "conflict".to_string(),
+                    recovered_path: Some(conflict_path.to_string_lossy().into_owned()),
+                });
+                continue;
+            }
+            let current_meta = read_json::<NoteMeta>(&note_dir.join("meta.json")).ok();
+            let current_markdown = fs::read(note_dir.join("note.md")).ok();
+            let baseline_matches = match (current_meta.as_ref(), current_markdown.as_deref()) {
+                (Some(meta), Some(markdown)) => {
+                    meta.revision == journal.base_revision
+                        && journal
+                            .base_content_hash
+                            .as_deref()
+                            .is_some_and(|expected| {
+                                expected.eq_ignore_ascii_case(&meta.content_hash)
+                                    && expected.eq_ignore_ascii_case(&content_hash(markdown))
+                            })
+                }
+                _ => false,
+            };
+            let body_committed_meta_pending = match (
+                current_meta.as_ref(),
+                current_markdown.as_deref(),
+                journal.base_content_hash.as_deref(),
+            ) {
+                (Some(meta), Some(markdown), Some(base_hash)) => {
+                    meta.revision == journal.base_revision
+                        && base_hash.eq_ignore_ascii_case(&meta.content_hash)
+                        && journal
+                            .meta
+                            .content_hash
+                            .eq_ignore_ascii_case(&content_hash(markdown))
+                }
+                _ => false,
+            };
+            let already_committed = current_meta.as_ref().is_some_and(|meta| {
+                meta == &journal.meta
+                    && current_markdown.as_deref().is_some_and(|markdown| {
+                        content_hash(markdown).eq_ignore_ascii_case(&journal.meta.content_hash)
+                    })
+            });
+            if baseline_matches {
                 atomic_write(&note_dir.join("note.md"), journal.markdown.as_bytes())?;
                 atomic_write_json(&note_dir.join("meta.json"), &journal.meta)?;
                 recovered.push(RecoveredDraft {
@@ -1051,14 +1186,36 @@ impl WorkspaceStore {
                     status: "restored".to_string(),
                     recovered_path: None,
                 });
-            } else {
+                let _ = remove_file_if_exists(&path);
+            } else if body_committed_meta_pending {
+                atomic_write_json(&note_dir.join("meta.json"), &journal.meta)?;
+                recovered.push(RecoveredDraft {
+                    note_id: journal.note_id.clone(),
+                    status: "restored".to_string(),
+                    recovered_path: None,
+                });
+                let _ = remove_file_if_exists(&path);
+            } else if already_committed {
                 recovered.push(RecoveredDraft {
                     note_id: journal.note_id.clone(),
                     status: "alreadyCommitted".to_string(),
                     recovered_path: None,
                 });
+                let _ = remove_file_if_exists(&path);
+            } else {
+                let conflict_path = match self.write_journal_conflict_copy(&journal) {
+                    Ok(conflict_path) => {
+                        let _ = remove_file_if_exists(&path);
+                        conflict_path
+                    }
+                    Err(_) => path.clone(),
+                };
+                recovered.push(RecoveredDraft {
+                    note_id: journal.note_id.clone(),
+                    status: "conflict".to_string(),
+                    recovered_path: Some(conflict_path.to_string_lossy().into_owned()),
+                });
             }
-            remove_file_if_exists(&path)?;
         }
         Ok(recovered)
     }
@@ -1068,33 +1225,43 @@ impl WorkspaceStore {
         if !note_dir.is_dir() {
             return Err(AppError::not_found("便签不存在"));
         }
+        if detect_external_change {
+            verify_direct_managed_directory(&note_dir, "便签目录")?;
+        }
         let markdown = fs::read_to_string(note_dir.join("note.md"))
             .map_err(|error| AppError::io("读取便签正文", error))?;
         let mut meta: NoteMeta = read_json(&note_dir.join("meta.json"))?;
         if meta.id != id {
             return Err(AppError::new("invalid_data", "便签元数据 ID 不匹配"));
         }
+        validate_supported_note_schema(&meta)?;
         validate_color_patch(Some(&meta.color))?;
-        let mut meta_changed = migrate_note_meta(&mut meta, &markdown);
+        let meta_changed = migrate_note_meta(&mut meta, &markdown);
         let actual_hash = content_hash(markdown.as_bytes());
         if detect_external_change && meta.content_hash != actual_hash {
+            let mut backup_meta = meta.clone();
+            backup_meta.content_hash = actual_hash.clone();
             self.backup_current(&NoteSnapshot {
                 id: id.to_string(),
                 revision: meta.revision,
+                content_hash: actual_hash.clone(),
                 markdown: markdown.clone(),
-                meta: meta.clone(),
+                meta: backup_meta,
             })?;
-            meta.revision = meta.revision.saturating_add(1);
+            meta.revision = meta
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| AppError::new("revision_overflow", "便签数据版本已达到上限"))?;
             meta.updated_at = now();
             meta.content_hash = actual_hash;
-            meta_changed = true;
-        }
-        if meta_changed {
+            atomic_write_json(&note_dir.join("meta.json"), &meta)?;
+        } else if detect_external_change && meta_changed {
             atomic_write_json(&note_dir.join("meta.json"), &meta)?;
         }
         Ok(NoteSnapshot {
             id: id.to_string(),
             revision: meta.revision,
+            content_hash: meta.content_hash.clone(),
             markdown,
             meta,
         })
@@ -1112,7 +1279,13 @@ impl WorkspaceStore {
         self.external_scan_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(id.to_string(), stamp);
+            .insert(
+                id.to_string(),
+                VerifiedFileStamp {
+                    stamp,
+                    verified_at: Instant::now(),
+                },
+            );
     }
 
     /// Autosave fires every couple of seconds while typing; a full snapshot per
@@ -1121,7 +1294,7 @@ impl WorkspaceStore {
     fn backup_current_throttled(&self, snapshot: &NoteSnapshot) -> AppResult<()> {
         let now = Instant::now();
         {
-            let mut clock = self
+            let clock = self
                 .backup_clock
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1130,14 +1303,21 @@ impl WorkspaceStore {
                     return Ok(());
                 }
             }
-            clock.insert(snapshot.id.clone(), now);
         }
-        self.backup_current(snapshot)
+        self.backup_current(snapshot)?;
+        self.backup_clock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(snapshot.id.clone(), now);
+        Ok(())
     }
 
     fn backup_current(&self, snapshot: &NoteSnapshot) -> AppResult<()> {
-        let backup_dir = self.backups_dir().join(&snapshot.id);
-        fs::create_dir_all(&backup_dir).map_err(|error| AppError::io("创建备份目录", error))?;
+        let workspace = self.workspace_path();
+        let backup_dir = ensure_managed_subdirectory(
+            &workspace,
+            &[INTERNAL_DATA_DIR, "backups", snapshot.id.as_str()],
+        )?;
         let prefix = format!(
             "{}-r{}",
             Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
@@ -1165,12 +1345,9 @@ impl WorkspaceStore {
     }
 
     fn write_conflict_copy(&self, id: &str, markdown: &str) -> AppResult<PathBuf> {
-        let directory = self
-            .workspace_path()
-            .join(INTERNAL_DATA_DIR)
-            .join("conflicts")
-            .join(id);
-        fs::create_dir_all(&directory).map_err(|error| AppError::io("创建冲突副本目录", error))?;
+        let workspace = self.workspace_path();
+        let directory =
+            ensure_managed_subdirectory(&workspace, &[INTERNAL_DATA_DIR, "conflicts", id])?;
         let path = directory.join(format!(
             "{}-{}.md",
             Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
@@ -1178,6 +1355,37 @@ impl WorkspaceStore {
         ));
         atomic_write(&path, markdown.as_bytes())?;
         Ok(path)
+    }
+
+    fn write_journal_conflict_copy(&self, journal: &JournalEntry) -> AppResult<PathBuf> {
+        let workspace = self.workspace_path();
+        let directory = ensure_managed_subdirectory(
+            &workspace,
+            &[INTERNAL_DATA_DIR, "conflicts", journal.note_id.as_str()],
+        )?;
+        let prefix = format!(
+            "{}-{}",
+            Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+            Uuid::new_v4()
+        );
+        let markdown_path = directory.join(format!("{prefix}.md"));
+        atomic_write(&markdown_path, journal.markdown.as_bytes())?;
+        atomic_write_json(&directory.join(format!("{prefix}.journal.json")), journal)?;
+        Ok(markdown_path)
+    }
+
+    fn disk_note_matches_snapshot(&self, id: &str, expected: &NoteSnapshot) -> bool {
+        let Ok(note_dir) = self.note_dir(id) else {
+            return false;
+        };
+        let Ok(markdown) = fs::read(note_dir.join("note.md")) else {
+            return false;
+        };
+        let Ok(meta) = read_json::<NoteMeta>(&note_dir.join("meta.json")) else {
+            return false;
+        };
+        meta == expected.meta
+            && content_hash(&markdown).eq_ignore_ascii_case(&expected.content_hash)
     }
 
     fn safe_asset_path(&self, note_id: &str, relative_path: &str) -> AppResult<PathBuf> {
@@ -1196,7 +1404,10 @@ impl WorkspaceStore {
             Component::Normal(name) => name,
             _ => unreachable!(),
         };
-        let assets_dir = self.note_dir(note_id)?.join("assets");
+        let note_dir = self.note_dir(note_id)?;
+        verify_direct_managed_directory(&note_dir, "便签目录")?;
+        let assets_dir = note_dir.join("assets");
+        verify_direct_managed_directory(&assets_dir, "便签图片目录")?;
         let path = assets_dir.join(file_name);
         if path.exists() {
             let canonical_assets = fs::canonicalize(&assets_dir)
@@ -1216,7 +1427,7 @@ impl WorkspaceStore {
     }
 
     fn save_data_storage_config(&self) -> AppResult<()> {
-        atomic_write_json(
+        atomic_write_json_if_changed(
             &data_storage_config_path(&self.workspace_path()),
             &DataStorageConfig {
                 schema_version: DATA_CONFIG_SCHEMA_VERSION,
@@ -1232,32 +1443,191 @@ impl WorkspaceStore {
         )
     }
 
-    fn rebuild_index(&self) -> AppResult<()> {
-        self.with_index(|connection| {
-            connection.execute("DELETE FROM note_search", [])?;
-            Ok(())
-        })?;
-        for note in self.list_notes()? {
-            if let Ok(snapshot) = self.read_snapshot(&note.id, true) {
-                self.index_note(&note.id, &snapshot.markdown, &snapshot.meta)?;
+    fn migrate_notes_on_startup(&self) -> AppResult<()> {
+        for (directory, reconcile_external_body) in
+            [(self.notes_dir(), true), (self.trash_dir(), false)]
+        {
+            let entries =
+                fs::read_dir(&directory).map_err(|error| AppError::io("读取便签目录", error))?;
+            for entry in entries {
+                let entry = entry.map_err(|error| AppError::io("读取便签条目", error))?;
+                if !entry
+                    .file_type()
+                    .map_err(|error| AppError::io("读取便签类型", error))?
+                    .is_dir()
+                {
+                    continue;
+                }
+                let id = entry.file_name().to_string_lossy().into_owned();
+                if validate_note_id(&id).is_err() {
+                    continue;
+                }
+                let markdown_path = entry.path().join("note.md");
+                let meta_path = entry.path().join("meta.json");
+                let markdown = match fs::read_to_string(&markdown_path) {
+                    Ok(markdown) => markdown,
+                    Err(_) => continue,
+                };
+                let mut meta = match read_json::<NoteMeta>(&meta_path) {
+                    Ok(meta) => meta,
+                    Err(_) => continue,
+                };
+                if meta.id != id {
+                    continue;
+                }
+                if validate_supported_note_schema(&meta).is_err() {
+                    continue;
+                }
+                let mut changed = migrate_note_meta(&mut meta, &markdown);
+                let actual_hash = content_hash(markdown.as_bytes());
+                if meta.content_hash.is_empty() {
+                    meta.content_hash = actual_hash;
+                    changed = true;
+                } else if reconcile_external_body && meta.content_hash != actual_hash {
+                    let Some(next_revision) = meta.revision.checked_add(1) else {
+                        continue;
+                    };
+                    meta.revision = next_revision;
+                    meta.updated_at = now();
+                    meta.content_hash = actual_hash;
+                    changed = true;
+                }
+                if changed {
+                    atomic_write_json(&meta_path, &meta)?;
+                }
             }
         }
+        let _order = self
+            .note_order_lock
+            .lock()
+            .expect("note order lock poisoned");
+        self.refresh_note_order_locked()?;
         Ok(())
+    }
+
+    fn sync_index_best_effort(&self) {
+        if self.sync_index().is_err() {
+            self.index_needs_sync.store(true, Ordering::Release);
+        }
+    }
+
+    fn sync_index(&self) -> AppResult<()> {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .expect("workspace mutation lock poisoned");
+        let mut active_ids = HashSet::new();
+        let mut snapshots = Vec::new();
+        for entry in
+            fs::read_dir(self.notes_dir()).map_err(|error| AppError::io("读取便签目录", error))?
+        {
+            let entry = entry.map_err(|error| AppError::io("读取便签条目", error))?;
+            if !entry
+                .file_type()
+                .map_err(|error| AppError::io("读取便签类型", error))?
+                .is_dir()
+            {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if validate_note_id(&id).is_err() {
+                continue;
+            }
+            active_ids.insert(id.clone());
+            if let Ok(snapshot) = self.read_snapshot(&id, false) {
+                snapshots.push(snapshot);
+            }
+        }
+
+        self.with_index(|connection| {
+            let indexed_states = {
+                let mut statement = connection.prepare_cached(
+                    "SELECT id, content_hash, title, updated_at FROM note_search_state",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        SearchIndexState {
+                            content_hash: row.get(1)?,
+                            title: row.get(2)?,
+                            updated_at: row.get(3)?,
+                        },
+                    ))
+                })?;
+                rows.collect::<Result<HashMap<_, _>, _>>()?
+            };
+            let indexed_ids = {
+                let mut statement = connection.prepare_cached("SELECT id FROM note_search")?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<HashSet<_>, _>>()?
+            };
+            let transaction = connection.transaction()?;
+            for snapshot in &snapshots {
+                let expected = SearchIndexState {
+                    content_hash: snapshot.content_hash.clone(),
+                    title: snapshot.meta.title.clone(),
+                    updated_at: snapshot.meta.updated_at.clone(),
+                };
+                if indexed_states.get(&snapshot.id) != Some(&expected)
+                    || !indexed_ids.contains(&snapshot.id)
+                {
+                    index_note_transaction(
+                        &transaction,
+                        &snapshot.id,
+                        &snapshot.markdown,
+                        &snapshot.meta,
+                    )?;
+                }
+            }
+            let known_index_ids = indexed_states
+                .keys()
+                .chain(indexed_ids.iter())
+                .collect::<HashSet<_>>();
+            for stale_id in known_index_ids
+                .into_iter()
+                .filter(|id| !active_ids.contains(*id))
+            {
+                remove_indexed_note_transaction(&transaction, stale_id)?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })?;
+        self.index_needs_sync.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn index_note_best_effort(&self, id: &str, markdown: &str, meta: &NoteMeta) {
+        if self.index_note(id, markdown, meta).is_err() {
+            self.index_needs_sync.store(true, Ordering::Release);
+        }
     }
 
     fn index_note(&self, id: &str, markdown: &str, meta: &NoteMeta) -> AppResult<()> {
         self.with_index(|connection| {
-            // One transaction instead of two autocommits halves the WAL syncs on
-            // a path that runs on every autosave.
             let transaction = connection.transaction()?;
-            transaction.execute("DELETE FROM note_search WHERE id = ?1", params![id])?;
-            transaction.execute(
-                "INSERT INTO note_search(id, title, body, updated_at) VALUES (?1, ?2, ?3, ?4)",
-                params![id, &meta.title, markdown, &meta.updated_at],
-            )?;
+            index_note_transaction(&transaction, id, markdown, meta)?;
             transaction.commit()?;
             Ok(())
         })
+    }
+
+    fn remove_indexed_note_best_effort(&self, id: &str) {
+        let result = self.with_index(|connection| {
+            let transaction = connection.transaction()?;
+            remove_indexed_note_transaction(&transaction, id)?;
+            transaction.commit()?;
+            Ok(())
+        });
+        if result.is_err() {
+            self.index_needs_sync.store(true, Ordering::Release);
+        }
+    }
+
+    fn reset_index_connection(&self) {
+        *self
+            .index_connection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     /// Serializes index access and reuses one long-lived connection. Opening a
@@ -1321,6 +1691,7 @@ impl WorkspaceStore {
             .join("journal")
     }
 
+    #[cfg(test)]
     fn backups_dir(&self) -> PathBuf {
         self.workspace_path()
             .join(INTERNAL_DATA_DIR)
@@ -1359,6 +1730,81 @@ fn resolve_workspace_configuration(
         configured
     };
     Ok((configured, stored_settings))
+}
+
+fn validate_recovery_journal(journal: &mut JournalEntry, path: &Path) -> AppResult<()> {
+    validate_note_id(&journal.note_id)?;
+    if path.file_stem().and_then(OsStr::to_str) != Some(journal.note_id.as_str()) {
+        return Err(AppError::invalid("恢复日志文件名与便签 ID 不匹配"));
+    }
+    if journal.meta.id != journal.note_id {
+        return Err(AppError::invalid("恢复日志元数据 ID 不匹配"));
+    }
+    if journal.meta.schema_version > SCHEMA_VERSION {
+        return Err(AppError::new(
+            "unsupported_schema",
+            "恢复日志使用了当前版本不支持的便签格式",
+        ));
+    }
+    migrate_note_meta(&mut journal.meta, &journal.markdown);
+    validate_color_patch(Some(&journal.meta.color))?;
+    validate_editor_mode_patch(Some(&journal.meta.editor_mode))?;
+
+    let expected_revision = journal
+        .base_revision
+        .checked_add(1)
+        .ok_or_else(|| AppError::invalid("恢复日志版本已溢出"))?;
+    if journal.new_revision != expected_revision || journal.meta.revision != journal.new_revision {
+        return Err(AppError::invalid("恢复日志版本关系无效"));
+    }
+    if !is_sha256_hex(&journal.meta.content_hash)
+        || !journal
+            .meta
+            .content_hash
+            .eq_ignore_ascii_case(&content_hash(journal.markdown.as_bytes()))
+    {
+        return Err(AppError::invalid("恢复日志正文哈希无效"));
+    }
+    if journal
+        .base_content_hash
+        .as_deref()
+        .is_some_and(|hash| !is_sha256_hex(hash))
+    {
+        return Err(AppError::invalid("恢复日志基线哈希无效"));
+    }
+    for timestamp in [
+        &journal.created_at,
+        &journal.meta.created_at,
+        &journal.meta.updated_at,
+    ] {
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .map_err(|_| AppError::invalid("恢复日志时间无效"))?;
+    }
+    Ok(())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn quarantine_recovery_journal(path: &Path) -> PathBuf {
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    let directory = parent.join("corrupt");
+    if fs::create_dir_all(&directory).is_err() {
+        return path.to_path_buf();
+    }
+    let stem = path
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or("journal");
+    let destination = directory.join(format!("{stem}-{}.json", Uuid::new_v4()));
+    if fs::rename(path, &destination).is_ok() {
+        destination
+    } else {
+        path.to_path_buf()
+    }
 }
 
 fn legacy_workspace_has_data(path: &Path) -> bool {
@@ -1423,7 +1869,11 @@ fn prepare_workspace(path: &Path) -> AppResult<PathBuf> {
             "飞花 - PetalDesk 数据存储路径必须是绝对路径",
         ));
     }
-    let internal = path.join(INTERNAL_DATA_DIR);
+    fs::create_dir_all(path)
+        .map_err(|error| AppError::io("创建飞花 - PetalDesk 数据存储目录", error))?;
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| AppError::io("解析飞花 - PetalDesk 数据存储路径", error))?;
+    let canonical = normalize_storage_path(&canonical)?;
     for directory in [
         "notes",
         "state",
@@ -1433,12 +1883,63 @@ fn prepare_workspace(path: &Path) -> AppResult<PathBuf> {
         "trash",
         "conflicts",
     ] {
-        fs::create_dir_all(internal.join(directory))
-            .map_err(|error| AppError::io("创建飞花 - PetalDesk 数据存储目录", error))?;
+        ensure_managed_subdirectory(&canonical, &[INTERNAL_DATA_DIR, directory])?;
     }
-    let canonical = fs::canonicalize(path)
+    Ok(canonical)
+}
+
+pub(crate) fn ensure_managed_subdirectory(root: &Path, segments: &[&str]) -> AppResult<PathBuf> {
+    let canonical_root = fs::canonicalize(root)
         .map_err(|error| AppError::io("解析飞花 - PetalDesk 数据存储路径", error))?;
-    normalize_storage_path(&canonical)
+    let mut current = normalize_storage_path(&canonical_root)?;
+    for segment in segments {
+        if Path::new(segment).components().count() != 1
+            || !matches!(
+                Path::new(segment).components().next(),
+                Some(Component::Normal(_))
+            )
+        {
+            return Err(AppError::invalid("飞花 - PetalDesk 数据子目录名称无效"));
+        }
+        let candidate = current.join(segment);
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&candidate)
+                    .map_err(|error| AppError::io("创建飞花 - PetalDesk 数据子目录", error))?;
+            }
+            Err(error) => return Err(AppError::io("检查飞花 - PetalDesk 数据子目录", error)),
+        }
+        current = verify_direct_managed_directory(&candidate, "飞花 - PetalDesk 数据子目录")?;
+    }
+    Ok(current)
+}
+
+fn verify_direct_managed_directory(path: &Path, description: &str) -> AppResult<PathBuf> {
+    let resolved = fs::canonicalize(path)
+        .map_err(|error| AppError::io(&format!("解析{description}"), error))?;
+    let resolved = normalize_storage_path(&resolved)?;
+    if !resolved.is_dir() {
+        return Err(AppError::invalid(format!("{description}不是目录")));
+    }
+    let expected = normalize_windows_display_path(path);
+    if !paths_equal_without_resolving(&expected, &resolved) {
+        return Err(AppError::new(
+            "path_outside_storage",
+            format!("{description}不能是指向其他位置的 junction 或符号链接"),
+        ));
+    }
+    Ok(resolved)
+}
+
+fn paths_equal_without_resolving(left: &Path, right: &Path) -> bool {
+    if cfg!(windows) {
+        left.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .eq_ignore_ascii_case(right.to_string_lossy().trim_end_matches(['\\', '/']))
+    } else {
+        left == right
+    }
 }
 
 fn normalize_storage_path(path: &Path) -> AppResult<PathBuf> {
@@ -1702,7 +2203,7 @@ fn write_storage_pointer(path: &Path, root: &Path) -> AppResult<()> {
     for unit in value.encode_utf16() {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
-    atomic_write(path, &bytes)
+    atomic_write_if_changed(path, &bytes).map(|_| ())
 }
 
 pub(crate) fn validate_note_id(id: &str) -> AppResult<()> {
@@ -1761,6 +2262,16 @@ fn normalize_title(title: &str) -> String {
     } else {
         title.chars().take(200).collect()
     }
+}
+
+fn validate_supported_note_schema(meta: &NoteMeta) -> AppResult<()> {
+    if meta.schema_version > SCHEMA_VERSION {
+        return Err(AppError::new(
+            "unsupported_schema",
+            format!("便签使用了当前版本不支持的数据格式 {}", meta.schema_version),
+        ));
+    }
+    Ok(())
 }
 
 fn migrate_note_meta(meta: &mut NoteMeta, markdown: &str) -> bool {
@@ -2033,8 +2544,42 @@ fn open_index_connection(path: &Path) -> AppResult<Connection> {
     Ok(connection)
 }
 
+fn index_note_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    id: &str,
+    markdown: &str,
+    meta: &NoteMeta,
+) -> AppResult<()> {
+    transaction.execute("DELETE FROM note_search WHERE id = ?1", params![id])?;
+    transaction.execute(
+        "INSERT INTO note_search(id, title, body, updated_at) VALUES (?1, ?2, ?3, ?4)",
+        params![id, &meta.title, markdown, &meta.updated_at],
+    )?;
+    transaction.execute(
+        "INSERT INTO note_search_state(id, content_hash, title, updated_at) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(id) DO UPDATE SET content_hash = excluded.content_hash, \
+         title = excluded.title, updated_at = excluded.updated_at",
+        params![id, &meta.content_hash, &meta.title, &meta.updated_at],
+    )?;
+    Ok(())
+}
+
+fn remove_indexed_note_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    id: &str,
+) -> AppResult<()> {
+    transaction.execute("DELETE FROM note_search WHERE id = ?1", params![id])?;
+    transaction.execute("DELETE FROM note_search_state WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
 const INDEX_SCHEMA_SQL: &str = "PRAGMA journal_mode=WAL;\
      PRAGMA synchronous=NORMAL;\
+     CREATE TABLE IF NOT EXISTS note_search_state(\
+       id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, title TEXT NOT NULL,\
+       updated_at TEXT NOT NULL\
+     );\
      CREATE VIRTUAL TABLE IF NOT EXISTS note_search USING fts5(\
        id UNINDEXED, title, body, updated_at UNINDEXED, tokenize='unicode61'\
      );";
@@ -2047,6 +2592,22 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> AppResult<T> {
 pub(crate) fn atomic_write_json<T: Serialize + ?Sized>(path: &Path, value: &T) -> AppResult<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
     atomic_write(path, &bytes)
+}
+
+fn atomic_write_json_if_changed<T: Serialize + ?Sized>(path: &Path, value: &T) -> AppResult<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    atomic_write_if_changed(path, &bytes).map(|_| ())
+}
+
+fn atomic_write_if_changed(path: &Path, bytes: &[u8]) -> AppResult<bool> {
+    match fs::read(path) {
+        Ok(current) if current == bytes => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(AppError::io("读取待更新文件", error)),
+    }
+    atomic_write(path, bytes)?;
+    Ok(true)
 }
 
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
@@ -2164,6 +2725,7 @@ mod tests {
             .commit_note(CommitNoteRequest {
                 id: note.id.clone(),
                 base_revision: note.revision,
+                base_content_hash: Some(note.content_hash.clone()),
                 markdown: note.markdown.clone(),
                 meta_patch: NoteMetaPatch {
                     pinned: Some(pinned),
@@ -2404,6 +2966,28 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn rejects_a_managed_directory_that_resolves_outside_the_storage_root() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root = TempDir::new().unwrap();
+        let workspace = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        if symlink_dir(&outside, workspace.join(INTERNAL_DATA_DIR)).is_err() {
+            // Windows without Developer Mode may forbid creating symlinks for
+            // an unprivileged test process.
+            return;
+        }
+
+        let error = prepare_workspace(&workspace).unwrap_err();
+
+        assert_eq!(error.code, "path_outside_storage");
+        assert!(!outside.join("notes").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn writing_storage_pointer_never_persists_extended_prefix() {
         let root = TempDir::new().unwrap();
         let pointer = root.path().join(STORAGE_POINTER_FILE);
@@ -2415,6 +2999,19 @@ mod tests {
         let decoded = decode_utf16_pointer(&bytes[2..], true).unwrap();
         assert_eq!(decoded, r"D:\StarsLiao\I_am\PetalDesk");
         assert!(!decoded.starts_with(r"\\?\"));
+    }
+
+    #[test]
+    fn unchanged_files_are_not_replaced() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("stable.json");
+
+        assert!(atomic_write_if_changed(&path, b"stable").unwrap());
+        let first_stamp = FileStamp::of(&path).unwrap();
+        assert!(!atomic_write_if_changed(&path, b"stable").unwrap());
+        assert_eq!(FileStamp::of(&path), Some(first_stamp));
+        assert!(atomic_write_if_changed(&path, b"changed").unwrap());
+        assert_eq!(fs::read(path).unwrap(), b"changed");
     }
 
     #[test]
@@ -2568,6 +3165,7 @@ mod tests {
             .commit_note(CommitNoteRequest {
                 id: note.id.clone(),
                 base_revision: note.revision,
+                base_content_hash: Some(note.content_hash.clone()),
                 markdown: "# 第一条\n\n正文".to_string(),
                 meta_patch: NoteMetaPatch {
                     title: Some("独立标题".to_string()),
@@ -2610,6 +3208,7 @@ mod tests {
             .commit_note(CommitNoteRequest {
                 id: first.id.clone(),
                 base_revision: first.revision,
+                base_content_hash: Some(first.content_hash.clone()),
                 markdown: "刚刚更新的正文".to_string(),
                 meta_patch: NoteMetaPatch {
                     title: Some("刚刚更新".to_string()),
@@ -2729,6 +3328,7 @@ mod tests {
             .commit_note(CommitNoteRequest {
                 id: second.id.clone(),
                 base_revision: second.revision,
+                base_content_hash: Some(second.content_hash.clone()),
                 markdown: second.markdown.clone(),
                 meta_patch: NoteMetaPatch {
                     pinned: Some(true),
@@ -2737,15 +3337,33 @@ mod tests {
             })
             .unwrap_err();
 
-        assert_eq!(error.code, "io_error");
+        assert_eq!(error.code, "invalid_input");
         assert_eq!(listed_note_ids(&store), vec![first.id, second.id.clone()]);
         let unchanged = store.get_note(&second.id).unwrap();
         assert_eq!(unchanged.revision, second.revision);
         assert!(!unchanged.meta.pinned);
+
+        fs::remove_file(&blocked_backup_path).unwrap();
+        store
+            .commit_note(CommitNoteRequest {
+                id: second.id.clone(),
+                base_revision: second.revision,
+                base_content_hash: Some(second.content_hash),
+                markdown: second.markdown,
+                meta_patch: NoteMetaPatch {
+                    pinned: Some(true),
+                    ..NoteMetaPatch::default()
+                },
+            })
+            .unwrap();
+        assert!(fs::read_dir(&blocked_backup_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.path().extension().and_then(OsStr::to_str) == Some("md")));
     }
 
     #[test]
-    fn missing_order_file_is_seeded_from_the_previous_list_order() {
+    fn missing_order_file_uses_the_previous_list_order_without_writing_on_read() {
         let (_root, store) = store();
         let first = store.create_note().unwrap();
         let second = store.create_note().unwrap();
@@ -2767,8 +3385,7 @@ mod tests {
             listed_note_ids(&store),
             vec![first.id.clone(), third.id.clone(), second.id.clone()]
         );
-        let persisted: StoredNoteOrder = read_json(&store.note_order_path()).unwrap();
-        assert_eq!(persisted.ordered_ids, vec![first.id, third.id, second.id]);
+        assert!(!store.note_order_path().exists());
     }
 
     #[test]
@@ -2791,6 +3408,7 @@ mod tests {
             .commit_note(CommitNoteRequest {
                 id: note.id.clone(),
                 base_revision: 0,
+                base_content_hash: Some(note.content_hash.clone()),
                 markdown: "current".to_string(),
                 meta_patch: NoteMetaPatch::default(),
             })
@@ -2799,6 +3417,7 @@ mod tests {
             .commit_note(CommitNoteRequest {
                 id: note.id,
                 base_revision: 0,
+                base_content_hash: None,
                 markdown: "incoming".to_string(),
                 meta_patch: NoteMetaPatch::default(),
             })
@@ -2809,6 +3428,28 @@ mod tests {
             .unwrap()
             .to_string();
         assert_eq!(fs::read_to_string(conflict).unwrap(), "incoming");
+    }
+
+    #[test]
+    fn rejects_a_stale_content_hash_even_when_the_revision_matches() {
+        let (_root, store) = store();
+        let note = store.create_note().unwrap();
+        let error = store
+            .commit_note(CommitNoteRequest {
+                id: note.id.clone(),
+                base_revision: note.revision,
+                base_content_hash: Some("stale-content-hash".to_string()),
+                markdown: "incoming".to_string(),
+                meta_patch: NoteMetaPatch::default(),
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, "revision_conflict");
+        assert_eq!(
+            error.details.as_ref().unwrap()["actualContentHash"],
+            note.content_hash
+        );
+        assert_eq!(store.get_note(&note.id).unwrap().markdown, note.markdown);
     }
 
     #[test]
@@ -2823,6 +3464,45 @@ mod tests {
         let changed = store.get_note(&note.id).unwrap();
         assert_eq!(changed.revision, 1);
         assert_eq!(changed.markdown, "external");
+        let backup_meta = fs::read_dir(store.backups_dir().join(&note.id))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(OsStr::to_str) == Some("json"))
+            .map(|path| read_json::<NoteMeta>(&path).unwrap())
+            .unwrap();
+        assert_eq!(backup_meta.content_hash, content_hash(b"external"));
+    }
+
+    #[test]
+    fn external_scan_periodically_hashes_even_when_the_file_stamp_looks_unchanged() {
+        let (_root, store) = store();
+        let note = store.create_note().unwrap();
+        store
+            .commit_note(CommitNoteRequest {
+                id: note.id.clone(),
+                base_revision: note.revision,
+                base_content_hash: Some(note.content_hash),
+                markdown: "aaaa".to_string(),
+                meta_patch: NoteMetaPatch::default(),
+            })
+            .unwrap();
+        let markdown_path = store.note_dir(&note.id).unwrap().join("note.md");
+        fs::write(&markdown_path, b"bbbb").unwrap();
+        let deceptive_stamp = FileStamp::of(&markdown_path).unwrap();
+        store.external_scan_cache.lock().unwrap().insert(
+            note.id.clone(),
+            VerifiedFileStamp {
+                stamp: deceptive_stamp,
+                verified_at: Instant::now() - EXTERNAL_FULL_HASH_INTERVAL,
+            },
+        );
+
+        let changed = store.detect_external_changes().unwrap();
+
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].markdown, "bbbb");
+        assert_eq!(changed[0].revision, 2);
     }
 
     #[test]
@@ -2863,6 +3543,7 @@ mod tests {
         let journal = JournalEntry {
             note_id: note.id.clone(),
             base_revision: 0,
+            base_content_hash: Some(note.content_hash),
             new_revision: 1,
             markdown: "recovered".to_string(),
             meta,
@@ -2877,6 +3558,137 @@ mod tests {
     }
 
     #[test]
+    fn journal_recovery_preserves_an_external_body_as_a_conflict() {
+        let (_root, store) = store();
+        let note = store.create_note().unwrap();
+        let mut meta = note.meta.clone();
+        meta.revision = 1;
+        meta.content_hash = content_hash(b"journal body");
+        let journal = JournalEntry {
+            note_id: note.id.clone(),
+            base_revision: note.revision,
+            base_content_hash: Some(note.content_hash),
+            new_revision: 1,
+            markdown: "journal body".to_string(),
+            meta,
+            created_at: now(),
+        };
+        atomic_write_json(&store.journal_path(&note.id).unwrap(), &journal).unwrap();
+        atomic_write(
+            &store.note_dir(&note.id).unwrap().join("note.md"),
+            b"external body",
+        )
+        .unwrap();
+
+        let recovered = store.recover_journals().unwrap();
+        assert_eq!(recovered[0].status, "conflict");
+        assert_eq!(
+            fs::read_to_string(store.note_dir(&note.id).unwrap().join("note.md")).unwrap(),
+            "external body"
+        );
+        assert_eq!(
+            fs::read_to_string(recovered[0].recovered_path.as_ref().unwrap()).unwrap(),
+            "journal body"
+        );
+        assert!(Path::new(recovered[0].recovered_path.as_ref().unwrap())
+            .with_extension("journal.json")
+            .is_file());
+        assert!(!store.journal_path(&note.id).unwrap().exists());
+    }
+
+    #[test]
+    fn journal_recovery_finishes_metadata_after_the_body_was_committed() {
+        let (_root, store) = store();
+        let note = store.create_note().unwrap();
+        let mut meta = note.meta.clone();
+        meta.revision = 1;
+        meta.title = "恢复后的标题".to_string();
+        meta.content_hash = content_hash(b"committed body");
+        let journal = JournalEntry {
+            note_id: note.id.clone(),
+            base_revision: note.revision,
+            base_content_hash: Some(note.content_hash),
+            new_revision: 1,
+            markdown: "committed body".to_string(),
+            meta: meta.clone(),
+            created_at: now(),
+        };
+        atomic_write_json(&store.journal_path(&note.id).unwrap(), &journal).unwrap();
+        atomic_write(
+            &store.note_dir(&note.id).unwrap().join("note.md"),
+            journal.markdown.as_bytes(),
+        )
+        .unwrap();
+
+        let recovered = store.recover_journals().unwrap();
+
+        assert_eq!(recovered[0].status, "restored");
+        let restored = store.get_note(&note.id).unwrap();
+        assert_eq!(restored.markdown, journal.markdown);
+        assert_eq!(restored.meta, meta);
+        assert!(!store.journal_path(&note.id).unwrap().exists());
+    }
+
+    #[test]
+    fn legacy_journal_without_a_baseline_hash_never_overwrites_the_note() {
+        let (_root, store) = store();
+        let note = store.create_note().unwrap();
+        let mut meta = note.meta.clone();
+        meta.revision = 1;
+        meta.content_hash = content_hash(b"legacy pending body");
+        let journal = JournalEntry {
+            note_id: note.id.clone(),
+            base_revision: note.revision,
+            base_content_hash: None,
+            new_revision: 1,
+            markdown: "legacy pending body".to_string(),
+            meta,
+            created_at: now(),
+        };
+        atomic_write_json(&store.journal_path(&note.id).unwrap(), &journal).unwrap();
+
+        let recovered = store.recover_journals().unwrap();
+
+        assert_eq!(recovered[0].status, "conflict");
+        assert_eq!(store.get_note(&note.id).unwrap().markdown, note.markdown);
+        assert_eq!(
+            fs::read_to_string(recovered[0].recovered_path.as_ref().unwrap()).unwrap(),
+            journal.markdown
+        );
+    }
+
+    #[test]
+    fn invalid_journal_semantics_are_quarantined_without_aborting_recovery() {
+        let (_root, store) = store();
+        let note = store.create_note().unwrap();
+        let path = store.journal_path(&note.id).unwrap();
+        atomic_write_json(
+            &path,
+            &json!({
+                "noteId": note.id,
+                "baseRevision": 0,
+                "baseContentHash": note.content_hash,
+                "newRevision": 9,
+                "markdown": "invalid target",
+                "meta": note.meta,
+                "createdAt": now(),
+            }),
+        )
+        .unwrap();
+
+        let recovered = store.recover_journals().unwrap();
+
+        assert_eq!(recovered[0].status, "corrupt");
+        let quarantined = PathBuf::from(recovered[0].recovered_path.as_ref().unwrap());
+        assert!(quarantined.is_file());
+        assert_eq!(
+            quarantined.parent().unwrap().file_name().unwrap(),
+            "corrupt"
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn searches_indexed_markdown() {
         let (_root, store) = store();
         let note = store.create_note().unwrap();
@@ -2884,6 +3696,7 @@ mod tests {
             .commit_note(CommitNoteRequest {
                 id: note.id,
                 base_revision: 0,
+                base_content_hash: Some(note.content_hash),
                 markdown: "# Rust 便签\nTauri 本地应用".to_string(),
                 meta_patch: NoteMetaPatch {
                     title: Some("Rust 便签".to_string()),
@@ -2894,6 +3707,126 @@ mod tests {
         let results = store.search_notes("Tauri", None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].note.title, "Rust 便签");
+    }
+
+    #[test]
+    fn index_sync_updates_only_changed_notes_and_removes_stale_rows() {
+        let (_root, store) = store();
+        let first = store.create_note().unwrap();
+        let second = store.create_note().unwrap();
+        store.sync_index().unwrap();
+        store
+            .with_index(|connection| {
+                connection.execute(
+                    "UPDATE note_search SET body = 'sentinel' WHERE id = ?1",
+                    params![&first.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let second_result = store
+            .commit_note(CommitNoteRequest {
+                id: second.id.clone(),
+                base_revision: second.revision,
+                base_content_hash: Some(second.content_hash),
+                markdown: "changed second note".to_string(),
+                meta_patch: NoteMetaPatch::default(),
+            })
+            .unwrap();
+        store.sync_index().unwrap();
+        let first_body = store
+            .with_index(|connection| {
+                Ok(connection.query_row(
+                    "SELECT body FROM note_search WHERE id = ?1",
+                    params![&first.id],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(first_body, "sentinel");
+        let second_hash = store
+            .with_index(|connection| {
+                Ok(connection.query_row(
+                    "SELECT content_hash FROM note_search_state WHERE id = ?1",
+                    params![&second.id],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(second_hash, second_result.content_hash);
+
+        fs::remove_dir_all(store.note_dir(&first.id).unwrap()).unwrap();
+        store.sync_index().unwrap();
+        let stale_count = store
+            .with_index(|connection| {
+                Ok(connection.query_row(
+                    "SELECT count(*) FROM note_search_state WHERE id = ?1",
+                    params![&first.id],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(stale_count, 0);
+    }
+
+    #[test]
+    fn ordinary_note_reads_do_not_rewrite_metadata_or_the_index() {
+        let (_root, store) = store();
+        let note = store.create_note().unwrap();
+        store.sync_index().unwrap();
+        let meta_path = store.note_dir(&note.id).unwrap().join("meta.json");
+        let meta_before = fs::read(&meta_path).unwrap();
+        store
+            .with_index(|connection| {
+                connection.execute(
+                    "UPDATE note_search SET body = 'sentinel' WHERE id = ?1",
+                    params![&note.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let _ = store.list_notes().unwrap();
+        let _ = store.get_note(&note.id).unwrap();
+
+        assert_eq!(fs::read(&meta_path).unwrap(), meta_before);
+        let indexed_body = store
+            .with_index(|connection| {
+                Ok(connection.query_row(
+                    "SELECT body FROM note_search WHERE id = ?1",
+                    params![&note.id],
+                    |row| row.get::<_, String>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(indexed_body, "sentinel");
+    }
+
+    #[test]
+    fn an_index_failure_does_not_turn_a_successful_note_save_into_an_error() {
+        let (_root, store) = store();
+        let note = store.create_note().unwrap();
+        store.reset_index_connection();
+        remove_sqlite_files(&store.index_path());
+        fs::create_dir(store.index_path()).unwrap();
+
+        let saved = store
+            .commit_note(CommitNoteRequest {
+                id: note.id.clone(),
+                base_revision: note.revision,
+                base_content_hash: Some(note.content_hash),
+                markdown: "authoritative body".to_string(),
+                meta_patch: NoteMetaPatch::default(),
+            })
+            .unwrap();
+
+        assert_eq!(saved.revision, note.revision + 1);
+        assert_eq!(
+            store.get_note(&note.id).unwrap().markdown,
+            "authoritative body"
+        );
+        assert!(store.index_needs_sync.load(Ordering::Acquire));
     }
 
     #[test]
@@ -3274,6 +4207,27 @@ mod tests {
         assert_eq!(persisted.schema_version, SCHEMA_VERSION);
         let persisted_json: serde_json::Value = read_json(&note_dir.join("meta.json")).unwrap();
         assert_eq!(persisted_json["readOnly"], false);
+    }
+
+    #[test]
+    fn newer_note_schema_is_never_downgraded_or_rewritten() {
+        let (_root, store) = store();
+        let note = store.create_note().unwrap();
+        let meta_path = store.note_dir(&note.id).unwrap().join("meta.json");
+        let mut future_meta = serde_json::to_value(&note.meta).unwrap();
+        future_meta["schemaVersion"] = json!(SCHEMA_VERSION + 1);
+        future_meta["futureField"] = json!({ "preserve": true });
+        atomic_write_json(&meta_path, &future_meta).unwrap();
+        let before = fs::read(&meta_path).unwrap();
+
+        store.migrate_notes_on_startup().unwrap();
+
+        assert_eq!(fs::read(&meta_path).unwrap(), before);
+        assert_eq!(
+            store.get_note(&note.id).unwrap_err().code,
+            "unsupported_schema"
+        );
+        assert!(store.list_notes().unwrap().is_empty());
     }
 
     #[test]

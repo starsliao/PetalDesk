@@ -8,6 +8,7 @@
     Eye,
     EyeOff,
     Image,
+    KeyRound,
     Keyboard,
     LoaderCircle,
     Pencil,
@@ -40,6 +41,7 @@
   }
 
   type AddMethod = "screen" | "uri" | "image" | "manual";
+  type RecoveryDialogMode = "setup" | "unlock" | "change";
 
   interface ContextMenuState {
     entryId: string;
@@ -74,6 +76,15 @@
   let contextMenu = $state<ContextMenuState | null>(null);
   let contextMenuElement = $state<HTMLElement | null>(null);
   let toast = $state("");
+
+  let recoveryDialogMode = $state<RecoveryDialogMode | null>(null);
+  let recoveryPassword = $state("");
+  let recoveryPasswordConfirm = $state("");
+  let recoveryError = $state("");
+  let recoveryBusy = $state(false);
+  let recoveryDialog = $state<HTMLElement | null>(null);
+  let recoveryPasswordInput = $state<HTMLInputElement | null>(null);
+  let recoveryReturnFocus: HTMLElement | null = null;
 
   let addOpen = $state(false);
   let addMethod = $state<AddMethod>("screen");
@@ -172,7 +183,8 @@
     try {
       const nextStatus = await api.getStatus();
       status = nextStatus;
-      if (!nextStatus.available) {
+      syncRecoveryDialog(nextStatus);
+      if (!nextStatus.available || nextStatus.recoveryState === "password-required") {
         entries = [];
         revealed = {};
         error = "";
@@ -248,6 +260,96 @@
 
   function focusElementAfterRender(element: HTMLElement | null): void {
     void tick().then(() => element?.isConnected && element.focus());
+  }
+
+  function clearRecoveryInputs(): void {
+    recoveryPassword = "";
+    recoveryPasswordConfirm = "";
+    recoveryError = "";
+  }
+
+  function focusRecoveryPassword(): void {
+    void tick().then(() => recoveryPasswordInput?.focus());
+  }
+
+  function syncRecoveryDialog(nextStatus: MfaStatus): void {
+    const requiredMode = nextStatus.recoveryState === "setup-required"
+      ? "setup"
+      : nextStatus.recoveryState === "password-required"
+        ? "unlock"
+        : null;
+    if (requiredMode) {
+      if (recoveryDialogMode !== requiredMode) clearRecoveryInputs();
+      recoveryDialogMode = requiredMode;
+      focusRecoveryPassword();
+      return;
+    }
+    if (recoveryDialogMode === "setup" || recoveryDialogMode === "unlock") {
+      clearRecoveryInputs();
+      recoveryDialogMode = null;
+    }
+  }
+
+  function openRecoveryPasswordChange(): void {
+    if (status?.recoveryState !== "ready" || status.protection === "browser-demo") return;
+    recoveryReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    clearRecoveryInputs();
+    recoveryDialogMode = "change";
+    focusRecoveryPassword();
+  }
+
+  function cancelRecoveryDialog(): void {
+    if (!recoveryDialogMode || recoveryBusy) return;
+    const mandatory = recoveryDialogMode !== "change";
+    clearRecoveryInputs();
+    if (mandatory) {
+      recoveryBusy = true;
+      void closeWindow().finally(() => (recoveryBusy = false));
+      return;
+    }
+    recoveryDialogMode = null;
+    focusElementAfterRender(recoveryReturnFocus);
+  }
+
+  async function submitRecoveryPassword(): Promise<void> {
+    const mode = recoveryDialogMode;
+    if (!mode || recoveryBusy) return;
+    if (recoveryPassword.length < 12) {
+      recoveryError = "恢复密码至少需要 12 个字符。";
+      focusRecoveryPassword();
+      return;
+    }
+    if (recoveryPassword.length > 256) {
+      recoveryError = "恢复密码不能超过 256 个字符。";
+      focusRecoveryPassword();
+      return;
+    }
+    if (mode !== "unlock" && recoveryPassword !== recoveryPasswordConfirm) {
+      recoveryError = "两次输入的恢复密码不一致。";
+      focusRecoveryPassword();
+      return;
+    }
+
+    recoveryBusy = true;
+    recoveryError = "";
+    try {
+      if (mode === "unlock") await api.unlockWithRecoveryPassword(recoveryPassword);
+      else await api.configureRecoveryPassword(recoveryPassword);
+      clearRecoveryInputs();
+      recoveryDialogMode = null;
+      await refreshList();
+      if (mode === "unlock") showToast("MFA 数据已在本机安全解锁");
+      else if (mode === "change") showToast("MFA 恢复密码已修改");
+      else showToast("MFA 恢复密码已设置");
+    } catch (reason) {
+      recoveryError = reasonMessage(
+        reason,
+        mode === "unlock" ? "恢复密码不正确，无法解锁 MFA 数据。" : "无法保存 MFA 恢复密码。",
+      );
+      focusRecoveryPassword();
+    } finally {
+      recoveryBusy = false;
+    }
   }
 
   function showContextMenu(entry: MfaEntrySummary, x: number, y: number, returnFocus: HTMLElement | null): void {
@@ -662,6 +764,7 @@
     }
     revealed = {};
     resetSensitiveInputs();
+    clearRecoveryInputs();
     if (!api.isDesktop()) return;
     try {
       const { getCurrentWindow } = await import("@tauri-apps/api/window");
@@ -683,6 +786,10 @@
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
     if (event.key !== "Escape") return;
+    if (recoveryDialogMode && !recoveryBusy) {
+      cancelRecoveryDialog();
+      return;
+    }
     if (contextMenu) {
       closeContextMenu(true);
       return;
@@ -752,6 +859,7 @@
       document.removeEventListener("visibilitychange", resync);
       revealed = {};
       resetSensitiveInputs();
+      clearRecoveryInputs();
       void api.lock();
     };
   });
@@ -769,6 +877,11 @@
       <input bind:value={searchText} type="search" placeholder="搜索" aria-label="搜索账户" />
     </label>
     <div class="window-actions">
+      {#if status?.recoveryState === "ready" && status.protection !== "browser-demo"}
+        <button type="button" aria-label="修改 MFA 恢复密码" title="修改恢复密码" onclick={openRecoveryPasswordChange}>
+          <KeyRound size={18} aria-hidden="true" />
+        </button>
+      {/if}
       <button type="button" class="primary-icon" aria-label="新增 MFA 账户" title="新增账户" disabled={Boolean(status && !status.available)} onclick={openAdd}>
         <Plus size={18} aria-hidden="true" />
       </button>
@@ -791,6 +904,12 @@
       <div class="info-banner">浏览器预览只显示模拟验证码；真实账户仅在 Windows 客户端加密保存。</div>
     {:else if status && status.captureExcluded === false}
       <div class="warning-banner">当前系统未能启用窗口防截屏保护，请避免在录屏或共享屏幕时显示验证码。</div>
+    {/if}
+
+    {#if status?.recoveredFromBackup}
+      <div class="info-banner" role="status">
+        {status.message || "MFA 主保险库缺失或损坏，已从最近的有效备份恢复。"}
+      </div>
     {/if}
 
     {#if loading}
@@ -903,6 +1022,94 @@
         </button>
       </div>
     {/if}
+  {/if}
+
+  {#if recoveryDialogMode}
+    {@const isUnlocking = recoveryDialogMode === "unlock"}
+    {@const isChanging = recoveryDialogMode === "change"}
+    <div class="modal-backdrop recovery-backdrop" role="presentation">
+      <div
+        bind:this={recoveryDialog}
+        class="modal recovery-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="mfa-recovery-title"
+        tabindex="-1"
+        onkeydown={(event) => trapDialogFocus(event, recoveryDialog)}
+      >
+        <form novalidate onsubmit={(event) => { event.preventDefault(); void submitRecoveryPassword(); }}>
+          <header class="modal-header">
+            <div>
+              <h2 id="mfa-recovery-title">{isUnlocking ? "使用恢复密码迁移" : isChanging ? "修改 MFA 恢复密码" : "设置 MFA 恢复密码"}</h2>
+              <p>{isUnlocking ? "验证成功后，这台电脑将恢复 Windows 免密解锁。" : "恢复密码仅用于换电脑或更换 Windows 用户。"}</p>
+            </div>
+            <button
+              type="button"
+              aria-label={isChanging ? "取消修改恢复密码" : "关闭 MFA 验证器"}
+              disabled={recoveryBusy}
+              onclick={cancelRecoveryDialog}
+            ><X size={18} aria-hidden="true" /></button>
+          </header>
+          <div class="recovery-content">
+            <div class="recovery-intro">
+              <div class="recovery-icon"><KeyRound size={24} aria-hidden="true" /></div>
+              <div class="recovery-copy">
+                <strong>{isUnlocking ? "解锁从其他电脑迁移来的 MFA 数据" : "本机使用仍然不需要输入密码"}</strong>
+                <p>
+                  {#if isUnlocking}
+                    输入原电脑设置的恢复密码。解锁后，飞花会为当前 Windows 用户建立新的本机保护。
+                  {:else}
+                    飞花日常由 Windows DPAPI 自动解锁。只有把飞花数据迁移到其他电脑或 Windows 用户时，才需要这个恢复密码。
+                  {/if}
+                </p>
+              </div>
+            </div>
+
+            <label class="field">
+              <span>恢复密码</span>
+              <input
+                bind:this={recoveryPasswordInput}
+                bind:value={recoveryPassword}
+                type="password"
+                minlength="12"
+                maxlength="256"
+                autocomplete={isUnlocking ? "current-password" : "new-password"}
+                aria-label="恢复密码"
+                required
+              />
+              {#if !isUnlocking}<small>至少 12 个字符，建议使用只有你知道的长密码。</small>{/if}
+            </label>
+
+            {#if !isUnlocking}
+              <label class="field">
+                <span>确认恢复密码</span>
+                <input
+                  bind:value={recoveryPasswordConfirm}
+                  type="password"
+                  minlength="12"
+                  maxlength="256"
+                  autocomplete="new-password"
+                  aria-label="确认恢复密码"
+                  required
+                />
+              </label>
+              <div class="recovery-warning"><AlertTriangle size={15} aria-hidden="true" /><span>飞花不会保存或找回恢复密码。遗忘后只能在仍可打开 MFA 的原电脑上重新设置。</span></div>
+            {/if}
+
+            {#if recoveryError}
+              <div class="recovery-error" role="alert"><AlertTriangle size={15} aria-hidden="true" /><span>{recoveryError}</span></div>
+            {/if}
+          </div>
+          <div class="modal-actions">
+            <button class="secondary-button" type="button" disabled={recoveryBusy} onclick={cancelRecoveryDialog}>{isChanging ? "取消" : "关闭"}</button>
+            <button class="primary-button" type="submit" disabled={recoveryBusy}>
+              {#if recoveryBusy}<LoaderCircle class="spinner" size={15} aria-hidden="true" />{:else}<KeyRound size={15} aria-hidden="true" />{/if}
+              {isUnlocking ? "解锁并迁移" : isChanging ? "保存新密码" : "设置恢复密码"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
   {/if}
 
   {#if addOpen}
@@ -1162,9 +1369,12 @@
   .entry-context-menu button.danger { color: #b42318; }
   .entry-context-menu button.danger:hover { background: #fff0ed; }
   .modal-backdrop { position: fixed; z-index: 30; inset: 0; display: grid; padding: 18px; place-items: center; background: rgb(27 24 31 / 38%); backdrop-filter: blur(2px); }
+  .recovery-backdrop { z-index: 70; }
   .modal { display: flex; width: min(640px, 100%); max-height: 100%; min-height: 0; overflow: hidden; flex-direction: column; background: #f8f8f8; border: 1px solid #c7c5c9; border-radius: 10px; box-shadow: 0 18px 54px rgb(0 0 0 / 24%); }
   .add-modal { min-height: min(520px, 100%); }
   .edit-modal { width: min(500px, 100%); }
+  .recovery-modal { width: min(510px, 100%); }
+  .recovery-modal form { display: flex; min-height: 0; flex-direction: column; }
   .edit-form { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; overflow: hidden; }
   .modal-header { display: flex; flex: 0 0 auto; min-height: 61px; padding: 11px 10px 10px 15px; align-items: center; justify-content: space-between; gap: 12px; background: #fff; border-bottom: 1px solid #dedde0; }
   .modal-header h2 { margin: 0; color: #29262d; font-size: 15px; font-weight: 650; }
@@ -1186,6 +1396,16 @@
   .field textarea { min-height: 96px; padding: 8px 9px; resize: vertical; line-height: 1.45; }
   .field input:focus, .field textarea:focus, .field select:focus, .custom-emoji input:focus { border-color: #7352b9; box-shadow: inset 0 -2px #7352b9; }
   .field small { color: #7b7580; line-height: 1.45; }
+  .recovery-content { display: grid; padding: 17px; gap: 13px; overflow: auto; }
+  .recovery-intro { display: grid; padding: 12px; grid-template-columns: 42px minmax(0, 1fr); align-items: start; gap: 11px; color: #463752; background: #f2edf8; border: 1px solid #d9cce9; border-radius: 7px; }
+  .recovery-icon { display: grid; width: 40px; height: 40px; place-items: center; color: #65439d; background: #fff; border: 1px solid #ded2eb; border-radius: 50%; }
+  .recovery-copy { display: grid; min-width: 0; gap: 4px; }
+  .recovery-copy strong { font-size: 12.5px; }
+  .recovery-copy p { margin: 0; color: #6d6375; font-size: 11px; line-height: 1.5; }
+  .recovery-warning, .recovery-error { display: flex; padding: 8px 9px; align-items: flex-start; gap: 7px; font-size: 10.5px; line-height: 1.45; border-radius: 6px; }
+  .recovery-warning { color: #76520b; background: #fff8df; border: 1px solid #ead69a; }
+  .recovery-error { color: #8c1d14; background: #fff0ed; border: 1px solid #f1c1bb; }
+  .recovery-warning :global(svg), .recovery-error :global(svg) { flex: 0 0 auto; margin-top: 1px; }
   .full-field { grid-column: 1 / -1; }
   .manual-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
   .panel-actions, .modal-actions { flex: 0 0 auto; justify-content: flex-end; gap: 8px; margin-top: 14px; }

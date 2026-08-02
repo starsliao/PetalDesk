@@ -14,11 +14,13 @@
 pnpm package:windows
 ```
 
-Version `0.3.9` adds the local MFA authenticator. It supports standard
+Version `0.4.0` adds portable MFA recovery and hardens local data migration. It supports standard
 RFC 6238 TOTP accounts, screen/image/URI/manual import, hidden-by-default codes,
-and safe clipboard cleanup. The encrypted vault is protected by the current
-Windows user's DPAPI identity and intentionally cannot be decrypted after being
-copied to a different computer or Windows user.
+and safe clipboard cleanup. The encrypted vault keeps a random data key behind
+two independent wrappers: Windows DPAPI for passwordless local use and an
+Argon2id-derived recovery-password wrapper for migration. After copying the
+complete PetalDesk data directory to another computer or Windows user, enter the
+recovery password once; the vault then creates a new local DPAPI wrapper.
 
 The package always includes and registers the Firefox Native Messaging host.
 Set `PETALDESK_CHROME_EXTENSION_ID` and/or `PETALDESK_EDGE_EXTENSION_ID` to the
@@ -43,8 +45,15 @@ When repository secrets `AMO_JWT_ISSUER` and `AMO_JWT_SECRET` are both present,
 it also requests an unlisted AMO signature and attaches the resulting signed
 XPI. The unsigned ZIP must not be presented as an installable Firefox package.
 
+The `0.4.0` installer can be installed directly over an earlier PetalDesk
+version. On first launch it migrates legacy note metadata and the previous
+Gantt JSON layout into `.petaldesk/`, preserving the note Markdown and a
+migration backup. Same-machine upgrades do not require an MFA recovery
+password; that password is only used when the encrypted data directory moves
+to a different Windows user or computer.
+
 安装包输出到 `src-tauri/target/release/bundle/nsis/`，构建目录不会提交到 Git。推送 `v*` 标签后，`.github/workflows/release.yml` 会在 Windows Runner 中重新构建，并把安装包发布到 GitHub Releases。
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.3.9>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.4.0>

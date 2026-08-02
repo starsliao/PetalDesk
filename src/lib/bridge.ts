@@ -39,6 +39,7 @@ export interface NoteListItem extends NoteMeta {
 export interface NoteSnapshot {
   id: string;
   revision: number;
+  contentHash: string;
   markdown: string;
   meta: NoteMeta;
 }
@@ -50,6 +51,7 @@ export interface TrashItem extends NoteListItem {
 export interface CommitNoteRequest {
   id: string;
   baseRevision: number;
+  baseContentHash?: string;
   markdown: string;
   metaPatch?: Partial<Pick<NoteMeta, "title" | "editorMode" | "color" | "pinned" | "readOnly">>;
 }
@@ -57,6 +59,7 @@ export interface CommitNoteRequest {
 export interface CommitResult {
   revision: number;
   savedAt: string;
+  contentHash: string;
 }
 
 export interface AssetRef {
@@ -127,6 +130,15 @@ function readBrowserDefaultEditorMode(): EditorMode {
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function browserContentHash(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `browser-${(hash >>> 0).toString(16).padStart(8, "0")}`;
 }
 
 function defaultTimerData(): TimerData {
@@ -238,6 +250,7 @@ function seedStore(): BrowserStore {
   ): NoteSnapshot => ({
     id,
     revision: 1,
+    contentHash: browserContentHash(markdown),
     markdown,
     meta: {
       id,
@@ -317,8 +330,13 @@ function readBrowserStore(): BrowserStore {
         note.meta.readOnly = false;
         changed = true;
       }
-      if (note.meta.schemaVersion !== 3) {
+      if (!Number.isInteger(note.meta.schemaVersion) || note.meta.schemaVersion < 3) {
         note.meta.schemaVersion = 3;
+        changed = true;
+      }
+      const contentHash = browserContentHash(note.markdown);
+      if (note.contentHash !== contentHash) {
+        note.contentHash = contentHash;
         changed = true;
       }
     }
@@ -374,7 +392,7 @@ export const notesApi = {
     if (isTauriRuntime()) return command<AppInfo>("get_app_info");
     return {
       workspacePath: "浏览器演示数据",
-      version: "0.3.9",
+      version: "0.4.0",
       defaultEditorMode: readBrowserDefaultEditorMode(),
       recoveredDrafts: 0,
     };
@@ -421,6 +439,7 @@ export const notesApi = {
     const note: NoteSnapshot = {
       id,
       revision: 1,
+      contentHash: browserContentHash(""),
       markdown: "",
       meta: {
         id,
@@ -467,7 +486,10 @@ export const notesApi = {
     const noteIndex = store.notes.findIndex((item) => item.id === request.id);
     const note = store.notes[noteIndex];
     if (!note) throw { code: "not_found", message: "没有找到这张便签。" } satisfies AppError;
-    if (note.revision !== request.baseRevision) {
+    if (
+      note.revision !== request.baseRevision
+      || (request.baseContentHash !== undefined && note.contentHash !== request.baseContentHash)
+    ) {
       throw { code: "conflict", message: "便签已在其他窗口中修改。" } satisfies AppError;
     }
     const metaPatch = { ...request.metaPatch };
@@ -478,6 +500,7 @@ export const notesApi = {
       metaPatch.title = metaPatch.title.trim().slice(0, 200) || "无标题便签";
     }
     note.markdown = request.markdown;
+    note.contentHash = browserContentHash(request.markdown);
     note.revision += 1;
     note.meta = { ...note.meta, ...metaPatch, updatedAt: now() };
     if (metaPatch.pinned === true && noteIndex > 0) {
@@ -485,7 +508,7 @@ export const notesApi = {
       store.notes.unshift(note);
     }
     writeBrowserStore(store);
-    return { revision: note.revision, savedAt: note.meta.updatedAt };
+    return { revision: note.revision, savedAt: note.meta.updatedAt, contentHash: note.contentHash };
   },
 
   async deleteNote(id: string): Promise<void> {

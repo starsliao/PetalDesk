@@ -50,6 +50,7 @@ fn default_schema_version() -> u32 {
 pub struct NoteSnapshot {
     pub id: String,
     pub revision: u64,
+    pub content_hash: String,
     pub markdown: String,
     pub meta: NoteMeta,
 }
@@ -85,6 +86,8 @@ pub struct NoteMetaPatch {
 pub struct CommitNoteRequest {
     pub id: String,
     pub base_revision: u64,
+    #[serde(default)]
+    pub base_content_hash: Option<String>,
     pub markdown: String,
     #[serde(default)]
     pub meta_patch: NoteMetaPatch,
@@ -95,6 +98,7 @@ pub struct CommitNoteRequest {
 pub struct CommitResult {
     pub revision: u64,
     pub saved_at: String,
+    pub content_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,6 +195,8 @@ pub fn default_editor_mode() -> String {
 pub struct JournalEntry {
     pub note_id: String,
     pub base_revision: u64,
+    #[serde(default)]
+    pub base_content_hash: Option<String>,
     pub new_revision: u64,
     pub markdown: String,
     pub meta: NoteMeta,

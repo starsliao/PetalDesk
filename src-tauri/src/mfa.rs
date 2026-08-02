@@ -1,13 +1,16 @@
-//! Local, Windows-user-bound MFA (TOTP) vault.
+//! Local MFA (TOTP) vault with passwordless Windows access and portable recovery.
 //!
 //! This module deliberately keeps the account secret out of all public
 //! serialised structures.  Only a short-lived reveal operation returns a
 //! generated code to the webview.  The on-disk vault contains an
-//! XChaCha20-Poly1305 envelope whose random key is protected by the current
-//! Windows user's DPAPI.
+//! XChaCha20-Poly1305 envelope whose random data key is wrapped both by the
+//! current Windows user's DPAPI and by an Argon2id-derived recovery key.
 
 use crate::error::{AppError, AppResult};
-use crate::storage::{atomic_write, atomic_write_json, INTERNAL_DATA_DIR};
+use crate::storage::{
+    atomic_write, atomic_write_json, ensure_managed_subdirectory, INTERNAL_DATA_DIR,
+};
+use argon2::{Algorithm as Argon2Algorithm, Argon2, Params as Argon2Params, Version};
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -17,6 +20,7 @@ use data_encoding::BASE32_NOPAD;
 use image::{ImageReader, Limits};
 use quircs::Quirc;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io::Cursor;
@@ -34,9 +38,28 @@ const MFA_DIR: &str = "mfa";
 const VAULT_FILE: &str = "vault.json";
 const SETTINGS_FILE: &str = "settings.json";
 const BACKUP_DIR: &str = "backups";
-const VAULT_SCHEMA_VERSION: u32 = 1;
+const CONFLICT_DIR: &str = "conflicts";
+const VAULT_SCHEMA_VERSION: u32 = 2;
 const SETTINGS_SCHEMA_VERSION: u32 = 1;
-const VAULT_AAD: &[u8] = b"PetalDesk MFA vault v1";
+const VAULT_AAD: &[u8] = b"PetalDesk MFA vault v2";
+const RECOVERY_KEY_AAD: &[u8] = b"PetalDesk MFA recovery key v2";
+const RECOVERY_KDF: &str = "argon2id";
+const RECOVERY_KDF_VERSION: u32 = 19;
+#[cfg(not(test))]
+const RECOVERY_KDF_MEMORY_KIB: u32 = 64 * 1024;
+#[cfg(test)]
+const RECOVERY_KDF_MEMORY_KIB: u32 = 8 * 1024;
+#[cfg(not(test))]
+const RECOVERY_KDF_ITERATIONS: u32 = 3;
+#[cfg(test)]
+const RECOVERY_KDF_ITERATIONS: u32 = 1;
+const RECOVERY_KDF_PARALLELISM: u32 = 1;
+const RECOVERY_KDF_MIN_MEMORY_KIB: u32 = 8 * 1024;
+const RECOVERY_KDF_MAX_MEMORY_KIB: u32 = 256 * 1024;
+const RECOVERY_KDF_MAX_ITERATIONS: u32 = 10;
+const RECOVERY_KDF_MAX_PARALLELISM: u32 = 4;
+const RECOVERY_PASSWORD_MIN_CHARS: usize = 12;
+const RECOVERY_PASSWORD_MAX_BYTES: usize = 1024;
 const MAX_VAULT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_VAULT_ENTRIES: usize = 10_000;
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
@@ -54,7 +77,28 @@ const CLIPBOARD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(35);
 fn generic_vault_error() -> AppError {
     AppError::new(
         "mfa_vault_unavailable",
-        "MFA 数据保险库无法解锁，请确认当前 Windows 用户未发生变化。",
+        "MFA 数据保险库损坏或暂时无法读取；不会创建空白保险库。",
+    )
+}
+
+fn recovery_password_required_error() -> AppError {
+    AppError::new(
+        "mfa_recovery_password_required",
+        "此 MFA 保险库来自另一台电脑，请输入恢复密码完成迁移。",
+    )
+}
+
+fn recovery_setup_required_error() -> AppError {
+    AppError::new(
+        "mfa_recovery_setup_required",
+        "请先设置 MFA 恢复密码，再添加或修改账户。",
+    )
+}
+
+fn invalid_recovery_password_error() -> AppError {
+    AppError::new(
+        "mfa_recovery_password_invalid",
+        "恢复密码不正确，请重新输入。",
     )
 }
 
@@ -133,10 +177,22 @@ pub struct MfaStatus {
     pub locked: bool,
     pub entry_count: usize,
     pub protection: String,
+    pub recovery_state: MfaRecoveryState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture_excluded: Option<bool>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recovered_from_backup: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MfaRecoveryState {
+    SetupRequired,
+    Ready,
+    PasswordRequired,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -219,11 +275,25 @@ impl Default for MfaSettings {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct VaultEnvelope {
     schema_version: u32,
-    wrapped_key: String,
+    dpapi_wrapped_key: String,
+    recovery_wrapped_key: RecoveryKeyEnvelope,
+    nonce: String,
+    ciphertext: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryKeyEnvelope {
+    kdf: String,
+    kdf_version: u32,
+    memory_kib: u32,
+    iterations: u32,
+    parallelism: u32,
+    salt: String,
     nonce: String,
     ciphertext: String,
 }
@@ -264,12 +334,14 @@ impl Drop for StoredEntry {
 struct UnlockedVault {
     payload: VaultPayload,
     key: Zeroizing<Vec<u8>>,
-    wrapped_key: Vec<u8>,
+    dpapi_wrapped_key: Vec<u8>,
+    recovery_wrapped_key: Option<RecoveryKeyEnvelope>,
+    disk_hash: Option<String>,
 }
 
 impl Drop for UnlockedVault {
     fn drop(&mut self) {
-        self.wrapped_key.zeroize();
+        self.dpapi_wrapped_key.zeroize();
     }
 }
 
@@ -286,13 +358,34 @@ struct ClipboardLease {
 
 struct RuntimeState {
     vault: Option<UnlockedVault>,
-    unavailable: bool,
+    recovery_state: MfaRecoveryState,
     recovered_from_backup: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalUnlockError {
+    InvalidEnvelope,
+    LocalKeyUnavailable,
+    InvalidPayload,
+}
+
+enum LocalBackupResult {
+    Found(Vec<u8>, UnlockedVault),
+    PasswordRequired,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryUnlockError {
+    InvalidEnvelope,
+    InvalidPassword,
+    InvalidPayload,
 }
 
 pub struct MfaStore {
     vault_path: PathBuf,
     backup_path: PathBuf,
+    conflict_path: PathBuf,
     runtime: Mutex<RuntimeState>,
     imports: Arc<Mutex<HashMap<String, PendingImport>>>,
     session_epoch: AtomicU64,
@@ -304,13 +397,16 @@ pub struct MfaStore {
 
 impl MfaStore {
     pub fn load(data_storage_path: &Path) -> AppResult<Self> {
-        let root = data_storage_path
-            .join(INTERNAL_DATA_DIR)
-            .join("tools")
-            .join(MFA_DIR);
-        std::fs::create_dir_all(&root).map_err(|e| AppError::io("创建 MFA 数据目录", e))?;
-        let backup_path = root.join(BACKUP_DIR);
-        std::fs::create_dir_all(&backup_path).map_err(|e| AppError::io("创建 MFA 备份目录", e))?;
+        let root =
+            ensure_managed_subdirectory(data_storage_path, &[INTERNAL_DATA_DIR, "tools", MFA_DIR])?;
+        let backup_path = ensure_managed_subdirectory(
+            data_storage_path,
+            &[INTERNAL_DATA_DIR, "tools", MFA_DIR, BACKUP_DIR],
+        )?;
+        let conflict_path = ensure_managed_subdirectory(
+            data_storage_path,
+            &[INTERNAL_DATA_DIR, "tools", MFA_DIR, CONFLICT_DIR],
+        )?;
         let settings_path = root.join(SETTINGS_FILE);
         if !settings_path.exists() {
             atomic_write_json(&settings_path, &MfaSettings::default())?;
@@ -330,10 +426,14 @@ impl MfaStore {
         // Validate only the envelope shape here. DPAPI is intentionally lazy:
         // copying the vault to another Windows user must not prevent the app
         // itself from starting.
-        let unavailable = if vault_path.exists() {
-            read_envelope(&vault_path).is_err()
+        let recovery_state = if vault_path.exists() {
+            if read_envelope(&vault_path).is_ok() {
+                MfaRecoveryState::Ready
+            } else {
+                MfaRecoveryState::Unavailable
+            }
         } else {
-            false
+            MfaRecoveryState::SetupRequired
         };
         let imports = Arc::new(Mutex::new(HashMap::new()));
         let imports_for_cleanup = Arc::downgrade(&imports);
@@ -347,9 +447,10 @@ impl MfaStore {
         Ok(Self {
             vault_path,
             backup_path,
+            conflict_path,
             runtime: Mutex::new(RuntimeState {
                 vault: None,
-                unavailable,
+                recovery_state,
                 recovered_from_backup: false,
             }),
             imports,
@@ -433,20 +534,34 @@ impl MfaStore {
             available,
             locked,
             entry_count,
-            protection: if cfg!(windows) {
-                "windows-dpapi".to_string()
-            } else {
-                "unsupported".to_string()
+            protection: match runtime.recovery_state {
+                MfaRecoveryState::SetupRequired if cfg!(windows) => "windows-dpapi".to_string(),
+                MfaRecoveryState::Ready | MfaRecoveryState::PasswordRequired if cfg!(windows) => {
+                    "windows-dpapi-recovery-password".to_string()
+                }
+                _ => "unavailable".to_string(),
             },
+            recovery_state: runtime.recovery_state,
             capture_excluded: match self.capture_excluded.load(Ordering::Acquire) {
                 1 => Some(false),
                 2 => Some(true),
                 _ => None,
             },
-            message: if available {
-                None
-            } else {
-                Some("MFA 数据当前无法解锁；不会创建空白保险库。".to_string())
+            recovered_from_backup: runtime.recovered_from_backup,
+            message: match runtime.recovery_state {
+                MfaRecoveryState::SetupRequired => {
+                    Some("请先设置恢复密码，之后即可添加 MFA 账户。".to_string())
+                }
+                MfaRecoveryState::Ready if runtime.recovered_from_backup => {
+                    Some("MFA 主保险库缺失或损坏，已从最近的有效备份恢复。".to_string())
+                }
+                MfaRecoveryState::PasswordRequired => {
+                    Some("此保险库来自另一台电脑，请输入恢复密码完成迁移。".to_string())
+                }
+                MfaRecoveryState::Unavailable => {
+                    Some("MFA 数据当前无法读取；不会创建空白保险库。".to_string())
+                }
+                MfaRecoveryState::Ready => None,
             },
         })
     }
@@ -462,6 +577,171 @@ impl MfaStore {
         self.ensure_unlocked_at(&mut runtime, epoch)?;
         let vault = runtime.vault.as_ref().ok_or_else(generic_vault_error)?;
         Ok(vault.payload.entries.iter().map(summary).collect())
+    }
+
+    #[cfg(test)]
+    fn configure_recovery_password(&self, password: &str) -> AppResult<MfaStatus> {
+        let epoch = self.require_active_epoch()?;
+        self.configure_recovery_password_at(password, epoch)
+    }
+
+    fn configure_recovery_password_at(&self, password: &str, epoch: u64) -> AppResult<MfaStatus> {
+        validate_recovery_password(password)?;
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        self.validate_epoch(epoch)?;
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        self.ensure_unlocked_at(&mut runtime, epoch)?;
+        let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
+        let previous_wrapper = vault.recovery_wrapped_key.clone();
+        vault.recovery_wrapped_key = Some(wrap_recovery_key(&vault.key, password)?);
+        if let Err(error) = self.save_vault(vault) {
+            vault.recovery_wrapped_key = previous_wrapper;
+            return Err(error);
+        }
+        let current = std::fs::read(&self.vault_path).map_err(|_| generic_vault_error())?;
+        if vault
+            .disk_hash
+            .as_deref()
+            .is_none_or(|expected| bytes_hash(&current) != expected)
+        {
+            return Err(AppError::new(
+                "mfa_vault_conflict",
+                "设置恢复密码后保险库又被外部修改，请重新打开并确认数据。",
+            ));
+        }
+        self.reset_backups_to_current(&current)?;
+        if std::fs::read(&self.vault_path)
+            .ok()
+            .is_none_or(|bytes| bytes_hash(&bytes) != bytes_hash(&current))
+        {
+            return Err(AppError::new(
+                "mfa_vault_conflict",
+                "设置恢复密码时保险库被外部修改，请重新打开并确认数据。",
+            ));
+        }
+        runtime.recovery_state = MfaRecoveryState::Ready;
+        runtime.recovered_from_backup = false;
+        drop(runtime);
+        drop(_lifecycle);
+        self.status_at(epoch)
+    }
+
+    #[cfg(test)]
+    fn unlock_with_recovery_password(&self, password: &str) -> AppResult<MfaStatus> {
+        let epoch = self.require_active_epoch()?;
+        self.unlock_with_recovery_password_at(password, epoch)
+    }
+
+    fn unlock_with_recovery_password_at(&self, password: &str, epoch: u64) -> AppResult<MfaStatus> {
+        validate_recovery_password(password)?;
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        self.validate_epoch(epoch)?;
+        let mut runtime = lock_unpoisoned(&self.runtime);
+
+        if let Some(vault) = runtime.vault.as_ref() {
+            let wrapper = vault
+                .recovery_wrapped_key
+                .as_ref()
+                .ok_or_else(recovery_setup_required_error)?;
+            let recovered =
+                unwrap_recovery_key(wrapper, password).map_err(|error| match error {
+                    RecoveryUnlockError::InvalidPassword => invalid_recovery_password_error(),
+                    RecoveryUnlockError::InvalidEnvelope | RecoveryUnlockError::InvalidPayload => {
+                        generic_vault_error()
+                    }
+                })?;
+            if recovered.as_slice() != vault.key.as_slice() {
+                return Err(invalid_recovery_password_error());
+            }
+            runtime.recovery_state = MfaRecoveryState::Ready;
+            drop(runtime);
+            drop(_lifecycle);
+            return self.status_at(epoch);
+        }
+
+        let primary = read_bounded_vault_bytes(&self.vault_path).ok();
+        let mut recovered_from_backup = false;
+        let mut preserve_primary = false;
+        let mut vault = match primary.as_deref() {
+            Some(bytes) => match decrypt_envelope_with_recovery(bytes, password) {
+                Ok(vault) => vault,
+                // A structurally valid primary rejected this password. Do not
+                // fall back to an older backup that may use a former password.
+                Err(RecoveryUnlockError::InvalidPassword) => {
+                    return Err(invalid_recovery_password_error())
+                }
+                Err(RecoveryUnlockError::InvalidEnvelope) => {
+                    preserve_primary = true;
+                    recovered_from_backup = true;
+                    self.find_valid_backup_with_recovery(password)?
+                        .ok_or_else(generic_vault_error)?
+                        .1
+                }
+                Err(RecoveryUnlockError::InvalidPayload) => {
+                    preserve_primary = true;
+                    recovered_from_backup = true;
+                    self.find_valid_backup_with_recovery(password)?
+                        .ok_or_else(generic_vault_error)?
+                        .1
+                }
+            },
+            None => {
+                recovered_from_backup = true;
+                self.find_valid_backup_with_recovery(password)?
+                    .ok_or_else(generic_vault_error)?
+                    .1
+            }
+        };
+
+        vault.dpapi_wrapped_key = protect_key(&vault.key)?;
+        let rebound = serialize_vault(&vault)?;
+        if let Some(expected) = primary.as_deref() {
+            let current = std::fs::read(&self.vault_path).map_err(|_| generic_vault_error())?;
+            if bytes_hash(&current) != bytes_hash(expected) {
+                return Err(AppError::new(
+                    "mfa_vault_conflict",
+                    "恢复过程中 MFA 保险库被外部修改，请重新打开后再试。",
+                ));
+            }
+            if preserve_primary {
+                preserve_corrupt_bytes(&self.vault_path, expected)?;
+            } else {
+                self.rotate_backup()?;
+            }
+            // Re-check after the backup/preservation work.  A copied data
+            // directory may be touched by another process while recovery is
+            // running; never publish a rebound vault over that replacement.
+            let current = std::fs::read(&self.vault_path).map_err(|_| generic_vault_error())?;
+            if bytes_hash(&current) != bytes_hash(expected) {
+                return Err(AppError::new(
+                    "mfa_vault_conflict",
+                    "恢复过程中 MFA 保险库被外部修改，请重新打开后再试。",
+                ));
+            }
+        } else if self.vault_path.exists() {
+            return Err(AppError::new(
+                "mfa_vault_conflict",
+                "恢复过程中出现了新的 MFA 保险库，请重新打开后再试。",
+            ));
+        }
+        atomic_write(&self.vault_path, &rebound)?;
+        self.reset_backups_to_current(&rebound)?;
+        if std::fs::read(&self.vault_path)
+            .ok()
+            .is_none_or(|bytes| bytes_hash(&bytes) != bytes_hash(&rebound))
+        {
+            return Err(AppError::new(
+                "mfa_vault_conflict",
+                "恢复过程中 MFA 保险库被外部修改，请重新打开后再试。",
+            ));
+        }
+        vault.disk_hash = Some(bytes_hash(&rebound));
+        runtime.vault = Some(vault);
+        runtime.recovery_state = MfaRecoveryState::Ready;
+        runtime.recovered_from_backup = recovered_from_backup;
+        drop(runtime);
+        drop(_lifecycle);
+        self.status_at(epoch)
     }
 
     pub fn set_capture_excluded(&self, excluded: bool) {
@@ -834,7 +1114,26 @@ impl MfaStore {
             return Ok(());
         }
         if !self.vault_path.exists() {
-            runtime.unavailable = false;
+            match self.find_valid_backup_local() {
+                LocalBackupResult::Found(bytes, mut vault) => {
+                    atomic_write(&self.vault_path, &bytes)?;
+                    vault.disk_hash = Some(bytes_hash(&bytes));
+                    runtime.recovery_state = MfaRecoveryState::Ready;
+                    runtime.recovered_from_backup = true;
+                    runtime.vault = Some(vault);
+                    return Ok(());
+                }
+                LocalBackupResult::PasswordRequired => {
+                    runtime.recovery_state = MfaRecoveryState::PasswordRequired;
+                    return Err(recovery_password_required_error());
+                }
+                LocalBackupResult::None if self.backup_candidates_exist() => {
+                    runtime.recovery_state = MfaRecoveryState::Unavailable;
+                    return Err(generic_vault_error());
+                }
+                LocalBackupResult::None => {}
+            }
+            runtime.recovery_state = MfaRecoveryState::SetupRequired;
             runtime.vault = Some(new_empty_vault()?);
             return Ok(());
         }
@@ -842,53 +1141,75 @@ impl MfaStore {
             .map_err(|_| generic_vault_error())?
             .len();
         if primary_len > MAX_VAULT_BYTES as u64 {
-            if let Some((bytes, vault)) = self.find_valid_backup() {
-                preserve_corrupt_path(&self.vault_path)?;
-                atomic_write(&self.vault_path, &bytes)?;
-                runtime.unavailable = false;
-                runtime.recovered_from_backup = true;
-                runtime.vault = Some(vault);
-                return Ok(());
+            match self.find_valid_backup_local() {
+                LocalBackupResult::Found(bytes, mut vault) => {
+                    preserve_corrupt_path(&self.vault_path)?;
+                    atomic_write(&self.vault_path, &bytes)?;
+                    vault.disk_hash = Some(bytes_hash(&bytes));
+                    runtime.recovery_state = MfaRecoveryState::Ready;
+                    runtime.recovered_from_backup = true;
+                    runtime.vault = Some(vault);
+                    return Ok(());
+                }
+                LocalBackupResult::PasswordRequired => {
+                    runtime.recovery_state = MfaRecoveryState::PasswordRequired;
+                    return Err(recovery_password_required_error());
+                }
+                LocalBackupResult::None => {}
             }
-            runtime.unavailable = true;
+            runtime.recovery_state = MfaRecoveryState::Unavailable;
             return Err(generic_vault_error());
         }
         let primary = std::fs::read(&self.vault_path).map_err(|_| generic_vault_error())?;
-        match decrypt_envelope(&primary) {
-            Ok(vault) => {
-                runtime.unavailable = false;
+        match decrypt_envelope_local(&primary) {
+            Ok(mut vault) => {
+                vault.disk_hash = Some(bytes_hash(&primary));
+                runtime.recovery_state = MfaRecoveryState::Ready;
                 runtime.vault = Some(vault);
                 Ok(())
             }
-            Err(_) => {
+            Err(LocalUnlockError::LocalKeyUnavailable) => {
+                runtime.recovery_state = MfaRecoveryState::PasswordRequired;
+                Err(recovery_password_required_error())
+            }
+            Err(LocalUnlockError::InvalidEnvelope | LocalUnlockError::InvalidPayload) => {
                 // Preserve the damaged primary and try encrypted backups.  A
                 // backup is accepted only after DPAPI + AEAD authentication.
-                if let Some((bytes, vault)) = self.find_valid_backup() {
-                    // Copy the damaged bytes first; never rename the only
-                    // primary away before a replacement has been durably
-                    // written. `atomic_write` leaves the destination intact
-                    // if replacement fails.
-                    preserve_corrupt_bytes(&self.vault_path, &primary)?;
-                    atomic_write(&self.vault_path, &bytes)?;
-                    runtime.unavailable = false;
-                    runtime.recovered_from_backup = true;
-                    runtime.vault = Some(vault);
-                    Ok(())
-                } else {
-                    runtime.unavailable = true;
-                    Err(generic_vault_error())
+                match self.find_valid_backup_local() {
+                    LocalBackupResult::Found(bytes, mut vault) => {
+                        // Copy the damaged bytes first; never rename the only
+                        // primary away before a replacement is durable.
+                        preserve_corrupt_bytes(&self.vault_path, &primary)?;
+                        atomic_write(&self.vault_path, &bytes)?;
+                        vault.disk_hash = Some(bytes_hash(&bytes));
+                        runtime.recovery_state = MfaRecoveryState::Ready;
+                        runtime.recovered_from_backup = true;
+                        runtime.vault = Some(vault);
+                        Ok(())
+                    }
+                    LocalBackupResult::PasswordRequired => {
+                        runtime.recovery_state = MfaRecoveryState::PasswordRequired;
+                        Err(recovery_password_required_error())
+                    }
+                    LocalBackupResult::None => {
+                        runtime.recovery_state = MfaRecoveryState::Unavailable;
+                        Err(generic_vault_error())
+                    }
                 }
             }
         }
     }
 
-    fn find_valid_backup(&self) -> Option<(Vec<u8>, UnlockedVault)> {
-        let mut files = std::fs::read_dir(&self.backup_path)
-            .ok()?
+    fn find_valid_backup_local(&self) -> LocalBackupResult {
+        let Ok(entries) = std::fs::read_dir(&self.backup_path) else {
+            return LocalBackupResult::None;
+        };
+        let mut files = entries
             .filter_map(Result::ok)
             .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
             .collect::<Vec<_>>();
         files.sort_by_key(|entry| std::cmp::Reverse(entry.file_name()));
+        let mut password_required = false;
         for file in files {
             let Ok(metadata) = file.metadata() else {
                 continue;
@@ -899,52 +1220,156 @@ impl MfaStore {
             let Ok(bytes) = std::fs::read(file.path()) else {
                 continue;
             };
-            if let Ok(vault) = decrypt_envelope(&bytes) {
-                return Some((bytes, vault));
+            match decrypt_envelope_local(&bytes) {
+                Ok(vault) => return LocalBackupResult::Found(bytes, vault),
+                Err(LocalUnlockError::LocalKeyUnavailable) => password_required = true,
+                Err(LocalUnlockError::InvalidEnvelope | LocalUnlockError::InvalidPayload) => {}
             }
         }
-        None
+        if password_required {
+            LocalBackupResult::PasswordRequired
+        } else {
+            LocalBackupResult::None
+        }
+    }
+
+    fn find_valid_backup_with_recovery(
+        &self,
+        password: &str,
+    ) -> AppResult<Option<(Vec<u8>, UnlockedVault)>> {
+        let mut files = std::fs::read_dir(&self.backup_path)
+            .map_err(|_| generic_vault_error())?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .collect::<Vec<_>>();
+        files.sort_by_key(|entry| std::cmp::Reverse(entry.file_name()));
+        for file in files {
+            let Ok(bytes) = read_bounded_vault_bytes(&file.path()) else {
+                continue;
+            };
+            if let Ok(vault) = decrypt_envelope_with_recovery(&bytes, password) {
+                return Ok(Some((bytes, vault)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn backup_candidates_exist(&self) -> bool {
+        match std::fs::read_dir(&self.backup_path) {
+            Ok(entries) => {
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        return true;
+                    };
+                    if entry.file_type().is_ok_and(|file_type| file_type.is_file())
+                        && entry.path().extension().is_some_and(|ext| ext == "json")
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+            // An unreadable backup directory cannot prove that this is a new
+            // vault. Refuse to create an empty primary until it is inspected.
+            Err(_) => true,
+        }
     }
 
     fn save_vault(&self, vault: &mut UnlockedVault) -> AppResult<()> {
-        let mut plaintext =
-            Zeroizing::new(serde_json::to_vec(&vault.payload).map_err(|_| generic_vault_error())?);
-        if plaintext.len() > MAX_VAULT_BYTES {
-            return Err(AppError::new(
-                "mfa_vault_too_large",
-                "MFA 数据保险库超过安全大小限制。",
-            ));
-        }
-        let mut nonce_bytes = [0u8; 24];
-        getrandom::fill(&mut nonce_bytes).map_err(|_| generic_vault_error())?;
-        let nonce: XNonce = nonce_bytes.into();
-        let cipher =
-            XChaCha20Poly1305::new_from_slice(&vault.key).map_err(|_| generic_vault_error())?;
-        let ciphertext = cipher
-            .encrypt(
-                &nonce,
-                Payload {
-                    msg: &plaintext,
-                    aad: VAULT_AAD,
-                },
-            )
-            .map_err(|_| generic_vault_error())?;
-        plaintext.zeroize();
-        let envelope = VaultEnvelope {
-            schema_version: VAULT_SCHEMA_VERSION,
-            wrapped_key: STANDARD_NO_PAD.encode(&vault.wrapped_key),
-            nonce: STANDARD_NO_PAD.encode(nonce_bytes),
-            ciphertext: STANDARD_NO_PAD.encode(ciphertext),
+        let bytes = serialize_vault(vault)?;
+        let disk_matches = match vault.disk_hash.as_deref() {
+            Some(expected) => std::fs::read(&self.vault_path)
+                .ok()
+                .is_some_and(|current| bytes_hash(&current) == expected),
+            None => !self.vault_path.exists(),
         };
-        let bytes = serde_json::to_vec_pretty(&envelope).map_err(|_| generic_vault_error())?;
-        if bytes.len() > MAX_VAULT_BYTES {
+        if !disk_matches {
+            let conflict = self.write_conflict(&bytes)?;
             return Err(AppError::new(
-                "mfa_vault_too_large",
-                "MFA 数据保险库超过安全大小限制。",
-            ));
+                "mfa_vault_conflict",
+                "MFA 保险库已被外部修改；本次更改已加密保存到冲突目录，未覆盖现有数据。",
+            )
+            .with_details(serde_json::json!({
+                "conflictPath": conflict.to_string_lossy(),
+            })));
         }
         self.rotate_backup()?;
-        atomic_write(&self.vault_path, &bytes)
+        let disk_still_matches = match vault.disk_hash.as_deref() {
+            Some(expected) => std::fs::read(&self.vault_path)
+                .ok()
+                .is_some_and(|current| bytes_hash(&current) == expected),
+            None => !self.vault_path.exists(),
+        };
+        if !disk_still_matches {
+            let conflict = self.write_conflict(&bytes)?;
+            return Err(AppError::new(
+                "mfa_vault_conflict",
+                "MFA 保险库已被外部修改；本次更改已加密保存到冲突目录，未覆盖现有数据。",
+            )
+            .with_details(serde_json::json!({
+                "conflictPath": conflict.to_string_lossy(),
+            })));
+        }
+        atomic_write(&self.vault_path, &bytes)?;
+        vault.disk_hash = Some(bytes_hash(&bytes));
+        Ok(())
+    }
+
+    fn reset_backups_to_current(&self, bytes: &[u8]) -> AppResult<()> {
+        let current = self.backup_path.join(format!(
+            "vault-{}-{}.json",
+            Utc::now().format("%Y%m%d%H%M%S%3f"),
+            Uuid::new_v4()
+        ));
+        atomic_write(&current, bytes)?;
+        for entry in std::fs::read_dir(&self.backup_path)
+            .map_err(|error| AppError::io("读取 MFA 备份目录", error))?
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            if path != current && path.extension().is_some_and(|ext| ext == "json") {
+                if std::fs::remove_file(&path).is_err() {
+                    // A scanner may briefly hold the old backup open. Replace
+                    // it with the newly wrapped snapshot so no retained JSON
+                    // file remains bound to a former recovery password.
+                    atomic_write(&path, bytes)?;
+                }
+            }
+        }
+        let expected_hash = bytes_hash(bytes);
+        for entry in std::fs::read_dir(&self.backup_path)
+            .map_err(|error| AppError::io("校验 MFA 备份目录", error))?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        {
+            let stored = read_bounded_vault_bytes(&entry.path())?;
+            if bytes_hash(&stored) != expected_hash {
+                return Err(AppError::new(
+                    "mfa_vault_conflict",
+                    "MFA 备份目录在更新恢复密码时被外部修改，请重新检查。",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn write_conflict(&self, bytes: &[u8]) -> AppResult<PathBuf> {
+        let conflict = self.conflict_path.join(format!(
+            "vault-{}-{}.json",
+            Utc::now().format("%Y%m%d%H%M%S%3f"),
+            Uuid::new_v4()
+        ));
+        atomic_write(&conflict, bytes)?;
+        let mut files = std::fs::read_dir(&self.conflict_path)
+            .map_err(|error| AppError::io("读取 MFA 冲突目录", error))?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .collect::<Vec<_>>();
+        files.sort_by_key(|entry| std::cmp::Reverse(entry.file_name()));
+        for old in files.into_iter().skip(10) {
+            let _ = std::fs::remove_file(old.path());
+        }
+        Ok(conflict)
     }
 
     fn rotate_backup(&self) -> AppResult<()> {
@@ -980,18 +1405,25 @@ impl MfaStore {
 fn new_empty_vault() -> AppResult<UnlockedVault> {
     let mut key = Zeroizing::new(vec![0u8; 32]);
     getrandom::fill(&mut key).map_err(|_| generic_vault_error())?;
-    let wrapped_key = protect_key(&key)?;
+    let dpapi_wrapped_key = protect_key(&key)?;
     Ok(UnlockedVault {
         payload: VaultPayload {
             schema_version: VAULT_SCHEMA_VERSION,
             entries: Vec::new(),
         },
         key,
-        wrapped_key,
+        dpapi_wrapped_key,
+        recovery_wrapped_key: None,
+        disk_hash: None,
     })
 }
 
 fn read_envelope(path: &Path) -> AppResult<VaultEnvelope> {
+    let bytes = read_bounded_vault_bytes(path)?;
+    parse_envelope(&bytes).map_err(|_| generic_vault_error())
+}
+
+fn read_bounded_vault_bytes(path: &Path) -> AppResult<Vec<u8>> {
     let length = std::fs::metadata(path)
         .map_err(|_| generic_vault_error())?
         .len();
@@ -1002,40 +1434,89 @@ fn read_envelope(path: &Path) -> AppResult<VaultEnvelope> {
     if bytes.len() > MAX_VAULT_BYTES {
         return Err(generic_vault_error());
     }
-    serde_json::from_slice(&bytes).map_err(|_| generic_vault_error())
+    Ok(bytes)
 }
 
-fn decrypt_envelope(bytes: &[u8]) -> AppResult<UnlockedVault> {
-    let envelope: VaultEnvelope =
-        serde_json::from_slice(bytes).map_err(|_| generic_vault_error())?;
-    if envelope.schema_version != VAULT_SCHEMA_VERSION {
-        return Err(generic_vault_error());
+fn parse_envelope(bytes: &[u8]) -> Result<VaultEnvelope, LocalUnlockError> {
+    if bytes.len() > MAX_VAULT_BYTES {
+        return Err(LocalUnlockError::InvalidEnvelope);
     }
+    let envelope: VaultEnvelope =
+        serde_json::from_slice(bytes).map_err(|_| LocalUnlockError::InvalidEnvelope)?;
+    if envelope.schema_version != VAULT_SCHEMA_VERSION {
+        return Err(LocalUnlockError::InvalidEnvelope);
+    }
+    validate_recovery_key_envelope(&envelope.recovery_wrapped_key)
+        .map_err(|_| LocalUnlockError::InvalidEnvelope)?;
+    Ok(envelope)
+}
+
+fn decrypt_envelope_local(bytes: &[u8]) -> Result<UnlockedVault, LocalUnlockError> {
+    let envelope = parse_envelope(bytes)?;
     let wrapped = STANDARD_NO_PAD
-        .decode(envelope.wrapped_key.as_bytes())
-        .map_err(|_| generic_vault_error())?;
+        .decode(envelope.dpapi_wrapped_key.as_bytes())
+        .map_err(|_| LocalUnlockError::InvalidEnvelope)?;
     let nonce_bytes = STANDARD_NO_PAD
         .decode(envelope.nonce.as_bytes())
-        .map_err(|_| generic_vault_error())?;
+        .map_err(|_| LocalUnlockError::InvalidEnvelope)?;
     let ciphertext = STANDARD_NO_PAD
         .decode(envelope.ciphertext.as_bytes())
-        .map_err(|_| generic_vault_error())?;
+        .map_err(|_| LocalUnlockError::InvalidEnvelope)?;
     if nonce_bytes.len() != 24
         || wrapped.is_empty()
         || wrapped.len() > 4096
         || ciphertext.is_empty()
     {
-        return Err(generic_vault_error());
+        return Err(LocalUnlockError::InvalidEnvelope);
     }
-    let key = unprotect_key(&wrapped)?;
+    let key = unprotect_key(&wrapped).map_err(|_| LocalUnlockError::LocalKeyUnavailable)?;
     if key.len() != 32 {
+        return Err(LocalUnlockError::LocalKeyUnavailable);
+    }
+    let payload = decrypt_vault_payload(&key, &nonce_bytes, &ciphertext)
+        .map_err(|_| LocalUnlockError::InvalidPayload)?;
+    Ok(UnlockedVault {
+        payload,
+        key,
+        dpapi_wrapped_key: wrapped,
+        recovery_wrapped_key: Some(envelope.recovery_wrapped_key),
+        disk_hash: Some(bytes_hash(bytes)),
+    })
+}
+
+fn decrypt_envelope_with_recovery(
+    bytes: &[u8],
+    password: &str,
+) -> Result<UnlockedVault, RecoveryUnlockError> {
+    let envelope = parse_envelope(bytes).map_err(|_| RecoveryUnlockError::InvalidEnvelope)?;
+    let key = unwrap_recovery_key(&envelope.recovery_wrapped_key, password)?;
+    let nonce_bytes = STANDARD_NO_PAD
+        .decode(envelope.nonce.as_bytes())
+        .map_err(|_| RecoveryUnlockError::InvalidEnvelope)?;
+    let ciphertext = STANDARD_NO_PAD
+        .decode(envelope.ciphertext.as_bytes())
+        .map_err(|_| RecoveryUnlockError::InvalidEnvelope)?;
+    let payload = decrypt_vault_payload(&key, &nonce_bytes, &ciphertext)
+        .map_err(|_| RecoveryUnlockError::InvalidPayload)?;
+    Ok(UnlockedVault {
+        payload,
+        key,
+        dpapi_wrapped_key: Vec::new(),
+        recovery_wrapped_key: Some(envelope.recovery_wrapped_key),
+        disk_hash: Some(bytes_hash(bytes)),
+    })
+}
+
+fn decrypt_vault_payload(
+    key: &[u8],
+    nonce_bytes: &[u8],
+    ciphertext: &[u8],
+) -> AppResult<VaultPayload> {
+    if key.len() != 32 || nonce_bytes.len() != 24 || ciphertext.is_empty() {
         return Err(generic_vault_error());
     }
-    let cipher = XChaCha20Poly1305::new_from_slice(&key).map_err(|_| generic_vault_error())?;
-    let nonce_array: [u8; 24] = nonce_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| generic_vault_error())?;
+    let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| generic_vault_error())?;
+    let nonce_array: [u8; 24] = nonce_bytes.try_into().map_err(|_| generic_vault_error())?;
     let nonce: XNonce = nonce_array.into();
     let plaintext = Zeroizing::new(
         cipher
@@ -1056,11 +1537,202 @@ fn decrypt_envelope(bytes: &[u8]) -> AppResult<UnlockedVault> {
     for entry in &payload.entries {
         validate_stored_entry(entry)?;
     }
-    Ok(UnlockedVault {
-        payload,
-        key,
-        wrapped_key: wrapped,
-    })
+    Ok(payload)
+}
+
+fn serialize_vault(vault: &UnlockedVault) -> AppResult<Vec<u8>> {
+    let recovery_wrapped_key = vault
+        .recovery_wrapped_key
+        .clone()
+        .ok_or_else(recovery_setup_required_error)?;
+    if vault.dpapi_wrapped_key.is_empty() {
+        return Err(generic_vault_error());
+    }
+    let mut plaintext =
+        Zeroizing::new(serde_json::to_vec(&vault.payload).map_err(|_| generic_vault_error())?);
+    if plaintext.len() > MAX_VAULT_BYTES {
+        return Err(AppError::new(
+            "mfa_vault_too_large",
+            "MFA 数据保险库超过安全大小限制。",
+        ));
+    }
+    let mut nonce_bytes = [0u8; 24];
+    getrandom::fill(&mut nonce_bytes).map_err(|_| generic_vault_error())?;
+    let nonce: XNonce = nonce_bytes.into();
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(&vault.key).map_err(|_| generic_vault_error())?;
+    let mut ciphertext = cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: &plaintext,
+                aad: VAULT_AAD,
+            },
+        )
+        .map_err(|_| generic_vault_error())?;
+    plaintext.zeroize();
+    let envelope = VaultEnvelope {
+        schema_version: VAULT_SCHEMA_VERSION,
+        dpapi_wrapped_key: STANDARD_NO_PAD.encode(&vault.dpapi_wrapped_key),
+        recovery_wrapped_key,
+        nonce: STANDARD_NO_PAD.encode(nonce_bytes),
+        ciphertext: STANDARD_NO_PAD.encode(&ciphertext),
+    };
+    ciphertext.zeroize();
+    let bytes = serde_json::to_vec_pretty(&envelope).map_err(|_| generic_vault_error())?;
+    if bytes.len() > MAX_VAULT_BYTES {
+        return Err(AppError::new(
+            "mfa_vault_too_large",
+            "MFA 数据保险库超过安全大小限制。",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn validate_recovery_password(password: &str) -> AppResult<()> {
+    let chars = password.chars().count();
+    if chars < RECOVERY_PASSWORD_MIN_CHARS || password.len() > RECOVERY_PASSWORD_MAX_BYTES {
+        return Err(AppError::new(
+            "mfa_recovery_password_policy",
+            format!(
+                "恢复密码至少需要 {RECOVERY_PASSWORD_MIN_CHARS} 个字符，且不能超过 {RECOVERY_PASSWORD_MAX_BYTES} 字节。"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recovery_key_envelope(wrapper: &RecoveryKeyEnvelope) -> AppResult<()> {
+    if wrapper.kdf != RECOVERY_KDF
+        || wrapper.kdf_version != RECOVERY_KDF_VERSION
+        || wrapper.memory_kib < RECOVERY_KDF_MIN_MEMORY_KIB
+        || wrapper.memory_kib > RECOVERY_KDF_MAX_MEMORY_KIB
+        || wrapper.iterations == 0
+        || wrapper.iterations > RECOVERY_KDF_MAX_ITERATIONS
+        || wrapper.parallelism == 0
+        || wrapper.parallelism > RECOVERY_KDF_MAX_PARALLELISM
+    {
+        return Err(generic_vault_error());
+    }
+    let salt = STANDARD_NO_PAD
+        .decode(wrapper.salt.as_bytes())
+        .map_err(|_| generic_vault_error())?;
+    let nonce = STANDARD_NO_PAD
+        .decode(wrapper.nonce.as_bytes())
+        .map_err(|_| generic_vault_error())?;
+    let ciphertext = STANDARD_NO_PAD
+        .decode(wrapper.ciphertext.as_bytes())
+        .map_err(|_| generic_vault_error())?;
+    if !(16..=64).contains(&salt.len()) || nonce.len() != 24 || ciphertext.len() != 48 {
+        return Err(generic_vault_error());
+    }
+    Ok(())
+}
+
+fn derive_recovery_wrapping_key(
+    password: &str,
+    salt: &[u8],
+    memory_kib: u32,
+    iterations: u32,
+    parallelism: u32,
+) -> AppResult<Zeroizing<Vec<u8>>> {
+    let params = Argon2Params::new(memory_kib, iterations, parallelism, Some(32))
+        .map_err(|_| generic_vault_error())?;
+    let argon2 = Argon2::new(Argon2Algorithm::Argon2id, Version::V0x13, params);
+    let mut output = Zeroizing::new(vec![0u8; 32]);
+    argon2
+        .hash_password_into(password.as_bytes(), salt, &mut output)
+        .map_err(|_| generic_vault_error())?;
+    Ok(output)
+}
+
+fn wrap_recovery_key(key: &[u8], password: &str) -> AppResult<RecoveryKeyEnvelope> {
+    validate_recovery_password(password)?;
+    let mut salt = [0u8; 16];
+    let mut nonce_bytes = [0u8; 24];
+    getrandom::fill(&mut salt).map_err(|_| generic_vault_error())?;
+    getrandom::fill(&mut nonce_bytes).map_err(|_| generic_vault_error())?;
+    let wrapping_key = derive_recovery_wrapping_key(
+        password,
+        &salt,
+        RECOVERY_KDF_MEMORY_KIB,
+        RECOVERY_KDF_ITERATIONS,
+        RECOVERY_KDF_PARALLELISM,
+    )?;
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(&wrapping_key).map_err(|_| generic_vault_error())?;
+    let nonce: XNonce = nonce_bytes.into();
+    let mut ciphertext = cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: key,
+                aad: RECOVERY_KEY_AAD,
+            },
+        )
+        .map_err(|_| generic_vault_error())?;
+    let wrapper = RecoveryKeyEnvelope {
+        kdf: RECOVERY_KDF.to_string(),
+        kdf_version: RECOVERY_KDF_VERSION,
+        memory_kib: RECOVERY_KDF_MEMORY_KIB,
+        iterations: RECOVERY_KDF_ITERATIONS,
+        parallelism: RECOVERY_KDF_PARALLELISM,
+        salt: STANDARD_NO_PAD.encode(salt),
+        nonce: STANDARD_NO_PAD.encode(nonce_bytes),
+        ciphertext: STANDARD_NO_PAD.encode(&ciphertext),
+    };
+    ciphertext.zeroize();
+    Ok(wrapper)
+}
+
+fn unwrap_recovery_key(
+    wrapper: &RecoveryKeyEnvelope,
+    password: &str,
+) -> Result<Zeroizing<Vec<u8>>, RecoveryUnlockError> {
+    validate_recovery_key_envelope(wrapper).map_err(|_| RecoveryUnlockError::InvalidEnvelope)?;
+    let salt = STANDARD_NO_PAD
+        .decode(wrapper.salt.as_bytes())
+        .map_err(|_| RecoveryUnlockError::InvalidEnvelope)?;
+    let nonce_bytes = STANDARD_NO_PAD
+        .decode(wrapper.nonce.as_bytes())
+        .map_err(|_| RecoveryUnlockError::InvalidEnvelope)?;
+    let ciphertext = STANDARD_NO_PAD
+        .decode(wrapper.ciphertext.as_bytes())
+        .map_err(|_| RecoveryUnlockError::InvalidEnvelope)?;
+    let wrapping_key = derive_recovery_wrapping_key(
+        password,
+        &salt,
+        wrapper.memory_kib,
+        wrapper.iterations,
+        wrapper.parallelism,
+    )
+    .map_err(|_| RecoveryUnlockError::InvalidEnvelope)?;
+    let cipher = XChaCha20Poly1305::new_from_slice(&wrapping_key)
+        .map_err(|_| RecoveryUnlockError::InvalidEnvelope)?;
+    let nonce_array: [u8; 24] = nonce_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| RecoveryUnlockError::InvalidEnvelope)?;
+    let nonce: XNonce = nonce_array.into();
+    let key = Zeroizing::new(
+        cipher
+            .decrypt(
+                &nonce,
+                Payload {
+                    msg: &ciphertext,
+                    aad: RECOVERY_KEY_AAD,
+                },
+            )
+            .map_err(|_| RecoveryUnlockError::InvalidPassword)?,
+    );
+    if key.len() != 32 {
+        return Err(RecoveryUnlockError::InvalidEnvelope);
+    }
+    Ok(key)
+}
+
+fn bytes_hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn validate_stored_entry(entry: &StoredEntry) -> AppResult<()> {
@@ -2045,6 +2717,38 @@ pub async fn list_mfa_entries(
 }
 
 #[tauri::command]
+pub async fn configure_mfa_recovery_password(
+    app: AppHandle,
+    window: WebviewWindow,
+    password: SensitiveText,
+) -> AppResult<MfaStatus> {
+    ensure_mfa_window(&window)?;
+    let epoch = app.state::<MfaStore>().require_active_epoch()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<MfaStore>()
+            .configure_recovery_password_at(password.as_str(), epoch)
+    })
+    .await
+    .map_err(|_| AppError::new("mfa_task_error", "设置 MFA 恢复密码任务异常结束。"))?
+}
+
+#[tauri::command]
+pub async fn unlock_mfa_with_recovery_password(
+    app: AppHandle,
+    window: WebviewWindow,
+    password: SensitiveText,
+) -> AppResult<MfaStatus> {
+    ensure_mfa_window(&window)?;
+    let epoch = app.state::<MfaStore>().require_active_epoch()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<MfaStore>()
+            .unlock_with_recovery_password_at(password.as_str(), epoch)
+    })
+    .await
+    .map_err(|_| AppError::new("mfa_task_error", "恢复 MFA 保险库任务异常结束。"))?
+}
+
+#[tauri::command]
 pub fn preview_mfa_uri(
     store: State<'_, MfaStore>,
     window: WebviewWindow,
@@ -2234,6 +2938,7 @@ mod tests {
 
     // RFC 6238 Appendix B public test vectors; these are not user credentials.
     const RFC_SECRET: &str = "12345678901234567890";
+    const RECOVERY_PASSWORD: &str = "petaldesk-test-recovery-password";
 
     #[test]
     fn rfc_sha1_vectors() {
@@ -2367,6 +3072,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = MfaStore::load(root.path()).unwrap();
         store.activate();
+        store
+            .configure_recovery_password(RECOVERY_PASSWORD)
+            .unwrap();
         (root, store)
     }
 
@@ -2390,6 +3098,238 @@ mod tests {
         assert_eq!(recovered.as_slice(), key.as_slice());
         key.zeroize();
         recovered.zeroize();
+    }
+
+    #[test]
+    fn recovery_password_policy_and_kdf_bounds_are_enforced() {
+        assert_eq!(
+            validate_recovery_password("short-pass").unwrap_err().code,
+            "mfa_recovery_password_policy"
+        );
+        assert!(validate_recovery_password("123456789012").is_ok());
+        assert_eq!(
+            validate_recovery_password(&"x".repeat(RECOVERY_PASSWORD_MAX_BYTES + 1))
+                .unwrap_err()
+                .code,
+            "mfa_recovery_password_policy"
+        );
+
+        let key = [7u8; 32];
+        let wrapper = wrap_recovery_key(&key, RECOVERY_PASSWORD).unwrap();
+        assert_eq!(
+            unwrap_recovery_key(&wrapper, RECOVERY_PASSWORD)
+                .unwrap()
+                .as_slice(),
+            key
+        );
+        let mut hostile = wrapper.clone();
+        hostile.memory_kib = RECOVERY_KDF_MAX_MEMORY_KIB + 1;
+        assert_eq!(
+            unwrap_recovery_key(&hostile, RECOVERY_PASSWORD).unwrap_err(),
+            RecoveryUnlockError::InvalidEnvelope
+        );
+        hostile = wrapper;
+        hostile.iterations = RECOVERY_KDF_MAX_ITERATIONS + 1;
+        assert_eq!(
+            unwrap_recovery_key(&hostile, RECOVERY_PASSWORD).unwrap_err(),
+            RecoveryUnlockError::InvalidEnvelope
+        );
+        hostile = wrap_recovery_key(&key, RECOVERY_PASSWORD).unwrap();
+        hostile.memory_kib = RECOVERY_KDF_MIN_MEMORY_KIB - 1;
+        assert_eq!(
+            unwrap_recovery_key(&hostile, RECOVERY_PASSWORD).unwrap_err(),
+            RecoveryUnlockError::InvalidEnvelope
+        );
+        hostile = wrap_recovery_key(&key, RECOVERY_PASSWORD).unwrap();
+        hostile.parallelism = RECOVERY_KDF_MAX_PARALLELISM + 1;
+        assert_eq!(
+            unwrap_recovery_key(&hostile, RECOVERY_PASSWORD).unwrap_err(),
+            RecoveryUnlockError::InvalidEnvelope
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_new_vault_requires_recovery_setup_before_first_write() {
+        let root = tempfile::tempdir().unwrap();
+        let store = MfaStore::load(root.path()).unwrap();
+        store.activate();
+        let status = store.status().unwrap();
+        assert!(status.available);
+        assert_eq!(status.recovery_state, MfaRecoveryState::SetupRequired);
+
+        let preview = store
+            .preview_uri("otpauth://totp/PetalDesk%3Asetup?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=PetalDesk")
+            .unwrap()
+            .remove(0);
+        let error = store.commit_import(&preview.session_id, "🌸").unwrap_err();
+        assert_eq!(error.code, "mfa_recovery_setup_required");
+        assert!(!store.vault_path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recovery_password_rebinds_a_copied_vault_to_local_dpapi() {
+        let (root, store) = test_store();
+        let added = import_public_rfc_entry(&store, "portable");
+        let original = std::fs::read(&store.vault_path).unwrap();
+        let mut envelope: VaultEnvelope = serde_json::from_slice(&original).unwrap();
+        envelope.dpapi_wrapped_key = STANDARD_NO_PAD.encode([0xA5; 64]);
+        let copied = serde_json::to_vec_pretty(&envelope).unwrap();
+        atomic_write(&store.vault_path, &copied).unwrap();
+        drop(store);
+
+        let reopened = MfaStore::load(root.path()).unwrap();
+        reopened.activate();
+        let status = reopened.status().unwrap();
+        assert!(!status.available);
+        assert_eq!(status.recovery_state, MfaRecoveryState::PasswordRequired);
+
+        let before_wrong_password = std::fs::read(&reopened.vault_path).unwrap();
+        let error = reopened
+            .unlock_with_recovery_password("definitely-wrong-password")
+            .unwrap_err();
+        assert_eq!(error.code, "mfa_recovery_password_invalid");
+        assert_eq!(
+            std::fs::read(&reopened.vault_path).unwrap(),
+            before_wrong_password
+        );
+
+        let status = reopened
+            .unlock_with_recovery_password(RECOVERY_PASSWORD)
+            .unwrap();
+        assert!(status.available);
+        assert_eq!(status.recovery_state, MfaRecoveryState::Ready);
+        assert_eq!(reopened.list_entries().unwrap()[0].id, added.id);
+        let rebound = std::fs::read(&reopened.vault_path).unwrap();
+        assert_ne!(rebound, copied);
+        assert!(decrypt_envelope_local(&rebound).is_ok());
+        drop(reopened);
+
+        let local_reopen = MfaStore::load(root.path()).unwrap();
+        local_reopen.activate();
+        assert_eq!(local_reopen.list_entries().unwrap()[0].id, added.id);
+        assert!(std::fs::read_dir(&local_reopen.backup_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| decrypt_envelope_local(&std::fs::read(entry.path()).unwrap()).is_ok()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn changing_password_rewraps_primary_and_all_retained_backups() {
+        const NEW_PASSWORD: &str = "petaldesk-new-recovery-password";
+        let (_root, store) = test_store();
+        import_public_rfc_entry(&store, "password-change");
+        store.configure_recovery_password(NEW_PASSWORD).unwrap();
+
+        let current = std::fs::read(&store.vault_path).unwrap();
+        assert!(matches!(
+            decrypt_envelope_with_recovery(&current, RECOVERY_PASSWORD),
+            Err(RecoveryUnlockError::InvalidPassword)
+        ));
+        assert!(decrypt_envelope_with_recovery(&current, NEW_PASSWORD).is_ok());
+        let backups = std::fs::read_dir(&store.backup_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| std::fs::read(entry.path()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert!(backups
+            .iter()
+            .all(|bytes| decrypt_envelope_with_recovery(bytes, NEW_PASSWORD).is_ok()));
+        assert!(backups.iter().all(|bytes| matches!(
+            decrypt_envelope_with_recovery(bytes, RECOVERY_PASSWORD),
+            Err(RecoveryUnlockError::InvalidPassword)
+        )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn valid_recovery_key_can_restore_a_payload_from_backup() {
+        let (root, store) = test_store();
+        let entry = import_public_rfc_entry(&store, "recovery-backup");
+        store
+            .update_entry(MfaEntryUpdateRequest {
+                id: entry.id.clone(),
+                name: "backup-snapshot".to_string(),
+                issuer: "PetalDesk".to_string(),
+                account_name: "recovery-backup".to_string(),
+                icon_emoji: "🌸".to_string(),
+            })
+            .unwrap();
+
+        let bytes = std::fs::read(&store.vault_path).unwrap();
+        let mut envelope: VaultEnvelope = serde_json::from_slice(&bytes).unwrap();
+        envelope.dpapi_wrapped_key = STANDARD_NO_PAD.encode([0x5A; 64]);
+        let mut ciphertext = STANDARD_NO_PAD
+            .decode(envelope.ciphertext.as_bytes())
+            .unwrap();
+        *ciphertext.last_mut().unwrap() ^= 0x80;
+        envelope.ciphertext = STANDARD_NO_PAD.encode(ciphertext);
+        atomic_write(
+            &store.vault_path,
+            &serde_json::to_vec_pretty(&envelope).unwrap(),
+        )
+        .unwrap();
+        drop(store);
+
+        let reopened = MfaStore::load(root.path()).unwrap();
+        reopened.activate();
+        assert_eq!(
+            reopened.status().unwrap().recovery_state,
+            MfaRecoveryState::PasswordRequired
+        );
+        let status = reopened
+            .unlock_with_recovery_password(RECOVERY_PASSWORD)
+            .unwrap();
+        assert!(status.recovered_from_backup);
+        let entries = reopened.list_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, entry.id);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn structurally_corrupt_primary_can_be_recovered_from_portable_backup() {
+        let (root, store) = test_store();
+        let entry = import_public_rfc_entry(&store, "structure-backup");
+        store
+            .update_entry(MfaEntryUpdateRequest {
+                id: entry.id.clone(),
+                name: "portable-backup".to_string(),
+                issuer: "PetalDesk".to_string(),
+                account_name: "structure-backup".to_string(),
+                icon_emoji: "🌸".to_string(),
+            })
+            .unwrap();
+        for backup in std::fs::read_dir(&store.backup_path)
+            .unwrap()
+            .filter_map(Result::ok)
+        {
+            let bytes = std::fs::read(backup.path()).unwrap();
+            let mut envelope: VaultEnvelope = serde_json::from_slice(&bytes).unwrap();
+            envelope.dpapi_wrapped_key = STANDARD_NO_PAD.encode([0x33; 64]);
+            atomic_write(
+                &backup.path(),
+                &serde_json::to_vec_pretty(&envelope).unwrap(),
+            )
+            .unwrap();
+        }
+        atomic_write(&store.vault_path, b"not-a-vault").unwrap();
+        drop(store);
+
+        let reopened = MfaStore::load(root.path()).unwrap();
+        reopened.activate();
+        assert_eq!(
+            reopened.status().unwrap().recovery_state,
+            MfaRecoveryState::PasswordRequired
+        );
+        let status = reopened
+            .unlock_with_recovery_password(RECOVERY_PASSWORD)
+            .unwrap();
+        assert!(status.recovered_from_backup);
+        assert_eq!(reopened.list_entries().unwrap()[0].id, entry.id);
     }
 
     #[cfg(windows)]
@@ -2460,7 +3400,7 @@ mod tests {
             .filter_map(Result::ok)
             .count();
         assert_eq!(backup_count, 5);
-        atomic_write(&store.vault_path, b"{\"schemaVersion\":1}").unwrap();
+        atomic_write(&store.vault_path, b"{\"schemaVersion\":2}").unwrap();
         drop(store);
 
         let reopened = MfaStore::load(root.path()).unwrap();
@@ -2468,7 +3408,7 @@ mod tests {
         let entries = reopened.list_entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entries[0].name.starts_with("backup-name-"));
-        assert!(decrypt_envelope(&std::fs::read(&reopened.vault_path).unwrap()).is_ok());
+        assert!(decrypt_envelope_local(&std::fs::read(&reopened.vault_path).unwrap()).is_ok());
         let preserved = std::fs::read_dir(reopened.vault_path.parent().unwrap())
             .unwrap()
             .filter_map(Result::ok)
@@ -2479,6 +3419,51 @@ mod tests {
                     .contains("vault.json.corrupt-")
             });
         assert!(preserved);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_primary_recovers_an_authenticated_backup() {
+        let (root, store) = test_store();
+        let entry = import_public_rfc_entry(&store, "missing-primary");
+        store
+            .update_entry(MfaEntryUpdateRequest {
+                id: entry.id,
+                name: "creates-backup".to_string(),
+                issuer: "PetalDesk".to_string(),
+                account_name: "missing-primary".to_string(),
+                icon_emoji: "🌸".to_string(),
+            })
+            .unwrap();
+        std::fs::remove_file(&store.vault_path).unwrap();
+        drop(store);
+
+        let reopened = MfaStore::load(root.path()).unwrap();
+        reopened.activate();
+        assert_eq!(reopened.list_entries().unwrap().len(), 1);
+        assert!(reopened.vault_path.exists());
+        assert!(reopened.status().unwrap().recovered_from_backup);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_primary_with_only_invalid_backups_never_creates_an_empty_vault() {
+        let root = tempfile::tempdir().unwrap();
+        let store = MfaStore::load(root.path()).unwrap();
+        atomic_write(
+            &store.backup_path.join("vault-invalid.json"),
+            b"not a vault",
+        )
+        .unwrap();
+        drop(store);
+
+        let reopened = MfaStore::load(root.path()).unwrap();
+        reopened.activate();
+        let status = reopened.status().unwrap();
+
+        assert!(!status.available);
+        assert!(reopened.list_entries().is_err());
+        assert!(!reopened.vault_path.exists());
     }
 
     #[cfg(windows)]
@@ -2507,6 +3492,39 @@ mod tests {
         let after_delete = store.list_entries().unwrap();
         assert_eq!(after_delete.len(), 1);
         assert_eq!(after_delete[0].id, entry.id);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn external_vault_replacement_is_not_overwritten() {
+        let (_root, store) = test_store();
+        let entry = import_public_rfc_entry(&store, "external-conflict");
+        let external = std::fs::read(&store.vault_path).unwrap();
+        atomic_write(&store.vault_path, b"externally-replaced-vault").unwrap();
+
+        let error = store
+            .update_entry(MfaEntryUpdateRequest {
+                id: entry.id,
+                name: "must-not-overwrite".to_string(),
+                issuer: "PetalDesk".to_string(),
+                account_name: "external-conflict".to_string(),
+                icon_emoji: "🔐".to_string(),
+            })
+            .unwrap_err();
+
+        assert_eq!(error.code, "mfa_vault_conflict");
+        assert_eq!(
+            std::fs::read(&store.vault_path).unwrap(),
+            b"externally-replaced-vault"
+        );
+        let conflicts = std::fs::read_dir(&store.conflict_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        assert_eq!(conflicts.len(), 1);
+        let conflict_bytes = std::fs::read(conflicts[0].path()).unwrap();
+        assert_ne!(conflict_bytes, external);
+        assert!(decrypt_envelope_local(&conflict_bytes).is_ok());
     }
 
     #[cfg(windows)]

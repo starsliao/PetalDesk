@@ -1,6 +1,6 @@
 [package]
 name = "petaldesk"
-version = "0.3.9"
+version = "0.4.0"
 description = "飞花 - PetalDesk local Markdown notes and desktop tools"
 authors = ["飞花 - PetalDesk contributors"]
 edition = "2021"
@@ -38,6 +38,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
+argon2 = "0.5.3"
 chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 data-encoding = "2.9"
 dirs = "6"

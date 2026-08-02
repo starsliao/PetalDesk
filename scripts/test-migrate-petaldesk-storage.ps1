@@ -94,6 +94,17 @@ function Assert-StorageStructure {
     }
 }
 
+# The production migration script must refuse to run while PetalDesk is open.
+# This test uses only its private temporary sandbox, so shadow the process probe
+# in this PowerShell scope instead of adding a bypass switch to production code.
+function Get-Process {
+    [CmdletBinding()]
+    param(
+        [string[]]$Name
+    )
+    return @()
+}
+
 New-Item -ItemType Directory -Path $sandbox -Force | Out-Null
 try {
     # 场景一：旧布局在原目录升级，并把根 notes 移动到带时间戳的保留备份。
@@ -165,7 +176,7 @@ try {
     Assert-True -Condition (Test-Path -LiteralPath (Join-Path $inPlaceRoot `
                 ".petaldesk\tools\reminders.json") -PathType Leaf) -Message "reminders.json 已迁移"
     Assert-True -Condition (Test-Path -LiteralPath (Join-Path $inPlaceRoot `
-                ".petaldesk\tools\gantt.json") -PathType Leaf) -Message "gantt.json 已迁移"
+                ".petaldesk\tools\gantt\gantt.json") -PathType Leaf) -Message "gantt.json 已迁移"
     Assert-StorageStructure -Root $inPlaceRoot
     Assert-Pointer -Path (Join-Path $inPlaceLocal "storage-path.txt") -ExpectedRoot $inPlaceRoot
     Assert-True -Condition (Test-Path -LiteralPath $inPlaceReport.archivedLegacyLocalAppDataPath `
@@ -451,7 +462,161 @@ try {
             -Message "跨目录迁移备份包含 $name"
     }
 
-    # 场景六：目标内容不同时必须报告冲突，不覆盖文件，也不更新路径指针。
+    # 场景六：原地已有新甘特图时，以新嵌套路径为真相，不被旧副本误判冲突。
+    $ganttCurrentRoot = Join-Path $sandbox "gantt-current\source"
+    $ganttCurrentLocal = Join-Path $sandbox "gantt-current\local\PetalDesk"
+    $ganttCurrentPath = Join-Path $ganttCurrentRoot ".petaldesk\tools\gantt\gantt.json"
+    $ganttCurrentFlatPath = Join-Path $ganttCurrentRoot ".petaldesk\tools\gantt.json"
+    Write-Utf8Json -Path $ganttCurrentPath -Value ([ordered]@{
+            schemaVersion = 2; documentId = "current"; revision = 8; tasks = @()
+        })
+    Write-Utf8Json -Path $ganttCurrentFlatPath -Value @(
+        [ordered]@{ id = "stale-flat"; name = "旧扁平副本" }
+    )
+    Write-Utf8Json -Path (Join-Path $ganttCurrentLocal "gantt.json") -Value @(
+        [ordered]@{ id = "stale-local"; name = "旧 LocalAppData 副本" }
+    )
+    $ganttCurrentHash = (Get-FileHash -LiteralPath $ganttCurrentPath -Algorithm SHA256).Hash
+
+    $ganttCurrentReportPath = Invoke-Migration -Source $ganttCurrentRoot `
+        -Local $ganttCurrentLocal
+    $ganttCurrentReport = Get-Content -LiteralPath $ganttCurrentReportPath -Raw -Encoding UTF8 |
+        ConvertFrom-Json
+    Assert-Equal -Expected "success" -Actual $ganttCurrentReport.status `
+        -Message "原地新甘特图迁移状态"
+    Assert-Equal -Expected "currentLayout" -Actual $ganttCurrentReport.ganttSourceKind `
+        -Message "新嵌套甘特图优先级"
+    Assert-Equal -Expected 0 -Actual ([int]$ganttCurrentReport.conflictCount) `
+        -Message "低优先级甘特图副本不制造冲突"
+    Assert-Equal -Expected $ganttCurrentHash `
+        -Actual (Get-FileHash -LiteralPath $ganttCurrentPath -Algorithm SHA256).Hash `
+        -Message "原地新甘特图内容未改变"
+    Assert-True -Condition (Test-Path -LiteralPath $ganttCurrentFlatPath -PathType Leaf) `
+        -Message "原地旧扁平甘特图保留"
+    Assert-True -Condition (-not (Test-Path -LiteralPath (Join-Path $ganttCurrentLocal `
+                    "gantt.json"))) -Message "旧 LocalAppData 甘特图已归档"
+    Assert-True -Condition (Test-Path -LiteralPath (Join-Path `
+                $ganttCurrentReport.archivedLegacyLocalAppDataPath "gantt.json") -PathType Leaf) `
+        -Message "低优先级 LocalAppData 甘特图归档存在"
+
+    # 场景七：跨目录仅有旧扁平甘特图时，迁入新嵌套路径并优先于 LocalAppData。
+    $ganttFlatSource = Join-Path $sandbox "gantt-flat\source"
+    $ganttFlatTarget = Join-Path $sandbox "gantt-flat\target"
+    $ganttFlatLocal = Join-Path $sandbox "gantt-flat\local\PetalDesk"
+    $ganttFlatSourcePath = Join-Path $ganttFlatSource ".petaldesk\tools\gantt.json"
+    $ganttFlatTargetPath = Join-Path $ganttFlatTarget ".petaldesk\tools\gantt\gantt.json"
+    Write-Utf8Json -Path $ganttFlatSourcePath -Value @(
+        [ordered]@{ id = "flat-source"; name = "旧扁平真相" }
+    )
+    Write-Utf8Json -Path (Join-Path $ganttFlatLocal "gantt.json") -Value @(
+        [ordered]@{ id = "local-stale"; name = "不应覆盖" }
+    )
+    $ganttFlatHash = (Get-FileHash -LiteralPath $ganttFlatSourcePath -Algorithm SHA256).Hash
+
+    $ganttFlatReportPath = Invoke-Migration -Source $ganttFlatSource -Target $ganttFlatTarget `
+        -Local $ganttFlatLocal
+    $ganttFlatReport = Get-Content -LiteralPath $ganttFlatReportPath -Raw -Encoding UTF8 |
+        ConvertFrom-Json
+    Assert-Equal -Expected "success" -Actual $ganttFlatReport.status `
+        -Message "跨目录旧扁平甘特图迁移状态"
+    Assert-Equal -Expected "legacyFlat" -Actual $ganttFlatReport.ganttSourceKind `
+        -Message "旧扁平甘特图优先于 LocalAppData"
+    Assert-Equal -Expected $ganttFlatHash `
+        -Actual (Get-FileHash -LiteralPath $ganttFlatTargetPath -Algorithm SHA256).Hash `
+        -Message "旧扁平甘特图迁入新嵌套路径"
+    Assert-True -Condition (-not (Test-Path -LiteralPath (Join-Path $ganttFlatTarget `
+                    ".petaldesk\tools\gantt.json"))) `
+        -Message "跨目录目标不再生成旧扁平甘特图"
+    Assert-True -Condition (Test-Path -LiteralPath $ganttFlatSourcePath -PathType Leaf) `
+        -Message "跨目录迁移保留源甘特图"
+
+    # 场景八：跨目录目标旧扁平甘特图与来源不同时，保护目标并拒绝覆盖。
+    $ganttTargetSource = Join-Path $sandbox "gantt-target\source"
+    $ganttTargetRoot = Join-Path $sandbox "gantt-target\target"
+    $ganttTargetLocal = Join-Path $sandbox "gantt-target\local\PetalDesk"
+    $ganttTargetSourcePath = Join-Path $ganttTargetSource `
+        ".petaldesk\tools\gantt\gantt.json"
+    $ganttTargetLegacyPath = Join-Path $ganttTargetRoot ".petaldesk\tools\gantt.json"
+    $ganttTargetCanonicalPath = Join-Path $ganttTargetRoot `
+        ".petaldesk\tools\gantt\gantt.json"
+    Write-Utf8Json -Path $ganttTargetSourcePath -Value ([ordered]@{
+            schemaVersion = 2; documentId = "incoming"; revision = 2; tasks = @()
+        })
+    Write-Utf8Json -Path $ganttTargetLegacyPath -Value @(
+        [ordered]@{ id = "target-existing"; name = "目标已有任务" }
+    )
+    $ganttTargetLegacyHash = (Get-FileHash -LiteralPath $ganttTargetLegacyPath `
+            -Algorithm SHA256).Hash
+    $ganttTargetThrew = $false
+    try {
+        & $migrationScript -SourceRoot $ganttTargetSource -TargetRoot $ganttTargetRoot `
+            -LocalAppDataRoot $ganttTargetLocal | Out-Null
+    }
+    catch {
+        $ganttTargetThrew = $true
+    }
+    Assert-True -Condition $ganttTargetThrew -Message "目标旧甘特图不同时迁移失败"
+    Assert-Equal -Expected $ganttTargetLegacyHash `
+        -Actual (Get-FileHash -LiteralPath $ganttTargetLegacyPath -Algorithm SHA256).Hash `
+        -Message "目标旧甘特图未覆盖"
+    Assert-True -Condition (-not (Test-Path -LiteralPath $ganttTargetCanonicalPath)) `
+        -Message "冲突时不创建会遮蔽目标旧数据的新甘特图"
+
+    # 场景九：目标旧扁平甘特图与来源相同时，可安全规范化到新路径。
+    $ganttSameSource = Join-Path $sandbox "gantt-target-same\source"
+    $ganttSameTarget = Join-Path $sandbox "gantt-target-same\target"
+    $ganttSameLocal = Join-Path $sandbox "gantt-target-same\local\PetalDesk"
+    $ganttSameSourcePath = Join-Path $ganttSameSource ".petaldesk\tools\gantt\gantt.json"
+    $ganttSameTargetLegacyPath = Join-Path $ganttSameTarget ".petaldesk\tools\gantt.json"
+    $ganttSameTargetCanonicalPath = Join-Path $ganttSameTarget `
+        ".petaldesk\tools\gantt\gantt.json"
+    Write-Utf8Json -Path $ganttSameSourcePath -Value @(
+        [ordered]@{ id = "same-task"; name = "相同任务" }
+    )
+    Write-Utf8Text -Path $ganttSameTargetLegacyPath `
+        -Value ([System.IO.File]::ReadAllText($ganttSameSourcePath, [System.Text.Encoding]::UTF8))
+    $ganttSameHash = (Get-FileHash -LiteralPath $ganttSameSourcePath -Algorithm SHA256).Hash
+    $ganttSameReportPath = Invoke-Migration -Source $ganttSameSource -Target $ganttSameTarget `
+        -Local $ganttSameLocal
+    $ganttSameReport = Get-Content -LiteralPath $ganttSameReportPath -Raw -Encoding UTF8 |
+        ConvertFrom-Json
+    Assert-Equal -Expected "success" -Actual $ganttSameReport.status `
+        -Message "目标旧甘特图相同时迁移成功"
+    Assert-Equal -Expected $ganttSameHash `
+        -Actual (Get-FileHash -LiteralPath $ganttSameTargetCanonicalPath -Algorithm SHA256).Hash `
+        -Message "目标旧甘特图规范化到新路径"
+
+    # 场景十：目标甘特图目录是 junction 时必须拒绝越界读取或写入。
+    $ganttJunctionSource = Join-Path $sandbox "gantt-junction\source"
+    $ganttJunctionTarget = Join-Path $sandbox "gantt-junction\target"
+    $ganttJunctionOutside = Join-Path $sandbox "gantt-junction\outside"
+    $ganttJunctionLocal = Join-Path $sandbox "gantt-junction\local\PetalDesk"
+    Write-Utf8Json -Path (Join-Path $ganttJunctionSource ".petaldesk\tools\gantt.json") `
+        -Value @([ordered]@{ id = "source-task"; name = "不得写入外部目录" })
+    [System.IO.Directory]::CreateDirectory((Join-Path $ganttJunctionTarget `
+            ".petaldesk\tools")) | Out-Null
+    [System.IO.Directory]::CreateDirectory($ganttJunctionOutside) | Out-Null
+    Write-Utf8Text -Path (Join-Path $ganttJunctionOutside "marker.txt") `
+        -Value "外部目录保持不变"
+    $ganttJunctionPath = Join-Path $ganttJunctionTarget ".petaldesk\tools\gantt"
+    New-Item -ItemType Junction -Path $ganttJunctionPath -Target $ganttJunctionOutside | Out-Null
+    $ganttJunctionThrew = $false
+    try {
+        & $migrationScript -SourceRoot $ganttJunctionSource -TargetRoot $ganttJunctionTarget `
+            -LocalAppDataRoot $ganttJunctionLocal | Out-Null
+    }
+    catch {
+        $ganttJunctionThrew = $true
+    }
+    Assert-True -Condition $ganttJunctionThrew -Message "目标甘特图 junction 被拒绝"
+    Assert-Equal -Expected 1 -Actual @(Get-ChildItem -LiteralPath $ganttJunctionOutside `
+            -File).Count -Message "甘特图 junction 外部目录未写入新文件"
+    Assert-Equal -Expected "外部目录保持不变" `
+        -Actual ([System.IO.File]::ReadAllText((Join-Path $ganttJunctionOutside "marker.txt"), `
+                [System.Text.Encoding]::UTF8)) -Message "甘特图 junction 外部文件未修改"
+    [System.IO.Directory]::Delete($ganttJunctionPath)
+
+    # 场景十一：目标内容不同时必须报告冲突，不覆盖文件，也不更新路径指针。
     $conflictSource = Join-Path $sandbox "conflict\source"
     $conflictTarget = Join-Path $sandbox "conflict\target"
     $conflictLocal = Join-Path $sandbox "conflict\local\PetalDesk"
@@ -485,7 +650,7 @@ try {
     Assert-Equal -Expected 1 -Actual ([int]$conflictReport.conflictCount) `
         -Message "冲突报告数量"
 
-    # 场景七：目标 notes 内的任务目录是 junction 时必须拒绝越界写入。
+    # 场景十二：目标 notes 内的任务目录是 junction 时必须拒绝越界写入。
     $junctionRoot = Join-Path $sandbox "junction\source"
     $junctionTarget = Join-Path $sandbox "junction\target"
     $junctionOutside = Join-Path $sandbox "junction\outside"
@@ -514,7 +679,7 @@ try {
                 [System.Text.Encoding]::UTF8)) -Message "junction 外部文件未修改"
     [System.IO.Directory]::Delete($junctionPath)
 
-    # 场景八：LocalAppDataRoot 与数据根重叠时必须拒绝。
+    # 场景十三：LocalAppDataRoot 与数据根重叠时必须拒绝。
     $overlapRoot = Join-Path $sandbox "overlap\source"
     Write-Utf8Text -Path (Join-Path $overlapRoot "notes\note\note.md") -Value "overlap"
     $overlapLocal = Join-Path $overlapRoot ".petaldesk\backups\local-app-data"
@@ -529,7 +694,7 @@ try {
     Assert-True -Condition (-not (Test-Path -LiteralPath $overlapLocal)) `
         -Message "重叠路径校验失败时未创建 LocalAppDataRoot"
 
-    Write-Host "迁移脚本演练通过：旧布局、旧内部目录、LocalAppData 收尾、双 notes 幂等、跨目录、冲突及 junction 防护。" `
+    Write-Host "迁移脚本演练通过：旧布局、甘特图新旧路径优先级、LocalAppData 收尾、双 notes 幂等、跨目录、冲突及 junction 防护。" `
         -ForegroundColor Green
     Write-Host "临时测试目录：$sandbox"
 }

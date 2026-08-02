@@ -1,13 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export type MfaAlgorithm = "sha1" | "sha256" | "sha512";
+export type MfaRecoveryState = "setup-required" | "ready" | "password-required" | "unavailable";
 
 export interface MfaStatus {
   available: boolean;
   locked: boolean;
   entryCount: number;
-  protection: "windows-dpapi" | "browser-demo";
+  protection: "windows-dpapi" | "windows-dpapi-recovery-password" | "browser-demo" | "unavailable";
+  recoveryState: MfaRecoveryState;
   captureExcluded?: boolean;
+  recoveredFromBackup?: boolean;
   message?: string | null;
 }
 
@@ -76,6 +79,8 @@ export interface MfaApi {
   delete(id: string): Promise<void>;
   reveal(id: string): Promise<MfaRevealResult>;
   copy(id: string): Promise<void>;
+  configureRecoveryPassword(password: string): Promise<void>;
+  unlockWithRecoveryPassword(password: string): Promise<void>;
   lock(): Promise<void>;
 }
 
@@ -263,6 +268,7 @@ export function createBrowserMfaApi(): MfaApi {
         locked: false,
         entryCount: entries.length,
         protection: "browser-demo",
+        recoveryState: "ready",
         captureExcluded: false,
         message: "浏览器预览使用模拟账户。",
       };
@@ -343,6 +349,8 @@ export function createBrowserMfaApi(): MfaApi {
         await navigator.clipboard.writeText(code);
       }
     },
+    async configureRecoveryPassword() {},
+    async unlockWithRecoveryPassword() {},
     async lock() {
       previews.clear();
     },
@@ -419,6 +427,16 @@ export const mfaApi: MfaApi = {
   async copy(id) {
     if (!isDesktopRuntime()) return browserApi.copy(id);
     await command<void>("copy_mfa_code", { entryId: id });
+  },
+
+  async configureRecoveryPassword(password) {
+    if (!isDesktopRuntime()) return browserApi.configureRecoveryPassword(password);
+    await command<void>("configure_mfa_recovery_password", { password });
+  },
+
+  async unlockWithRecoveryPassword(password) {
+    if (!isDesktopRuntime()) return browserApi.unlockWithRecoveryPassword(password);
+    await command<void>("unlock_mfa_with_recovery_password", { password });
   },
 
   async lock() {

@@ -38,7 +38,7 @@ describe("main note order", () => {
     vi.spyOn(notesApi, "migrateLegacyTimerData").mockResolvedValue(false);
     vi.spyOn(notesApi, "appInfo").mockResolvedValue({
       workspacePath: "测试目录",
-      version: "0.3.9",
+      version: "0.4.0",
       defaultEditorMode: "typora",
     });
     vi.spyOn(notesApi, "listNotes").mockResolvedValue(initial);

@@ -1,18 +1,46 @@
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/svelte";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type {
-  MfaApi,
-  MfaEntrySummary,
-  MfaEntryUpdateRequest,
-  MfaImportPreview,
-  MfaManualImportRequest,
+import {
+  mfaApi,
+  type MfaApi,
+  type MfaEntrySummary,
+  type MfaEntryUpdateRequest,
+  type MfaImportPreview,
+  type MfaManualImportRequest,
 } from "../mfa";
 import MfaTool from "./MfaTool.svelte";
 
+const backendInvoke = vi.hoisted(() => vi.fn());
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: backendInvoke }));
+
+interface TauriTestWindow extends Window {
+  __TAURI_INTERNALS__?: object;
+}
+
 afterEach(() => {
   cleanup();
+  backendInvoke.mockReset();
+  delete (window as TauriTestWindow).__TAURI_INTERNALS__;
   vi.useRealTimers();
   vi.restoreAllMocks();
+});
+
+describe("mfaApi recovery commands", () => {
+  it("sends recovery passwords using the backend command parameter name", async () => {
+    (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
+    backendInvoke.mockResolvedValue(undefined);
+
+    await mfaApi.configureRecoveryPassword("correct horse battery");
+    await mfaApi.unlockWithRecoveryPassword("migration recovery code");
+
+    expect(backendInvoke).toHaveBeenNthCalledWith(1, "configure_mfa_recovery_password", {
+      password: "correct horse battery",
+    });
+    expect(backendInvoke).toHaveBeenNthCalledWith(2, "unlock_mfa_with_recovery_password", {
+      password: "migration recovery code",
+    });
+  });
 });
 
 function entry(overrides: Partial<MfaEntrySummary> = {}): MfaEntrySummary {
@@ -54,7 +82,8 @@ function mockApi(initial: MfaEntrySummary[] = [entry()]): MfaApi & Record<string
       available: true,
       locked: false,
       entryCount: items.length,
-      protection: "windows-dpapi",
+      protection: "windows-dpapi-recovery-password",
+      recoveryState: "ready",
       captureExcluded: true,
     }),
     list: vi.fn().mockImplementation(async () => structuredClone(items)),
@@ -79,11 +108,119 @@ function mockApi(initial: MfaEntrySummary[] = [entry()]): MfaApi & Record<string
     }),
     reveal: vi.fn().mockResolvedValue({ id: entry().id, code: "123456", validUntil: Date.now() + 30_000 }),
     copy: vi.fn().mockResolvedValue(undefined),
+    configureRecoveryPassword: vi.fn().mockResolvedValue(undefined),
+    unlockWithRecoveryPassword: vi.fn().mockResolvedValue(undefined),
     lock: vi.fn().mockResolvedValue(undefined),
   } as MfaApi & Record<string, ReturnType<typeof vi.fn> | (() => boolean)>;
 }
 
 describe("MfaTool", () => {
+  it("tells the user when the vault was recovered from a backup", async () => {
+    const api = mockApi();
+    (api.getStatus as ReturnType<typeof vi.fn>).mockResolvedValue({
+      available: true,
+      locked: false,
+      entryCount: 1,
+      protection: "windows-dpapi-recovery-password",
+      recoveryState: "ready",
+      captureExcluded: true,
+      recoveredFromBackup: true,
+      message: "MFA 主保险库缺失或损坏，已从最近的有效备份恢复。",
+    });
+
+    const rendered = render(MfaTool, { api });
+
+    expect(await rendered.findByRole("status")).toHaveTextContent("已从最近的有效备份恢复");
+  });
+
+  it("blocks first use until a recovery password is configured", async () => {
+    const api = mockApi([]);
+    (api.getStatus as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      available: true,
+      locked: false,
+      entryCount: 0,
+      protection: "windows-dpapi",
+      recoveryState: "setup-required",
+      captureExcluded: true,
+    });
+    const rendered = render(MfaTool, { api });
+    const dialog = await rendered.findByRole("dialog", { name: "设置 MFA 恢复密码" });
+
+    expect(within(dialog).getByText("本机使用仍然不需要输入密码")).toBeInTheDocument();
+    await fireEvent.input(within(dialog).getByLabelText("恢复密码"), { target: { value: "correct horse battery" } });
+    await fireEvent.input(within(dialog).getByLabelText("确认恢复密码"), { target: { value: "correct horse battery" } });
+    await fireEvent.click(within(dialog).getByRole("button", { name: "设置恢复密码" }));
+
+    await waitFor(() => expect(api.configureRecoveryPassword).toHaveBeenCalledWith("correct horse battery"));
+    await waitFor(() => expect(rendered.queryByRole("dialog", { name: "设置 MFA 恢复密码" })).not.toBeInTheDocument());
+  });
+
+  it("validates recovery password length and confirmation before calling the API", async () => {
+    const api = mockApi([]);
+    (api.getStatus as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      available: true,
+      locked: false,
+      entryCount: 0,
+      protection: "windows-dpapi",
+      recoveryState: "setup-required",
+      captureExcluded: true,
+    });
+    const rendered = render(MfaTool, { api });
+    const dialog = await rendered.findByRole("dialog", { name: "设置 MFA 恢复密码" });
+    const form = dialog.querySelector("form") as HTMLFormElement;
+    const password = within(dialog).getByLabelText("恢复密码");
+    const confirmation = within(dialog).getByLabelText("确认恢复密码");
+
+    await fireEvent.input(password, { target: { value: "too-short" } });
+    await fireEvent.input(confirmation, { target: { value: "too-short" } });
+    await fireEvent.submit(form);
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("至少需要 12 个字符");
+    expect(api.configureRecoveryPassword).not.toHaveBeenCalled();
+
+    await fireEvent.input(password, { target: { value: "correct horse battery" } });
+    await fireEvent.input(confirmation, { target: { value: "different horse code" } });
+    await fireEvent.submit(form);
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("两次输入的恢复密码不一致");
+    expect(api.configureRecoveryPassword).not.toHaveBeenCalled();
+  });
+
+  it("unlocks migrated MFA data with one recovery-password field", async () => {
+    const api = mockApi([]);
+    (api.getStatus as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      available: false,
+      locked: true,
+      entryCount: 0,
+      protection: "windows-dpapi-recovery-password",
+      recoveryState: "password-required",
+      captureExcluded: true,
+      message: "请输入恢复密码以迁移 MFA 数据。",
+    });
+    const rendered = render(MfaTool, { api });
+    const dialog = await rendered.findByRole("dialog", { name: "使用恢复密码迁移" });
+
+    expect(within(dialog).queryByLabelText("确认恢复密码")).not.toBeInTheDocument();
+    await fireEvent.input(within(dialog).getByLabelText("恢复密码"), { target: { value: "correct horse battery" } });
+    await fireEvent.click(within(dialog).getByRole("button", { name: "解锁并迁移" }));
+
+    await waitFor(() => expect(api.unlockWithRecoveryPassword).toHaveBeenCalledWith("correct horse battery"));
+    await waitFor(() => expect(rendered.queryByRole("dialog", { name: "使用恢复密码迁移" })).not.toBeInTheDocument());
+  });
+
+  it("changes the recovery password from the titlebar key action", async () => {
+    const api = mockApi();
+    const rendered = render(MfaTool, { api });
+    await rendered.findByText("GitHub", { selector: ".account-heading strong" });
+
+    await fireEvent.click(rendered.getByRole("button", { name: "修改 MFA 恢复密码" }));
+    const dialog = rendered.getByRole("dialog", { name: "修改 MFA 恢复密码" });
+    await fireEvent.input(within(dialog).getByLabelText("恢复密码"), { target: { value: "new recovery password" } });
+    await fireEvent.input(within(dialog).getByLabelText("确认恢复密码"), { target: { value: "new recovery password" } });
+    await fireEvent.click(within(dialog).getByRole("button", { name: "保存新密码" }));
+
+    await waitFor(() => expect(api.configureRecoveryPassword).toHaveBeenCalledWith("new recovery password"));
+    expect(rendered.queryByRole("dialog", { name: "修改 MFA 恢复密码" })).not.toBeInTheDocument();
+  });
+
   it("keeps codes hidden by default, continuously reveals them, and hides on the second toggle", async () => {
     const api = mockApi();
     const rendered = render(MfaTool, { api });
@@ -242,7 +379,8 @@ describe("MfaTool", () => {
       available: false,
       locked: true,
       entryCount: 0,
-      protection: "windows-dpapi",
+      protection: "unavailable",
+      recoveryState: "unavailable",
       captureExcluded: true,
       message: "当前 Windows 用户无法解锁这份 MFA 数据。",
     });

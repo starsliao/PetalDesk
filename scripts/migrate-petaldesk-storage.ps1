@@ -53,6 +53,8 @@ $reportPath = $null
 $sessionDirectory = $null
 $notesSourceKind = "none"
 $notesSourcePath = $null
+$ganttSourceKind = "none"
+$ganttSourcePath = $null
 $archivedLegacyNotesPath = $null
 $archiveLegacyNotesAfterSuccess = $false
 $archivedLegacyLocalAppDataPath = $null
@@ -183,6 +185,8 @@ function Assert-TargetStoragePathsSafe {
         Assert-DirectoryIsSafe -Path $path -Description "飞花 - PetalDesk 数据存储路径" `
             -AllowMissing:$AllowMissing
     }
+    Assert-DirectoryIsSafe -Path (Join-Path (Join-Path $internal "tools") "gantt") `
+        -Description "飞花 - PetalDesk 甘特图数据目录" -AllowMissing
 }
 
 function Assert-MigrationSessionSafe {
@@ -350,7 +354,9 @@ function Add-DirectoryOperations {
     param(
         [Parameter(Mandatory = $true)][string]$Category,
         [Parameter(Mandatory = $true)][string]$Source,
-        [Parameter(Mandatory = $true)][string]$Destination
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [string]$RelativePath = "",
+        [string[]]$ExcludedRelativeFiles = @()
     )
 
     if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
@@ -404,6 +410,28 @@ function Add-DirectoryOperations {
     $entries = @(Get-ChildItem -LiteralPath $sourcePath -Force | Sort-Object -Property Name)
     foreach ($entry in $entries) {
         $target = Join-Path $destinationPath $entry.Name
+        $entryRelativePath = if ([string]::IsNullOrWhiteSpace($RelativePath)) {
+            $entry.Name
+        }
+        else {
+            Join-Path $RelativePath $entry.Name
+        }
+        if (-not $entry.PSIsContainer) {
+            $normalizedEntryRelativePath = $entryRelativePath.Replace("/", "\")
+            $isExcluded = $false
+            foreach ($excludedRelativeFile in $ExcludedRelativeFiles) {
+                if ($normalizedEntryRelativePath.Equals(
+                        ([string]$excludedRelativeFile).Replace("/", "\"),
+                        $pathComparison
+                    )) {
+                    $isExcluded = $true
+                    break
+                }
+            }
+            if ($isExcluded) {
+                continue
+            }
+        }
         if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
             Add-Conflict -Category $Category -Source $entry.FullName -Destination $target `
                 -Reason "源条目是重解析点，为避免越界未迁移。"
@@ -415,7 +443,9 @@ function Add-DirectoryOperations {
                     -Reason "源条目是目录，但目标路径已存在为文件。"
                 continue
             }
-            Add-DirectoryOperations -Category $Category -Source $entry.FullName -Destination $target
+            Add-DirectoryOperations -Category $Category -Source $entry.FullName `
+                -Destination $target -RelativePath $entryRelativePath `
+                -ExcludedRelativeFiles $ExcludedRelativeFiles
         }
         else {
             Add-FileOperation -Category $Category -Source $entry.FullName -Destination $target `
@@ -1042,6 +1072,8 @@ function Write-MigrationReport {
         localAppDataRoot        = $LocalAppDataRoot
         notesSourceKind         = $notesSourceKind
         notesSourcePath         = $notesSourcePath
+        ganttSourceKind         = $ganttSourceKind
+        ganttSourcePath         = $ganttSourcePath
         archivedLegacyNotesPath = $archivedLegacyNotesPath
         archivedLegacyLocalAppDataPath = $archivedLegacyLocalAppDataPath
         archivedLegacyLocalAppDataFiles = @($legacyLocalAppDataArchiveResults)
@@ -1118,6 +1150,29 @@ $sourceNewNotesExists = Test-Path -LiteralPath $newNotes -PathType Container
 $sourceLegacyNotesExists = Test-Path -LiteralPath $legacyNotes -PathType Container
 $sourceConfig = Join-Path $sourceInternal "config.json"
 $sourceConfigExists = Test-Path -LiteralPath $sourceConfig -PathType Leaf
+$sourceGanttCandidates = @(
+    [pscustomobject]@{
+        kind = "currentLayout"
+        path = Join-Path (Join-Path (Join-Path $sourceInternal "tools") "gantt") "gantt.json"
+    },
+    [pscustomobject]@{
+        kind = "legacyFlat"
+        path = Join-Path (Join-Path $sourceInternal "tools") "gantt.json"
+    },
+    [pscustomobject]@{
+        kind = "legacyLocalAppData"
+        path = Join-Path $LocalAppDataRoot "gantt.json"
+    }
+)
+foreach ($candidate in $sourceGanttCandidates) {
+    if (Test-Path -LiteralPath ([string]$candidate.path) -PathType Leaf) {
+        $ganttSourceKind = [string]$candidate.kind
+        $ganttSourcePath = Get-NormalizedPath -Path ([string]$candidate.path)
+        break
+    }
+}
+$targetGantt = Join-Path (Join-Path (Join-Path $targetInternal "tools") "gantt") "gantt.json"
+$targetLegacyGantt = Join-Path (Join-Path $targetInternal "tools") "gantt.json"
 $newDirectoryAvailability = @{}
 foreach ($name in @("state", "tools", "backups", "journal", "trash", "conflicts")) {
     $newDirectoryAvailability[$name] = Test-Path -LiteralPath (Join-Path $sourceInternal $name) -PathType Container
@@ -1167,8 +1222,15 @@ try {
 
     foreach ($name in @("state", "tools", "backups", "journal", "trash", "conflicts")) {
         if ([bool]$newDirectoryAvailability[$name]) {
-            Add-DirectoryOperations -Category $name -Source (Join-Path $sourceInternal $name) `
-                -Destination (Join-Path $targetInternal $name)
+            if ($name -eq "tools") {
+                Add-DirectoryOperations -Category $name -Source (Join-Path $sourceInternal $name) `
+                    -Destination (Join-Path $targetInternal $name) `
+                    -ExcludedRelativeFiles @("gantt.json", "gantt\gantt.json")
+            }
+            else {
+                Add-DirectoryOperations -Category $name -Source (Join-Path $sourceInternal $name) `
+                    -Destination (Join-Path $targetInternal $name)
+            }
         }
     }
 
@@ -1191,24 +1253,42 @@ try {
         }
     }
 
+    if (Test-Path -LiteralPath $targetGantt -PathType Leaf) {
+        if ($null -ne $ganttSourcePath) {
+            Add-FileOperation -Category "tools" -Source $ganttSourcePath `
+                -Destination $targetGantt -Description "迁移当前甘特图数据"
+        }
+    }
+    elseif (Test-Path -LiteralPath $targetLegacyGantt -PathType Leaf) {
+        if ($null -ne $ganttSourcePath) {
+            Add-FileOperation -Category "tools" -Source $ganttSourcePath `
+                -Destination $targetLegacyGantt -Description "核对目标旧甘特图数据"
+        }
+        Add-FileOperation -Category "tools" -Source $targetLegacyGantt `
+            -Destination $targetGantt -Description "升级目标旧甘特图数据路径"
+    }
+    elseif ($null -ne $ganttSourcePath) {
+        Add-FileOperation -Category "tools" -Source $ganttSourcePath `
+            -Destination $targetGantt -Description "迁移甘特图数据"
+    }
+
     $legacyFileMappings = @(
         [pscustomobject]@{
-            name = "windows.json"; category = "state";
+            name = "windows.json"; category = "state"; relativePath = "windows.json";
             destination = Join-Path (Join-Path $targetInternal "state") "windows.json"
         },
         [pscustomobject]@{
-            name = "reminders.json"; category = "tools";
+            name = "reminders.json"; category = "tools"; relativePath = "reminders.json";
             destination = Join-Path (Join-Path $targetInternal "tools") "reminders.json"
-        },
-        [pscustomobject]@{
-            name = "gantt.json"; category = "tools";
-            destination = Join-Path (Join-Path $targetInternal "tools") "gantt.json"
         }
     )
     foreach ($mapping in $legacyFileMappings) {
         $newLayoutCandidate = Join-Path (Join-Path $sourceInternal ([string]$mapping.category)) `
+            ([string]$mapping.relativePath)
+        $oldInternalCandidate = Join-Path (Join-Path $sourceInternal ([string]$mapping.category)) `
             ([string]$mapping.name)
-        if (-not (Test-Path -LiteralPath $newLayoutCandidate -PathType Leaf)) {
+        if (-not (Test-Path -LiteralPath $newLayoutCandidate -PathType Leaf) -and
+            -not (Test-Path -LiteralPath $oldInternalCandidate -PathType Leaf)) {
             $legacySource = Join-Path $LocalAppDataRoot ([string]$mapping.name)
             Add-FileOperation -Category ([string]$mapping.category) -Source $legacySource `
                 -Destination ([string]$mapping.destination) `

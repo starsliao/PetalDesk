@@ -408,6 +408,7 @@
     const markdown = markdownValue;
     const metaPatch = { ...pendingMeta };
     const baseRevision = activeNote.revision;
+    const baseContentHash = activeNote.contentHash;
     const includedBody = bodyDirty;
     bodyDirty = false;
     pendingMeta = {};
@@ -418,6 +419,7 @@
       const result = await notesApi.commitNote({
         id: activeNote.id,
         baseRevision,
+        baseContentHash,
         markdown,
         metaPatch,
       });
@@ -425,6 +427,7 @@
         ...activeNote,
         markdown,
         revision: result.revision,
+        contentHash: result.contentHash,
         meta: { ...activeNote.meta, ...metaPatch, updatedAt: result.savedAt },
       };
     } catch (error) {
@@ -570,6 +573,7 @@
       await notesApi.commitNote({
         id,
         baseRevision: snapshot.revision,
+        baseContentHash: snapshot.contentHash,
         markdown: snapshot.markdown,
         metaPatch: { pinned },
       });

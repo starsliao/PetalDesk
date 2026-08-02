@@ -2,7 +2,7 @@
 
 > 把想法留在桌面，把文件留在自己手里。
 
-[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.9/PetalDesk_0.3.9_x64-setup.exe)
+[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.4.0/PetalDesk_0.4.0_x64-setup.exe)
 
 飞花 - PetalDesk 是一款 Windows 10/11 本地便签与效率工具。它启动快、界面安静，支持 Markdown 即时排版、纯文本、图片、搜索、回收站，以及截图、任务规划和本地 MFA 验证器等随时可以唤起的小工具。没有账号、没有云端依赖，内容保留在你的本地数据目录中。
 
@@ -31,7 +31,7 @@
 - 计时器：透明电子管数字、暂停/重置记录、透明度、位置和大小记忆。
 - 提醒：一次、间隔、日/周/月/年周期，到点发送 Windows 通知。
 - 任务甘特图：任务排序、进度筛选、时间条拖动、小时级时间轴缩放。
-- MFA 验证器：支持标准 `TOTP` 单账户、屏幕二维码扫描、图片/链接/手动导入、默认隐藏验证码与双击安全复制；密钥使用当前 Windows 用户的 DPAPI 加密保护。
+- MFA 验证器：支持标准 `TOTP` 单账户、屏幕二维码扫描、图片/链接/手动导入、默认隐藏验证码与双击安全复制；本机使用 Windows DPAPI 免密解锁，恢复密码用于跨电脑迁移。
 - 截图：默认 `F1`，单显示器手动框选，标注、马赛克、模糊、复制、保存和置顶贴图；选区内双击即可复制，选区外右键直接取消。
 - 长截图：默认由用户在原窗口中手动滚动并实时拼接，支持暂停、重试、回退和完整标注；自动滚动作为高级模式保留，浏览器扩展可增强 Chrome、Edge 与 Firefox 长页面的滚动定位和拼接稳定性。
 
@@ -39,7 +39,7 @@
 
 ## 数据真正属于你
 
-安装时可以选择“飞花 - PetalDesk 数据存储”，默认位置是用户“文档”目录下的 `PetalDesk`。便签、附件、设置和普通小工具数据迁移到新电脑时，复制整个目录，再在安装器或设置中指定它即可。
+安装时可以选择“飞花 - PetalDesk 数据存储”，默认位置是用户“文档”目录下的 `PetalDesk`。便签、附件、设置和普通小工具数据迁移到新电脑时，复制整个目录，再在安装器或设置中指定它即可。存储按“本地读多、写入很少”设计；坚果云、OneDrive 等同步目录只作为可选的文件搬运方式，不依赖专有同步协议。
 
 ```text
 PetalDesk/
@@ -51,20 +51,33 @@ PetalDesk/
    ├─ config.json
    ├─ state/
    ├─ tools/
-   │  └─ mfa/              # DPAPI 保护的加密保险库
+   │  ├─ gantt/
+   │  │  ├─ gantt.json     # 版本化任务快照
+   │  │  ├─ backups/
+   │  │  └─ conflicts/
+   │  └─ mfa/
+   │     ├─ vault.json     # DPAPI + 恢复密码双包装的 AEAD 加密保险库
+   │     ├─ backups/
+   │     └─ conflicts/
    ├─ backups/
    ├─ journal/
    ├─ trash/
    └─ conflicts/
 ```
 
-`note.md` 是正文唯一真相，图片使用便签目录内 `assets/` 的相对路径。Markdown 图片和受控的 HTML `<img>` 标签都经过相同的本地资源映射；脚本、事件属性、任意本地路径和远程图片不会被加载。搜索索引可以重建，不会成为迁移或恢复的前置条件。旧版本布局可用 [`scripts/migrate-petaldesk-storage.ps1`](scripts/migrate-petaldesk-storage.ps1) 迁移。
+`note.md` 是正文唯一真相，图片使用便签目录内 `assets/` 的相对路径。Markdown 图片和受控的 HTML `<img>` 标签都经过相同的本地资源映射；脚本、事件属性、任意本地路径和远程图片不会被加载。普通读取不会改写笔记；搜索索引按内容哈希增量维护且随时可以重建，不会成为迁移或恢复的前置条件。甘特图不保存为同步服务准备的删除墓碑或操作日志，只保留当前快照。
 
-MFA 是唯一的迁移例外：保险库虽然也位于统一数据目录，但解密密钥绑定当前 Windows 用户。把目录复制到另一台电脑或另一个 Windows 用户后，原 MFA 账户无法解密；飞花不会为迁移便利降级为明文，也不会静默覆盖无法解密的保险库。迁移前请先在各服务中重新绑定或准备恢复码。
+所有权威文件都采用同目录临时文件、磁盘刷新和 Windows 原子替换。便签提交同时校验版本和正文哈希；甘特图与 MFA 保存前校验启动时读取的文件指纹。检测到外部替换时不会静默覆盖，而是将待保存内容写入 `conflicts/`，由用户决定保留哪一版。甘特图与 MFA 保留最近 5 份写前备份。旧版本布局可用 [`scripts/migrate-petaldesk-storage.ps1`](scripts/migrate-petaldesk-storage.ps1) 迁移，完整取舍见 [本地存储设计](docs/storage.md)。
+
+MFA 同样可以随整个数据目录迁移。首次使用时需要设置恢复密码；保险库正文由随机密钥进行 XChaCha20-Poly1305 认证加密，同一密钥分别由当前 Windows 用户的 DPAPI 和基于 Argon2id 的恢复密码包装。本机日常打开不需要输入密码；复制目录到新电脑或另一个 Windows 用户后，输入一次恢复密码即可解锁，并为新环境建立新的 DPAPI 包装。恢复密码不会保存，保险库、备份和冲突副本也不会降级为明文；忘记恢复密码且原电脑已不可用时，只能使用各服务提供的账户恢复码。
+
+### 升级与兼容
+
+`0.4.0` 可以直接覆盖安装。首次启动时会自动识别旧的 `飞花/.feihua` 存储布局、旧便签元数据和旧甘特图数组格式，转换到当前 `.petaldesk/` 结构；便签正文 `note.md` 不会被改写，甘特图转换前会保留迁移备份。普通版本升级不需要导出、导入或输入 MFA 恢复密码；恢复密码只在把 MFA 数据目录复制到另一台电脑或另一个 Windows 用户时使用。旧数据损坏或格式版本过新时，飞花会保留原文件并阻止静默覆盖。
 
 ## 安装与运行
 
-下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.3.9/PetalDesk_0.3.9_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。
+下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.4.0/PetalDesk_0.4.0_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。
 
 没有 WebView2 或下载权限时，安装器会明确提示失败原因，不会静默留下无法启动的程序。未签名构建可能显示“未知发布者”，这是 Windows 对代码签名的正常提示。
 
