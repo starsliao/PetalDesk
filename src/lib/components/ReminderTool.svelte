@@ -304,7 +304,7 @@
 
         <label>
           <span>通知内容</span>
-          <textarea bind:value={message} maxlength="500" rows="2" placeholder="可选，到点时显示在 Windows 通知中"></textarea>
+          <textarea bind:value={message} maxlength="500" rows="2" placeholder="可选，到点时显示在系统通知中"></textarea>
         </label>
 
         <div class="form-grid">
@@ -378,7 +378,7 @@
         <div class="empty-state">
           <Bell size={28} aria-hidden="true" />
           <strong>还没有提醒</strong>
-          <span>创建一个一次性或周期提醒，到点由 Windows 通知你。</span>
+          <span>创建一个一次性或周期提醒，到点由系统通知你。</span>
           <button type="button" class="primary-button" onclick={startCreate}>
             <Plus size={16} aria-hidden="true" /> 新建提醒
           </button>

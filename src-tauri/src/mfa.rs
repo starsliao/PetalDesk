@@ -1,10 +1,10 @@
-//! Local MFA (TOTP) vault with passwordless Windows access and portable recovery.
+//! Local MFA (TOTP) vault with passwordless OS-backed access and portable recovery.
 //!
 //! This module deliberately keeps the account secret out of all public
 //! serialised structures.  Only a short-lived reveal operation returns a
 //! generated code to the webview.  The on-disk vault contains an
 //! XChaCha20-Poly1305 envelope whose random data key is wrapped both by the
-//! current Windows user's DPAPI and by an Argon2id-derived recovery key.
+//! Windows DPAPI or macOS Keychain and by an Argon2id-derived recovery key.
 
 use crate::error::{AppError, AppResult};
 use crate::storage::{
@@ -81,6 +81,8 @@ const CLIPBOARD_MAX_SECONDS: Duration = Duration::from_secs(30);
 const CLIPBOARD_RETRY_COUNT: usize = 10;
 const CLIPBOARD_RETRY_DELAY: Duration = Duration::from_millis(20);
 const CLIPBOARD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(35);
+#[cfg(any(target_os = "macos", test))]
+const MACOS_CLIPBOARD_MARKER_SALT_BYTES: usize = 32;
 
 fn generic_vault_error() -> AppError {
     AppError::new(
@@ -373,7 +375,10 @@ impl Default for MfaSettings {
 #[serde(rename_all = "camelCase")]
 struct VaultEnvelope {
     schema_version: u32,
+    #[serde(default)]
     dpapi_wrapped_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keychain_key_id: Option<String>,
     recovery_wrapped_key: RecoveryKeyEnvelope,
     nonce: String,
     ciphertext: String,
@@ -439,7 +444,8 @@ impl Drop for StoredEntry {
 struct UnlockedVault {
     payload: VaultPayload,
     key: Zeroizing<Vec<u8>>,
-    dpapi_wrapped_key: Vec<u8>,
+    dpapi_wrapped_key: String,
+    keychain_key_id: Option<String>,
     recovery_wrapped_key: Option<RecoveryKeyEnvelope>,
     disk_hash: Option<String>,
 }
@@ -447,6 +453,9 @@ struct UnlockedVault {
 impl Drop for UnlockedVault {
     fn drop(&mut self) {
         self.dpapi_wrapped_key.zeroize();
+        if let Some(keychain_key_id) = self.keychain_key_id.as_mut() {
+            keychain_key_id.zeroize();
+        }
     }
 }
 
@@ -485,6 +494,33 @@ enum RecoveryUnlockError {
     InvalidEnvelope,
     InvalidPassword,
     InvalidPayload,
+}
+
+#[cfg(windows)]
+fn local_protection_label(recovery_state: MfaRecoveryState) -> &'static str {
+    match recovery_state {
+        MfaRecoveryState::SetupRequired => "windows-dpapi",
+        MfaRecoveryState::Ready | MfaRecoveryState::PasswordRequired => {
+            "windows-dpapi-recovery-password"
+        }
+        MfaRecoveryState::Unavailable => "unavailable",
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn local_protection_label(recovery_state: MfaRecoveryState) -> &'static str {
+    match recovery_state {
+        MfaRecoveryState::SetupRequired => "macos-keychain",
+        MfaRecoveryState::Ready | MfaRecoveryState::PasswordRequired => {
+            "macos-keychain-recovery-password"
+        }
+        MfaRecoveryState::Unavailable => "unavailable",
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn local_protection_label(_recovery_state: MfaRecoveryState) -> &'static str {
+    "unavailable"
 }
 
 pub struct MfaStore {
@@ -528,9 +564,8 @@ impl MfaStore {
             }
         }
         let vault_path = root.join(VAULT_FILE);
-        // Validate only the envelope shape here. DPAPI is intentionally lazy:
-        // copying the vault to another Windows user must not prevent the app
-        // itself from starting.
+        // Validate only the envelope shape here. Local key protection is
+        // intentionally lazy so a copied vault can still open with recovery.
         let recovery_state = if vault_path.exists() {
             if read_envelope(&vault_path).is_ok() {
                 MfaRecoveryState::Ready
@@ -639,13 +674,7 @@ impl MfaStore {
             available,
             locked,
             entry_count,
-            protection: match runtime.recovery_state {
-                MfaRecoveryState::SetupRequired if cfg!(windows) => "windows-dpapi".to_string(),
-                MfaRecoveryState::Ready | MfaRecoveryState::PasswordRequired if cfg!(windows) => {
-                    "windows-dpapi-recovery-password".to_string()
-                }
-                _ => "unavailable".to_string(),
-            },
+            protection: local_protection_label(runtime.recovery_state).to_string(),
             recovery_state: runtime.recovery_state,
             capture_excluded: match self.capture_excluded.load(Ordering::Acquire) {
                 1 => Some(false),
@@ -661,7 +690,7 @@ impl MfaStore {
                     Some("MFA 主保险库缺失或损坏，已从最近的有效备份恢复。".to_string())
                 }
                 MfaRecoveryState::PasswordRequired => {
-                    Some("此保险库来自另一台电脑，请输入恢复密码完成迁移。".to_string())
+                    Some("此保险库缺少当前系统可用的本机密钥，请输入恢复密码完成迁移。".to_string())
                 }
                 MfaRecoveryState::Unavailable => {
                     Some("MFA 数据当前无法读取；不会创建空白保险库。".to_string())
@@ -924,7 +953,7 @@ impl MfaStore {
             }
         };
 
-        vault.dpapi_wrapped_key = protect_key(&vault.key)?;
+        rebind_current_platform_local_key(&mut vault)?;
         let rebound = serialize_vault(&vault)?;
         if let Some(expected) = primary.as_deref() {
             let current = std::fs::read(&self.vault_path).map_err(|_| generic_vault_error())?;
@@ -1987,18 +2016,20 @@ impl MfaStore {
 fn new_empty_vault() -> AppResult<UnlockedVault> {
     let mut key = Zeroizing::new(vec![0u8; 32]);
     getrandom::fill(&mut key).map_err(|_| generic_vault_error())?;
-    let dpapi_wrapped_key = protect_key(&key)?;
-    Ok(UnlockedVault {
+    let mut vault = UnlockedVault {
         payload: VaultPayload {
             schema_version: VAULT_SCHEMA_VERSION,
             entries: Vec::new(),
             trash: Vec::new(),
         },
         key,
-        dpapi_wrapped_key,
+        dpapi_wrapped_key: String::new(),
+        keychain_key_id: None,
         recovery_wrapped_key: None,
         disk_hash: None,
-    })
+    };
+    rebind_current_platform_local_key(&mut vault)?;
+    Ok(vault)
 }
 
 fn read_envelope(path: &Path) -> AppResult<VaultEnvelope> {
@@ -2034,28 +2065,32 @@ fn parse_envelope(bytes: &[u8]) -> Result<VaultEnvelope, LocalUnlockError> {
     }
     validate_recovery_key_envelope(&envelope.recovery_wrapped_key)
         .map_err(|_| LocalUnlockError::InvalidEnvelope)?;
+    if envelope
+        .keychain_key_id
+        .as_ref()
+        .is_some_and(|value| value.is_empty() || value.len() > 128)
+    {
+        return Err(LocalUnlockError::InvalidEnvelope);
+    }
     Ok(envelope)
 }
 
 fn decrypt_envelope_local(bytes: &[u8]) -> Result<UnlockedVault, LocalUnlockError> {
     let envelope = parse_envelope(bytes)?;
-    let wrapped = STANDARD_NO_PAD
-        .decode(envelope.dpapi_wrapped_key.as_bytes())
-        .map_err(|_| LocalUnlockError::InvalidEnvelope)?;
     let nonce_bytes = STANDARD_NO_PAD
         .decode(envelope.nonce.as_bytes())
         .map_err(|_| LocalUnlockError::InvalidEnvelope)?;
     let ciphertext = STANDARD_NO_PAD
         .decode(envelope.ciphertext.as_bytes())
         .map_err(|_| LocalUnlockError::InvalidEnvelope)?;
-    if nonce_bytes.len() != 24
-        || wrapped.is_empty()
-        || wrapped.len() > 4096
-        || ciphertext.is_empty()
-    {
+    if nonce_bytes.len() != 24 || ciphertext.is_empty() {
         return Err(LocalUnlockError::InvalidEnvelope);
     }
-    let key = unprotect_key(&wrapped).map_err(|_| LocalUnlockError::LocalKeyUnavailable)?;
+    let key = unprotect_local_key(
+        &envelope.dpapi_wrapped_key,
+        envelope.keychain_key_id.as_deref(),
+    )
+    .map_err(|_| LocalUnlockError::LocalKeyUnavailable)?;
     if key.len() != 32 {
         return Err(LocalUnlockError::LocalKeyUnavailable);
     }
@@ -2064,7 +2099,8 @@ fn decrypt_envelope_local(bytes: &[u8]) -> Result<UnlockedVault, LocalUnlockErro
     Ok(UnlockedVault {
         payload,
         key,
-        dpapi_wrapped_key: wrapped,
+        dpapi_wrapped_key: envelope.dpapi_wrapped_key,
+        keychain_key_id: envelope.keychain_key_id,
         recovery_wrapped_key: Some(envelope.recovery_wrapped_key),
         disk_hash: Some(bytes_hash(bytes)),
     })
@@ -2087,7 +2123,8 @@ fn decrypt_envelope_with_recovery(
     Ok(UnlockedVault {
         payload,
         key,
-        dpapi_wrapped_key: Vec::new(),
+        dpapi_wrapped_key: envelope.dpapi_wrapped_key,
+        keychain_key_id: envelope.keychain_key_id,
         recovery_wrapped_key: Some(envelope.recovery_wrapped_key),
         disk_hash: Some(bytes_hash(bytes)),
     })
@@ -2149,7 +2186,7 @@ fn serialize_vault(vault: &UnlockedVault) -> AppResult<Vec<u8>> {
         .recovery_wrapped_key
         .clone()
         .ok_or_else(recovery_setup_required_error)?;
-    if vault.dpapi_wrapped_key.is_empty() {
+    if !has_current_platform_local_key(vault) {
         return Err(generic_vault_error());
     }
     let mut plaintext =
@@ -2177,7 +2214,8 @@ fn serialize_vault(vault: &UnlockedVault) -> AppResult<Vec<u8>> {
     plaintext.zeroize();
     let envelope = VaultEnvelope {
         schema_version: VAULT_SCHEMA_VERSION,
-        dpapi_wrapped_key: STANDARD_NO_PAD.encode(&vault.dpapi_wrapped_key),
+        dpapi_wrapped_key: vault.dpapi_wrapped_key.clone(),
+        keychain_key_id: vault.keychain_key_id.clone(),
         recovery_wrapped_key,
         nonce: STANDARD_NO_PAD.encode(nonce_bytes),
         ciphertext: STANDARD_NO_PAD.encode(&ciphertext),
@@ -2939,6 +2977,103 @@ fn ensure_mfa_window(window: &WebviewWindow) -> AppResult<()> {
     }
 }
 
+#[cfg(any(windows, test))]
+fn apply_dpapi_wrapper(vault: &mut UnlockedVault, wrapped: &[u8]) {
+    vault.dpapi_wrapped_key = STANDARD_NO_PAD.encode(wrapped);
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn apply_keychain_key_id(vault: &mut UnlockedVault, key_id: String) {
+    vault.keychain_key_id = Some(key_id);
+}
+
+#[cfg(windows)]
+fn rebind_current_platform_local_key(vault: &mut UnlockedVault) -> AppResult<()> {
+    let wrapped = protect_key(&vault.key)?;
+    apply_dpapi_wrapper(vault, &wrapped);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn rebind_current_platform_local_key(vault: &mut UnlockedVault) -> AppResult<()> {
+    let key_id = vault
+        .keychain_key_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let entry =
+        keyring::Entry::new("com.petaldesk.app.mfa", &key_id).map_err(|_| generic_vault_error())?;
+    entry
+        .set_secret(&vault.key)
+        .map_err(|_| generic_vault_error())?;
+    apply_keychain_key_id(vault, key_id);
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn rebind_current_platform_local_key(_vault: &mut UnlockedVault) -> AppResult<()> {
+    Err(AppError::new(
+        "unsupported_platform",
+        "MFA 本机密钥保护仅支持 Windows 和 macOS。",
+    ))
+}
+
+#[cfg(windows)]
+fn has_current_platform_local_key(vault: &UnlockedVault) -> bool {
+    !vault.dpapi_wrapped_key.is_empty()
+}
+
+#[cfg(target_os = "macos")]
+fn has_current_platform_local_key(vault: &UnlockedVault) -> bool {
+    vault
+        .keychain_key_id
+        .as_ref()
+        .is_some_and(|value| !value.is_empty())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn has_current_platform_local_key(_vault: &UnlockedVault) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn unprotect_local_key(
+    dpapi_wrapped_key: &str,
+    _keychain_key_id: Option<&str>,
+) -> AppResult<Zeroizing<Vec<u8>>> {
+    let wrapped = STANDARD_NO_PAD
+        .decode(dpapi_wrapped_key.as_bytes())
+        .map_err(|_| generic_vault_error())?;
+    if wrapped.is_empty() || wrapped.len() > 4096 {
+        return Err(generic_vault_error());
+    }
+    unprotect_key(&wrapped)
+}
+
+#[cfg(target_os = "macos")]
+fn unprotect_local_key(
+    _dpapi_wrapped_key: &str,
+    keychain_key_id: Option<&str>,
+) -> AppResult<Zeroizing<Vec<u8>>> {
+    let key_id = keychain_key_id.ok_or_else(generic_vault_error)?;
+    let entry =
+        keyring::Entry::new("com.petaldesk.app.mfa", key_id).map_err(|_| generic_vault_error())?;
+    entry
+        .get_secret()
+        .map(Zeroizing::new)
+        .map_err(|_| generic_vault_error())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn unprotect_local_key(
+    _dpapi_wrapped_key: &str,
+    _keychain_key_id: Option<&str>,
+) -> AppResult<Zeroizing<Vec<u8>>> {
+    Err(AppError::new(
+        "unsupported_platform",
+        "MFA 本机密钥保护仅支持 Windows 和 macOS。",
+    ))
+}
+
 #[cfg(windows)]
 fn protect_key(key: &[u8]) -> AppResult<Vec<u8>> {
     use windows_sys::Win32::Foundation::LocalFree;
@@ -2972,7 +3107,7 @@ fn protect_key(key: &[u8]) -> AppResult<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn protect_key(_key: &[u8]) -> AppResult<Vec<u8>> {
     Err(AppError::new(
         "unsupported_platform",
@@ -3015,7 +3150,7 @@ fn unprotect_key(wrapped: &[u8]) -> AppResult<Zeroizing<Vec<u8>>> {
     Ok(bytes)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn unprotect_key(_wrapped: &[u8]) -> AppResult<Zeroizing<Vec<u8>>> {
     Err(AppError::new(
         "unsupported_platform",
@@ -3032,7 +3167,11 @@ fn write_code_to_clipboard(
     {
         write_code_to_clipboard_windows(code, valid_until, lease)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        write_code_to_clipboard_macos(code, valid_until, lease)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (code, valid_until, lease);
         Err(AppError::new(
@@ -3056,7 +3195,9 @@ fn schedule_clipboard_cleanup(lease: Arc<Mutex<Option<ClipboardLease>>>, clear_a
         loop {
             #[cfg(windows)]
             let outcome = try_clear_owned_clipboard_windows(&lease);
-            #[cfg(not(windows))]
+            #[cfg(target_os = "macos")]
+            let outcome = try_clear_owned_clipboard_macos(&lease);
+            #[cfg(not(any(windows, target_os = "macos")))]
             let outcome: AppResult<bool> = {
                 lock_unpoisoned(&lease).take();
                 Ok(true)
@@ -3092,11 +3233,121 @@ fn clear_clipboard_now(lease: &Arc<Mutex<Option<ClipboardLease>>>) -> bool {
         }
         return lock_unpoisoned(lease).is_none();
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let mut retry_delay = Duration::from_millis(20);
+        for _ in 0..5 {
+            match try_clear_owned_clipboard_macos(lease) {
+                Ok(true) => return true,
+                Ok(false) | Err(_) => std::thread::sleep(retry_delay),
+            }
+            retry_delay = (retry_delay * 2).min(Duration::from_millis(160));
+        }
+        return lock_unpoisoned(lease).is_none();
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         lock_unpoisoned(lease).take();
         true
     }
+}
+
+#[cfg(target_os = "macos")]
+fn write_code_to_clipboard_macos(
+    code: &str,
+    valid_until: u64,
+    lease: &Arc<Mutex<Option<ClipboardLease>>>,
+) -> AppResult<()> {
+    use arboard::SetExtApple;
+
+    let marker = new_macos_clipboard_marker(code)?;
+    let mut clipboard = arboard::Clipboard::new().map_err(|error| {
+        AppError::new("clipboard_error", format!("打开 macOS 剪贴板失败: {error}"))
+    })?;
+    clipboard
+        .set()
+        .exclude_from_history()
+        .text(code.to_string())
+        .map_err(|error| {
+            AppError::new("clipboard_error", format!("写入 macOS 剪贴板失败: {error}"))
+        })?;
+    let remaining = valid_until.saturating_sub(unix_seconds());
+    let clear_at =
+        Instant::now() + CLIPBOARD_MAX_SECONDS.min(Duration::from_secs(remaining.max(1)));
+    *lock_unpoisoned(lease) = Some(ClipboardLease {
+        sequence: 0,
+        marker,
+        clear_at,
+    });
+    schedule_clipboard_cleanup(lease.clone(), clear_at);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn try_clear_owned_clipboard_macos(lease: &Arc<Mutex<Option<ClipboardLease>>>) -> AppResult<bool> {
+    let expected = {
+        let guard = lock_unpoisoned(lease);
+        let Some(value) = guard.as_ref() else {
+            return Ok(true);
+        };
+        if value.clear_at > Instant::now() {
+            return Ok(true);
+        }
+        value.marker.clone()
+    };
+    let mut clipboard = arboard::Clipboard::new().map_err(|error| {
+        AppError::new("clipboard_error", format!("打开 macOS 剪贴板失败: {error}"))
+    })?;
+    let Ok(current) = clipboard.get_text() else {
+        clear_matching_lease(lease, 0, &expected);
+        return Ok(true);
+    };
+    if !macos_clipboard_marker_matches(&current, &expected) {
+        clear_matching_lease(lease, 0, &expected);
+        return Ok(true);
+    }
+    clipboard.clear().map_err(|error| {
+        AppError::new("clipboard_error", format!("清理 macOS 剪贴板失败: {error}"))
+    })?;
+    clear_matching_lease(lease, 0, &expected);
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn new_macos_clipboard_marker(value: &str) -> AppResult<Vec<u8>> {
+    let mut salt = [0_u8; MACOS_CLIPBOARD_MARKER_SALT_BYTES];
+    getrandom::fill(&mut salt)
+        .map_err(|_| AppError::new("clipboard_error", "生成 macOS 剪贴板所有权标记失败。"))?;
+    Ok(macos_clipboard_marker_with_salt(value, &salt))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_clipboard_marker_with_salt(
+    value: &str,
+    salt: &[u8; MACOS_CLIPBOARD_MARKER_SALT_BYTES],
+) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+
+    let mut marker = Vec::with_capacity(MACOS_CLIPBOARD_MARKER_SALT_BYTES + digest.len());
+    marker.extend_from_slice(salt);
+    marker.extend_from_slice(&digest);
+    marker
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_clipboard_marker_matches(value: &str, marker: &[u8]) -> bool {
+    let expected_len = MACOS_CLIPBOARD_MARKER_SALT_BYTES + 32;
+    if marker.len() != expected_len {
+        return false;
+    }
+    let (salt, expected_digest) = marker.split_at(MACOS_CLIPBOARD_MARKER_SALT_BYTES);
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update(value.as_bytes());
+    hasher.finalize().as_slice() == expected_digest
 }
 
 #[cfg(windows)]
@@ -3364,7 +3615,7 @@ fn decode_qr_payloads(width: u32, height: u32, gray: &[u8]) -> AppResult<Vec<Vec
 }
 
 #[cfg(windows)]
-fn capture_mfa_monitor_luma() -> AppResult<(u32, u32, Vec<u8>)> {
+fn capture_mfa_monitor_luma(_app: &AppHandle) -> AppResult<(u32, u32, Vec<u8>)> {
     use std::mem::size_of;
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::POINT;
@@ -3507,8 +3758,31 @@ fn capture_mfa_monitor_luma() -> AppResult<(u32, u32, Vec<u8>)> {
     Ok((width, height, gray))
 }
 
-#[cfg(not(windows))]
-fn capture_mfa_monitor_luma() -> AppResult<(u32, u32, Vec<u8>)> {
+#[cfg(target_os = "macos")]
+fn capture_mfa_monitor_luma(app: &AppHandle) -> AppResult<(u32, u32, Vec<u8>)> {
+    let (bounds, mut rgba) = crate::screenshot::capture_cursor_monitor_rgba(app)?;
+    let pixels = (bounds.width as usize)
+        .checked_mul(bounds.height as usize)
+        .ok_or_else(generic_qr_error)?;
+    if pixels > 40_000_000 || rgba.len() != pixels * 4 {
+        rgba.zeroize();
+        return Err(AppError::invalid(
+            "显示器画面过大或像素数据无效，无法进行二维码识别。",
+        ));
+    }
+    let mut gray = Vec::with_capacity(pixels);
+    for pixel in rgba.chunks_exact(4) {
+        let y =
+            (u32::from(pixel[0]) * 77 + u32::from(pixel[1]) * 150 + u32::from(pixel[2]) * 29 + 128)
+                / 256;
+        gray.push(y as u8);
+    }
+    rgba.zeroize();
+    Ok((bounds.width, bounds.height, gray))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn capture_mfa_monitor_luma(_app: &AppHandle) -> AppResult<(u32, u32, Vec<u8>)> {
     Err(AppError::new(
         "unsupported_platform",
         "MFA 屏幕扫码仅支持 Windows。",
@@ -3680,7 +3954,7 @@ pub async fn scan_mfa_screen_qr(
             }
             std::thread::sleep(Duration::from_millis(40));
         }
-        let result = match capture_mfa_monitor_luma() {
+        let result = match capture_mfa_monitor_luma(&app) {
             Ok((width, height, mut gray)) => {
                 let result = app.state::<MfaStore>().preview_luma_at_epoch(
                     width,
@@ -3906,6 +4180,30 @@ mod tests {
         for (timestamp, code) in expected {
             assert_eq!(totp.generate(timestamp), code);
         }
+    }
+
+    #[test]
+    fn macos_clipboard_marker_is_salted_and_does_not_store_the_code() {
+        let code = "123456";
+        let first_salt = [0x11; MACOS_CLIPBOARD_MARKER_SALT_BYTES];
+        let second_salt = [0x22; MACOS_CLIPBOARD_MARKER_SALT_BYTES];
+        let first = macos_clipboard_marker_with_salt(code, &first_salt);
+        let second = macos_clipboard_marker_with_salt(code, &second_salt);
+
+        assert_ne!(first, second);
+        assert!(!first
+            .windows(code.len())
+            .any(|window| window == code.as_bytes()));
+        assert_ne!(
+            &first[MACOS_CLIPBOARD_MARKER_SALT_BYTES..],
+            Sha256::digest(code.as_bytes()).as_slice()
+        );
+        assert!(macos_clipboard_marker_matches(code, &first));
+        assert!(!macos_clipboard_marker_matches("654321", &first));
+        assert!(!macos_clipboard_marker_matches(
+            code,
+            &first[..first.len() - 1]
+        ));
     }
 
     #[test]
@@ -4157,6 +4455,50 @@ mod tests {
         recovered.zeroize();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn local_key_metadata_round_trip_preserves_both_platform_wrappers() {
+        let (_root, store) = test_store();
+        let bytes = std::fs::read(&store.vault_path).unwrap();
+        let mut vault = decrypt_envelope_with_recovery(&bytes, RECOVERY_PASSWORD).unwrap();
+        let original_dpapi = vault.dpapi_wrapped_key.clone();
+
+        apply_keychain_key_id(&mut vault, "mac-keychain-test-item".to_string());
+        apply_dpapi_wrapper(&mut vault, &[0xA7; 48]);
+        let rebound_dpapi = vault.dpapi_wrapped_key.clone();
+        assert_ne!(rebound_dpapi, original_dpapi);
+        assert_eq!(
+            vault.keychain_key_id.as_deref(),
+            Some("mac-keychain-test-item")
+        );
+
+        let serialized = serialize_vault(&vault).unwrap();
+        let envelope: VaultEnvelope = serde_json::from_slice(&serialized).unwrap();
+        assert_eq!(envelope.dpapi_wrapped_key, rebound_dpapi);
+        assert_eq!(
+            envelope.keychain_key_id.as_deref(),
+            Some("mac-keychain-test-item")
+        );
+
+        let recovered = decrypt_envelope_with_recovery(&serialized, RECOVERY_PASSWORD).unwrap();
+        assert_eq!(recovered.dpapi_wrapped_key, envelope.dpapi_wrapped_key);
+        assert_eq!(recovered.keychain_key_id, envelope.keychain_key_id);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_envelope_without_keychain_metadata_still_opens_locally() {
+        let (_root, store) = test_store();
+        let bytes = std::fs::read(&store.vault_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value.as_object_mut().unwrap().remove("keychainKeyId");
+        let legacy_bytes = serde_json::to_vec_pretty(&value).unwrap();
+
+        let envelope = parse_envelope(&legacy_bytes).unwrap();
+        assert!(envelope.keychain_key_id.is_none());
+        assert!(decrypt_envelope_local(&legacy_bytes).is_ok());
+    }
+
     #[test]
     fn recovery_password_policy_and_kdf_bounds_are_enforced() {
         assert_eq!(
@@ -4232,6 +4574,7 @@ mod tests {
         let original = std::fs::read(&store.vault_path).unwrap();
         let mut envelope: VaultEnvelope = serde_json::from_slice(&original).unwrap();
         envelope.dpapi_wrapped_key = STANDARD_NO_PAD.encode([0xA5; 64]);
+        envelope.keychain_key_id = Some("preserved-mac-keychain-item".to_string());
         let copied = serde_json::to_vec_pretty(&envelope).unwrap();
         atomic_write(&store.vault_path, &copied).unwrap();
         drop(store);
@@ -4261,6 +4604,11 @@ mod tests {
         let rebound = std::fs::read(&reopened.vault_path).unwrap();
         assert_ne!(rebound, copied);
         assert!(decrypt_envelope_local(&rebound).is_ok());
+        let rebound_envelope: VaultEnvelope = serde_json::from_slice(&rebound).unwrap();
+        assert_eq!(
+            rebound_envelope.keychain_key_id.as_deref(),
+            Some("preserved-mac-keychain-item")
+        );
         drop(reopened);
 
         let local_reopen = MfaStore::load(root.path()).unwrap();

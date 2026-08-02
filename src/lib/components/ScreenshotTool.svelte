@@ -24,6 +24,7 @@
     X,
   } from "@lucide/svelte";
   import LongCaptureControl from "$lib/screenshot/LongCaptureControl.svelte";
+  import { formatShortcut } from "$lib/shortcuts";
   import {
     DEFAULT_TOOL_SETTINGS,
     annotationBounds,
@@ -2028,13 +2029,13 @@
           onclick={toggleLongModeMenu}
         ><ChevronDown size={15} /></button>
         <span class="separator"></span>
-        <button type="button" title="撤销 Ctrl+Z" aria-label="撤销" disabled={history.past.length === 0} onclick={undo}><Undo2 size={19} /></button>
-        <button type="button" title="重做 Ctrl+Y" aria-label="重做" disabled={history.future.length === 0} onclick={redo}><Redo2 size={19} /></button>
+        <button type="button" title={`撤销 ${formatShortcut("Ctrl+Z")}`} aria-label="撤销" disabled={history.past.length === 0} onclick={undo}><Undo2 size={19} /></button>
+        <button type="button" title={`重做 ${formatShortcut("Ctrl+Y")}`} aria-label="重做" disabled={history.future.length === 0} onclick={redo}><Redo2 size={19} /></button>
         <span class="separator"></span>
         <button type="button" title="取消 Esc" aria-label="取消截图" onclick={() => void cancel()}><X size={19} /></button>
         <button type="button" title="置顶贴图" aria-label="置顶贴图" onclick={() => void exportImage("pin")}><Pin size={19} /></button>
-        <button type="button" title="保存 Ctrl+S" aria-label="保存截图" onclick={() => void exportImage("save")}><Save size={19} /></button>
-        <button class="primary-action" type="button" title="复制 Ctrl+C" aria-label="复制截图" onclick={() => void exportImage("copy")}><Copy size={19} /></button>
+        <button type="button" title={`保存 ${formatShortcut("Ctrl+S")}`} aria-label="保存截图" onclick={() => void exportImage("save")}><Save size={19} /></button>
+        <button class="primary-action" type="button" title={`复制 ${formatShortcut("Ctrl+C")}`} aria-label="复制截图" onclick={() => void exportImage("copy")}><Copy size={19} /></button>
       </div>
 
       {#if longModeMenuOpen}
@@ -2175,8 +2176,8 @@
         <span>{longStatus.width.toLocaleString()} × {longStatus.height.toLocaleString()} px</span>
         <div class="long-preview-actions">
           <button type="button" title="置顶贴图" aria-label="置顶长截图" disabled={longBusy} onclick={() => void exportLongImage("pin")}><Pin size={18} /></button>
-          <button type="button" title="保存 Ctrl+S" aria-label="保存长截图" disabled={longBusy} onclick={() => void exportLongImage("save")}><Save size={18} /></button>
-          <button class="primary-action" type="button" title="复制 Ctrl+C" aria-label="复制长截图" disabled={longBusy} onclick={() => void exportLongImage("copy")}><Copy size={18} /></button>
+          <button type="button" title={`保存 ${formatShortcut("Ctrl+S")}`} aria-label="保存长截图" disabled={longBusy} onclick={() => void exportLongImage("save")}><Save size={18} /></button>
+          <button class="primary-action" type="button" title={`复制 ${formatShortcut("Ctrl+C")}`} aria-label="复制长截图" disabled={longBusy} onclick={() => void exportLongImage("copy")}><Copy size={18} /></button>
         </div>
       </header>
       <div class="long-annotation-tools" role="toolbar" aria-label="长截图标注工具">
@@ -2189,8 +2190,8 @@
           <button class:active={longActiveTool === "text"} type="button" title="文字" aria-label="长截图文字" onclick={() => activateLongTool("text")}><Type size={18} /></button>
           <button class:active={longActiveTool === "eraser"} type="button" title="橡皮擦" aria-label="长截图橡皮擦" onclick={() => activateLongTool("eraser")}><Eraser size={18} /></button>
           <span class="long-tool-separator"></span>
-          <button type="button" title="撤销 Ctrl+Z" aria-label="撤销长截图标注" disabled={longHistory.past.length === 0} onclick={undoLongAnnotation}><Undo2 size={18} /></button>
-          <button type="button" title="重做 Ctrl+Y" aria-label="重做长截图标注" disabled={longHistory.future.length === 0} onclick={redoLongAnnotation}><Redo2 size={18} /></button>
+          <button type="button" title={`撤销 ${formatShortcut("Ctrl+Z")}`} aria-label="撤销长截图标注" disabled={longHistory.past.length === 0} onclick={undoLongAnnotation}><Undo2 size={18} /></button>
+          <button type="button" title={`重做 ${formatShortcut("Ctrl+Y")}`} aria-label="重做长截图标注" disabled={longHistory.future.length === 0} onclick={redoLongAnnotation}><Redo2 size={18} /></button>
           {#if longSelectedId}
             <button type="button" title="删除 Delete" aria-label="删除长截图标注" onclick={removeLongSelected}><Trash2 size={18} /></button>
           {/if}
@@ -2325,7 +2326,7 @@
         <strong>{colorText()}</strong>
         <span>{session ? session.monitor.x + Math.round(hoverPoint.x) : 0}, {session ? session.monitor.y + Math.round(hoverPoint.y) : 0}</span>
       </div>
-      <small>C 复制 · Shift 切换</small>
+      <small>C 复制 · {formatShortcut("Shift")} 切换</small>
     </div>
   {/if}
 

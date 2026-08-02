@@ -2,9 +2,9 @@
 
 > 把想法留在桌面，把文件留在自己手里。
 
-[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.4.3/PetalDesk_0.4.3_x64-setup.exe)
+[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows x64](https://github.com/starsliao/PetalDesk/releases/download/v0.5.0/PetalDesk_0.5.0_x64-setup.exe) · [下载 macOS Universal](https://github.com/starsliao/PetalDesk/releases/download/v0.5.0/PetalDesk_0.5.0_universal.dmg)
 
-飞花 - PetalDesk 是一款 Windows 10/11 本地便签与效率工具。它启动快、界面安静，支持 Markdown 即时排版、纯文本、图片、搜索、回收站，以及截图、任务规划和本地 MFA 验证器等随时可以唤起的小工具。没有账号、没有云端依赖，内容保留在你的本地数据目录中。
+飞花 - PetalDesk 是一款面向 Windows 10/11 与 macOS 12+ 的本地便签与效率工具。它启动快、界面安静，支持 Markdown 即时排版、纯文本、图片、搜索、回收站，以及截图、任务规划和本地 MFA 验证器等随时可以唤起的小工具。没有账号、没有云端依赖，内容保留在你的本地数据目录中。
 
 <p align="center">
   <img src="website/assets/screenshots/main-window-0.2.1.png" alt="飞花 - PetalDesk 主界面" width="860" />
@@ -28,14 +28,24 @@
 | --- | --- |
 | <img src="website/assets/screenshots/gantt-tool.png" alt="飞花 - PetalDesk 任务甘特图" width="500" /> | <img src="website/assets/screenshots/screenshot-tool-final.png" alt="飞花 - PetalDesk 截图工具" width="500" /> |
 
-- 计时器：透明电子管数字、暂停/重置记录、透明度、位置和大小记忆。
-- 提醒：一次、间隔、日/周/月/年周期，到点发送 Windows 通知。
-- 任务甘特图：任务排序、进度筛选、时间条拖动、小时级时间轴缩放。
-- MFA 验证器：支持标准 `TOTP`、屏幕二维码扫描、图片/链接/手动导入，也支持一行一个链接批量导入并为批量账户随机搭配图标；验证码默认隐藏、双击安全复制，账户可拖动排序或通过右键置顶/取消置顶。单项可从右键菜单安全导出，经恢复密码验证后提供 Base32 密钥、完整 `otpauth://` 链接和二维码；删除项保留在 MFA 加密回收站中，可恢复，永久删除或清空前均需二次确认。
-- 截图：默认 `F1`，在飞花窗口内外都可直接唤起；支持单显示器手动框选、标注、马赛克、模糊、复制、保存和置顶贴图，选区内双击即可复制，选区外右键直接取消。
-- 长截图：默认由用户在原窗口中手动滚动并实时拼接，支持暂停、重试、回退和完整标注；自动滚动作为高级模式保留，浏览器扩展可增强 Chrome、Edge 与 Firefox 长页面的滚动定位和拼接稳定性。
+### 0.5.0 平台支持
 
-长截图的默认操作只有三步：按 `F1` 框选固定区域并点击工具栏中的长截图按钮；冻结画面切回原窗口后，选区外仍保留暗色遮罩，直接在选区内向下滚动；控制条帧数增长后，点击“完成”。无需再次点击选区，普通 Windows 窗口也不需要安装浏览器扩展。向上滚动只会回看已捕获内容，不会反向写入长图；重新向下越过已捕获末尾后会自动继续拼接。采集会跟随真实滚动连续取帧，并在停止滚动后补一张稳定帧；空闲等待不会自动结束。需要自动滚动时，从长截图按钮旁的小箭头选择自动模式，再点击选区内真正会滚动的正文区域。
+| 能力 | Windows 10/11 x64 | macOS 12+（Intel / Apple Silicon） |
+| --- | --- | --- |
+| 便签、甘特图、计时器、提醒 | 支持 | 支持 |
+| MFA 本机免密保护 | Windows DPAPI | macOS Keychain |
+| 普通区域截图、标注、复制、保存、贴图 | 支持 | 支持；首次使用需授予“屏幕录制”权限 |
+| 长截图、浏览器增强 / Native Messaging | 支持 | 0.5.0 暂不支持 |
+| 安装包 | Windows x64 联网安装 EXE | 一个 Universal DMG，同时支持 Intel 与 Apple Silicon |
+
+- 计时器：透明电子管数字、暂停/重置记录、透明度、位置和大小记忆。
+- 提醒：一次、间隔、日/周/月/年周期，到点发送系统通知。
+- 任务甘特图：任务排序、进度筛选、时间条拖动、小时级时间轴缩放。
+- MFA 验证器：支持标准 `TOTP`、屏幕二维码扫描、图片/链接/手动导入，也支持一行一个链接批量导入并为批量账户随机搭配图标。验证码默认隐藏、双击安全复制，账户可拖动排序或通过右键置顶/取消置顶。单项可从右键菜单安全导出，经恢复密码验证后提供 Base32 密钥、完整 `otpauth://` 链接和二维码；删除项保留在 MFA 加密回收站中，可恢复，永久删除或清空前均需二次确认。
+- 截图：默认 `F1`，在飞花窗口内外都可直接唤起；Windows 与 macOS 均支持单显示器手动框选、标注、马赛克、模糊、复制、保存和置顶贴图，选区内双击即可复制，选区外右键直接取消。
+- Windows 长截图：默认由用户在原窗口中手动滚动并实时拼接，支持暂停、重试、回退和完整标注；自动滚动作为高级模式保留，浏览器扩展可增强 Chrome、Edge 与 Firefox 长页面的滚动定位和拼接稳定性。macOS 0.5.0 不提供长截图和浏览器联动。
+
+Windows 长截图的默认操作只有三步：按 `F1` 框选固定区域并点击工具栏中的长截图按钮；冻结画面切回原窗口后，选区外仍保留暗色遮罩，直接在选区内向下滚动；控制条帧数增长后，点击“完成”。无需再次点击选区，普通 Windows 窗口也不需要安装浏览器扩展。向上滚动只会回看已捕获内容，不会反向写入长图；重新向下越过已捕获末尾后会自动继续拼接。采集会跟随真实滚动连续取帧，并在停止滚动后补一张稳定帧；空闲等待不会自动结束。需要自动滚动时，从长截图按钮旁的小箭头选择自动模式，再点击选区内真正会滚动的正文区域。
 
 ## 数据真正属于你
 
@@ -56,7 +66,7 @@ PetalDesk/
    │  │  ├─ backups/
    │  │  └─ conflicts/
    │  └─ mfa/
-   │     ├─ vault.json     # DPAPI + 恢复密码双包装的 AEAD 加密保险库
+   │     ├─ vault.json     # 本机保护 + 恢复密码包装的 AEAD 加密保险库
    │     ├─ backups/
    │     └─ conflicts/
    ├─ backups/
@@ -67,33 +77,35 @@ PetalDesk/
 
 `note.md` 是正文唯一真相，图片使用便签目录内 `assets/` 的相对路径。Markdown 图片和受控的 HTML `<img>` 标签都经过相同的本地资源映射；脚本、事件属性、任意本地路径和远程图片不会被加载。普通读取不会改写笔记；搜索索引按内容哈希增量维护且随时可以重建，不会成为迁移或恢复的前置条件。甘特图不保存为同步服务准备的删除墓碑或操作日志，只保留当前快照。
 
-所有权威文件都采用同目录临时文件、磁盘刷新和 Windows 原子替换。便签提交同时校验版本和正文哈希；甘特图与 MFA 保存前校验启动时读取的文件指纹。检测到外部替换时不会静默覆盖，而是将待保存内容写入 `conflicts/`，由用户决定保留哪一版。甘特图与 MFA 保留最近 5 份写前备份。旧版本布局可用 [`scripts/migrate-petaldesk-storage.ps1`](scripts/migrate-petaldesk-storage.ps1) 迁移，完整取舍见 [本地存储设计](docs/storage.md)。
+所有权威文件都采用同目录临时文件、磁盘刷新和原子替换。便签提交同时校验版本和正文哈希；甘特图与 MFA 保存前校验启动时读取的文件指纹。检测到外部替换时不会静默覆盖，而是将待保存内容写入 `conflicts/`，由用户决定保留哪一版。甘特图与 MFA 保留最近 5 份写前备份。旧版本布局可在 Windows 上使用 [`scripts/migrate-petaldesk-storage.ps1`](scripts/migrate-petaldesk-storage.ps1) 迁移，完整取舍见 [本地存储设计](docs/storage.md)。
 
-MFA 同样可以随整个数据目录迁移。首次使用时需要设置恢复密码；保险库正文由随机密钥进行 XChaCha20-Poly1305 认证加密，同一密钥分别由当前 Windows 用户的 DPAPI 和基于 Argon2id 的恢复密码包装。本机日常打开不需要输入密码；复制目录到新电脑或另一个 Windows 用户后，输入一次恢复密码即可解锁，并为新环境建立新的 DPAPI 包装。导出单项密钥也必须重新验证恢复密码；恢复密码不会保存，保险库、加密回收站、备份和冲突副本都不会降级为明文。忘记恢复密码且原电脑已不可用时，只能使用各服务提供的账户恢复码。
+MFA 同样可以随整个数据目录迁移。首次使用时需要设置恢复密码；保险库正文由随机密钥进行 XChaCha20-Poly1305 认证加密，数据密钥由基于 Argon2id 的恢复密码包装，同时保留当前平台的本机免密包装：Windows 使用 DPAPI，macOS 使用 Keychain。复制目录到另一台电脑、另一个系统用户或另一平台后，输入一次恢复密码即可解锁，并为新环境绑定本机保护；已有的另一平台包装会继续保留。导出单项密钥也必须重新验证恢复密码；恢复密码不会保存，保险库、加密回收站、备份和冲突副本都不会降级为明文。忘记恢复密码且原设备已不可用时，只能使用各服务提供的账户恢复码。
 
 ### 升级与兼容
 
-`0.4.3` 可以直接覆盖安装。首次启动时会自动识别旧的 `飞花/.feihua` 存储布局、旧便签元数据和旧甘特图数组格式，转换到当前 `.petaldesk/` 结构；便签正文 `note.md` 不会被改写，甘特图转换前会保留迁移备份。普通版本升级不需要导出、导入或输入 MFA 恢复密码；恢复密码用于把 MFA 数据目录迁移到另一台电脑或另一个 Windows 用户，以及主动导出单个 MFA 账户。旧数据损坏或格式版本过新时，飞花会保留原文件并阻止静默覆盖。
+Windows 上的 `0.5.0` 可以直接覆盖早期版本安装；macOS 的 `0.5.0` 是首个公开版本。首次启动时会自动识别旧的 `飞花/.feihua` 存储布局、旧便签元数据和旧甘特图数组格式，转换到当前 `.petaldesk/` 结构；便签正文 `note.md` 不会被改写，甘特图转换前会保留迁移备份。同机升级不需要输入 MFA 恢复密码；恢复密码用于把 MFA 数据目录迁移到另一台电脑、另一个系统用户或另一平台，以及主动导出单个 MFA 账户。旧数据损坏或格式版本过新时，飞花会保留原文件并阻止静默覆盖。
 
 ## 安装与运行
 
-下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.4.3/PetalDesk_0.4.3_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。
+Windows 用户下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.5.0/PetalDesk_0.5.0_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。
 
 没有 WebView2 或下载权限时，安装器会明确提示失败原因，不会静默留下无法启动的程序。未签名构建可能显示“未知发布者”，这是 Windows 对代码签名的正常提示。
 
-安装包已经包含长截图所需的 Native Messaging Host。浏览器增强模式还需要安装对应扩展；Firefox 面向普通用户的扩展必须经过 AMO 签名，具体发布方式见 [`docs/publishing.md`](docs/publishing.md)。不安装扩展仍可使用通用长截图。
+macOS 用户下载 [Universal DMG](https://github.com/starsliao/PetalDesk/releases/download/v0.5.0/PetalDesk_0.5.0_universal.dmg)，将应用拖入“应用程序”即可。同一个 DMG 同时包含 Intel（x86_64）和 Apple Silicon（arm64）代码，不需要按芯片下载不同安装包。普通截图首次使用时，请在“系统设置 > 隐私与安全性 > 屏幕录制”中允许 PetalDesk；未签名、未公证的测试构建可能被 Gatekeeper 阻止，正式发布方式见 [`docs/publishing.md`](docs/publishing.md)。
+
+Windows 安装包已经包含长截图所需的 Native Messaging Host。浏览器增强模式还需要安装对应扩展；Firefox 面向普通用户的扩展必须经过 AMO 签名。不安装扩展仍可使用 Windows 通用长截图。macOS 版本不安装 Native Messaging Host，也不提供长截图或浏览器增强模式。
 
 ## 技术栈
 
 - Rust stable + Tauri 2：文件、窗口、托盘、截图、剪贴板、通知和本地 IPC。
 - Svelte 5 + TypeScript：主界面、便签和小工具。
 - CodeMirror 6：Markdown/纯文本编辑、中文输入法、撤回与重做。
-- Chrome、Edge、Firefox 扩展：为浏览器长页面提供稳定的滚动控制和页面状态协作。
-- 系统 WebView2：Windows 桌面渲染，避免 Electron 自带 Chromium 的体积。
+- Chrome、Edge、Firefox 扩展：在 Windows 上为浏览器长页面提供稳定的滚动控制和页面状态协作。
+- 系统 WebView：Windows 使用 WebView2，macOS 使用 WKWebView，避免 Electron 自带 Chromium 的体积。
 
 ## 开发
 
-环境：Rust stable、Node.js、pnpm 和 Windows WebView2 Runtime。
+环境：Rust stable、Node.js、pnpm；Windows 开发需要 WebView2 Runtime，macOS 构建需要 macOS 12+ 与 Xcode Command Line Tools。
 
 ```powershell
 pnpm install
@@ -123,5 +135,14 @@ cargo test --manifest-path src-tauri/Cargo.toml --offline
 ```powershell
 pnpm package:windows
 ```
+
+在 macOS 上生成同时支持 Intel 与 Apple Silicon 的 Universal DMG：
+
+```bash
+rustup target add x86_64-apple-darwin aarch64-apple-darwin
+pnpm package:macos
+```
+
+没有 Mac 时，可推送 `v*` 标签，由 GitHub Actions 的 macOS Runner 构建 Universal DMG；签名、公证与未签名构建限制见 [`docs/publishing.md`](docs/publishing.md)。
 
 更完整的架构、发布和目录说明见 [`docs/README.md`](docs/README.md)。

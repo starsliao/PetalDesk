@@ -1,4 +1,4 @@
-name: Build Windows release
+name: Build desktop release
 
 on:
   push:
@@ -9,8 +9,8 @@ permissions:
   contents: write
 
 jobs:
-  windows:
-    runs-on: windows-latest
+  validate:
+    runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -39,6 +39,13 @@ jobs:
             }
           }
           Write-Host "All release versions match $tag."
+
+  windows:
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6
@@ -85,51 +92,159 @@ jobs:
           }
           & ".\browser-extension\scripts\package-firefox.ps1" @signArguments
 
-      - name: Publish release asset
+      - name: Collect Windows release assets
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          $installers = @(
-            Get-ChildItem `
-              -Path "src-tauri/target/release/bundle/nsis" `
-              -Filter "PetalDesk_*_x64-setup.exe" `
-              -File
-          )
+          $assetsDirectory = New-Item -ItemType Directory -Path "release-assets" -Force
+          $installers = @(Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "PetalDesk_*_x64-setup.exe" -File)
           if ($installers.Count -ne 1) {
             throw "Expected one Windows installer, found $($installers.Count)."
           }
-          $firefoxArchives = @(
-            Get-ChildItem `
-              -Path "browser-extension/dist/artifacts" `
-              -Filter "PetalDesk_Firefox_AMO-upload_*.zip" `
-              -File
-          )
+          Copy-Item -LiteralPath $installers[0].FullName -Destination $assetsDirectory.FullName
+
+          $firefoxArchives = @(Get-ChildItem -Path "browser-extension/dist/artifacts" -Filter "PetalDesk_Firefox_AMO-upload_*.zip" -File)
           if ($firefoxArchives.Count -ne 1) {
             throw "Expected one Firefox AMO upload archive, found $($firefoxArchives.Count)."
           }
-          $signedFirefoxPackages = @(
-            Get-ChildItem `
-              -Path "browser-extension/dist/signed" `
-              -Filter "PetalDesk_Firefox_*-signed.xpi" `
-              -File `
-              -ErrorAction SilentlyContinue
-          )
+          Copy-Item -LiteralPath $firefoxArchives[0].FullName -Destination $assetsDirectory.FullName
+
+          $signedFirefoxPackages = @(Get-ChildItem -Path "browser-extension/dist/signed" -Filter "PetalDesk_Firefox_*-signed.xpi" -File -ErrorAction SilentlyContinue)
           if ($signedFirefoxPackages.Count -gt 1) {
             throw "Expected at most one signed Firefox XPI, found $($signedFirefoxPackages.Count)."
           }
-          $assets = @(
-            $installers[0].FullName
-            $firefoxArchives[0].FullName
-          )
           if ($signedFirefoxPackages.Count -eq 1) {
-            $assets += $signedFirefoxPackages[0].FullName
+            Copy-Item -LiteralPath $signedFirefoxPackages[0].FullName -Destination $assetsDirectory.FullName
           }
-          $version = $tag.TrimStart("v")
-          gh release view $tag 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag @assets --clobber
-          } else {
-            gh release create $tag @assets --title "飞花 - PetalDesk $version" --generate-notes
-          }
+
+      - name: Upload Windows release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+  macos:
+    needs: validate
+    runs-on: macos-15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: universal-apple-darwin
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Universal macOS DMG
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          certificate_values=("$APPLE_CERTIFICATE" "$APPLE_CERTIFICATE_PASSWORD" "$APPLE_SIGNING_IDENTITY")
+          certificate_count=0
+          for value in "${certificate_values[@]}"; do
+            [[ -n "$value" ]] && certificate_count=$((certificate_count + 1))
+          done
+          if [[ "$certificate_count" -ne 0 && "$certificate_count" -ne 3 ]]; then
+            echo "Configure APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD and APPLE_SIGNING_IDENTITY together." >&2
+            exit 1
+          fi
+
+          notarization_values=("$APPLE_ID" "$APPLE_PASSWORD" "$APPLE_TEAM_ID")
+          notarization_count=0
+          for value in "${notarization_values[@]}"; do
+            [[ -n "$value" ]] && notarization_count=$((notarization_count + 1))
+          done
+          if [[ "$notarization_count" -ne 0 && "$notarization_count" -ne 3 ]]; then
+            echo "Configure APPLE_ID, APPLE_PASSWORD and APPLE_TEAM_ID together." >&2
+            exit 1
+          fi
+          if [[ "$notarization_count" -ne "$certificate_count" ]]; then
+            echo "Configure all six Apple signing and notarization secrets together, or leave all of them empty." >&2
+            exit 1
+          fi
+          if [[ "$certificate_count" -eq 0 ]]; then
+            unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY
+          fi
+          if [[ "$notarization_count" -eq 0 ]]; then
+            unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          fi
+          pnpm package:macos
+
+      - name: Collect macOS release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          source_directory="src-tauri/target/universal-apple-darwin/release/bundle/dmg"
+          shopt -s nullglob
+          images=("$source_directory"/*.dmg)
+          if [[ "${#images[@]}" -ne 1 ]]; then
+            echo "Expected one Universal macOS DMG, found ${#images[@]}." >&2
+            exit 1
+          fi
+          mkdir -p release-assets
+          cp "${images[0]}" "release-assets/PetalDesk_${version}_universal.dmg"
+
+      - name: Upload macOS release asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-release-assets'
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          version="${tag#v}"
+          mapfile -t assets < <(find release-assets -maxdepth 1 -type f | sort)
+          if [[ "${#assets[@]}" -lt 3 ]]; then
+            echo "Expected Windows, macOS and Firefox release assets." >&2
+            exit 1
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" --title "飞花 - PetalDesk $version" --generate-notes

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="飞花 - PetalDesk 是一款 Windows 本地便签与效率工具，支持 Markdown、纯文本、截图与长截图、计时器、提醒、任务甘特图和带恢复密码迁移的本地 MFA 验证器。"
+      content="飞花 - PetalDesk 是一款面向 Windows 与 macOS 的本地便签和效率工具，支持 Markdown、普通截图、计时器、提醒、任务甘特图，以及由 DPAPI 或 Keychain 保护的本地 MFA 验证器。"
     />
     <meta name="theme-color" content="#f7f7f5" />
     <link rel="icon" href="./assets/app-icon.svg" type="image/svg+xml" />
@@ -30,7 +30,8 @@
         --red: #d95d49;
         --max-width: 1180px;
         font-family:
-          "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+          "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", -apple-system,
+          "Segoe UI", Arial, sans-serif;
         font-synthesis: none;
       }
 
@@ -810,7 +811,11 @@
       }
 
       .install-actions {
-        width: min(100%, 310px);
+        width: min(100%, 340px);
+      }
+
+      .download-option + .download-option {
+        margin-top: 16px;
       }
 
       .download-action {
@@ -1278,9 +1283,8 @@
           </a>
           <a
             class="nav-download"
-            href="https://github.com/starsliao/PetalDesk/releases/download/v0.4.3/PetalDesk_0.4.3_x64-setup.exe"
-            download
-          >下载 0.4.3</a>
+            href="#download"
+          >下载 0.5.0</a>
         </div>
       </nav>
     </header>
@@ -1289,7 +1293,7 @@
       <section class="hero" id="top" aria-labelledby="hero-title">
         <div class="hero-inner container">
           <div class="hero-copy">
-            <p class="eyebrow">Windows 本地便签与效率工具</p>
+            <p class="eyebrow">Windows 与 macOS 本地便签与效率工具</p>
             <h1 id="hero-title">飞花 - PetalDesk</h1>
             <p class="hero-lead">
               让 Markdown 像普通文字一样自然，也让截图、提醒与任务安排留在一个安静的桌面空间里。
@@ -1297,10 +1301,14 @@
             <div class="hero-actions">
               <a
                 class="primary-action"
-                href="https://github.com/starsliao/PetalDesk/releases/download/v0.4.3/PetalDesk_0.4.3_x64-setup.exe"
+                href="https://github.com/starsliao/PetalDesk/releases/download/v0.5.0/PetalDesk_0.5.0_x64-setup.exe"
                 download
-              >下载 Windows 版 0.4.3</a>
-              <a class="secondary-action" href="#notes">查看功能</a>
+              >Windows x64</a>
+              <a
+                class="secondary-action"
+                href="https://github.com/starsliao/PetalDesk/releases/download/v0.5.0/PetalDesk_0.5.0_universal.dmg"
+                download
+              >macOS Universal</a>
             </div>
           </div>
           <div class="hero-visual">
@@ -1354,7 +1362,7 @@
             <article class="note-feature">
               <span class="feature-label">WINDOW</span>
               <h3>每张都是独立窗口</h3>
-              <p>双击默认打开首个便签，Alt / Ctrl / Shift + 双击默认打开甘特图、MFA 与主界面；四组动作均可改绑到首个便签、最近便签、主界面或任一小工具，桌面快捷方式也沿用“双击”设置。</p>
+              <p>Windows 可配置托盘双击及 Alt / Ctrl / Shift + 双击动作；macOS 可从菜单栏与 Dock 自然唤回主界面、便签和小工具。</p>
             </article>
             <article class="note-feature">
               <span class="feature-label">FOCUS</span>
@@ -1417,7 +1425,7 @@
             <article class="tool-item">
               <span class="tool-number">02</span>
               <h3>提醒</h3>
-              <p>支持一次、间隔以及日、周、月、年周期，到点发送 Windows 通知。</p>
+              <p>支持一次、间隔以及日、周、月、年周期，到点发送 Windows 或 macOS 系统通知。</p>
             </article>
             <article class="tool-item">
               <span class="tool-number">03</span>
@@ -1427,12 +1435,12 @@
             <article class="tool-item">
               <span class="tool-number">04</span>
               <h3>MFA 验证器</h3>
-              <p>TOTP 支持一行一个链接批量导入，批量账户随机搭配图标；验证码默认隐藏、双击复制。账户可拖动排序或右键置顶；单项经恢复密码验证后可导出 Base32 密钥、完整链接和二维码，删除项可从 MFA 加密回收站恢复。</p>
+              <p>TOTP 支持图片、链接、手动和批量导入；Windows 使用 DPAPI、macOS 使用 Keychain 实现本机免密。验证码默认隐藏、双击复制，单项经恢复密码验证后可安全导出，删除项可从加密回收站恢复。</p>
             </article>
             <article class="tool-item">
               <span class="tool-number">05</span>
-              <h3>截图与长截图</h3>
-              <p>在飞花窗口内外按快捷键都能直接框选，再标注、复制、保存或贴图；长截图保留选区遮罩，在原窗口中滚动并稳定拼接。</p>
+              <h3>截图</h3>
+              <p>Windows 与 macOS 都能直接框选，再标注、复制、保存或贴图。长截图、浏览器增强与 Native Messaging 仅在 Windows 提供。</p>
             </article>
           </div>
 
@@ -1459,8 +1467,8 @@
               loading="lazy"
             />
             <figcaption>
-              <span class="caption-title">从区域截图到完整长页面</span>
-              <span>完整标注工具与滚动拼接；Chrome、Edge、Firefox 可启用浏览器增强模式</span>
+              <span class="caption-title">跨平台区域截图，Windows 再加长截图</span>
+              <span>Windows 与 macOS 共享标注、复制、保存和贴图；滚动拼接与浏览器增强仅限 Windows</span>
             </figcaption>
           </figure>
         </div>
@@ -1477,7 +1485,7 @@
               </h2>
             </div>
             <p class="section-intro">
-              飞花 - PetalDesk 把便签、附件、设置和小工具数据统一放进“飞花 - PetalDesk 数据存储”。它按本地读多写少设计，换电脑时复制整个目录即可；MFA 本机免密，迁移时输入一次恢复密码。
+              飞花 - PetalDesk 把便签、附件、设置和小工具数据统一放进“飞花 - PetalDesk 数据存储”。它按本地读多写少设计，换电脑或平台时复制整个目录即可；MFA 本机免密，迁移时输入一次恢复密码。
             </p>
           </div>
 
@@ -1494,7 +1502,7 @@
                 <span class="data-point-number">02</span>
                 <div>
                   <strong>普通数据一个目录完成迁移</strong>
-                  <p>复制完整数据目录并重新指定路径即可；MFA 密钥不会降级为明文，跨电脑后输入恢复密码即可重新绑定本机保护，导出密钥也不能绕过恢复密码验证。</p>
+                  <p>复制完整数据目录并重新指定路径即可；MFA 密钥不会降级为明文，跨电脑或平台后输入恢复密码即可重新绑定 DPAPI 或 Keychain，导出密钥也不能绕过恢复密码验证。</p>
                 </div>
               </li>
               <li>
@@ -1509,7 +1517,7 @@
             <div>
               <div class="directory-panel">
                 <div class="directory-titlebar">
-                  <span>文档\PetalDesk</span>
+                  <span>文档 / PetalDesk</span>
                   <span>可在安装或设置中修改</span>
                 </div>
                 <pre aria-label="飞花 - PetalDesk 数据存储目录结构">PetalDesk/
@@ -1534,10 +1542,10 @@
    └─ conflicts/</pre>
               </div>
               <p class="directory-note">
-                `%LOCALAPPDATA%\PetalDesk` 只保存当前数据目录指针、可重建索引和调试日志，不属于需要迁移的业务内容。
+                Windows 的 `%LOCALAPPDATA%\PetalDesk` 或 macOS 的 `~/Library/Application Support/PetalDesk` 只保存当前数据目录指针、可重建索引和调试日志，不属于需要迁移的业务内容。
               </p>
               <p class="directory-note">
-                直接覆盖安装即可升级：首次启动会自动兼容旧便签元数据和旧甘特图文件，并在写入新格式前保留迁移备份；同机升级不需要 MFA 恢复密码。
+                Windows 可直接覆盖安装 0.5.0；首次启动会自动兼容旧便签元数据和旧甘特图文件，并在写入新格式前保留迁移备份。同机升级不需要 MFA 恢复密码。
               </p>
             </div>
           </div>
@@ -1549,16 +1557,26 @@
           <div>
             <h2 id="download-title">现在，把飞花 - PetalDesk 放到桌面。</h2>
             <p>
-              安装器会先检查 WebView2；缺少时从微软官方地址联网下载，显示进度并静默安装，完成后再继续安装飞花 - PetalDesk。
+              Windows x64 安装器会自动检查 WebView2；macOS Universal DMG 同时支持 Intel 与 Apple Silicon。macOS 普通截图首次使用时需要授予“屏幕录制”权限。
             </p>
           </div>
           <div class="install-actions">
-            <a
-              class="download-action"
-              href="https://github.com/starsliao/PetalDesk/releases/download/v0.4.3/PetalDesk_0.4.3_x64-setup.exe"
-              download
-            >下载飞花 - PetalDesk 0.4.3</a>
-            <div class="download-meta">Windows 10 / 11 · x64 · 联网安装包</div>
+            <div class="download-option">
+              <a
+                class="download-action"
+                href="https://github.com/starsliao/PetalDesk/releases/download/v0.5.0/PetalDesk_0.5.0_x64-setup.exe"
+                download
+              >下载 Windows x64 版 0.5.0</a>
+              <div class="download-meta">Windows 10 / 11 · x64 · 联网安装包</div>
+            </div>
+            <div class="download-option">
+              <a
+                class="download-action"
+                href="https://github.com/starsliao/PetalDesk/releases/download/v0.5.0/PetalDesk_0.5.0_universal.dmg"
+                download
+              >下载 macOS 版 0.5.0</a>
+              <div class="download-meta">macOS 12+ · Intel + Apple Silicon · Universal DMG</div>
+            </div>
           </div>
         </div>
       </section>
@@ -1570,7 +1588,7 @@
           <img src="./assets/app-icon.svg" alt="" width="28" height="28" />
           <span>飞花 - PetalDesk</span>
         </div>
-        <span>本地优先 · 数据可见 · Windows 桌面体验</span>
+        <span>本地优先 · 数据可见 · Windows 与 macOS 桌面体验</span>
       </div>
     </footer>
   </body>

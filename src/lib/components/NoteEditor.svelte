@@ -45,6 +45,7 @@
     type EditorMode,
     type EditorReadyDetail,
   } from "../editor";
+  import { formatShortcut } from "$lib/shortcuts";
 
   interface Props {
     value?: string;
@@ -1105,19 +1106,19 @@
 >
   {#if !readonly}
     <div class="toolbar" role="toolbar" aria-label="便签编辑工具栏">
-      <button type="button" title="撤回 (Ctrl+Z)" aria-label="撤回" disabled={!canUndo} onclick={runUndo}><Undo2 size={17} /></button>
-      <button type="button" title="重做 (Ctrl+Y)" aria-label="重做" disabled={!canRedo} onclick={runRedo}><Redo2 size={17} /></button>
+      <button type="button" title={`撤回 (${formatShortcut("Ctrl+Z")})`} aria-label="撤回" disabled={!canUndo} onclick={runUndo}><Undo2 size={17} /></button>
+      <button type="button" title={`重做 (${formatShortcut("Ctrl+Y")})`} aria-label="重做" disabled={!canRedo} onclick={runRedo}><Redo2 size={17} /></button>
       <span class="separator"></span>
       {#if mode === "typora"}
-        <button type="button" title="粗体 (Ctrl+B)" aria-label="粗体" onclick={() => format("bold")}><Bold size={17} /></button>
-        <button type="button" title="斜体 (Ctrl+I)" aria-label="斜体" onclick={() => format("italic")}><Italic size={17} /></button>
+        <button type="button" title={`粗体 (${formatShortcut("Ctrl+B")})`} aria-label="粗体" onclick={() => format("bold")}><Bold size={17} /></button>
+        <button type="button" title={`斜体 (${formatShortcut("Ctrl+I")})`} aria-label="斜体" onclick={() => format("italic")}><Italic size={17} /></button>
         <button type="button" title="高亮" aria-label="高亮" onclick={() => format("highlight")}><Highlighter size={17} /></button>
-        <button type="button" title="链接 (Ctrl+K)" aria-label="链接" onclick={() => format("link")}><Link size={17} /></button>
+        <button type="button" title={`链接 (${formatShortcut("Ctrl+K")})`} aria-label="链接" onclick={() => format("link")}><Link size={17} /></button>
         <button type="button" title="插入图片" aria-label="插入图片" disabled={!onasset || importing} onclick={openImagePicker}><ImagePlus size={17} /></button>
         <button type="button" title="插入分割线" aria-label="插入分割线" onclick={insertRule}><Minus size={18} /></button>
         <span class="separator"></span>
       {/if}
-      <button type="button" title="查找 (Ctrl+F)" aria-label="查找" onclick={find}><Search size={17} /></button>
+      <button type="button" title={`查找 (${formatShortcut("Ctrl+F")})`} aria-label="查找" onclick={find}><Search size={17} /></button>
       {#if mode === "typora"}
         <button type="button" class:active={sourceMode} title="切换源码模式" aria-label="切换源码模式" aria-pressed={sourceMode} onclick={toggleSourceMode}><Code2 size={17} /></button>
       {/if}
@@ -1135,7 +1136,7 @@
       style={`left: ${linkContextMenu.x}px; top: ${linkContextMenu.y}px;`}
       oncontextmenu={(event) => event.preventDefault()}
     >
-      <button type="button" role="menuitem" onclick={openContextMenuLink}>跳转（Ctrl+左键）</button>
+      <button type="button" role="menuitem" onclick={openContextMenuLink}>跳转（{formatShortcut("Ctrl+左键")}）</button>
     </div>
   {/if}
   <input

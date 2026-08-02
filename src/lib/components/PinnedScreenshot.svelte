@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { Copy, LoaderCircle, Save, X } from "@lucide/svelte";
   import { pinnedScreenshotApi, pngBlob, type PinnedScreenshotApi } from "$lib/screenshot";
+  import { formatShortcut } from "$lib/shortcuts";
 
   interface Props {
     pinId?: string;
@@ -209,8 +210,8 @@
       onclick={(event) => event.stopPropagation()}
       onkeydown={(event) => event.stopPropagation()}
     >
-      <button type="button" role="menuitem" onclick={() => void copy()}><Copy size={16} /><span>复制</span><kbd>Ctrl+C</kbd></button>
-      <button type="button" role="menuitem" onclick={() => void save()}><Save size={16} /><span>另存为</span><kbd>Ctrl+S</kbd></button>
+      <button type="button" role="menuitem" onclick={() => void copy()}><Copy size={16} /><span>复制</span><kbd>{formatShortcut("Ctrl+C")}</kbd></button>
+      <button type="button" role="menuitem" onclick={() => void save()}><Save size={16} /><span>另存为</span><kbd>{formatShortcut("Ctrl+S")}</kbd></button>
       <span class="menu-separator"></span>
       <button type="button" role="menuitem" onclick={() => void close()}><X size={16} /><span>关闭</span><kbd>Esc</kbd></button>
     </div>

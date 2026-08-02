@@ -28,6 +28,7 @@
     X,
   } from "@lucide/svelte";
   import ConfirmDialog from "./ConfirmDialog.svelte";
+  import { formatShortcut } from "$lib/shortcuts";
   import {
     formatOtpCode,
     maskedOtpCode,
@@ -1112,7 +1113,7 @@
 
   async function readClipboard(): Promise<void> {
     if (!navigator.clipboard) {
-      error = "当前环境不能直接读取剪贴板，请使用 Ctrl+V 粘贴。";
+      error = `当前环境不能直接读取剪贴板，请使用 ${formatShortcut("Ctrl+V")} 粘贴。`;
       return;
     }
     try {
@@ -1134,7 +1135,7 @@
       uriText = text;
       await previewUri();
     } catch (reason) {
-      error = reasonMessage(reason, "读取剪贴板失败，请使用 Ctrl+V 粘贴。");
+      error = reasonMessage(reason, `读取剪贴板失败，请使用 ${formatShortcut("Ctrl+V")} 粘贴。`);
     }
   }
 
@@ -1400,7 +1401,7 @@
     {/if}
 
     {#if status?.protection === "browser-demo"}
-      <div class="info-banner">浏览器预览只显示模拟验证码；真实账户仅在 Windows 客户端加密保存。</div>
+      <div class="info-banner">浏览器预览只显示模拟验证码；真实账户仅在桌面客户端加密保存。</div>
     {:else if status && status.captureExcluded === false}
       <div class="warning-banner">当前系统未能启用窗口防截屏保护，请避免在录屏或共享屏幕时显示验证码。</div>
     {/if}
@@ -1420,7 +1421,7 @@
       <div class="empty-state unavailable" role="alert">
         <div class="empty-icon danger"><AlertTriangle size={28} aria-hidden="true" /></div>
         <strong>MFA 数据保险库不可用</strong>
-        <span>{status.message || "无法使用当前 Windows 用户解锁验证器数据，请检查数据目录和用户身份。"}</span>
+        <span>{status.message || "无法使用本机安全存储解锁验证器数据，请检查数据目录和系统用户身份。"}</span>
       </div>
     {:else if entries.length === 0}
       <div class="empty-state">
@@ -1461,7 +1462,7 @@
               aria-label={`调整“${entry.name}”的顺序`}
               aria-pressed={reorderDragId === entry.id}
               aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
-              title={searchActive ? "清空搜索后可调整顺序" : "拖动调整顺序；Alt + 方向键移动"}
+              title={searchActive ? "清空搜索后可调整顺序" : `拖动调整顺序；${formatShortcut("Alt")} + 方向键移动`}
               disabled={searchActive || reordering || pinBusy}
               onpointerdown={(event) => beginReorderPointer(event, entry)}
               onkeydown={(event) => moveReorderByKeyboard(event, entry)}
@@ -1647,7 +1648,7 @@
           <header class="modal-header">
             <div>
               <h2 id="mfa-recovery-title">{isUnlocking ? "使用恢复密码迁移" : isChanging ? "修改 MFA 恢复密码" : "设置 MFA 恢复密码"}</h2>
-              <p>{isUnlocking ? "验证成功后，这台电脑将恢复 Windows 免密解锁。" : "恢复密码仅用于换电脑或更换 Windows 用户。"}</p>
+              <p>{isUnlocking ? "验证成功后，这台电脑将恢复本机免密解锁。" : "恢复密码仅用于换电脑或更换系统用户。"}</p>
             </div>
             <button
               type="button"
@@ -1663,11 +1664,11 @@
                 <strong>{isUnlocking ? "解锁从其他电脑迁移来的 MFA 数据" : isChanging ? "验证原密码后再设置新密码" : "本机使用仍然不需要输入密码"}</strong>
                 <p>
                   {#if isUnlocking}
-                    输入原电脑设置的恢复密码。解锁后，飞花会为当前 Windows 用户建立新的本机保护。
+                    输入原电脑设置的恢复密码。解锁后，飞花会为当前系统用户建立新的本机保护。
                   {:else if isChanging}
                     原恢复密码只用于验证身份；修改后，跨电脑迁移和账户导出都需要使用新密码。
                   {:else}
-                    飞花日常由 Windows DPAPI 自动解锁。只有把飞花数据迁移到其他电脑或 Windows 用户时，才需要这个恢复密码。
+                    飞花日常由 Windows DPAPI 或 macOS Keychain 自动解锁。只有把飞花数据迁移到其他电脑或系统用户时，才需要这个恢复密码。
                   {/if}
                 </p>
               </div>

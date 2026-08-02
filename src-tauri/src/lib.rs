@@ -213,7 +213,21 @@ fn show_about_dialog() {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+fn show_about_dialog() {
+    let last_updated = std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|metadata| metadata.modified().ok());
+    let _ = rfd::MessageDialog::new()
+        .set_title("关于飞花 - PetalDesk")
+        .set_description(about_message(last_updated).replace("\r\n", "\n"))
+        .set_level(rfd::MessageLevel::Info)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn show_about_dialog() {}
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -508,7 +522,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let menu = build_tray_menu(app.handle())?;
     let mut tray = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
-        .show_menu_on_left_click(false)
+        .show_menu_on_left_click(!cfg!(windows))
         .tooltip("飞花 - PetalDesk")
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_main_window(app),
@@ -820,7 +834,14 @@ pub fn run() {
         }
         RunEvent::ExitRequested { api, code, .. } => {
             if code.is_none() {
+                #[cfg(not(target_os = "macos"))]
                 api.prevent_exit();
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = api;
+                    app.state::<MfaStore>().lock();
+                    long_screenshot::shutdown(app);
+                }
             } else {
                 app.state::<MfaStore>().lock();
             }
@@ -828,6 +849,15 @@ pub fn run() {
             // worker thread before requesting process exit. Repeating that
             // blocking cleanup here can stall Tauri's event loop while Windows
             // is already tearing down the process.
+        }
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen {
+            has_visible_windows,
+            ..
+        } => {
+            if !has_visible_windows {
+                show_main_window(app);
+            }
         }
         _ => {}
     });

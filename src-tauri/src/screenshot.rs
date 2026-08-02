@@ -1731,12 +1731,129 @@ fn monitor_scale_factor(app: &AppHandle, bounds: &MonitorBounds) -> f64 {
         .unwrap_or(1.0)
 }
 
+#[cfg(windows)]
 fn capture_cursor_monitor(app: &AppHandle) -> AppResult<(MonitorBounds, Vec<u8>)> {
     let (mut bounds, bgra) = capture_cursor_monitor_bgra()?;
     bounds.scale_factor = monitor_scale_factor(app, &bounds);
     let rgba = bgra_to_rgba(&bgra)?;
     let png = encode_rgba_png(bounds.width, bounds.height, &rgba)?;
     Ok((bounds, png))
+}
+
+#[cfg(target_os = "macos")]
+fn capture_cursor_monitor(app: &AppHandle) -> AppResult<(MonitorBounds, Vec<u8>)> {
+    let (bounds, rgba) = capture_cursor_monitor_rgba(app)?;
+    let png = encode_rgba_png(bounds.width, bounds.height, &rgba)?;
+    Ok((bounds, png))
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn capture_cursor_monitor(_app: &AppHandle) -> AppResult<(MonitorBounds, Vec<u8>)> {
+    Err(AppError::new(
+        "unsupported_platform",
+        "截图仅支持 Windows 10/11 和 macOS 12 及以上版本",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn capture_cursor_monitor_rgba(app: &AppHandle) -> AppResult<(MonitorBounds, Vec<u8>)> {
+    if !objc2_core_graphics::CGPreflightScreenCaptureAccess() {
+        let _ = objc2_core_graphics::CGRequestScreenCaptureAccess();
+        return Err(AppError::new(
+            "screen_recording_permission",
+            "请在系统设置 > 隐私与安全性 > 屏幕录制中允许 PetalDesk，然后重新打开应用后再截图",
+        ));
+    }
+    let cursor = app
+        .cursor_position()
+        .map_err(|error| AppError::new("capture_error", format!("读取鼠标位置失败: {error}")))?;
+    // Tao reports the global cursor in physical coordinates based on the main
+    // display scale. CoreGraphics, which xcap uses, expects global points.
+    let main_scale = app
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| monitor.scale_factor())
+        .filter(|scale| scale.is_finite() && *scale > 0.0)
+        .unwrap_or(1.0);
+    let logical_x = (cursor.x / main_scale).round();
+    let logical_y = (cursor.y / main_scale).round();
+    let point_x = i32::try_from(logical_x as i64)
+        .map_err(|_| AppError::new("capture_error", "鼠标横坐标超过截图范围"))?;
+    let point_y = i32::try_from(logical_y as i64)
+        .map_err(|_| AppError::new("capture_error", "鼠标纵坐标超过截图范围"))?;
+    let monitor = xcap::Monitor::from_point(point_x, point_y).map_err(|error| {
+        AppError::new("capture_error", format!("定位鼠标所在显示器失败: {error}"))
+    })?;
+    let logical_monitor_x = monitor
+        .x()
+        .map_err(|error| AppError::new("capture_error", format!("读取显示器位置失败: {error}")))?;
+    let logical_monitor_y = monitor
+        .y()
+        .map_err(|error| AppError::new("capture_error", format!("读取显示器位置失败: {error}")))?;
+    let logical_width = monitor
+        .width()
+        .map_err(|error| AppError::new("capture_error", format!("读取显示器宽度失败: {error}")))?;
+    let logical_height = monitor
+        .height()
+        .map_err(|error| AppError::new("capture_error", format!("读取显示器高度失败: {error}")))?;
+    let xcap_scale = f64::from(monitor.scale_factor().map_err(|error| {
+        AppError::new("capture_error", format!("读取显示器缩放比例失败: {error}"))
+    })?);
+    let image = monitor.capture_image().map_err(|error| {
+        AppError::new(
+            "screen_recording_permission",
+            format!(
+                "无法捕获屏幕。请在系统设置 > 隐私与安全性 > 屏幕录制中允许 PetalDesk，然后重新打开应用。详情: {error}"
+            ),
+        )
+    })?;
+    let width = image.width();
+    let height = image.height();
+    let expected = checked_rgba_len(width, height)?;
+    let rgba = image.into_raw();
+    if rgba.len() != expected {
+        return Err(AppError::new("capture_error", "macOS 截图像素长度无效"));
+    }
+
+    let tauri_monitor = app.available_monitors().ok().and_then(|monitors| {
+        monitors.into_iter().find(|candidate| {
+            let scale = candidate.scale_factor();
+            if !scale.is_finite() || scale <= 0.0 {
+                return false;
+            }
+            let position = candidate.position();
+            let logical_candidate_x = f64::from(position.x) / scale;
+            let logical_candidate_y = f64::from(position.y) / scale;
+            (logical_candidate_x - f64::from(logical_monitor_x)).abs() <= 1.0
+                && (logical_candidate_y - f64::from(logical_monitor_y)).abs() <= 1.0
+                && candidate.size().width.abs_diff(width) <= 2
+                && candidate.size().height.abs_diff(height) <= 2
+        })
+    });
+    let scale_factor = tauri_monitor
+        .as_ref()
+        .map(|candidate| candidate.scale_factor())
+        .unwrap_or(xcap_scale)
+        .max(1.0);
+    let (x, y) = tauri_monitor
+        .map(|candidate| (candidate.position().x, candidate.position().y))
+        .unwrap_or_else(|| {
+            (
+                (f64::from(logical_monitor_x) * scale_factor).round() as i32,
+                (f64::from(logical_monitor_y) * scale_factor).round() as i32,
+            )
+        });
+    Ok((
+        MonitorBounds {
+            x,
+            y,
+            width,
+            height,
+            scale_factor,
+        },
+        rgba,
+    ))
 }
 
 fn bgra_to_rgba(bgra: &[u8]) -> AppResult<Vec<u8>> {
@@ -1993,7 +2110,7 @@ fn bounds_from_rect(rect: windows_sys::Win32::Foundation::RECT) -> AppResult<Mon
     })
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn capture_cursor_monitor_bgra() -> AppResult<(MonitorBounds, Vec<u8>)> {
     Err(AppError::new(
         "unsupported_platform",
@@ -2150,7 +2267,32 @@ fn write_png_to_clipboard(png: &[u8], decoded: &DecodedPng) -> AppResult<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn write_png_to_clipboard(_png: &[u8], decoded: &DecodedPng) -> AppResult<()> {
+    use std::borrow::Cow;
+
+    let expected = checked_rgba_len(decoded.width, decoded.height)?;
+    if decoded.rgba.len() != expected {
+        return Err(AppError::new("invalid_png", "剪贴板图片像素长度无效"));
+    }
+    let mut clipboard = arboard::Clipboard::new().map_err(|error| {
+        AppError::new("clipboard_error", format!("打开 macOS 剪贴板失败: {error}"))
+    })?;
+    clipboard
+        .set_image(arboard::ImageData {
+            width: decoded.width as usize,
+            height: decoded.height as usize,
+            bytes: Cow::Borrowed(&decoded.rgba),
+        })
+        .map_err(|error| {
+            AppError::new(
+                "clipboard_error",
+                format!("写入 macOS 剪贴板图片失败: {error}"),
+            )
+        })
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn write_png_to_clipboard(_png: &[u8], _decoded: &DecodedPng) -> AppResult<()> {
     Err(AppError::new(
         "unsupported_platform",

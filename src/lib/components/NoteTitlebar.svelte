@@ -19,6 +19,7 @@
   } from "@lucide/svelte";
   import ColorPicker from "./ColorPicker.svelte";
   import type { EditorMode } from "$lib/editor";
+  import { formatShortcut } from "$lib/shortcuts";
   import { TOOL_MENU_ITEMS, toolMenuItemLabel, type ToolName } from "$lib/tools";
   import type { NoteColor } from "./types";
 
@@ -315,7 +316,7 @@
                 {:else}
                   <ScanLine size={15} aria-hidden="true" />
                 {/if}
-                <span>{toolMenuItemLabel(item, screenshotShortcut)}</span>
+                <span>{toolMenuItemLabel(item, formatShortcut(screenshotShortcut))}</span>
               </button>
             {/each}
           </div>

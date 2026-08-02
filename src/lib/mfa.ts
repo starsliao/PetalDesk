@@ -7,7 +7,13 @@ export interface MfaStatus {
   available: boolean;
   locked: boolean;
   entryCount: number;
-  protection: "windows-dpapi" | "windows-dpapi-recovery-password" | "browser-demo" | "unavailable";
+  protection:
+    | "windows-dpapi"
+    | "windows-dpapi-recovery-password"
+    | "macos-keychain"
+    | "macos-keychain-recovery-password"
+    | "browser-demo"
+    | "unavailable";
   recoveryState: MfaRecoveryState;
   captureExcluded?: boolean;
   recoveredFromBackup?: boolean;
@@ -490,7 +496,7 @@ export function createBrowserMfaApi(): MfaApi {
       return demoCode(entry.id, entry.digits, entry.period);
     },
     async exportEntry() {
-      throw new Error("浏览器预览不包含可导出的真实密钥，请在 Windows 客户端使用。");
+      throw new Error("浏览器预览不包含可导出的真实密钥，请在桌面客户端使用。");
     },
     async copy(id) {
       const entry = entries.find((item) => item.id === id);

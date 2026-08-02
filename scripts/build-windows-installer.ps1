@@ -18,6 +18,7 @@ $installerScript = Join-Path $nsisDir "installer.nsi"
 $nsisOutput = Join-Path $nsisDir "nsis-output.exe"
 $makensis = Join-Path $env:LOCALAPPDATA "tauri\NSIS\makensis.exe"
 $configPath = Join-Path $tauriRoot "tauri.conf.json"
+$windowsConfigPath = Join-Path $tauriRoot "tauri.windows.conf.json"
 $storagePathHooks = Join-Path $tauriRoot "nsis\storage-path.nsh"
 $installerDisplayName = "飞花 - PetalDesk"
 $desktopShortcutName = "飞花"
@@ -429,25 +430,27 @@ $edgeExtensionId = Get-OptionalChromiumExtensionId -EnvironmentVariable "PETALDE
 
 $configText = [System.IO.File]::ReadAllText($configPath, [System.Text.Encoding]::UTF8)
 $config = $configText | ConvertFrom-Json
-$configuredHooks = $config.bundle.windows.nsis.installerHooks
+$windowsConfigText = [System.IO.File]::ReadAllText($windowsConfigPath, [System.Text.Encoding]::UTF8)
+$windowsConfig = $windowsConfigText | ConvertFrom-Json
+$configuredHooks = $windowsConfig.bundle.windows.nsis.installerHooks
 if ([string]::IsNullOrWhiteSpace($configuredHooks)) {
-    throw "tauri.conf.json 未配置 bundle.windows.nsis.installerHooks。"
+    throw "tauri.windows.conf.json 未配置 bundle.windows.nsis.installerHooks。"
 }
 $resolvedHooks = [System.IO.Path]::GetFullPath((Join-Path $tauriRoot $configuredHooks))
 if (-not $resolvedHooks.Equals(
     [System.IO.Path]::GetFullPath($storagePathHooks),
     [System.StringComparison]::OrdinalIgnoreCase
 )) {
-    throw "tauri.conf.json 的 installerHooks 未指向：$storagePathHooks"
+    throw "tauri.windows.conf.json 的 installerHooks 未指向：$storagePathHooks"
 }
 
 $expectedBundleResources = @{
     "../browser-extension/native-host/windows/Register-PetalDeskNativeHost.ps1" = "native-messaging/Register-PetalDeskNativeHost.ps1"
 }
 foreach ($resource in $expectedBundleResources.GetEnumerator()) {
-    $configuredResource = $config.bundle.resources.PSObject.Properties[$resource.Key]
+    $configuredResource = $windowsConfig.bundle.resources.PSObject.Properties[$resource.Key]
     if ($null -eq $configuredResource -or $configuredResource.Value -ne $resource.Value) {
-        throw "tauri.conf.json 缺少 Native Messaging 资源映射：$($resource.Key) -> $($resource.Value)"
+        throw "tauri.windows.conf.json 缺少 Native Messaging 资源映射：$($resource.Key) -> $($resource.Value)"
     }
 }
 

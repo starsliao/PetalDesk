@@ -6,6 +6,7 @@
     type TrayShortcutSettings,
   } from "$lib/bridge";
   import type { EditorMode } from "$lib/editor";
+  import { formatShortcut } from "$lib/shortcuts";
 
   interface Props {
     open?: boolean;
@@ -210,7 +211,7 @@
               </select>
             </label>
             <label>
-              <span>Alt + 双击</span>
+              <span>{formatShortcut("Alt")} + 双击</span>
               <select aria-label="Alt 加双击打开" disabled={submitting} bind:value={trayDraft.altDoubleClick}>
                 {#each trayActionOptions as option}
                   <option value={option.value}>{option.label}</option>
@@ -218,7 +219,7 @@
               </select>
             </label>
             <label>
-              <span>Ctrl + 双击</span>
+              <span>{formatShortcut("Ctrl")} + 双击</span>
               <select aria-label="Ctrl 加双击打开" disabled={submitting} bind:value={trayDraft.ctrlDoubleClick}>
                 {#each trayActionOptions as option}
                   <option value={option.value}>{option.label}</option>
@@ -226,7 +227,7 @@
               </select>
             </label>
             <label>
-              <span>Shift + 双击</span>
+              <span>{formatShortcut("Shift")} + 双击</span>
               <select aria-label="Shift 加双击打开" disabled={submitting} bind:value={trayDraft.shiftDoubleClick}>
                 {#each trayActionOptions as option}
                   <option value={option.value}>{option.label}</option>
@@ -262,7 +263,7 @@
               onclick={() => (recording = true)}
             >
               <Keyboard size={16} aria-hidden="true" />
-              <kbd>{recording ? "请按快捷键…" : draft}</kbd>
+              <kbd>{recording ? "请按快捷键…" : formatShortcut(draft)}</kbd>
             </button>
           </div>
 

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["nsis"],
+    "resources": {
+      "../browser-extension/native-host/windows/Register-PetalDeskNativeHost.ps1": "native-messaging/Register-PetalDeskNativeHost.ps1"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"],
+        "installerHooks": "nsis/storage-path.nsh"
+      }
+    }
+  }
+}

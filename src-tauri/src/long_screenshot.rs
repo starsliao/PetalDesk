@@ -415,6 +415,16 @@ impl Drop for PendingLongCaptureStartGuard<'_> {
     }
 }
 
+#[cfg(windows)]
+fn start_browser_bridge() -> Option<Arc<BrowserBridge>> {
+    BrowserBridge::start().ok().map(Arc::new)
+}
+
+#[cfg(not(windows))]
+fn start_browser_bridge() -> Option<Arc<BrowserBridge>> {
+    None
+}
+
 impl LongScreenshotStore {
     pub fn load(data_storage_path: &Path) -> AppResult<Self> {
         let cache_root = data_storage_path
@@ -430,7 +440,7 @@ impl LongScreenshotStore {
             .map_err(|error| AppError::io("创建长截图标注导出缓存目录", error))?;
         Ok(Self {
             cache_root,
-            browser_bridge: BrowserBridge::start().ok().map(Arc::new),
+            browser_bridge: start_browser_bridge(),
             job: Mutex::new(None),
             annotation_exports: Mutex::new(HashMap::new()),
             start_lock: Mutex::new(()),
@@ -782,7 +792,7 @@ fn long_capture_capability(bridge: Option<&BrowserBridge>) -> LongCaptureCapabil
     LongCaptureCapability {
         available,
         supported: available,
-        reason: (!available).then(|| "长截图通用引擎仅支持 Windows 10/11".to_string()),
+        reason: (!available).then(|| long_capture_unsupported_reason().to_string()),
         platform: std::env::consts::OS.to_string(),
         engines,
         preferred_engine: available.then_some(LongCaptureEngine::Manual),
@@ -790,6 +800,16 @@ fn long_capture_capability(bridge: Option<&BrowserBridge>) -> LongCaptureCapabil
         max_pixels: MAX_LONG_PIXELS,
         tile_height: DEFAULT_TILE_HEIGHT,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn long_capture_unsupported_reason() -> &'static str {
+    "macOS 0.5.0 基础版暂不提供长截图；普通截图可以正常使用"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn long_capture_unsupported_reason() -> &'static str {
+    "长截图通用引擎仅支持 Windows 10/11"
 }
 
 fn browser_statuses(status: &BrowserBridgeStatus) -> [&BrowserConnectionStatus; 3] {
@@ -827,7 +847,7 @@ fn start_long_capture_inner(
     if !cfg!(windows) {
         return Err(AppError::new(
             "unsupported_platform",
-            "长截图通用引擎仅支持 Windows 10/11",
+            long_capture_unsupported_reason(),
         ));
     }
     let store = app.state::<LongScreenshotStore>();
@@ -6802,7 +6822,7 @@ fn capture_roi(bounds: PhysicalRect) -> AppResult<Frame> {
 fn capture_roi(_bounds: PhysicalRect) -> AppResult<Frame> {
     Err(AppError::new(
         "unsupported_platform",
-        "长截图通用引擎仅支持 Windows 10/11",
+        long_capture_unsupported_reason(),
     ))
 }
 
