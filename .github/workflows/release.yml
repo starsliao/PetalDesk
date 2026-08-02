@@ -248,3 +248,4 @@ jobs:
             gh release upload "$tag" "${assets[@]}" --clobber
           else
             gh release create "$tag" "${assets[@]}" --title "飞花 - PetalDesk $version" --generate-notes
+          fi
