@@ -792,16 +792,37 @@ impl MfaStore {
     #[cfg(test)]
     fn configure_recovery_password(&self, password: &str) -> AppResult<MfaStatus> {
         let epoch = self.require_active_epoch()?;
-        self.configure_recovery_password_at(password, epoch)
+        self.configure_recovery_password_at(password, None, epoch)
     }
 
-    fn configure_recovery_password_at(&self, password: &str, epoch: u64) -> AppResult<MfaStatus> {
+    #[cfg(test)]
+    fn change_recovery_password(
+        &self,
+        current_password: &str,
+        password: &str,
+    ) -> AppResult<MfaStatus> {
+        let epoch = self.require_active_epoch()?;
+        self.configure_recovery_password_at(password, Some(current_password), epoch)
+    }
+
+    fn configure_recovery_password_at(
+        &self,
+        password: &str,
+        current_password: Option<&str>,
+        epoch: u64,
+    ) -> AppResult<MfaStatus> {
         validate_recovery_password(password)?;
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
         self.validate_epoch(epoch)?;
         let mut runtime = lock_unpoisoned(&self.runtime);
         self.ensure_unlocked_at(&mut runtime, epoch)?;
         let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
+        if vault.recovery_wrapped_key.is_some() {
+            verify_current_recovery_password(
+                vault,
+                current_password.ok_or_else(invalid_recovery_password_error)?,
+            )?;
+        }
         let previous_wrapper = vault.recovery_wrapped_key.clone();
         vault.recovery_wrapped_key = Some(wrap_recovery_key(&vault.key, password)?);
         if let Err(error) = self.save_vault(vault) {
@@ -3553,12 +3574,16 @@ pub async fn configure_mfa_recovery_password(
     app: AppHandle,
     window: WebviewWindow,
     password: SensitiveText,
+    current_password: Option<SensitiveText>,
 ) -> AppResult<MfaStatus> {
     ensure_mfa_window(&window)?;
     let epoch = app.state::<MfaStore>().require_active_epoch()?;
     tauri::async_runtime::spawn_blocking(move || {
-        app.state::<MfaStore>()
-            .configure_recovery_password_at(password.as_str(), epoch)
+        app.state::<MfaStore>().configure_recovery_password_at(
+            password.as_str(),
+            current_password.as_ref().map(SensitiveText::as_str),
+            epoch,
+        )
     })
     .await
     .map_err(|_| AppError::new("mfa_task_error", "设置 MFA 恢复密码任务异常结束。"))?
@@ -4253,7 +4278,9 @@ mod tests {
         const NEW_PASSWORD: &str = "petaldesk-new-recovery-password";
         let (_root, store) = test_store();
         import_public_rfc_entry(&store, "password-change");
-        store.configure_recovery_password(NEW_PASSWORD).unwrap();
+        store
+            .change_recovery_password(RECOVERY_PASSWORD, NEW_PASSWORD)
+            .unwrap();
 
         let current = std::fs::read(&store.vault_path).unwrap();
         assert!(matches!(
@@ -4274,6 +4301,41 @@ mod tests {
             decrypt_envelope_with_recovery(bytes, RECOVERY_PASSWORD),
             Err(RecoveryUnlockError::InvalidPassword)
         )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn changing_password_rejects_an_incorrect_current_password_without_writing() {
+        const NEW_PASSWORD: &str = "petaldesk-new-recovery-password";
+        let (_root, store) = test_store();
+        import_public_rfc_entry(&store, "password-change-auth");
+        let primary_before = std::fs::read(&store.vault_path).unwrap();
+        let backups_before = std::fs::read_dir(&store.backup_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| (entry.file_name(), std::fs::read(entry.path()).unwrap()))
+            .collect::<Vec<_>>();
+
+        let missing = store.configure_recovery_password(NEW_PASSWORD).unwrap_err();
+        assert_eq!(missing.code, "mfa_recovery_password_invalid");
+
+        let error = store
+            .change_recovery_password("definitely-wrong-password", NEW_PASSWORD)
+            .unwrap_err();
+
+        assert_eq!(error.code, "mfa_recovery_password_invalid");
+        assert_eq!(std::fs::read(&store.vault_path).unwrap(), primary_before);
+        let backups_after = std::fs::read_dir(&store.backup_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| (entry.file_name(), std::fs::read(entry.path()).unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(backups_after, backups_before);
+        assert!(decrypt_envelope_with_recovery(&primary_before, RECOVERY_PASSWORD).is_ok());
+        assert!(matches!(
+            decrypt_envelope_with_recovery(&primary_before, NEW_PASSWORD),
+            Err(RecoveryUnlockError::InvalidPassword)
+        ));
     }
 
     #[cfg(windows)]
@@ -4882,7 +4944,9 @@ mod tests {
         assert_eq!(unknown_without_auth.code, "mfa_recovery_password_invalid");
 
         const NEW_PASSWORD: &str = "petaldesk-export-new-recovery-password";
-        store.configure_recovery_password(NEW_PASSWORD).unwrap();
+        store
+            .change_recovery_password(RECOVERY_PASSWORD, NEW_PASSWORD)
+            .unwrap();
         assert_eq!(
             store
                 .export_entry(&entry.id, RECOVERY_PASSWORD)

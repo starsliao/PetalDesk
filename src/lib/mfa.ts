@@ -124,7 +124,7 @@ export interface MfaApi {
   reveal(id: string): Promise<MfaRevealResult>;
   exportEntry(id: string, password: string): Promise<MfaEntryExport>;
   copy(id: string): Promise<void>;
-  configureRecoveryPassword(password: string): Promise<void>;
+  configureRecoveryPassword(password: string, currentPassword?: string): Promise<void>;
   unlockWithRecoveryPassword(password: string): Promise<void>;
   lock(): Promise<void>;
 }
@@ -625,9 +625,10 @@ export const mfaApi: MfaApi = {
     await command<void>("copy_mfa_code", { entryId: id });
   },
 
-  async configureRecoveryPassword(password) {
-    if (!isDesktopRuntime()) return browserApi.configureRecoveryPassword(password);
-    await command<void>("configure_mfa_recovery_password", { password });
+  async configureRecoveryPassword(password, currentPassword) {
+    if (!isDesktopRuntime()) return browserApi.configureRecoveryPassword(password, currentPassword);
+    const args = currentPassword === undefined ? { password } : { password, currentPassword };
+    await command<void>("configure_mfa_recovery_password", args);
   },
 
   async unlockWithRecoveryPassword(password) {

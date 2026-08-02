@@ -399,7 +399,7 @@ fn spawn_create_note(app: &tauri::AppHandle) {
 }
 
 fn build_tray_menu(app: &tauri::AppHandle) -> Result<Menu<tauri::Wry>, Box<dyn std::error::Error>> {
-    let show = MenuItem::with_id(app, "show", "显示飞花 - PetalDesk", true, None::<&str>)?;
+    let show = MenuItem::with_id(app, "show", "打开 飞花", true, None::<&str>)?;
     let note_list = Submenu::with_id(app, "note-list", "便签列表", true)?;
     let notes = app.state::<WorkspaceStore>().list_notes()?;
     if notes.is_empty() {
@@ -444,7 +444,7 @@ fn build_tray_menu(app: &tauri::AppHandle) -> Result<Menu<tauri::Wry>, Box<dyn s
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     Ok(Menu::with_items(
         app,
-        &[&show, &note_list, &tools, &new_note, &about, &quit],
+        &[&show, &new_note, &note_list, &tools, &about, &quit],
     )?)
 }
 

@@ -383,12 +383,33 @@ describe("MfaTool", () => {
 
     await fireEvent.click(rendered.getByRole("button", { name: "修改 MFA 恢复密码" }));
     const dialog = rendered.getByRole("dialog", { name: "修改 MFA 恢复密码" });
-    await fireEvent.input(within(dialog).getByLabelText("恢复密码"), { target: { value: "new recovery password" } });
-    await fireEvent.input(within(dialog).getByLabelText("确认恢复密码"), { target: { value: "new recovery password" } });
+    await fireEvent.input(within(dialog).getByLabelText("原恢复密码"), { target: { value: "current recovery password" } });
+    await fireEvent.input(within(dialog).getByLabelText("新恢复密码"), { target: { value: "new recovery password" } });
+    await fireEvent.input(within(dialog).getByLabelText("确认新恢复密码"), { target: { value: "new recovery password" } });
     await fireEvent.click(within(dialog).getByRole("button", { name: "保存新密码" }));
 
-    await waitFor(() => expect(api.configureRecoveryPassword).toHaveBeenCalledWith("new recovery password"));
+    await waitFor(() => expect(api.configureRecoveryPassword).toHaveBeenCalledWith(
+      "new recovery password",
+      "current recovery password",
+    ));
     expect(rendered.queryByRole("dialog", { name: "修改 MFA 恢复密码" })).not.toBeInTheDocument();
+  });
+
+  it("requires the original recovery password before changing it", async () => {
+    const api = mockApi();
+    const rendered = render(MfaTool, { api });
+    await rendered.findByText("GitHub", { selector: ".account-heading strong" });
+
+    await fireEvent.click(rendered.getByRole("button", { name: "修改 MFA 恢复密码" }));
+    const dialog = rendered.getByRole("dialog", { name: "修改 MFA 恢复密码" });
+    const originalPassword = within(dialog).getByLabelText("原恢复密码");
+    await fireEvent.input(within(dialog).getByLabelText("新恢复密码"), { target: { value: "new recovery password" } });
+    await fireEvent.input(within(dialog).getByLabelText("确认新恢复密码"), { target: { value: "new recovery password" } });
+    await fireEvent.click(within(dialog).getByRole("button", { name: "保存新密码" }));
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("原恢复密码");
+    expect(api.configureRecoveryPassword).not.toHaveBeenCalled();
+    expect(originalPassword).toHaveFocus();
   });
 
   it("keeps codes hidden by default, continuously reveals them, and hides on the second toggle", async () => {
@@ -751,15 +772,24 @@ describe("MfaTool", () => {
 
     await waitFor(() => expect(api.exportEntry).toHaveBeenCalledWith(entry().id, "correct horse battery"));
     expect(within(passwordDialog).queryByLabelText("导出恢复密码")).not.toBeInTheDocument();
+    expect(passwordDialog).toHaveClass("export-result-modal");
     expect(within(passwordDialog).getByText("JBSWY3DPEHPK3PXP")).toBeInTheDocument();
-    expect(within(passwordDialog).getByText(/otpauth:\/\/totp\/GitHub/)).toBeInTheDocument();
+    expect(within(passwordDialog).getByText("otpauth", { selector: "strong" })).toBeInTheDocument();
+    expect(within(passwordDialog).queryByText("完整 otpauth 链接")).not.toBeInTheDocument();
+    const uriValue = within(passwordDialog).getByText(/otpauth:\/\/totp\/GitHub/);
+    expect(uriValue).toHaveClass("uri-value");
+    expect(uriValue).toHaveAttribute("title", exportedEntry().otpauthUri);
     expect(within(passwordDialog).getByRole("img", { name: "GitHub 的 TOTP 导入二维码" })).toHaveAttribute(
       "src",
       exportedEntry().qrPngDataUrl,
     );
 
-    await fireEvent.click(within(passwordDialog).getByRole("button", { name: "复制密钥" }));
-    await fireEvent.click(within(passwordDialog).getByRole("button", { name: "复制完整 otpauth 链接" }));
+    const secretCopy = within(passwordDialog).getByRole("button", { name: "复制密钥" });
+    const uriCopy = within(passwordDialog).getByRole("button", { name: "复制 otpauth 链接" });
+    expect(secretCopy.querySelector(".lucide-copy")).toBeInTheDocument();
+    expect(uriCopy.querySelector(".lucide-copy")).toBeInTheDocument();
+    await fireEvent.click(secretCopy);
+    await fireEvent.click(uriCopy);
     expect(clipboardWrite).toHaveBeenNthCalledWith(1, exportedEntry().secretBase32);
     expect(clipboardWrite).toHaveBeenNthCalledWith(2, exportedEntry().otpauthUri);
   });

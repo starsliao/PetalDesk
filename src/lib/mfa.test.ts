@@ -3,12 +3,41 @@ import {
   createBrowserMfaApi,
   formatOtpCode,
   maskedOtpCode,
+  mfaApi,
   secondsUntil,
   validUntilMilliseconds,
 } from "./mfa";
 
+const backendInvoke = vi.hoisted(() => vi.fn());
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: backendInvoke }));
+
+interface TauriTestWindow extends Window {
+  __TAURI_INTERNALS__?: object;
+}
+
 afterEach(() => {
+  backendInvoke.mockReset();
+  delete (window as TauriTestWindow).__TAURI_INTERNALS__;
   vi.restoreAllMocks();
+});
+
+describe("MFA recovery password API", () => {
+  it("sends the current password only when rotating an existing recovery password", async () => {
+    (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
+    backendInvoke.mockResolvedValue(undefined);
+
+    await mfaApi.configureRecoveryPassword("first recovery password");
+    await mfaApi.configureRecoveryPassword("replacement recovery password", "current recovery password");
+
+    expect(backendInvoke).toHaveBeenNthCalledWith(1, "configure_mfa_recovery_password", {
+      password: "first recovery password",
+    });
+    expect(backendInvoke).toHaveBeenNthCalledWith(2, "configure_mfa_recovery_password", {
+      password: "replacement recovery password",
+      currentPassword: "current recovery password",
+    });
+  });
 });
 
 describe("MFA presentation helpers", () => {

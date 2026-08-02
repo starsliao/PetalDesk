@@ -14,6 +14,10 @@
 pnpm package:windows
 ```
 
+Version `0.4.3` requires the current recovery password before rotating the MFA
+recovery password, compacts the authenticated MFA export dialog without a
+vertical scrollbar, shortens the first tray menu item to `打开 飞花`, and moves
+`新建便签` into the second position.
 Version `0.4.2` adds line-oriented batch URI import for MFA accounts and assigns
 varied default icons to batch-added accounts. Individual MFA accounts can now be
 exported as a Base32 secret, complete `otpauth://` URI, and QR code after recovery
@@ -56,7 +60,7 @@ When repository secrets `AMO_JWT_ISSUER` and `AMO_JWT_SECRET` are both present,
 it also requests an unlisted AMO signature and attaches the resulting signed
 XPI. The unsigned ZIP must not be presented as an installable Firefox package.
 
-The `0.4.2` installer can be installed directly over an earlier PetalDesk
+The `0.4.3` installer can be installed directly over an earlier PetalDesk
 version. On first launch it migrates legacy note metadata and the previous
 Gantt JSON layout into `.petaldesk/`, preserving the note Markdown and a
 migration backup. Same-machine upgrades do not require an MFA recovery
@@ -68,4 +72,4 @@ account.
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.4.2>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.4.3>

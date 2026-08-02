@@ -12,7 +12,6 @@
     Image,
     KeyRound,
     Keyboard,
-    Link2,
     LoaderCircle,
     Pencil,
     Pin,
@@ -102,11 +101,13 @@
   let mainElement = $state<HTMLElement | null>(null);
 
   let recoveryDialogMode = $state<RecoveryDialogMode | null>(null);
+  let currentRecoveryPassword = $state("");
   let recoveryPassword = $state("");
   let recoveryPasswordConfirm = $state("");
   let recoveryError = $state("");
   let recoveryBusy = $state(false);
   let recoveryDialog = $state<HTMLElement | null>(null);
+  let currentRecoveryPasswordInput = $state<HTMLInputElement | null>(null);
   let recoveryPasswordInput = $state<HTMLInputElement | null>(null);
   let recoveryReturnFocus: HTMLElement | null = null;
 
@@ -320,13 +321,17 @@
   }
 
   function clearRecoveryInputs(): void {
+    currentRecoveryPassword = "";
     recoveryPassword = "";
     recoveryPasswordConfirm = "";
     recoveryError = "";
   }
 
   function focusRecoveryPassword(): void {
-    void tick().then(() => recoveryPasswordInput?.focus());
+    void tick().then(() => {
+      const input = recoveryDialogMode === "change" ? currentRecoveryPasswordInput : recoveryPasswordInput;
+      input?.focus();
+    });
   }
 
   function syncRecoveryDialog(nextStatus: MfaStatus): void {
@@ -371,6 +376,11 @@
   async function submitRecoveryPassword(): Promise<void> {
     const mode = recoveryDialogMode;
     if (!mode || recoveryBusy) return;
+    if (mode === "change" && currentRecoveryPassword.length < 12) {
+      recoveryError = "请输入至少 12 个字符的原恢复密码。";
+      focusRecoveryPassword();
+      return;
+    }
     if (recoveryPassword.length < 12) {
       recoveryError = "恢复密码至少需要 12 个字符。";
       focusRecoveryPassword();
@@ -391,6 +401,7 @@
     recoveryError = "";
     try {
       if (mode === "unlock") await api.unlockWithRecoveryPassword(recoveryPassword);
+      else if (mode === "change") await api.configureRecoveryPassword(recoveryPassword, currentRecoveryPassword);
       else await api.configureRecoveryPassword(recoveryPassword);
       clearRecoveryInputs();
       recoveryDialogMode = null;
@@ -401,7 +412,11 @@
     } catch (reason) {
       recoveryError = reasonMessage(
         reason,
-        mode === "unlock" ? "恢复密码不正确，无法解锁 MFA 数据。" : "无法保存 MFA 恢复密码。",
+        mode === "unlock"
+          ? "恢复密码不正确，无法解锁 MFA 数据。"
+          : mode === "change"
+            ? "原恢复密码不正确，无法修改恢复密码。"
+            : "无法保存 MFA 恢复密码。",
       );
       focusRecoveryPassword();
     } finally {
@@ -1645,10 +1660,12 @@
             <div class="recovery-intro">
               <div class="recovery-icon"><KeyRound size={24} aria-hidden="true" /></div>
               <div class="recovery-copy">
-                <strong>{isUnlocking ? "解锁从其他电脑迁移来的 MFA 数据" : "本机使用仍然不需要输入密码"}</strong>
+                <strong>{isUnlocking ? "解锁从其他电脑迁移来的 MFA 数据" : isChanging ? "验证原密码后再设置新密码" : "本机使用仍然不需要输入密码"}</strong>
                 <p>
                   {#if isUnlocking}
                     输入原电脑设置的恢复密码。解锁后，飞花会为当前 Windows 用户建立新的本机保护。
+                  {:else if isChanging}
+                    原恢复密码只用于验证身份；修改后，跨电脑迁移和账户导出都需要使用新密码。
                   {:else}
                     飞花日常由 Windows DPAPI 自动解锁。只有把飞花数据迁移到其他电脑或 Windows 用户时，才需要这个恢复密码。
                   {/if}
@@ -1656,8 +1673,24 @@
               </div>
             </div>
 
+            {#if isChanging}
+              <label class="field">
+                <span>原恢复密码</span>
+                <input
+                  bind:this={currentRecoveryPasswordInput}
+                  bind:value={currentRecoveryPassword}
+                  type="password"
+                  minlength="12"
+                  maxlength="256"
+                  autocomplete="current-password"
+                  aria-label="原恢复密码"
+                  required
+                />
+              </label>
+            {/if}
+
             <label class="field">
-              <span>恢复密码</span>
+              <span>{isChanging ? "新恢复密码" : "恢复密码"}</span>
               <input
                 bind:this={recoveryPasswordInput}
                 bind:value={recoveryPassword}
@@ -1665,7 +1698,7 @@
                 minlength="12"
                 maxlength="256"
                 autocomplete={isUnlocking ? "current-password" : "new-password"}
-                aria-label="恢复密码"
+                aria-label={isChanging ? "新恢复密码" : "恢复密码"}
                 required
               />
               {#if !isUnlocking}<small>至少 12 个字符，建议使用只有你知道的长密码。</small>{/if}
@@ -1673,14 +1706,14 @@
 
             {#if !isUnlocking}
               <label class="field">
-                <span>确认恢复密码</span>
+                <span>{isChanging ? "确认新恢复密码" : "确认恢复密码"}</span>
                 <input
                   bind:value={recoveryPasswordConfirm}
                   type="password"
                   minlength="12"
                   maxlength="256"
                   autocomplete="new-password"
-                  aria-label="确认恢复密码"
+                  aria-label={isChanging ? "确认新恢复密码" : "确认恢复密码"}
                   required
                 />
               </label>
@@ -1708,6 +1741,7 @@
       <div
         bind:this={exportDialog}
         class="modal export-modal"
+        class:export-result-modal={Boolean(exportResult)}
         role="dialog"
         aria-modal="true"
         aria-labelledby="mfa-export-title"
@@ -1739,22 +1773,18 @@
               </div>
             </div>
             <section class="export-value" aria-labelledby="mfa-export-secret-label">
-              <div class="export-value-heading">
-                <strong id="mfa-export-secret-label">密钥</strong>
-                <button type="button" aria-label="复制密钥" title="复制密钥" onclick={() => void copyExportValue("secret")}>
-                  <Copy size={16} aria-hidden="true" />
-                </button>
-              </div>
-              <code>{exportResult.secretBase32}</code>
+              <strong id="mfa-export-secret-label">密钥</strong>
+              <code title={exportResult.secretBase32}>{exportResult.secretBase32}</code>
+              <button type="button" aria-label="复制密钥" title="复制密钥" onclick={() => void copyExportValue("secret")}>
+                <Copy size={16} aria-hidden="true" />
+              </button>
             </section>
             <section class="export-value" aria-labelledby="mfa-export-uri-label">
-              <div class="export-value-heading">
-                <strong id="mfa-export-uri-label">完整 otpauth 链接</strong>
-                <button type="button" aria-label="复制完整 otpauth 链接" title="复制链接" onclick={() => void copyExportValue("uri")}>
-                  <Link2 size={16} aria-hidden="true" />
-                </button>
-              </div>
-              <code class="uri-value">{exportResult.otpauthUri}</code>
+              <strong id="mfa-export-uri-label">otpauth</strong>
+              <code class="uri-value" title={exportResult.otpauthUri}>{exportResult.otpauthUri}</code>
+              <button type="button" aria-label="复制 otpauth 链接" title="复制链接" onclick={() => void copyExportValue("uri")}>
+                <Copy size={16} aria-hidden="true" />
+              </button>
             </section>
             <section class="export-qr" aria-labelledby="mfa-export-qr-label">
               <div>
@@ -2138,6 +2168,7 @@
   .edit-modal { width: min(500px, 100%); }
   .recovery-modal { width: min(510px, 100%); }
   .export-modal { width: min(560px, 100%); }
+  .export-modal.export-result-modal { min-height: min(590px, 100%); }
   .trash-modal { width: min(570px, 100%); min-height: min(440px, 100%); }
   .recovery-modal form, .export-modal form { display: flex; min-height: 0; flex-direction: column; }
   .edit-form { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; overflow: hidden; }
@@ -2172,6 +2203,7 @@
   .recovery-error { color: #8c1d14; background: #fff0ed; border: 1px solid #f1c1bb; }
   .recovery-warning :global(svg), .recovery-error :global(svg) { flex: 0 0 auto; margin-top: 1px; }
   .export-password-content, .export-content { display: grid; min-height: 0; padding: 17px; gap: 12px; overflow: auto; }
+  .export-result-modal .export-content { flex: 1 1 auto; padding: 14px 17px; align-content: start; gap: 9px; overflow: hidden; }
   .export-warning { display: flex; padding: 9px 10px; align-items: flex-start; gap: 8px; color: #794b08; font-size: 10.5px; line-height: 1.45; background: #fff8df; border: 1px solid #ead69a; border-radius: 6px; }
   .export-warning :global(svg) { flex: 0 0 auto; margin-top: 1px; }
   .export-account { display: grid; padding: 9px 10px; grid-template-columns: 38px minmax(0, 1fr); align-items: center; gap: 10px; background: #f2edf8; border: 1px solid #ddd2e9; border-radius: 7px; }
@@ -2180,16 +2212,16 @@
   .export-account strong { color: #332b3d; font-size: 12.5px; }
   .export-account span { color: #716879; font-size: 10.5px; }
   .export-account small { color: #8b8291; font-size: 9.5px; }
-  .export-value { display: grid; min-width: 0; gap: 6px; }
-  .export-value-heading { display: flex; min-height: 28px; align-items: center; justify-content: space-between; gap: 8px; }
-  .export-value-heading strong { color: #4d4752; font-size: 11.5px; }
-  .export-value-heading button { display: grid; width: 30px; height: 28px; padding: 0; place-items: center; color: #5c3e88; background: #f1ebf8; border: 1px solid #ddd0eb; border-radius: 5px; cursor: pointer; }
-  .export-value-heading button:hover, .export-value-heading button:focus-visible { color: #402665; background: #e8ddf4; outline: 0; box-shadow: 0 0 0 2px rgb(104 69 173 / 16%); }
-  .export-value code { display: block; min-height: 38px; padding: 9px 10px; overflow-wrap: anywhere; color: #28232e; font-family: "Cascadia Mono", "Segoe UI Mono", Consolas, monospace; font-size: 10.5px; line-height: 1.55; background: #fff; border: 1px solid #d5d1d9; border-radius: 6px; user-select: text; }
-  .export-value code.uri-value { max-height: 82px; overflow: auto; }
+  .export-value { display: grid; min-width: 0; grid-template-columns: max-content minmax(0, 1fr) 30px; align-items: center; gap: 8px; }
+  .export-value > strong { min-width: 45px; color: #4d4752; font-size: 11.5px; }
+  .export-value code { display: block; box-sizing: border-box; width: 100%; min-width: 0; min-height: 34px; padding: 7px 9px; overflow: hidden; color: #28232e; font-family: "Cascadia Mono", "Segoe UI Mono", Consolas, monospace; font-size: 10.5px; line-height: 1.55; text-overflow: ellipsis; white-space: nowrap; background: #fff; border: 1px solid #d5d1d9; border-radius: 6px; user-select: text; }
+  .export-value button { display: grid; width: 30px; height: 30px; padding: 0; place-items: center; color: #5c3e88; background: #f1ebf8; border: 1px solid #ddd0eb; border-radius: 5px; cursor: pointer; }
+  .export-value button:hover, .export-value button:focus-visible { color: #402665; background: #e8ddf4; outline: 0; box-shadow: 0 0 0 2px rgb(104 69 173 / 16%); }
   .export-qr { display: grid; justify-items: center; gap: 9px; }
   .export-qr > div { display: flex; align-items: center; gap: 7px; color: #4d4752; font-size: 11.5px; }
   .export-qr img { width: min(230px, 74vw); height: min(230px, 74vw); image-rendering: pixelated; background: #fff; border: 8px solid #fff; border-radius: 6px; box-shadow: 0 0 0 1px #d7d3da; }
+  .export-result-modal .export-qr { gap: 6px; }
+  .export-result-modal .export-qr img { width: min(190px, 30vh, 64vw); height: min(190px, 30vh, 64vw); }
   .trash-toolbar { display: flex; min-height: 42px; padding: 7px 14px; align-items: center; justify-content: space-between; gap: 10px; color: #766f7a; font-size: 10.5px; background: #f2f1f3; border-bottom: 1px solid #dedce0; }
   .trash-clear-button { display: inline-flex; min-height: 28px; padding: 4px 8px; align-items: center; gap: 5px; color: #9f2d22; background: #fff; border: 1px solid #d5c8c6; border-radius: 5px; cursor: pointer; }
   .trash-clear-button:hover, .trash-clear-button:focus-visible { color: #8f2118; background: #fff0ed; border-color: #dfaaa4; outline: 0; }
@@ -2286,6 +2318,15 @@
     .method-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .manual-grid { grid-template-columns: 1fr; }
     .full-field { grid-column: auto; }
+  }
+  @media (max-height: 520px) {
+    .modal-backdrop { padding-block: 8px; }
+    .export-result-modal .export-content { padding: 9px 12px; gap: 5px; }
+    .export-result-modal .export-warning { display: none; }
+    .export-result-modal .export-account { padding-block: 5px; }
+    .export-result-modal .export-qr { gap: 3px; }
+    .export-result-modal .export-qr > div { display: none; }
+    .export-result-modal .export-qr img { width: min(120px, 27vh, 56vw); height: min(120px, 27vh, 56vw); }
   }
   @media (prefers-reduced-motion: reduce) { .account-card, .ring-value { transition: none; } :global(.spinner) { animation: none; } }
 </style>
