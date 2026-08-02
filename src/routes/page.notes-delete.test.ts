@@ -2,6 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 type NotesApi = typeof import("$lib/bridge").notesApi;
 let activeUnmount: (() => void) | null = null;
+const trayShortcutSettings = {
+  doubleClick: "firstNote",
+  altDoubleClick: "gantt",
+  ctrlDoubleClick: "mfa",
+  shiftDoubleClick: "mainWindow",
+} as const;
 
 afterEach(() => {
   activeUnmount?.();
@@ -33,8 +39,9 @@ async function renderNotesList() {
   };
   vi.spyOn(notesApi, "appInfo").mockResolvedValue({
     workspacePath: "E:/notes",
-    version: "0.4.0",
+    version: "0.4.1",
     defaultEditorMode: "typora",
+    trayShortcutSettings,
   });
   vi.spyOn(notesApi, "listNotes").mockResolvedValue([note]);
   vi.spyOn(notesApi, "listTrash").mockResolvedValue([]);
@@ -55,8 +62,9 @@ async function renderActiveNote() {
   ]);
   vi.spyOn(notesApi, "appInfo").mockResolvedValue({
     workspacePath: "E:/notes",
-    version: "0.4.0",
+    version: "0.4.1",
     defaultEditorMode: "typora",
+    trayShortcutSettings,
   });
   vi.spyOn(notesApi, "getNote").mockResolvedValue({
     id: "note-1",

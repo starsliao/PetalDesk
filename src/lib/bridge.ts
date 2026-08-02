@@ -19,6 +19,29 @@ import {
 export type NoteColor = "yellow" | "pink" | "blue" | "green" | "purple" | "gray" | "charcoal";
 export type { ToolName } from "./tools";
 
+export type TrayShortcutAction =
+  | "firstNote"
+  | "mainWindow"
+  | "timer"
+  | "reminder"
+  | "gantt"
+  | "mfa"
+  | "screenshot";
+
+export interface TrayShortcutSettings {
+  doubleClick: TrayShortcutAction;
+  altDoubleClick: TrayShortcutAction;
+  ctrlDoubleClick: TrayShortcutAction;
+  shiftDoubleClick: TrayShortcutAction;
+}
+
+export const DEFAULT_TRAY_SHORTCUT_SETTINGS: Readonly<TrayShortcutSettings> = {
+  doubleClick: "firstNote",
+  altDoubleClick: "gantt",
+  ctrlDoubleClick: "mfa",
+  shiftDoubleClick: "mainWindow",
+};
+
 export interface NoteMeta {
   id: string;
   title: string;
@@ -71,6 +94,7 @@ export interface AppInfo {
   workspacePath: string;
   version: string;
   defaultEditorMode: EditorMode;
+  trayShortcutSettings: TrayShortcutSettings;
   recoveredDrafts?: number;
   name?: string;
   colors?: string[];
@@ -92,7 +116,17 @@ const previousBrowserKey = previousStorageKey("browser-notes.v1");
 export const defaultEditorModeStorageKey = "petaldesk.default-editor-mode.v2";
 const previousDefaultEditorModeStorageKey = previousStorageKey("default-editor-mode.v2");
 const previousEditorModeStorageKey = previousStorageKey("editor-mode.v1");
+const trayShortcutSettingsStorageKey = "petaldesk.tray-shortcut-settings.v1";
 const editorModes: readonly EditorMode[] = ["typora", "plain"];
+const trayShortcutActions: readonly TrayShortcutAction[] = [
+  "firstNote",
+  "mainWindow",
+  "timer",
+  "reminder",
+  "gantt",
+  "mfa",
+  "screenshot",
+];
 
 interface BrowserStore {
   orderSchemaVersion: number;
@@ -110,6 +144,41 @@ function isEditorMode(value: unknown): value is EditorMode {
 
 function normalizeStoredEditorMode(value: unknown): EditorMode {
   return value === "plain" ? "plain" : "typora";
+}
+
+function isTrayShortcutAction(value: unknown): value is TrayShortcutAction {
+  return typeof value === "string"
+    && trayShortcutActions.includes(value as TrayShortcutAction);
+}
+
+function normalizeTrayShortcutSettings(value: unknown): TrayShortcutSettings {
+  const candidate = typeof value === "object" && value !== null
+    ? value as Partial<Record<keyof TrayShortcutSettings, unknown>>
+    : {};
+  return {
+    doubleClick: isTrayShortcutAction(candidate.doubleClick)
+      ? candidate.doubleClick
+      : DEFAULT_TRAY_SHORTCUT_SETTINGS.doubleClick,
+    altDoubleClick: isTrayShortcutAction(candidate.altDoubleClick)
+      ? candidate.altDoubleClick
+      : DEFAULT_TRAY_SHORTCUT_SETTINGS.altDoubleClick,
+    ctrlDoubleClick: isTrayShortcutAction(candidate.ctrlDoubleClick)
+      ? candidate.ctrlDoubleClick
+      : DEFAULT_TRAY_SHORTCUT_SETTINGS.ctrlDoubleClick,
+    shiftDoubleClick: isTrayShortcutAction(candidate.shiftDoubleClick)
+      ? candidate.shiftDoubleClick
+      : DEFAULT_TRAY_SHORTCUT_SETTINGS.shiftDoubleClick,
+  };
+}
+
+function readBrowserTrayShortcutSettings(): TrayShortcutSettings {
+  if (typeof localStorage === "undefined") return { ...DEFAULT_TRAY_SHORTCUT_SETTINGS };
+  try {
+    const stored = localStorage.getItem(trayShortcutSettingsStorageKey);
+    return normalizeTrayShortcutSettings(stored ? JSON.parse(stored) : null);
+  } catch {
+    return { ...DEFAULT_TRAY_SHORTCUT_SETTINGS };
+  }
 }
 
 function readBrowserDefaultEditorMode(): EditorMode {
@@ -392,8 +461,9 @@ export const notesApi = {
     if (isTauriRuntime()) return command<AppInfo>("get_app_info");
     return {
       workspacePath: "浏览器演示数据",
-      version: "0.4.0",
+      version: "0.4.1",
       defaultEditorMode: readBrowserDefaultEditorMode(),
+      trayShortcutSettings: readBrowserTrayShortcutSettings(),
       recoveredDrafts: 0,
     };
   },
@@ -410,6 +480,17 @@ export const notesApi = {
       new CustomEvent("petaldesk:default-editor-mode-changed", { detail: defaultEditorMode }),
     );
     return defaultEditorMode;
+  },
+
+  async setTrayShortcutSettings(
+    settings: TrayShortcutSettings,
+  ): Promise<TrayShortcutSettings> {
+    if (isTauriRuntime()) {
+      return command<TrayShortcutSettings>("set_tray_shortcut_settings", { settings });
+    }
+    const normalized = normalizeTrayShortcutSettings(settings);
+    localStorage.setItem(trayShortcutSettingsStorageKey, JSON.stringify(normalized));
+    return normalized;
   },
 
   async listNotes(query = ""): Promise<NoteListItem[]> {

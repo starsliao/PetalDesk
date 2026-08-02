@@ -21,7 +21,7 @@ use image::{ImageReader, Limits};
 use quircs::Quirc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -203,6 +203,7 @@ pub struct MfaEntrySummary {
     pub issuer: String,
     pub account_name: String,
     pub icon_emoji: String,
+    pub pinned: bool,
     pub algorithm: MfaAlgorithm,
     pub digits: u32,
     pub period: u64,
@@ -313,6 +314,8 @@ struct StoredEntry {
     issuer: String,
     account_name: String,
     icon_emoji: String,
+    #[serde(default)]
+    pinned: bool,
     algorithm: MfaAlgorithm,
     digits: u32,
     period: u64,
@@ -577,6 +580,111 @@ impl MfaStore {
         self.ensure_unlocked_at(&mut runtime, epoch)?;
         let vault = runtime.vault.as_ref().ok_or_else(generic_vault_error)?;
         Ok(vault.payload.entries.iter().map(summary).collect())
+    }
+
+    #[cfg(test)]
+    fn reorder_entries(&self, ordered_ids: Vec<String>) -> AppResult<Vec<MfaEntrySummary>> {
+        let epoch = self.require_active_epoch()?;
+        self.reorder_entries_at(ordered_ids, epoch)
+    }
+
+    fn reorder_entries_at(
+        &self,
+        ordered_ids: Vec<String>,
+        epoch: u64,
+    ) -> AppResult<Vec<MfaEntrySummary>> {
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        self.validate_epoch(epoch)?;
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        self.ensure_unlocked_at(&mut runtime, epoch)?;
+        let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
+        validate_complete_entry_order(&vault.payload.entries, &ordered_ids)?;
+
+        let previous_order = vault
+            .payload
+            .entries
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
+        apply_grouped_entry_order(&mut vault.payload.entries, &ordered_ids);
+        let result = vault.payload.entries.iter().map(summary).collect();
+        if vault
+            .payload
+            .entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .eq(previous_order.iter().map(String::as_str))
+        {
+            return Ok(result);
+        }
+        if let Err(error) = self.save_vault(vault) {
+            apply_exact_entry_order(&mut vault.payload.entries, &previous_order);
+            return Err(error);
+        }
+        Ok(result)
+    }
+
+    #[cfg(test)]
+    fn set_entry_pinned(&self, entry_id: &str, pinned: bool) -> AppResult<Vec<MfaEntrySummary>> {
+        let epoch = self.require_active_epoch()?;
+        self.set_entry_pinned_at(entry_id, pinned, epoch)
+    }
+
+    fn set_entry_pinned_at(
+        &self,
+        entry_id: &str,
+        pinned: bool,
+        epoch: u64,
+    ) -> AppResult<Vec<MfaEntrySummary>> {
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        self.validate_epoch(epoch)?;
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        self.ensure_unlocked_at(&mut runtime, epoch)?;
+        let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
+        let index = vault
+            .payload
+            .entries
+            .iter()
+            .position(|entry| entry.id == entry_id)
+            .ok_or_else(|| AppError::not_found("没有找到这个 MFA 账户。"))?;
+        if vault.payload.entries[index].pinned == pinned {
+            return Ok(vault.payload.entries.iter().map(summary).collect());
+        }
+
+        let previous_order = vault
+            .payload
+            .entries
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
+        let previous_pinned = vault.payload.entries[index].pinned;
+        let mut entry = vault.payload.entries.remove(index);
+        entry.pinned = pinned;
+        let target_index = if pinned {
+            0
+        } else {
+            vault
+                .payload
+                .entries
+                .iter()
+                .take_while(|entry| entry.pinned)
+                .count()
+        };
+        vault.payload.entries.insert(target_index, entry);
+        let result = vault.payload.entries.iter().map(summary).collect();
+        if let Err(error) = self.save_vault(vault) {
+            if let Some(entry) = vault
+                .payload
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == entry_id)
+            {
+                entry.pinned = previous_pinned;
+            }
+            apply_exact_entry_order(&mut vault.payload.entries, &previous_order);
+            return Err(error);
+        }
+        Ok(result)
     }
 
     #[cfg(test)]
@@ -1792,12 +1900,61 @@ fn summary(entry: &StoredEntry) -> MfaEntrySummary {
         issuer: entry.issuer.clone(),
         account_name: entry.account_name.clone(),
         icon_emoji: entry.icon_emoji.clone(),
+        pinned: entry.pinned,
         algorithm: entry.algorithm,
         digits: entry.digits,
         period: entry.period,
         created_at: entry.created_at.clone(),
         updated_at: entry.updated_at.clone(),
     }
+}
+
+fn validate_complete_entry_order(entries: &[StoredEntry], ordered_ids: &[String]) -> AppResult<()> {
+    if ordered_ids.len() != entries.len() {
+        return Err(AppError::invalid("MFA 账户顺序与当前列表不匹配。"));
+    }
+    let current_ids = entries
+        .iter()
+        .map(|entry| entry.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut requested_ids = HashSet::with_capacity(ordered_ids.len());
+    for id in ordered_ids {
+        if !current_ids.contains(id.as_str()) || !requested_ids.insert(id.as_str()) {
+            return Err(AppError::invalid("MFA 账户顺序与当前列表不匹配。"));
+        }
+    }
+    Ok(())
+}
+
+fn apply_exact_entry_order(entries: &mut [StoredEntry], ordered_ids: &[String]) {
+    let positions = ordered_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    entries.sort_by_key(|entry| {
+        positions
+            .get(entry.id.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+}
+
+fn apply_grouped_entry_order(entries: &mut [StoredEntry], ordered_ids: &[String]) {
+    let positions = ordered_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    entries.sort_by_key(|entry| {
+        (
+            !entry.pinned,
+            positions
+                .get(entry.id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX),
+        )
+    });
 }
 
 fn now_iso() -> String {
@@ -2031,6 +2188,7 @@ fn parse_entry(input: ParsedEntryInput) -> AppResult<ParsedImport> {
             issuer,
             account_name: account,
             icon_emoji: normalize_icon(&icon),
+            pinned: false,
             algorithm,
             digits,
             period,
@@ -2717,6 +2875,39 @@ pub async fn list_mfa_entries(
 }
 
 #[tauri::command]
+pub async fn reorder_mfa_entries(
+    app: AppHandle,
+    window: WebviewWindow,
+    ordered_ids: Vec<String>,
+) -> AppResult<Vec<MfaEntrySummary>> {
+    ensure_mfa_window(&window)?;
+    let epoch = app.state::<MfaStore>().require_active_epoch()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<MfaStore>()
+            .reorder_entries_at(ordered_ids, epoch)
+    })
+    .await
+    .map_err(|_| AppError::new("mfa_task_error", "调整 MFA 账户顺序任务异常结束。"))?
+}
+
+#[tauri::command]
+pub async fn set_mfa_entry_pinned(
+    app: AppHandle,
+    window: WebviewWindow,
+    entry_id: String,
+    pinned: bool,
+) -> AppResult<Vec<MfaEntrySummary>> {
+    ensure_mfa_window(&window)?;
+    let epoch = app.state::<MfaStore>().require_active_epoch()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<MfaStore>()
+            .set_entry_pinned_at(&entry_id, pinned, epoch)
+    })
+    .await
+    .map_err(|_| AppError::new("mfa_task_error", "更新 MFA 账户置顶状态任务异常结束。"))?
+}
+
+#[tauri::command]
 pub async fn configure_mfa_recovery_password(
     app: AppHandle,
     window: WebviewWindow,
@@ -3065,6 +3256,26 @@ mod tests {
             serde_json::from_slice(&std::fs::read(settings_path).unwrap()).unwrap();
         assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
         drop(reloaded);
+    }
+
+    #[test]
+    fn existing_entries_without_pinned_default_to_unpinned() {
+        let entry: StoredEntry = serde_json::from_value(serde_json::json!({
+            "id": "existing-entry",
+            "name": "Existing",
+            "issuer": "PetalDesk",
+            "accountName": "account",
+            "iconEmoji": "key",
+            "algorithm": "sha1",
+            "digits": 6,
+            "period": 30,
+            "createdAt": "2026-01-01T00:00:00.000Z",
+            "updatedAt": "2026-01-01T00:00:00.000Z",
+            "secret": [1, 2, 3]
+        }))
+        .unwrap();
+
+        assert!(!entry.pinned);
     }
 
     #[cfg(windows)]
@@ -3468,6 +3679,140 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn reorder_requires_the_complete_unique_current_id_set() {
+        let (_root, store) = test_store();
+        let first = import_public_rfc_entry(&store, "order-first");
+        let second = import_public_rfc_entry(&store, "order-second");
+        let third = import_public_rfc_entry(&store, "order-third");
+        let baseline = vec![first.id.clone(), second.id.clone(), third.id.clone()];
+
+        for invalid in [
+            vec![first.id.clone(), first.id.clone(), third.id.clone()],
+            vec![first.id.clone(), second.id.clone(), "unknown".to_string()],
+            vec![first.id.clone(), second.id.clone()],
+        ] {
+            let error = store.reorder_entries(invalid).unwrap_err();
+            assert_eq!(error.code, "invalid_input");
+            assert_eq!(
+                store
+                    .list_entries()
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| entry.id)
+                    .collect::<Vec<_>>(),
+                baseline
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinning_and_reordering_keep_pinned_and_unpinned_groups_stable() {
+        let (_root, store) = test_store();
+        let first = import_public_rfc_entry(&store, "pin-first");
+        let second = import_public_rfc_entry(&store, "pin-second");
+        let third = import_public_rfc_entry(&store, "pin-third");
+
+        let entries = store.set_entry_pinned(&second.id, true).unwrap();
+        assert_eq!(entries[0].id, second.id);
+        assert!(entries[0].pinned);
+
+        let entries = store.set_entry_pinned(&third.id, true).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![third.id.as_str(), second.id.as_str(), first.id.as_str()]
+        );
+
+        let entries = store
+            .reorder_entries(vec![second.id.clone(), first.id.clone(), third.id.clone()])
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![second.id.as_str(), third.id.as_str(), first.id.as_str()]
+        );
+        assert!(entries[0].pinned && entries[1].pinned && !entries[2].pinned);
+
+        let entries = store.set_entry_pinned(&second.id, false).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![third.id.as_str(), second.id.as_str(), first.id.as_str()]
+        );
+        assert!(entries[0].pinned && !entries[1].pinned && !entries[2].pinned);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mfa_order_and_pinned_state_persist_after_reopen() {
+        let (root, store) = test_store();
+        let first = import_public_rfc_entry(&store, "persist-first");
+        let second = import_public_rfc_entry(&store, "persist-second");
+        let third = import_public_rfc_entry(&store, "persist-third");
+        store.set_entry_pinned(&second.id, true).unwrap();
+        store
+            .reorder_entries(vec![third.id.clone(), second.id.clone(), first.id.clone()])
+            .unwrap();
+        drop(store);
+
+        let reopened = MfaStore::load(root.path()).unwrap();
+        reopened.activate();
+        let entries = reopened.list_entries().unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![second.id.as_str(), third.id.as_str(), first.id.as_str()]
+        );
+        assert!(entries[0].pinned);
+        assert!(!entries[1].pinned && !entries[2].pinned);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reorder_and_pin_roll_back_when_persistence_fails() {
+        let (_root, store) = test_store();
+        let first = import_public_rfc_entry(&store, "order-rollback-first");
+        let second = import_public_rfc_entry(&store, "order-rollback-second");
+        let baseline = vec![first.id.clone(), second.id.clone()];
+        std::fs::remove_file(&store.vault_path).unwrap();
+        std::fs::create_dir(&store.vault_path).unwrap();
+
+        assert!(store
+            .reorder_entries(vec![second.id.clone(), first.id.clone()])
+            .is_err());
+        let entries = store.list_entries().unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>(),
+            baseline
+        );
+        assert!(entries.iter().all(|entry| !entry.pinned));
+
+        assert!(store.set_entry_pinned(&second.id, true).is_err());
+        let entries = store.list_entries().unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>(),
+            baseline
+        );
+        assert!(entries.iter().all(|entry| !entry.pinned));
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn update_and_delete_roll_back_when_persistence_fails() {
         let (_root, store) = test_store();
         let entry = import_public_rfc_entry(&store, "rollback-test");
@@ -3554,6 +3899,7 @@ mod tests {
                     issuer: String::new(),
                     account_name: String::new(),
                     icon_emoji: "🔐".to_string(),
+                    pinned: false,
                     algorithm: MfaAlgorithm::Sha1,
                     digits: 6,
                     period: 30,

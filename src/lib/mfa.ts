@@ -20,6 +20,7 @@ export interface MfaEntrySummary {
   issuer: string;
   accountName: string;
   iconEmoji: string;
+  pinned: boolean;
   algorithm: MfaAlgorithm;
   digits: number;
   period: number;
@@ -77,6 +78,8 @@ export interface MfaApi {
   cancelImport(sessionId: string): Promise<void>;
   update(request: MfaEntryUpdateRequest): Promise<MfaEntrySummary>;
   delete(id: string): Promise<void>;
+  reorder(orderedIds: string[]): Promise<MfaEntrySummary[]>;
+  setPinned(id: string, pinned: boolean): Promise<MfaEntrySummary[]>;
   reveal(id: string): Promise<MfaRevealResult>;
   copy(id: string): Promise<void>;
   configureRecoveryPassword(password: string): Promise<void>;
@@ -173,6 +176,13 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function pinnedFirst(items: MfaEntrySummary[]): MfaEntrySummary[] {
+  return [
+    ...items.filter((entry) => entry.pinned),
+    ...items.filter((entry) => !entry.pinned),
+  ];
+}
+
 function demoCode(id: string, digits: number, period: number): MfaRevealResult {
   const now = Date.now();
   const step = Math.floor(now / (period * 1_000));
@@ -213,6 +223,7 @@ export function createBrowserMfaApi(): MfaApi {
       issuer: "PetalDesk",
       accountName: "demo@example.com",
       iconEmoji: "🌸",
+      pinned: false,
       algorithm: "sha1",
       digits: 6,
       period: 30,
@@ -225,6 +236,7 @@ export function createBrowserMfaApi(): MfaApi {
       issuer: "GitHub",
       accountName: "octocat",
       iconEmoji: "🐙",
+      pinned: false,
       algorithm: "sha1",
       digits: 6,
       period: 30,
@@ -307,6 +319,7 @@ export function createBrowserMfaApi(): MfaApi {
         issuer: preview.issuer,
         accountName: preview.accountName,
         iconEmoji: iconEmoji || preview.iconEmoji || "🔐",
+        pinned: false,
         algorithm: preview.algorithm,
         digits: preview.digits,
         period: preview.period,
@@ -335,6 +348,29 @@ export function createBrowserMfaApi(): MfaApi {
     },
     async delete(id) {
       entries = entries.filter((entry) => entry.id !== id);
+    },
+    async reorder(orderedIds) {
+      if (orderedIds.length !== entries.length || new Set(orderedIds).size !== entries.length) {
+        throw new Error("请提供完整且不重复的 MFA 账户顺序。");
+      }
+      const byId = new Map(entries.map((entry) => [entry.id, entry]));
+      const reordered = orderedIds.flatMap((id) => {
+        const entry = byId.get(id);
+        return entry ? [entry] : [];
+      });
+      if (reordered.length !== entries.length) throw new Error("账户顺序中包含未知账户。");
+      entries = pinnedFirst(reordered);
+      return structuredClone(entries);
+    },
+    async setPinned(id, pinned) {
+      const current = entries.find((entry) => entry.id === id);
+      if (!current) throw new Error("没有找到这个账户。");
+      const saved = { ...current, pinned, updatedAt: nowIso() };
+      const remaining = entries.filter((entry) => entry.id !== id);
+      entries = pinned
+        ? [saved, ...remaining.filter((entry) => entry.pinned), ...remaining.filter((entry) => !entry.pinned)]
+        : [...remaining.filter((entry) => entry.pinned), saved, ...remaining.filter((entry) => !entry.pinned)];
+      return structuredClone(entries);
     },
     async reveal(id) {
       const entry = entries.find((item) => item.id === id);
@@ -417,6 +453,16 @@ export const mfaApi: MfaApi = {
   async delete(id) {
     if (!isDesktopRuntime()) return browserApi.delete(id);
     await command<void>("delete_mfa_entry", { entryId: id });
+  },
+
+  async reorder(orderedIds) {
+    if (!isDesktopRuntime()) return browserApi.reorder(orderedIds);
+    return command<MfaEntrySummary[]>("reorder_mfa_entries", { orderedIds });
+  },
+
+  async setPinned(id, pinned) {
+    if (!isDesktopRuntime()) return browserApi.setPinned(id, pinned);
+    return command<MfaEntrySummary[]>("set_mfa_entry_pinned", { entryId: id, pinned });
   },
 
   async reveal(id) {

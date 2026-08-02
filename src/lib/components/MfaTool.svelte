@@ -7,11 +7,14 @@
     Copy,
     Eye,
     EyeOff,
+    GripVertical,
     Image,
     KeyRound,
     Keyboard,
     LoaderCircle,
     Pencil,
+    Pin,
+    PinOff,
     Plus,
     RefreshCw,
     ScanLine,
@@ -42,11 +45,17 @@
 
   type AddMethod = "screen" | "uri" | "image" | "manual";
   type RecoveryDialogMode = "setup" | "unlock" | "change";
+  type DropPosition = "before" | "after";
 
   interface ContextMenuState {
     entryId: string;
     x: number;
     y: number;
+  }
+
+  interface ReorderPointerState {
+    pointerId: number;
+    sourceId: string;
   }
 
   let { api = mfaApi }: Props = $props();
@@ -73,9 +82,17 @@
   let revealed = $state<Record<string, MfaRevealResult>>({});
   let revealingIds = $state<Record<string, true>>({});
   let copyingIds = $state<Record<string, true>>({});
+  let pinningIds = $state<Record<string, true>>({});
   let contextMenu = $state<ContextMenuState | null>(null);
   let contextMenuElement = $state<HTMLElement | null>(null);
   let toast = $state("");
+  let reorderPointerState = $state<ReorderPointerState | null>(null);
+  let reorderDragId = $state<string | null>(null);
+  let reorderDropId = $state<string | null>(null);
+  let reorderDropPosition = $state<DropPosition>("after");
+  let reordering = $state(false);
+  let mfaToolElement = $state<HTMLElement | null>(null);
+  let mainElement = $state<HTMLElement | null>(null);
 
   let recoveryDialogMode = $state<RecoveryDialogMode | null>(null);
   let recoveryPassword = $state("");
@@ -125,6 +142,8 @@
     return entries.filter((entry) => [entry.name, entry.issuer, entry.accountName]
       .some((value) => value.toLocaleLowerCase().includes(query)));
   });
+  let searchActive = $derived(Boolean(searchText.trim()));
+  let pinBusy = $derived(Object.keys(pinningIds).length > 0);
 
   let selectedPreview = $derived(previews.find((preview) => preview.sessionId === selectedSessionId) ?? null);
 
@@ -354,7 +373,7 @@
 
   function showContextMenu(entry: MfaEntrySummary, x: number, y: number, returnFocus: HTMLElement | null): void {
     const width = 170;
-    const height = 176;
+    const height = 210;
     contextReturnFocus = returnFocus;
     contextMenu = {
       entryId: entry.id,
@@ -415,7 +434,172 @@
     return entries.find((entry) => entry.id === contextMenu?.entryId) ?? null;
   }
 
+  function optimisticPinnedEntries(entry: MfaEntrySummary, pinned: boolean): MfaEntrySummary[] {
+    const saved = { ...entry, pinned };
+    const remaining = entries.filter((item) => item.id !== entry.id);
+    return pinned
+      ? [saved, ...remaining.filter((item) => item.pinned), ...remaining.filter((item) => !item.pinned)]
+      : [...remaining.filter((item) => item.pinned), saved, ...remaining.filter((item) => !item.pinned)];
+  }
+
+  async function setEntryPinned(
+    entry: MfaEntrySummary,
+    pinned: boolean,
+    returnFocus: HTMLElement | null,
+  ): Promise<void> {
+    if (pinBusy || reordering) return;
+    const previousEntries = [...entries];
+    pinningIds = setBusy(pinningIds, entry.id, true);
+    entries = optimisticPinnedEntries(entry, pinned);
+    error = "";
+    try {
+      entries = await api.setPinned(entry.id, pinned);
+      showToast(pinned ? `已置顶“${entry.name}”` : `已取消置顶“${entry.name}”`);
+    } catch (reason) {
+      entries = previousEntries;
+      error = reasonMessage(reason, pinned ? "置顶账户失败。" : "取消置顶失败。");
+    } finally {
+      pinningIds = setBusy(pinningIds, entry.id, false);
+      focusElementAfterRender(returnFocus);
+    }
+  }
+
+  function togglePinnedFromContext(entry: MfaEntrySummary): void {
+    const returnFocus = contextReturnFocus;
+    closeContextMenu();
+    void setEntryPinned(entry, !entry.pinned, returnFocus);
+  }
+
+  function beginReorderPointer(event: PointerEvent, entry: MfaEntrySummary): void {
+    if (
+      event.button !== 0
+      || searchActive
+      || reordering
+      || pinBusy
+      || reorderPointerState
+    ) return;
+    event.preventDefault();
+    event.stopPropagation();
+    closeContextMenu();
+    try {
+      mfaToolElement?.setPointerCapture?.(event.pointerId);
+    } catch {}
+    reorderPointerState = { pointerId: event.pointerId, sourceId: entry.id };
+    reorderDragId = entry.id;
+    reorderDropId = null;
+  }
+
+  function updateReorderPointer(event: PointerEvent): void {
+    const state = reorderPointerState;
+    if (!state || state.pointerId !== event.pointerId) return;
+    event.preventDefault();
+
+    if (mainElement) {
+      const bounds = mainElement.getBoundingClientRect();
+      if (event.clientY < bounds.top + 28) mainElement.scrollTop = Math.max(0, mainElement.scrollTop - 12);
+      else if (event.clientY > bounds.bottom - 28) mainElement.scrollTop += 12;
+    }
+
+    const source = entries.find((entry) => entry.id === state.sourceId);
+    if (!source) return;
+    const cards = Array.from(mfaToolElement?.querySelectorAll<HTMLElement>(".account-card[data-entry-id]") ?? []);
+    let targetCard: HTMLElement | null = null;
+    let targetBounds: DOMRect | null = null;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+    for (const card of cards) {
+      if (card.dataset.entryId === state.sourceId || card.dataset.entryPinned !== String(source.pinned)) continue;
+      const bounds = card.getBoundingClientRect();
+      if (bounds.height <= 0) continue;
+      const distance = event.clientY < bounds.top
+        ? bounds.top - event.clientY
+        : event.clientY > bounds.bottom
+          ? event.clientY - bounds.bottom
+          : 0;
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        targetCard = card;
+        targetBounds = bounds;
+      }
+      if (distance === 0) break;
+    }
+
+    const targetId = targetCard?.dataset.entryId;
+    if (!targetId || !targetBounds) {
+      reorderDropId = null;
+      return;
+    }
+    reorderDropId = targetId;
+    reorderDropPosition = event.clientY < targetBounds.top + targetBounds.height / 2 ? "before" : "after";
+  }
+
+  function finishReorderPointer(cancelled = false): void {
+    const pointer = reorderPointerState;
+    const sourceId = pointer?.sourceId ?? reorderDragId;
+    const targetId = reorderDropId;
+    const position = reorderDropPosition;
+    if (pointer && mfaToolElement?.hasPointerCapture?.(pointer.pointerId)) {
+      mfaToolElement.releasePointerCapture(pointer.pointerId);
+    }
+    reorderPointerState = null;
+    reorderDragId = null;
+    reorderDropId = null;
+    if (!cancelled && sourceId && targetId) void persistReorder(sourceId, targetId, position);
+  }
+
+  function finishReorderFromEvent(event: PointerEvent, cancelled = false): void {
+    if (!reorderPointerState || reorderPointerState.pointerId !== event.pointerId) return;
+    finishReorderPointer(cancelled);
+  }
+
+  async function persistReorder(sourceId: string, targetId: string, position: DropPosition): Promise<void> {
+    if (sourceId === targetId || searchActive || reordering || pinBusy) return;
+    const source = entries.find((entry) => entry.id === sourceId);
+    const target = entries.find((entry) => entry.id === targetId);
+    if (!source || !target || source.pinned !== target.pinned) return;
+
+    const previousEntries = [...entries];
+    const reordered = entries.filter((entry) => entry.id !== sourceId);
+    const targetIndex = reordered.findIndex((entry) => entry.id === targetId);
+    if (targetIndex < 0) return;
+    reordered.splice(targetIndex + (position === "after" ? 1 : 0), 0, source);
+    if (reordered.every((entry, index) => entry.id === entries[index]?.id)) return;
+
+    entries = reordered;
+    reordering = true;
+    error = "";
+    try {
+      entries = await api.reorder(reordered.map((entry) => entry.id));
+    } catch (reason) {
+      entries = previousEntries;
+      error = reasonMessage(reason, "调整 MFA 账户顺序失败。");
+    } finally {
+      reordering = false;
+    }
+  }
+
+  function moveReorderByKeyboard(event: KeyboardEvent, entry: MfaEntrySummary): void {
+    if (
+      !event.altKey
+      || (event.key !== "ArrowUp" && event.key !== "ArrowDown")
+      || searchActive
+      || reordering
+      || pinBusy
+    ) return;
+    const group = entries.filter((item) => item.pinned === entry.pinned);
+    const index = group.findIndex((item) => item.id === entry.id);
+    const targetIndex = index + (event.key === "ArrowUp" ? -1 : 1);
+    if (index < 0 || targetIndex < 0 || targetIndex >= group.length) return;
+    event.preventDefault();
+    const target = group[targetIndex];
+    void persistReorder(entry.id, target.id, event.key === "ArrowUp" ? "before" : "after");
+  }
+
+  function stopHandleClick(event: MouseEvent): void {
+    event.stopPropagation();
+  }
+
   function startEdit(entry: MfaEntrySummary): void {
+    if (pinBusy || reordering) return;
     editReturnFocus = contextReturnFocus;
     closeContextMenu();
     editing = entry;
@@ -461,6 +645,7 @@
   }
 
   function requestDelete(entry: MfaEntrySummary): void {
+    if (pinBusy || reordering) return;
     deleteReturnFocus = contextReturnFocus;
     closeContextMenu();
     pendingDelete = entry;
@@ -515,6 +700,7 @@
   }
 
   function openAdd(): void {
+    if (pinBusy || reordering) return;
     if (status && !status.available) {
       error = status.message || "MFA 数据保险库当前不可用。";
       return;
@@ -784,8 +970,17 @@
     if (contextMenu && !target?.closest(".entry-context-menu")) closeContextMenu();
   }
 
+  function handleWindowBlur(): void {
+    if (reorderPointerState) finishReorderPointer(true);
+  }
+
   function handleGlobalKeydown(event: KeyboardEvent): void {
     if (event.key !== "Escape") return;
+    if (reorderPointerState) {
+      event.preventDefault();
+      finishReorderPointer(true);
+      return;
+    }
     if (recoveryDialogMode && !recoveryBusy) {
       cancelRecoveryDialog();
       return;
@@ -835,6 +1030,7 @@
     void refreshList();
     tick();
     window.addEventListener("focus", resync);
+    window.addEventListener("blur", handleWindowBlur);
     window.addEventListener("pointerdown", handleGlobalPointerDown);
     window.addEventListener("keydown", handleGlobalKeydown);
     window.addEventListener("beforeunload", beforeUnload);
@@ -850,9 +1046,11 @@
 
     return () => {
       disposed = true;
+      finishReorderPointer(true);
       if (clockHandle !== undefined) window.clearTimeout(clockHandle);
       unlisten?.();
       window.removeEventListener("focus", resync);
+      window.removeEventListener("blur", handleWindowBlur);
       window.removeEventListener("pointerdown", handleGlobalPointerDown);
       window.removeEventListener("keydown", handleGlobalKeydown);
       window.removeEventListener("beforeunload", beforeUnload);
@@ -865,7 +1063,17 @@
   });
 </script>
 
-<section class="mfa-tool" data-testid="mfa-tool" aria-label="MFA 验证器" onpaste={handlePaste}>
+<section
+  bind:this={mfaToolElement}
+  class="mfa-tool"
+  data-testid="mfa-tool"
+  aria-label="MFA 验证器"
+  onpaste={handlePaste}
+  onpointermove={updateReorderPointer}
+  onpointerup={(event) => finishReorderFromEvent(event)}
+  onpointercancel={(event) => finishReorderFromEvent(event, true)}
+  onlostpointercapture={(event) => finishReorderFromEvent(event, true)}
+>
   <header class="titlebar" data-tauri-drag-region>
     <div class="brand" data-tauri-drag-region>
       <ShieldCheck size={18} aria-hidden="true" />
@@ -882,7 +1090,14 @@
           <KeyRound size={18} aria-hidden="true" />
         </button>
       {/if}
-      <button type="button" class="primary-icon" aria-label="新增 MFA 账户" title="新增账户" disabled={Boolean(status && !status.available)} onclick={openAdd}>
+      <button
+        type="button"
+        class="primary-icon"
+        aria-label="新增 MFA 账户"
+        title={pinBusy || reordering ? "账户顺序保存完成后可添加" : "新增账户"}
+        disabled={Boolean(status && !status.available) || pinBusy || reordering}
+        onclick={openAdd}
+      >
         <Plus size={18} aria-hidden="true" />
       </button>
       <button type="button" aria-label="关闭 MFA 验证器" title="关闭" onclick={() => void closeWindow()}>
@@ -891,7 +1106,7 @@
     </div>
   </header>
 
-  <main>
+  <main bind:this={mainElement}>
     {#if error}
       <div class="error-banner" role="alert">
         <AlertTriangle size={16} aria-hidden="true" />
@@ -928,7 +1143,7 @@
         <div class="empty-icon"><ShieldCheck size={30} aria-hidden="true" /></div>
         <strong>还没有验证码</strong>
         <span>扫描二维码或粘贴 otpauth 链接即可添加。</span>
-        <button class="primary-button" type="button" onclick={openAdd}><Plus size={16} aria-hidden="true" /> 添加账户</button>
+        <button class="primary-button" type="button" disabled={pinBusy || reordering} onclick={openAdd}><Plus size={16} aria-hidden="true" /> 添加账户</button>
       </div>
     {:else if filteredEntries.length === 0}
       <div class="empty-state compact">
@@ -937,23 +1152,47 @@
         <span>换一个名称、服务商或账号试试。</span>
       </div>
     {:else}
-      <div class="account-list" aria-label="验证器账户">
+      <div class="account-list" aria-label="验证器账户" aria-busy={pinBusy || reordering}>
         {#each filteredEntries as entry (entry.id)}
           {@const currentReveal = revealFor(entry)}
           <div
             class:revealed={Boolean(currentReveal)}
+            class:pinned={entry.pinned}
+            class:dragging={reorderDragId === entry.id}
+            class:drop-before={reorderDropId === entry.id && reorderDropPosition === "before"}
+            class:drop-after={reorderDropId === entry.id && reorderDropPosition === "after"}
             class="account-card"
             role="button"
             tabindex="0"
+            data-entry-id={entry.id}
+            data-entry-pinned={String(entry.pinned)}
             aria-label={`${entry.name}，双击复制验证码`}
             oncontextmenu={(event) => openContextMenu(event, entry)}
             ondblclick={() => void copyCode(entry)}
             onkeydown={(event) => handleCardKeydown(event, entry)}
           >
+            <button
+              type="button"
+              class="reorder-handle"
+              aria-label={`调整“${entry.name}”的顺序`}
+              aria-pressed={reorderDragId === entry.id}
+              aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
+              title={searchActive ? "清空搜索后可调整顺序" : "拖动调整顺序；Alt + 方向键移动"}
+              disabled={searchActive || reordering || pinBusy}
+              onpointerdown={(event) => beginReorderPointer(event, entry)}
+              onkeydown={(event) => moveReorderByKeyboard(event, entry)}
+              onclick={stopHandleClick}
+              ondblclick={stopHandleClick}
+            >
+              <GripVertical size={17} strokeWidth={2.1} aria-hidden="true" />
+            </button>
             <div class="account-icon" aria-hidden="true">{entry.iconEmoji || "🔐"}</div>
             <div class="account-main">
               <div class="account-heading">
                 <strong>{entry.name}</strong>
+                {#if entry.pinned}
+                  <span class="pin-indicator" aria-label="已置顶" title="已置顶"><Pin size={11} fill="currentColor" aria-hidden="true" /></span>
+                {/if}
                 {#if copyingIds[entry.id]}<span class="copying-label">正在复制…</span>{/if}
               </div>
               <span class="account-meta" title={metadata(entry)}>{metadata(entry)}</span>
@@ -1014,10 +1253,13 @@
         <button type="button" role="menuitem" onclick={() => { closeContextMenu(true); void toggleReveal(entry); }}>
           {#if revealed[entry.id]}<EyeOff size={15} aria-hidden="true" /> 隐藏验证码{:else}<Eye size={15} aria-hidden="true" /> 显示验证码{/if}
         </button>
-        <button type="button" role="menuitem" onclick={() => startEdit(entry)}>
+        <button type="button" role="menuitem" disabled={pinBusy || reordering} onclick={() => togglePinnedFromContext(entry)}>
+          {#if entry.pinned}<PinOff size={15} aria-hidden="true" /> 取消置顶{:else}<Pin size={15} aria-hidden="true" /> 置顶{/if}
+        </button>
+        <button type="button" role="menuitem" disabled={pinBusy || reordering} onclick={() => startEdit(entry)}>
           <Pencil size={15} aria-hidden="true" /> 编辑
         </button>
-        <button type="button" class="danger" role="menuitem" onclick={() => requestDelete(entry)}>
+        <button type="button" class="danger" role="menuitem" disabled={pinBusy || reordering} onclick={() => requestDelete(entry)}>
           <Trash2 size={15} aria-hidden="true" /> 删除
         </button>
       </div>
@@ -1330,13 +1572,25 @@
   .info-banner { color: #503775; background: #f0eafb; border: 1px solid #d8c9f0; }
   .warning-banner { color: #76520b; background: #fff8df; border: 1px solid #ead69a; }
   .account-list { display: grid; gap: 8px; }
-  .account-card { display: grid; min-height: 88px; padding: 11px 12px; grid-template-columns: 48px minmax(0, 1fr) 42px; align-items: center; gap: 11px; background: #fff; border: 1px solid #d8d8d8; border-radius: 8px; box-shadow: 0 1px 4px rgb(0 0 0 / 4%); cursor: default; transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease; }
+  .account-card { position: relative; display: grid; min-height: 88px; padding: 11px 12px 11px 6px; grid-template-columns: 24px 48px minmax(0, 1fr) 42px; align-items: center; gap: 9px; background: #fff; border: 1px solid #d8d8d8; border-radius: 8px; box-shadow: 0 1px 4px rgb(0 0 0 / 4%); cursor: default; transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease, opacity 120ms ease; }
   .account-card:hover { border-color: #c5b7dc; box-shadow: 0 3px 10px rgb(58 37 93 / 8%); }
+  .account-card:focus-visible { border-color: #8f72bc; outline: 2px solid rgb(104 69 173 / 24%); outline-offset: 1px; }
   .account-card.revealed { border-color: #baa5dc; background: linear-gradient(100deg, #fff 0%, #fcfaff 100%); }
+  .account-card.pinned { border-left-color: #9474bd; box-shadow: inset 3px 0 #a78ac9, 0 1px 4px rgb(0 0 0 / 4%); }
+  .account-card.dragging { z-index: 2; opacity: .7; transform: scale(.99); }
+  .account-card.drop-before::after, .account-card.drop-after::after { position: absolute; z-index: 3; right: 4px; left: 4px; height: 3px; content: ""; background: #6d49a7; border-radius: 2px; box-shadow: 0 0 0 2px rgb(109 73 167 / 13%); pointer-events: none; }
+  .account-card.drop-before::after { top: -6px; }
+  .account-card.drop-after::after { bottom: -6px; }
+  .reorder-handle { display: grid; width: 24px; height: 34px; padding: 0; place-items: center; color: #91899b; touch-action: none; user-select: none; background: transparent; border: 0; border-radius: 5px; cursor: grab; }
+  .reorder-handle:hover, .reorder-handle:focus-visible, .account-card.dragging .reorder-handle { color: #593b86; background: #f0eaf7; outline: 0; }
+  .reorder-handle:focus-visible { box-shadow: 0 0 0 2px rgb(104 69 173 / 23%); }
+  .reorder-handle:active { cursor: grabbing; }
+  .reorder-handle:disabled { color: #b9b5bd; background: transparent; cursor: not-allowed; opacity: .58; }
   .account-icon { display: grid; width: 46px; height: 46px; place-items: center; font-size: 24px; line-height: 1; background: #f0ecf7; border: 1px solid #ded4ed; border-radius: 50%; user-select: none; }
   .account-main { display: grid; min-width: 0; gap: 2px; }
   .account-heading { min-width: 0; gap: 7px; }
   .account-heading strong { min-width: 0; overflow: hidden; color: #28252d; font-size: 13.5px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+  .pin-indicator { display: grid; width: 18px; height: 18px; flex: 0 0 auto; place-items: center; color: #67469a; background: #eee7f7; border: 1px solid #ded2ed; border-radius: 50%; }
   .copying-label { color: #7a6995; font-size: 9.5px; white-space: nowrap; }
   .account-meta { overflow: hidden; color: #79747f; font-size: 10.5px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
   .otp-code { margin-top: 2px; color: #362552; font-family: "Cascadia Mono", "Segoe UI Mono", Consolas, monospace; font-size: clamp(20px, 5.3vw, 27px); font-variant-numeric: tabular-nums; font-weight: 650; letter-spacing: .08em; line-height: 1.12; white-space: nowrap; }
@@ -1366,6 +1620,7 @@
   .entry-context-menu { position: fixed; z-index: 40; display: grid; width: 164px; padding: 4px; gap: 2px; background: #fff; border: 1px solid #d2d2d2; border-radius: 6px; box-shadow: 0 8px 24px rgb(0 0 0 / 18%); }
   .entry-context-menu button { display: flex; width: 100%; height: 34px; padding: 0 9px; align-items: center; gap: 8px; color: #303030; background: transparent; border: 0; border-radius: 4px; cursor: pointer; }
   .entry-context-menu button:hover, .entry-context-menu button:focus-visible { background: #f0f0f0; outline: 0; }
+  .entry-context-menu button:disabled { color: #999; cursor: wait; opacity: .65; }
   .entry-context-menu button.danger { color: #b42318; }
   .entry-context-menu button.danger:hover { background: #fff0ed; }
   .modal-backdrop { position: fixed; z-index: 30; inset: 0; display: grid; padding: 18px; place-items: center; background: rgb(27 24 31 / 38%); backdrop-filter: blur(2px); }
@@ -1460,7 +1715,8 @@
     .brand h1 { display: none; }
     .search-box { width: auto; flex: 1 1 auto; }
     main { padding: 10px; }
-    .account-card { padding: 9px; grid-template-columns: 42px minmax(0, 1fr) 38px; gap: 8px; }
+    .account-card { padding: 9px 8px 9px 4px; grid-template-columns: 22px 42px minmax(0, 1fr) 38px; gap: 7px; }
+    .reorder-handle { width: 22px; }
     .account-icon { width: 40px; height: 40px; font-size: 21px; }
     .otp-code { font-size: 20px; }
     .modal-backdrop { padding: 7px; }

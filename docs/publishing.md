@@ -14,7 +14,9 @@
 pnpm package:windows
 ```
 
-Version `0.4.0` adds portable MFA recovery and hardens local data migration. It supports standard
+Version `0.4.1` adds configurable tray double-click actions plus manual ordering
+and pinning for MFA accounts. Version `0.4.0` introduced portable MFA recovery
+and hardened local data migration. The MFA tool supports standard
 RFC 6238 TOTP accounts, screen/image/URI/manual import, hidden-by-default codes,
 and safe clipboard cleanup. The encrypted vault keeps a random data key behind
 two independent wrappers: Windows DPAPI for passwordless local use and an
@@ -45,7 +47,7 @@ When repository secrets `AMO_JWT_ISSUER` and `AMO_JWT_SECRET` are both present,
 it also requests an unlisted AMO signature and attaches the resulting signed
 XPI. The unsigned ZIP must not be presented as an installable Firefox package.
 
-The `0.4.0` installer can be installed directly over an earlier PetalDesk
+The `0.4.1` installer can be installed directly over an earlier PetalDesk
 version. On first launch it migrates legacy note metadata and the previous
 Gantt JSON layout into `.petaldesk/`, preserving the note Markdown and a
 migration backup. Same-machine upgrades do not require an MFA recovery
@@ -56,4 +58,4 @@ to a different Windows user or computer.
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.4.0>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.4.1>

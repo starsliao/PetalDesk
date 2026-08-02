@@ -1,5 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { defaultEditorModeStorageKey, noteColorForSeed, notesApi } from "./bridge";
+import {
+  DEFAULT_TRAY_SHORTCUT_SETTINGS,
+  defaultEditorModeStorageKey,
+  noteColorForSeed,
+  notesApi,
+} from "./bridge";
 import { previousStorageKey } from "./storage";
 
 const browserNotesKey = "petaldesk.browser-notes.v1";
@@ -96,13 +101,28 @@ describe("browser note styles", () => {
   });
 
   it("defaults to Typora mode and persists a new global selection", async () => {
-    expect((await notesApi.appInfo()).version).toBe("0.4.0");
+    expect((await notesApi.appInfo()).version).toBe("0.4.1");
     expect((await notesApi.appInfo()).defaultEditorMode).toBe("typora");
 
     await expect(notesApi.setDefaultEditorMode("plain")).resolves.toBe("plain");
 
     expect(localStorage.getItem(defaultEditorModeStorageKey)).toBe("plain");
     expect((await notesApi.appInfo()).defaultEditorMode).toBe("plain");
+  });
+
+  it("persists configurable tray double-click actions in the browser fallback", async () => {
+    expect((await notesApi.appInfo()).trayShortcutSettings).toEqual(
+      DEFAULT_TRAY_SHORTCUT_SETTINGS,
+    );
+
+    const settings = {
+      doubleClick: "mainWindow",
+      altDoubleClick: "reminder",
+      ctrlDoubleClick: "screenshot",
+      shiftDoubleClick: "timer",
+    } as const;
+    await expect(notesApi.setTrayShortcutSettings(settings)).resolves.toEqual(settings);
+    expect((await notesApi.appInfo()).trayShortcutSettings).toEqual(settings);
   });
 
   it("moves the previous product default editor preference to the new key", async () => {

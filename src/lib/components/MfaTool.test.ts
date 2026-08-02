@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/svelte";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  createBrowserMfaApi,
   mfaApi,
   type MfaApi,
   type MfaEntrySummary,
@@ -41,6 +42,38 @@ describe("mfaApi recovery commands", () => {
       password: "migration recovery code",
     });
   });
+
+  it("uses the exact backend argument names for reorder and pin commands", async () => {
+    (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
+    backendInvoke.mockResolvedValue([]);
+
+    await mfaApi.reorder(["first", "second"]);
+    await mfaApi.setPinned("second", true);
+
+    expect(backendInvoke).toHaveBeenNthCalledWith(1, "reorder_mfa_entries", {
+      orderedIds: ["first", "second"],
+    });
+    expect(backendInvoke).toHaveBeenNthCalledWith(2, "set_mfa_entry_pinned", {
+      entryId: "second",
+      pinned: true,
+    });
+  });
+
+  it("keeps browser-demo pin and reorder operations in memory", async () => {
+    const api = createBrowserMfaApi();
+    const initial = await api.list();
+    const github = initial.find((item) => item.name === "GitHub")!;
+    const petaldesk = initial.find((item) => item.name === "飞花演示")!;
+
+    await api.setPinned(github.id, true);
+    expect((await api.list())[0]).toMatchObject({ id: github.id, pinned: true });
+    await api.setPinned(github.id, false);
+    await api.reorder([petaldesk.id, github.id]);
+
+    const saved = await api.list();
+    expect(saved.map((item) => item.id)).toEqual([petaldesk.id, github.id]);
+    expect(saved.every((item) => !item.pinned)).toBe(true);
+  });
 });
 
 function entry(overrides: Partial<MfaEntrySummary> = {}): MfaEntrySummary {
@@ -50,6 +83,7 @@ function entry(overrides: Partial<MfaEntrySummary> = {}): MfaEntrySummary {
     issuer: "GitHub",
     accountName: "octocat",
     iconEmoji: "🐙",
+    pinned: false,
     algorithm: "sha1",
     digits: 6,
     period: 30,
@@ -106,12 +140,49 @@ function mockApi(initial: MfaEntrySummary[] = [entry()]): MfaApi & Record<string
     delete: vi.fn().mockImplementation(async (id: string) => {
       items = items.filter((item) => item.id !== id);
     }),
+    reorder: vi.fn().mockImplementation(async (orderedIds: string[]) => {
+      const byId = new Map(items.map((item) => [item.id, item]));
+      const reordered = orderedIds.map((id) => byId.get(id)!);
+      items = [...reordered.filter((item) => item.pinned), ...reordered.filter((item) => !item.pinned)];
+      return structuredClone(items);
+    }),
+    setPinned: vi.fn().mockImplementation(async (id: string, pinned: boolean) => {
+      const current = items.find((item) => item.id === id)!;
+      const saved = { ...current, pinned };
+      const remaining = items.filter((item) => item.id !== id);
+      items = pinned
+        ? [saved, ...remaining.filter((item) => item.pinned), ...remaining.filter((item) => !item.pinned)]
+        : [...remaining.filter((item) => item.pinned), saved, ...remaining.filter((item) => !item.pinned)];
+      return structuredClone(items);
+    }),
     reveal: vi.fn().mockResolvedValue({ id: entry().id, code: "123456", validUntil: Date.now() + 30_000 }),
     copy: vi.fn().mockResolvedValue(undefined),
     configureRecoveryPassword: vi.fn().mockResolvedValue(undefined),
     unlockWithRecoveryPassword: vi.fn().mockResolvedValue(undefined),
     lock: vi.fn().mockResolvedValue(undefined),
   } as MfaApi & Record<string, ReturnType<typeof vi.fn> | (() => boolean)>;
+}
+
+function pointerEvent(type: string, values: Record<string, number>): Event {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  for (const [key, value] of Object.entries(values)) {
+    Object.defineProperty(event, key, { configurable: true, value });
+  }
+  return event;
+}
+
+function domRect(left: number, top: number, width: number, height: number): DOMRect {
+  return {
+    x: left,
+    y: top,
+    top,
+    right: left + width,
+    bottom: top + height,
+    left,
+    width,
+    height,
+    toJSON: () => ({}),
+  };
 }
 
 describe("MfaTool", () => {
@@ -267,6 +338,123 @@ describe("MfaTool", () => {
     await waitFor(() => expect(api.copy).toHaveBeenCalledWith(entry().id));
     expect(api.reveal).not.toHaveBeenCalled();
     expect(rendered.getByLabelText("验证码已隐藏")).toBeInTheDocument();
+  });
+
+  it("reorders accounts from the dedicated drag handle without copying a code", async () => {
+    const api = mockApi([
+      entry(),
+      entry({ id: "cloud", name: "Cloud", issuer: "Cloud", iconEmoji: "☁️" }),
+      entry({ id: "mail", name: "Mail", issuer: "Mail", iconEmoji: "📧" }),
+    ]);
+    const rendered = render(MfaTool, { api });
+    await rendered.findByText("Mail", { selector: ".account-heading strong" });
+
+    const source = rendered.getByRole("button", { name: "调整“GitHub”的顺序" });
+    const target = rendered.getByRole("button", { name: "调整“Mail”的顺序" });
+    const sourceCard = source.closest<HTMLElement>(".account-card")!;
+    const targetCard = target.closest<HTMLElement>(".account-card")!;
+    vi.spyOn(sourceCard, "getBoundingClientRect").mockReturnValue(domRect(0, 100, 420, 88));
+    vi.spyOn(targetCard, "getBoundingClientRect").mockReturnValue(domRect(0, 276, 420, 88));
+    vi.spyOn(rendered.container.querySelector("main")!, "getBoundingClientRect").mockReturnValue(domRect(0, 44, 460, 500));
+    const root = rendered.getByTestId("mfa-tool");
+
+    await fireEvent(source, pointerEvent("pointerdown", { button: 0, pointerId: 17, clientX: 15, clientY: 120 }));
+    expect(sourceCard).toHaveClass("dragging");
+    await fireEvent(root, pointerEvent("pointermove", { pointerId: 17, clientX: 15, clientY: 350 }));
+    expect(targetCard).toHaveClass("drop-after");
+    await fireEvent(root, pointerEvent("pointerup", { pointerId: 17, clientX: 15, clientY: 350 }));
+
+    await waitFor(() => expect(api.reorder).toHaveBeenCalledWith(["cloud", "mail", entry().id]));
+    expect(api.copy).not.toHaveBeenCalled();
+    const names = Array.from(rendered.container.querySelectorAll<HTMLElement>(".account-heading strong"))
+      .map((element) => element.textContent);
+    expect(names).toEqual(["Cloud", "Mail", "GitHub"]);
+  });
+
+  it("cancels a drag cleanly when pointer capture is lost", async () => {
+    const api = mockApi([
+      entry(),
+      entry({ id: "cloud", name: "Cloud", issuer: "Cloud", iconEmoji: "☁️" }),
+    ]);
+    const rendered = render(MfaTool, { api });
+    await rendered.findByText("Cloud", { selector: ".account-heading strong" });
+    const handle = rendered.getByRole("button", { name: "调整“GitHub”的顺序" });
+    const sourceCard = handle.closest<HTMLElement>(".account-card")!;
+    const root = rendered.getByTestId("mfa-tool");
+
+    await fireEvent(handle, pointerEvent("pointerdown", { button: 0, pointerId: 21, clientX: 10, clientY: 90 }));
+    expect(sourceCard).toHaveClass("dragging");
+    await fireEvent(root, pointerEvent("lostpointercapture", { pointerId: 21 }));
+    expect(sourceCard).not.toHaveClass("dragging");
+    await fireEvent(root, pointerEvent("pointerup", { pointerId: 21 }));
+    expect(api.reorder).not.toHaveBeenCalled();
+  });
+
+  it("disables manual reordering while a search is active", async () => {
+    const api = mockApi([
+      entry(),
+      entry({ id: "cloud", name: "Cloud", issuer: "Cloud", iconEmoji: "☁️" }),
+    ]);
+    const rendered = render(MfaTool, { api });
+    await rendered.findByText("Cloud", { selector: ".account-heading strong" });
+
+    await fireEvent.input(rendered.getByRole("searchbox", { name: "搜索账户" }), { target: { value: "Git" } });
+    const handle = rendered.getByRole("button", { name: "调整“GitHub”的顺序" });
+    expect(handle).toBeDisabled();
+    expect(handle).toHaveAttribute("title", "清空搜索后可调整顺序");
+    await fireEvent(handle, pointerEvent("pointerdown", { button: 0, pointerId: 3, clientX: 10, clientY: 90 }));
+    await fireEvent(rendered.getByTestId("mfa-tool"), pointerEvent("pointerup", { pointerId: 3 }));
+    expect(api.reorder).not.toHaveBeenCalled();
+  });
+
+  it("supports keyboard reordering and serializes list mutations while the order is saving", async () => {
+    const github = entry();
+    const cloud = entry({ id: "cloud", name: "Cloud", issuer: "Cloud", iconEmoji: "☁️" });
+    const api = mockApi([github, cloud]);
+    let finishReorder!: (entries: MfaEntrySummary[]) => void;
+    (api.reorder as ReturnType<typeof vi.fn>).mockImplementationOnce(() => (
+      new Promise<MfaEntrySummary[]>((resolve) => (finishReorder = resolve))
+    ));
+    const rendered = render(MfaTool, { api });
+    await rendered.findByText("Cloud", { selector: ".account-heading strong" });
+
+    const handle = rendered.getByRole("button", { name: "调整“GitHub”的顺序" });
+    await fireEvent.keyDown(handle, { key: "ArrowDown", altKey: true });
+    await waitFor(() => expect(api.reorder).toHaveBeenCalledWith([cloud.id, github.id]));
+    expect(rendered.getByLabelText("验证器账户")).toHaveAttribute("aria-busy", "true");
+    expect(rendered.getByRole("button", { name: "新增 MFA 账户" })).toBeDisabled();
+
+    await fireEvent.contextMenu(rendered.getByLabelText("GitHub，双击复制验证码"), {
+      clientX: 30,
+      clientY: 30,
+    });
+    expect(rendered.getByRole("menuitem", { name: "编辑" })).toBeDisabled();
+    expect(rendered.getByRole("menuitem", { name: "删除" })).toBeDisabled();
+
+    finishReorder([cloud, github]);
+    await waitFor(() => expect(rendered.getByLabelText("验证器账户")).toHaveAttribute("aria-busy", "false"));
+    expect(rendered.getByRole("button", { name: "新增 MFA 账户" })).toBeEnabled();
+  });
+
+  it("pins and unpins an account from its context menu using backend order as authority", async () => {
+    const api = mockApi([
+      entry(),
+      entry({ id: "cloud", name: "Cloud", issuer: "Cloud", iconEmoji: "☁️" }),
+    ]);
+    const rendered = render(MfaTool, { api });
+    const cloudCard = await rendered.findByLabelText("Cloud，双击复制验证码");
+
+    await fireEvent.contextMenu(cloudCard, { clientX: 30, clientY: 30 });
+    await fireEvent.click(rendered.getByRole("menuitem", { name: "置顶" }));
+    await waitFor(() => expect(api.setPinned).toHaveBeenCalledWith("cloud", true));
+    expect(rendered.getByLabelText("已置顶")).toBeInTheDocument();
+    expect(rendered.container.querySelector(".account-heading strong")).toHaveTextContent("Cloud");
+
+    const pinnedCard = rendered.getByLabelText("Cloud，双击复制验证码");
+    await fireEvent.contextMenu(pinnedCard, { clientX: 30, clientY: 30 });
+    await fireEvent.click(rendered.getByRole("menuitem", { name: "取消置顶" }));
+    await waitFor(() => expect(api.setPinned).toHaveBeenLastCalledWith("cloud", false));
+    expect(rendered.queryByLabelText("已置顶")).not.toBeInTheDocument();
   });
 
   it("previews a standard link, shows warnings, imports it and securely asks the backend to copy", async () => {

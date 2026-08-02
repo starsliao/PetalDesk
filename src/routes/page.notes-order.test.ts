@@ -2,6 +2,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { NoteListItem } from "$lib/bridge";
 
 let activeUnmount: (() => void) | null = null;
+const trayShortcutSettings = {
+  doubleClick: "firstNote",
+  altDoubleClick: "gantt",
+  ctrlDoubleClick: "mfa",
+  shiftDoubleClick: "mainWindow",
+} as const;
 
 afterEach(() => {
   activeUnmount?.();
@@ -38,8 +44,9 @@ describe("main note order", () => {
     vi.spyOn(notesApi, "migrateLegacyTimerData").mockResolvedValue(false);
     vi.spyOn(notesApi, "appInfo").mockResolvedValue({
       workspacePath: "测试目录",
-      version: "0.4.0",
+      version: "0.4.1",
       defaultEditorMode: "typora",
+      trayShortcutSettings,
     });
     vi.spyOn(notesApi, "listNotes").mockResolvedValue(initial);
     vi.spyOn(notesApi, "listTrash").mockResolvedValue([]);

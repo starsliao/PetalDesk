@@ -19,6 +19,58 @@ pub enum ToolName {
     Screenshot,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TrayShortcutAction {
+    FirstNote,
+    MainWindow,
+    Timer,
+    Reminder,
+    Gantt,
+    Mfa,
+    Screenshot,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TrayShortcutSettings {
+    #[serde(default = "default_tray_double_click")]
+    pub double_click: TrayShortcutAction,
+    #[serde(default = "default_tray_alt_double_click")]
+    pub alt_double_click: TrayShortcutAction,
+    #[serde(default = "default_tray_ctrl_double_click")]
+    pub ctrl_double_click: TrayShortcutAction,
+    #[serde(default = "default_tray_shift_double_click")]
+    pub shift_double_click: TrayShortcutAction,
+}
+
+impl Default for TrayShortcutSettings {
+    fn default() -> Self {
+        Self {
+            double_click: default_tray_double_click(),
+            alt_double_click: default_tray_alt_double_click(),
+            ctrl_double_click: default_tray_ctrl_double_click(),
+            shift_double_click: default_tray_shift_double_click(),
+        }
+    }
+}
+
+fn default_tray_double_click() -> TrayShortcutAction {
+    TrayShortcutAction::FirstNote
+}
+
+fn default_tray_alt_double_click() -> TrayShortcutAction {
+    TrayShortcutAction::Gantt
+}
+
+fn default_tray_ctrl_double_click() -> TrayShortcutAction {
+    TrayShortcutAction::Mfa
+}
+
+fn default_tray_shift_double_click() -> TrayShortcutAction {
+    TrayShortcutAction::MainWindow
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteMeta {
@@ -152,6 +204,7 @@ pub struct AppInfo {
     pub version: String,
     pub workspace_path: String,
     pub default_editor_mode: String,
+    pub tray_shortcut_settings: TrayShortcutSettings,
     pub colors: Vec<String>,
     pub recovered_drafts: usize,
 }

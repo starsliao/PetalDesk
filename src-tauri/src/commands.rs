@@ -142,12 +142,25 @@ pub fn get_app_info(store: State<'_, WorkspaceStore>) -> AppInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         workspace_path: store.workspace_path().to_string_lossy().into_owned(),
         default_editor_mode: store.default_editor_mode(),
+        tray_shortcut_settings: store.tray_shortcut_settings(),
         colors: ALLOWED_COLORS
             .iter()
             .map(|color| (*color).to_string())
             .collect(),
         recovered_drafts: store.startup_recovery().len(),
     }
+}
+
+#[tauri::command]
+pub async fn set_tray_shortcut_settings(
+    app: AppHandle,
+    settings: TrayShortcutSettings,
+) -> AppResult<TrayShortcutSettings> {
+    run_background("设置托盘双击动作", move || {
+        app.state::<WorkspaceStore>()
+            .set_tray_shortcut_settings(settings)
+    })
+    .await
 }
 
 #[tauri::command]

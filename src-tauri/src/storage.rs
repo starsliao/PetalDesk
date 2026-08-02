@@ -24,7 +24,7 @@ const BACKUP_LIMIT: usize = 5;
 /// charge it at most once per interval per note.
 const BACKUP_MIN_INTERVAL: Duration = Duration::from_secs(180);
 const EXTERNAL_FULL_HASH_INTERVAL: Duration = Duration::from_secs(60);
-const DATA_CONFIG_SCHEMA_VERSION: u32 = 1;
+const DATA_CONFIG_SCHEMA_VERSION: u32 = 2;
 const NOTE_ORDER_SCHEMA_VERSION: u32 = 1;
 const STORAGE_POINTER_FILE: &str = "storage-path.txt";
 pub(crate) const INTERNAL_DATA_DIR: &str = ".petaldesk";
@@ -42,6 +42,8 @@ struct DataStorageConfig {
     schema_version: u32,
     #[serde(default = "default_editor_mode", alias = "editorMode")]
     default_editor_mode: String,
+    #[serde(default)]
+    tray_shortcuts: TrayShortcutSettings,
 }
 
 impl Default for DataStorageConfig {
@@ -49,6 +51,7 @@ impl Default for DataStorageConfig {
         Self {
             schema_version: DATA_CONFIG_SCHEMA_VERSION,
             default_editor_mode: DEFAULT_EDITOR_MODE.to_string(),
+            tray_shortcuts: TrayShortcutSettings::default(),
         }
     }
 }
@@ -113,6 +116,7 @@ impl FileStamp {
 pub struct WorkspaceStore {
     workspace: RwLock<PathBuf>,
     default_editor_mode: RwLock<String>,
+    tray_shortcuts: RwLock<TrayShortcutSettings>,
     app_data: PathBuf,
     startup_recovery: RwLock<Vec<RecoveredDraft>>,
     mutation_lock: Mutex<()>,
@@ -158,10 +162,11 @@ impl WorkspaceStore {
             Some(&legacy_app_data),
             stored_settings.as_ref(),
         )?;
-        let default_editor_mode = load_data_storage_config(&workspace, stored_settings.as_ref())?;
+        let data_config = load_data_storage_config(&workspace, stored_settings.as_ref())?;
         let store = Self {
             workspace: RwLock::new(workspace),
-            default_editor_mode: RwLock::new(default_editor_mode),
+            default_editor_mode: RwLock::new(data_config.default_editor_mode),
+            tray_shortcuts: RwLock::new(data_config.tray_shortcuts),
             app_data,
             startup_recovery: RwLock::new(Vec::new()),
             mutation_lock: Mutex::new(()),
@@ -188,6 +193,7 @@ impl WorkspaceStore {
         Ok(Self {
             workspace: RwLock::new(prepare_workspace(workspace)?),
             default_editor_mode: RwLock::new(DEFAULT_EDITOR_MODE.to_string()),
+            tray_shortcuts: RwLock::new(TrayShortcutSettings::default()),
             app_data: app_data.to_path_buf(),
             startup_recovery: RwLock::new(Vec::new()),
             mutation_lock: Mutex::new(()),
@@ -234,6 +240,38 @@ impl WorkspaceStore {
         Ok(editor_mode.to_string())
     }
 
+    pub fn tray_shortcut_settings(&self) -> TrayShortcutSettings {
+        *self
+            .tray_shortcuts
+            .read()
+            .expect("tray shortcut settings lock poisoned")
+    }
+
+    pub fn set_tray_shortcut_settings(
+        &self,
+        settings: TrayShortcutSettings,
+    ) -> AppResult<TrayShortcutSettings> {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .expect("workspace mutation lock poisoned");
+        let previous = {
+            let mut stored = self
+                .tray_shortcuts
+                .write()
+                .expect("tray shortcut settings lock poisoned");
+            std::mem::replace(&mut *stored, settings)
+        };
+        if let Err(error) = self.save_data_storage_config() {
+            *self
+                .tray_shortcuts
+                .write()
+                .expect("tray shortcut settings lock poisoned") = previous;
+            return Err(error);
+        }
+        Ok(settings)
+    }
+
     pub fn startup_recovery(&self) -> Vec<RecoveredDraft> {
         self.startup_recovery
             .read()
@@ -257,6 +295,7 @@ impl WorkspaceStore {
                 &DataStorageConfig {
                     schema_version: DATA_CONFIG_SCHEMA_VERSION,
                     default_editor_mode: self.default_editor_mode(),
+                    tray_shortcuts: self.tray_shortcut_settings(),
                 },
             )?;
         }
@@ -1432,6 +1471,7 @@ impl WorkspaceStore {
             &DataStorageConfig {
                 schema_version: DATA_CONFIG_SCHEMA_VERSION,
                 default_editor_mode: self.default_editor_mode(),
+                tray_shortcuts: self.tray_shortcut_settings(),
             },
         )
     }
@@ -2034,21 +2074,28 @@ fn data_storage_config_path(root: &Path) -> PathBuf {
 fn load_data_storage_config(
     root: &Path,
     legacy_settings: Option<&AppSettings>,
-) -> AppResult<String> {
+) -> AppResult<DataStorageConfig> {
+    let fallback = || DataStorageConfig {
+        default_editor_mode: legacy_settings
+            .map(|settings| normalize_stored_editor_mode(&settings.default_editor_mode))
+            .unwrap_or_else(|| DEFAULT_EDITOR_MODE.to_string()),
+        ..DataStorageConfig::default()
+    };
     let path = data_storage_config_path(root);
     match fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice::<DataStorageConfig>(&bytes) {
-            Ok(config) => Ok(normalize_stored_editor_mode(&config.default_editor_mode)),
+            Ok(mut config) => {
+                config.default_editor_mode =
+                    normalize_stored_editor_mode(&config.default_editor_mode);
+                config.schema_version = DATA_CONFIG_SCHEMA_VERSION;
+                Ok(config)
+            }
             Err(_) => {
                 preserve_corrupt_config(&path);
-                Ok(legacy_settings
-                    .map(|settings| normalize_stored_editor_mode(&settings.default_editor_mode))
-                    .unwrap_or_else(|| DEFAULT_EDITOR_MODE.to_string()))
+                Ok(fallback())
             }
         },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(legacy_settings
-            .map(|settings| normalize_stored_editor_mode(&settings.default_editor_mode))
-            .unwrap_or_else(|| DEFAULT_EDITOR_MODE.to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(fallback()),
         Err(error) => Err(AppError::io("读取飞花 - PetalDesk 数据配置", error)),
     }
 }
@@ -2107,6 +2154,7 @@ fn migrate_legacy_storage(
             &DataStorageConfig {
                 schema_version: DATA_CONFIG_SCHEMA_VERSION,
                 default_editor_mode,
+                tray_shortcuts: TrayShortcutSettings::default(),
             },
         )?;
     }
@@ -4147,6 +4195,45 @@ mod tests {
         let error = store.set_default_editor_mode("unknown").unwrap_err();
         assert_eq!(error.code, "invalid_input");
         assert_eq!(store.default_editor_mode(), "plain");
+    }
+
+    #[test]
+    fn persists_tray_shortcut_settings_in_the_data_directory() {
+        let (_root, store) = store();
+        let settings = TrayShortcutSettings {
+            double_click: TrayShortcutAction::MainWindow,
+            alt_double_click: TrayShortcutAction::Timer,
+            ctrl_double_click: TrayShortcutAction::Screenshot,
+            shift_double_click: TrayShortcutAction::Reminder,
+        };
+
+        assert_eq!(
+            store.set_tray_shortcut_settings(settings).unwrap(),
+            settings
+        );
+        assert_eq!(store.tray_shortcut_settings(), settings);
+
+        let config =
+            read_json::<DataStorageConfig>(&data_storage_config_path(&store.workspace_path()))
+                .unwrap();
+        assert_eq!(config.schema_version, DATA_CONFIG_SCHEMA_VERSION);
+        assert_eq!(config.tray_shortcuts, settings);
+    }
+
+    #[test]
+    fn old_data_config_receives_default_tray_shortcuts() {
+        let root = TempDir::new().unwrap();
+        let workspace = prepare_workspace(root.path()).unwrap();
+        atomic_write_json(
+            &data_storage_config_path(&workspace),
+            &json!({ "schemaVersion": 1, "defaultEditorMode": "plain" }),
+        )
+        .unwrap();
+
+        let config = load_data_storage_config(&workspace, None).unwrap();
+        assert_eq!(config.schema_version, DATA_CONFIG_SCHEMA_VERSION);
+        assert_eq!(config.default_editor_mode, "plain");
+        assert_eq!(config.tray_shortcuts, TrayShortcutSettings::default());
     }
 
     #[test]

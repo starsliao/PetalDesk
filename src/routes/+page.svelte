@@ -9,6 +9,7 @@
   import ReminderTool from "$lib/components/ReminderTool.svelte";
   import TimerTool from "$lib/components/TimerTool.svelte";
   import {
+    DEFAULT_TRAY_SHORTCUT_SETTINGS,
     defaultEditorModeStorageKey,
     notesApi,
     type AppError,
@@ -17,6 +18,7 @@
     type NoteListItem,
     type NoteMeta,
     type NoteSnapshot,
+    type TrayShortcutSettings,
     type TrashItem,
   } from "$lib/bridge";
   import { extractLocalImagePaths, type EditorMode } from "$lib/editor";
@@ -119,6 +121,9 @@
   let settingsBusy = $state(false);
   let settingsError = $state<string | null>(null);
   let screenshotShortcut = $state("F1");
+  let trayShortcutSettings = $state<TrayShortcutSettings>({
+    ...DEFAULT_TRAY_SHORTCUT_SETTINGS,
+  });
 
   let activeNote = $state<NoteSnapshot | null>(null);
   let NoteEditor = $state<NoteEditorComponent | null>(null);
@@ -169,6 +174,9 @@
       }
       appInfo = await notesApi.appInfo();
       defaultEditorMode = appInfo.defaultEditorMode ?? "typora";
+      trayShortcutSettings = {
+        ...(appInfo.trayShortcutSettings ?? DEFAULT_TRAY_SHORTCUT_SETTINGS),
+      };
       if (notesApi.isDesktop()) {
         try {
           screenshotShortcut = (await screenshotApi.getSettings()).shortcut;
@@ -544,6 +552,12 @@
     settingsBusy = true;
     settingsError = null;
     try {
+      const latestAppInfo = await notesApi.appInfo();
+      appInfo = latestAppInfo;
+      defaultEditorMode = latestAppInfo.defaultEditorMode ?? "typora";
+      trayShortcutSettings = {
+        ...(latestAppInfo.trayShortcutSettings ?? DEFAULT_TRAY_SHORTCUT_SETTINGS),
+      };
       screenshotShortcut = (await screenshotApi.getSettings()).shortcut;
     } catch (error) {
       settingsError = errorMessage(error);
@@ -552,14 +566,24 @@
     }
   }
 
-  async function saveScreenshotShortcut(shortcut: string): Promise<void> {
+  async function saveSettings(
+    shortcut: string,
+    nextTrayShortcutSettings: TrayShortcutSettings,
+  ): Promise<void> {
     settingsBusy = true;
     settingsError = null;
     try {
       const settings = await screenshotApi.setShortcut(shortcut);
       screenshotShortcut = settings.shortcut;
+      const savedTrayShortcutSettings = await notesApi.setTrayShortcutSettings(
+        nextTrayShortcutSettings,
+      );
+      trayShortcutSettings = { ...savedTrayShortcutSettings };
+      if (appInfo) {
+        appInfo = { ...appInfo, trayShortcutSettings: { ...savedTrayShortcutSettings } };
+      }
       settingsOpen = false;
-      showToast(`截图快捷键已设为 ${settings.shortcut}`);
+      showToast("设置已保存");
     } catch (error) {
       settingsError = errorMessage(error);
     } finally {
@@ -1000,11 +1024,12 @@
   <ScreenshotSettingsDialog
     open
     shortcut={screenshotShortcut}
+    {trayShortcutSettings}
     editorMode={defaultEditorMode}
     dataStoragePath={appInfo?.workspacePath ?? ""}
     busy={settingsBusy}
     error={settingsError}
-    onsave={saveScreenshotShortcut}
+    onsave={saveSettings}
     oneditormodechange={(mode) => void changeDefaultEditorMode(mode)}
     ondatastoragechange={() => void chooseDataStoragePath()}
     oncancel={() => {

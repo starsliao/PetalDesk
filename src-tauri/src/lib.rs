@@ -133,6 +133,45 @@ fn tool_from_tray_menu_id(menu_id: &str) -> Option<models::ToolName> {
     }
 }
 
+fn tray_action_for_modifiers(
+    settings: models::TrayShortcutSettings,
+    alt_pressed: bool,
+    ctrl_pressed: bool,
+    shift_pressed: bool,
+) -> Option<models::TrayShortcutAction> {
+    match (alt_pressed, ctrl_pressed, shift_pressed) {
+        (false, false, false) => Some(settings.double_click),
+        (true, false, false) => Some(settings.alt_double_click),
+        (false, true, false) => Some(settings.ctrl_double_click),
+        (false, false, true) => Some(settings.shift_double_click),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn current_tray_double_click_action(
+    settings: models::TrayShortcutSettings,
+) -> Option<models::TrayShortcutAction> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
+    };
+
+    let pressed = |key| unsafe { GetAsyncKeyState(i32::from(key)) < 0 };
+    tray_action_for_modifiers(
+        settings,
+        pressed(VK_MENU),
+        pressed(VK_CONTROL),
+        pressed(VK_SHIFT),
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+fn current_tray_double_click_action(
+    settings: models::TrayShortcutSettings,
+) -> Option<models::TrayShortcutAction> {
+    tray_action_for_modifiers(settings, false, false, false)
+}
+
 fn about_message(last_updated: Option<SystemTime>) -> String {
     let last_updated = last_updated
         .map(chrono::DateTime::<chrono::Local>::from)
@@ -317,6 +356,23 @@ fn spawn_open_tool(app: &tauri::AppHandle, tool: models::ToolName) {
     });
 }
 
+fn spawn_tray_action(app: &tauri::AppHandle, action: models::TrayShortcutAction) {
+    match action {
+        models::TrayShortcutAction::FirstNote => spawn_show_first_note_or_main(app),
+        models::TrayShortcutAction::MainWindow => {
+            let app = app.clone();
+            tauri::async_runtime::spawn_blocking(move || show_main_window(&app));
+        }
+        models::TrayShortcutAction::Timer => spawn_open_tool(app, models::ToolName::Timer),
+        models::TrayShortcutAction::Reminder => spawn_open_tool(app, models::ToolName::Reminder),
+        models::TrayShortcutAction::Gantt => spawn_open_tool(app, models::ToolName::Gantt),
+        models::TrayShortcutAction::Mfa => spawn_open_tool(app, models::ToolName::Mfa),
+        models::TrayShortcutAction::Screenshot => {
+            spawn_open_tool(app, models::ToolName::Screenshot)
+        }
+    }
+}
+
 fn spawn_create_note(app: &tauri::AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -473,7 +529,11 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 ..
             } = event
             {
-                spawn_show_first_note_or_main(tray.app_handle());
+                let app = tray.app_handle();
+                let settings = app.state::<WorkspaceStore>().tray_shortcut_settings();
+                if let Some(action) = current_tray_double_click_action(settings) {
+                    spawn_tray_action(app, action);
+                }
             }
         });
     if let Some(icon) = app.default_window_icon() {
@@ -658,6 +718,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_app_info,
             commands::set_default_editor_mode,
+            commands::set_tray_shortcut_settings,
             commands::set_data_storage_path,
             commands::restart_app,
             commands::list_notes,
@@ -688,6 +749,8 @@ pub fn run() {
             timer::save_timer_data,
             mfa::get_mfa_status,
             mfa::list_mfa_entries,
+            mfa::reorder_mfa_entries,
+            mfa::set_mfa_entry_pinned,
             mfa::configure_mfa_recovery_password,
             mfa::unlock_mfa_with_recovery_password,
             mfa::scan_mfa_screen_qr,
@@ -845,6 +908,28 @@ mod tests {
         assert_eq!(tool_from_tray_menu_id("timer"), None);
         assert_eq!(tool_from_tray_menu_id("gantt"), None);
         assert_eq!(tool_from_tray_menu_id("mfa"), None);
+    }
+
+    #[test]
+    fn tray_modifier_actions_use_defaults_and_reject_multiple_modifiers() {
+        let settings = models::TrayShortcutSettings::default();
+        assert_eq!(
+            tray_action_for_modifiers(settings, false, false, false),
+            Some(models::TrayShortcutAction::FirstNote)
+        );
+        assert_eq!(
+            tray_action_for_modifiers(settings, true, false, false),
+            Some(models::TrayShortcutAction::Gantt)
+        );
+        assert_eq!(
+            tray_action_for_modifiers(settings, false, true, false),
+            Some(models::TrayShortcutAction::Mfa)
+        );
+        assert_eq!(
+            tray_action_for_modifiers(settings, false, false, true),
+            Some(models::TrayShortcutAction::MainWindow)
+        );
+        assert_eq!(tray_action_for_modifiers(settings, true, true, false), None);
     }
 
     #[test]

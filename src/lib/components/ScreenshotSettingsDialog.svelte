@@ -1,16 +1,25 @@
 <script lang="ts">
   import { FileText, FolderOpen, Keyboard, RotateCcw, X } from "@lucide/svelte";
+  import {
+    DEFAULT_TRAY_SHORTCUT_SETTINGS,
+    type TrayShortcutAction,
+    type TrayShortcutSettings,
+  } from "$lib/bridge";
   import type { EditorMode } from "$lib/editor";
 
   interface Props {
     open?: boolean;
     shortcut?: string;
+    trayShortcutSettings?: TrayShortcutSettings;
     editorMode?: EditorMode;
     dataStoragePath?: string;
     dataStorageLabel?: string;
     busy?: boolean;
     error?: string | null;
-    onsave?: (shortcut: string) => void | Promise<void>;
+    onsave?: (
+      shortcut: string,
+      trayShortcutSettings: TrayShortcutSettings,
+    ) => void | Promise<void>;
     oncancel?: () => void;
     oneditormodechange?: (mode: EditorMode) => void | Promise<void>;
     ondatastoragechange?: () => void | Promise<void>;
@@ -19,6 +28,7 @@
   let {
     open = false,
     shortcut = "F1",
+    trayShortcutSettings = { ...DEFAULT_TRAY_SHORTCUT_SETTINGS },
     editorMode = "typora",
     dataStoragePath = "",
     dataStorageLabel = "尚未获取到存储路径",
@@ -34,15 +44,36 @@
   let recording = $state(false);
   let saving = $state(false);
   let lastShortcut = $state("");
+  let lastTraySettings = $state("");
+  let trayDraft = $state<TrayShortcutSettings>({ ...DEFAULT_TRAY_SHORTCUT_SETTINGS });
   let submitting = $derived(busy || saving);
   let storagePathText = $derived(dataStoragePath || dataStorageLabel);
+
+  const trayActionOptions: ReadonlyArray<{ value: TrayShortcutAction; label: string }> = [
+    { value: "firstNote", label: "首个便签" },
+    { value: "mainWindow", label: "主界面" },
+    { value: "timer", label: "计时器" },
+    { value: "reminder", label: "提醒" },
+    { value: "gantt", label: "任务甘特图" },
+    { value: "mfa", label: "MFA 验证器" },
+    { value: "screenshot", label: "截图" },
+  ];
 
   $effect(() => {
     if (open && shortcut !== lastShortcut) {
       lastShortcut = shortcut;
       draft = shortcut || "F1";
     }
-    if (!open) recording = false;
+    const traySignature = JSON.stringify(trayShortcutSettings);
+    if (open && traySignature !== lastTraySettings) {
+      lastTraySettings = traySignature;
+      trayDraft = { ...trayShortcutSettings };
+    }
+    if (!open) {
+      recording = false;
+      lastShortcut = "";
+      lastTraySettings = "";
+    }
   });
 
   function normalizeKey(event: KeyboardEvent): string | null {
@@ -88,7 +119,7 @@
     if (submitting || !draft) return;
     saving = true;
     try {
-      await onsave?.(draft);
+      await onsave?.(draft, { ...trayDraft });
     } finally {
       saving = false;
     }
@@ -163,6 +194,54 @@
               onclick={ondatastoragechange}
             >更改</button>
           </div>
+        </section>
+
+        <section class="settings-section" aria-labelledby="tray-settings-title">
+          <h3 id="tray-settings-title">托盘双击动作</h3>
+          <p class="section-description">按住对应按键并双击任务栏通知区域的飞花图标</p>
+          <div class="tray-shortcut-grid">
+            <label>
+              <span>双击</span>
+              <select aria-label="双击打开" disabled={submitting} bind:value={trayDraft.doubleClick}>
+                {#each trayActionOptions as option}
+                  <option value={option.value}>{option.label}</option>
+                {/each}
+              </select>
+            </label>
+            <label>
+              <span>Alt + 双击</span>
+              <select aria-label="Alt 加双击打开" disabled={submitting} bind:value={trayDraft.altDoubleClick}>
+                {#each trayActionOptions as option}
+                  <option value={option.value}>{option.label}</option>
+                {/each}
+              </select>
+            </label>
+            <label>
+              <span>Ctrl + 双击</span>
+              <select aria-label="Ctrl 加双击打开" disabled={submitting} bind:value={trayDraft.ctrlDoubleClick}>
+                {#each trayActionOptions as option}
+                  <option value={option.value}>{option.label}</option>
+                {/each}
+              </select>
+            </label>
+            <label>
+              <span>Shift + 双击</span>
+              <select aria-label="Shift 加双击打开" disabled={submitting} bind:value={trayDraft.shiftDoubleClick}>
+                {#each trayActionOptions as option}
+                  <option value={option.value}>{option.label}</option>
+                {/each}
+              </select>
+            </label>
+          </div>
+          <button
+            type="button"
+            class="reset-button tray-reset-button"
+            disabled={submitting}
+            onclick={() => (trayDraft = { ...DEFAULT_TRAY_SHORTCUT_SETTINGS })}
+          >
+            <RotateCcw size={15} aria-hidden="true" />
+            恢复默认动作
+          </button>
         </section>
 
         <section class="settings-section" aria-labelledby="screenshot-settings-title">
@@ -257,6 +336,57 @@
   .reset-button {
     display: flex;
     align-items: center;
+  }
+
+  .section-description {
+    margin: -5px 0 11px;
+    color: var(--app-muted);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+
+  .tray-shortcut-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px 12px;
+  }
+
+  .tray-shortcut-grid label {
+    display: grid;
+    grid-template-columns: minmax(88px, auto) minmax(0, 1fr);
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .tray-shortcut-grid label > span {
+    color: var(--app-fg);
+    font-size: 12.5px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .tray-shortcut-grid select {
+    width: 100%;
+    min-width: 0;
+    min-height: 32px;
+    padding: 4px 24px 4px 8px;
+    color: var(--app-fg);
+    font: inherit;
+    font-size: 12.5px;
+    background: #fff;
+    border: 1px solid var(--app-border-strong);
+    border-radius: 4px;
+  }
+
+  .tray-shortcut-grid select:focus-visible {
+    border-color: var(--app-accent);
+    outline: 2px solid rgb(0 103 192 / 15%);
+    outline-offset: 1px;
+  }
+
+  .tray-reset-button {
+    margin-top: 8px;
   }
 
   header {
@@ -513,6 +643,10 @@
 
     .mode-selector button {
       width: 50%;
+    }
+
+    .tray-shortcut-grid {
+      grid-template-columns: 1fr;
     }
   }
 </style>
