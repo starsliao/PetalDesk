@@ -11,6 +11,14 @@ default-run = "petaldesk"
 # protocol. `tauri dev` disables default features and keeps using `devUrl`.
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+# The browser Native Messaging host is a Windows-only release artifact. Keeping
+# it behind a non-default feature prevents Tauri's macOS build from compiling it.
+browser-native-host = []
+
+[[bin]]
+name = "petaldesk-browser-host"
+path = "src/bin/petaldesk-browser-host.rs"
+required-features = ["browser-native-host"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

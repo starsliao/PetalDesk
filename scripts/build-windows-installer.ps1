@@ -473,7 +473,8 @@ Invoke-CheckedCommand -Command "cargo.exe" -Arguments @(
     "build",
     "--manifest-path", $manifestPath,
     "--release",
-    "--bin", "petaldesk-browser-host"
+    "--bin", "petaldesk-browser-host",
+    "--features", "browser-native-host"
 ) -WorkingDirectory $projectRoot
 if (-not (Test-Path -LiteralPath $nativeHostReleaseExe)) {
     throw "Native Messaging Host 构建后不存在：$nativeHostReleaseExe"

@@ -1791,12 +1791,6 @@ pub(crate) fn capture_cursor_monitor_rgba(app: &AppHandle) -> AppResult<(Monitor
     let logical_monitor_y = monitor
         .y()
         .map_err(|error| AppError::new("capture_error", format!("读取显示器位置失败: {error}")))?;
-    let logical_width = monitor
-        .width()
-        .map_err(|error| AppError::new("capture_error", format!("读取显示器宽度失败: {error}")))?;
-    let logical_height = monitor
-        .height()
-        .map_err(|error| AppError::new("capture_error", format!("读取显示器高度失败: {error}")))?;
     let xcap_scale = f64::from(monitor.scale_factor().map_err(|error| {
         AppError::new("capture_error", format!("读取显示器缩放比例失败: {error}"))
     })?);

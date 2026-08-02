@@ -22,6 +22,7 @@ use quircs::Quirc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+#[cfg(windows)]
 use std::ffi::c_void;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
