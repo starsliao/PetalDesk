@@ -779,19 +779,28 @@ describe("MfaTool", () => {
     const uriValue = within(passwordDialog).getByText(/otpauth:\/\/totp\/GitHub/);
     expect(uriValue).toHaveClass("uri-value");
     expect(uriValue).toHaveAttribute("title", exportedEntry().otpauthUri);
-    expect(within(passwordDialog).getByRole("img", { name: "GitHub 的 TOTP 导入二维码" })).toHaveAttribute(
+    const qrImage = within(passwordDialog).getByRole("img", { name: "GitHub 的 TOTP 导入二维码" });
+    expect(qrImage).toHaveAttribute(
       "src",
       exportedEntry().qrPngDataUrl,
     );
 
     const secretCopy = within(passwordDialog).getByRole("button", { name: "复制密钥" });
     const uriCopy = within(passwordDialog).getByRole("button", { name: "复制 otpauth 链接" });
+    expect(secretCopy.closest(".export-secret")).toBeInTheDocument();
+    expect(uriCopy.closest(".export-uri")).toBeInTheDocument();
+    expect(qrImage.closest(".export-qr")).toBeInTheDocument();
     expect(secretCopy.querySelector(".lucide-copy")).toBeInTheDocument();
     expect(uriCopy.querySelector(".lucide-copy")).toBeInTheDocument();
     await fireEvent.click(secretCopy);
     await fireEvent.click(uriCopy);
     expect(clipboardWrite).toHaveBeenNthCalledWith(1, exportedEntry().secretBase32);
     expect(clipboardWrite).toHaveBeenNthCalledWith(2, exportedEntry().otpauthUri);
+
+    clipboardWrite.mockRejectedValueOnce(new Error("clipboard busy"));
+    await fireEvent.click(secretCopy);
+    const exportAlert = await within(passwordDialog).findByRole("alert");
+    expect(exportAlert).toHaveClass("export-error");
   });
 
   it("does not bubble a reveal-button double-click into the row copy action", async () => {

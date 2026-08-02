@@ -1772,14 +1772,14 @@
                 <small>{exportResult.algorithm.toUpperCase()} · {exportResult.digits} 位 · {exportResult.period} 秒</small>
               </div>
             </div>
-            <section class="export-value" aria-labelledby="mfa-export-secret-label">
+            <section class="export-value export-secret" aria-labelledby="mfa-export-secret-label">
               <strong id="mfa-export-secret-label">密钥</strong>
               <code title={exportResult.secretBase32}>{exportResult.secretBase32}</code>
               <button type="button" aria-label="复制密钥" title="复制密钥" onclick={() => void copyExportValue("secret")}>
                 <Copy size={16} aria-hidden="true" />
               </button>
             </section>
-            <section class="export-value" aria-labelledby="mfa-export-uri-label">
+            <section class="export-value export-uri" aria-labelledby="mfa-export-uri-label">
               <strong id="mfa-export-uri-label">otpauth</strong>
               <code class="uri-value" title={exportResult.otpauthUri}>{exportResult.otpauthUri}</code>
               <button type="button" aria-label="复制 otpauth 链接" title="复制链接" onclick={() => void copyExportValue("uri")}>
@@ -1794,7 +1794,7 @@
               <img src={exportResult.qrPngDataUrl} alt={`${exportResult.name} 的 TOTP 导入二维码`} />
             </section>
             {#if exportError}
-              <div class="recovery-error" role="alert"><AlertTriangle size={15} aria-hidden="true" /><span>{exportError}</span></div>
+              <div class="recovery-error export-error" role="alert"><AlertTriangle size={15} aria-hidden="true" /><span>{exportError}</span></div>
             {/if}
           </div>
           <div class="modal-actions">
@@ -2203,16 +2203,20 @@
   .recovery-error { color: #8c1d14; background: #fff0ed; border: 1px solid #f1c1bb; }
   .recovery-warning :global(svg), .recovery-error :global(svg) { flex: 0 0 auto; margin-top: 1px; }
   .export-password-content, .export-content { display: grid; min-height: 0; padding: 17px; gap: 12px; overflow: auto; }
-  .export-result-modal .export-content { flex: 1 1 auto; padding: 14px 17px; align-content: start; gap: 9px; overflow: hidden; }
+  .export-result-modal .export-content { flex: 1 1 auto; padding: 14px 17px; grid-template-areas: "warning" "account" "secret" "uri" "qr" "error"; grid-template-rows: auto auto auto auto minmax(0, 1fr) auto; gap: 9px; overflow: hidden; }
   .export-warning { display: flex; padding: 9px 10px; align-items: flex-start; gap: 8px; color: #794b08; font-size: 10.5px; line-height: 1.45; background: #fff8df; border: 1px solid #ead69a; border-radius: 6px; }
+  .export-result-modal .export-warning { grid-area: warning; }
   .export-warning :global(svg) { flex: 0 0 auto; margin-top: 1px; }
   .export-account { display: grid; padding: 9px 10px; grid-template-columns: 38px minmax(0, 1fr); align-items: center; gap: 10px; background: #f2edf8; border: 1px solid #ddd2e9; border-radius: 7px; }
+  .export-result-modal .export-account { grid-area: account; }
   .export-account > div { display: grid; min-width: 0; gap: 2px; }
   .export-account strong, .export-account span, .export-account small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .export-account strong { color: #332b3d; font-size: 12.5px; }
   .export-account span { color: #716879; font-size: 10.5px; }
   .export-account small { color: #8b8291; font-size: 9.5px; }
   .export-value { display: grid; min-width: 0; grid-template-columns: max-content minmax(0, 1fr) 30px; align-items: center; gap: 8px; }
+  .export-result-modal .export-secret { grid-area: secret; }
+  .export-result-modal .export-uri { grid-area: uri; }
   .export-value > strong { min-width: 45px; color: #4d4752; font-size: 11.5px; }
   .export-value code { display: block; box-sizing: border-box; width: 100%; min-width: 0; min-height: 34px; padding: 7px 9px; overflow: hidden; color: #28232e; font-family: "Cascadia Mono", "Segoe UI Mono", Consolas, monospace; font-size: 10.5px; line-height: 1.55; text-overflow: ellipsis; white-space: nowrap; background: #fff; border: 1px solid #d5d1d9; border-radius: 6px; user-select: text; }
   .export-value button { display: grid; width: 30px; height: 30px; padding: 0; place-items: center; color: #5c3e88; background: #f1ebf8; border: 1px solid #ddd0eb; border-radius: 5px; cursor: pointer; }
@@ -2220,8 +2224,9 @@
   .export-qr { display: grid; justify-items: center; gap: 9px; }
   .export-qr > div { display: flex; align-items: center; gap: 7px; color: #4d4752; font-size: 11.5px; }
   .export-qr img { width: min(230px, 74vw); height: min(230px, 74vw); image-rendering: pixelated; background: #fff; border: 8px solid #fff; border-radius: 6px; box-shadow: 0 0 0 1px #d7d3da; }
-  .export-result-modal .export-qr { gap: 6px; }
-  .export-result-modal .export-qr img { width: min(190px, 30vh, 64vw); height: min(190px, 30vh, 64vw); }
+  .export-result-modal .export-qr { min-height: 0; grid-area: qr; grid-template-rows: auto minmax(0, 1fr); align-items: center; gap: 6px; overflow: hidden; }
+  .export-result-modal .export-qr img { width: min(190px, 30vh, 64vw); height: auto; max-height: 100%; object-fit: contain; aspect-ratio: 1; }
+  .export-result-modal .export-error { grid-area: error; }
   .trash-toolbar { display: flex; min-height: 42px; padding: 7px 14px; align-items: center; justify-content: space-between; gap: 10px; color: #766f7a; font-size: 10.5px; background: #f2f1f3; border-bottom: 1px solid #dedce0; }
   .trash-clear-button { display: inline-flex; min-height: 28px; padding: 4px 8px; align-items: center; gap: 5px; color: #9f2d22; background: #fff; border: 1px solid #d5c8c6; border-radius: 5px; cursor: pointer; }
   .trash-clear-button:hover, .trash-clear-button:focus-visible { color: #8f2118; background: #fff0ed; border-color: #dfaaa4; outline: 0; }
@@ -2321,12 +2326,17 @@
   }
   @media (max-height: 520px) {
     .modal-backdrop { padding-block: 8px; }
-    .export-result-modal .export-content { padding: 9px 12px; gap: 5px; }
+    .export-result-modal .modal-header { min-height: 52px; padding-block: 6px; }
+    .export-result-modal .export-content { padding: 6px 10px; gap: 4px; }
     .export-result-modal .export-warning { display: none; }
-    .export-result-modal .export-account { padding-block: 5px; }
-    .export-result-modal .export-qr { gap: 3px; }
+    .export-result-modal .export-account { padding-block: 3px; }
+    .export-result-modal .export-account small { display: none; }
+    .export-result-modal .export-value code { min-height: 28px; padding-block: 4px; }
+    .export-result-modal .export-value button { width: 28px; height: 28px; }
+    .export-result-modal .export-qr { gap: 0; }
     .export-result-modal .export-qr > div { display: none; }
-    .export-result-modal .export-qr img { width: min(120px, 27vh, 56vw); height: min(120px, 27vh, 56vw); }
+    .export-result-modal .export-qr img { width: min(120px, 56vw); height: auto; max-height: 100%; }
+    .export-result-modal .modal-actions { padding-block: 6px; }
   }
   @media (prefers-reduced-motion: reduce) { .account-card, .ring-value { transition: none; } :global(.spinner) { animation: none; } }
 </style>
