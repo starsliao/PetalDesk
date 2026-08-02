@@ -21,6 +21,7 @@ export type { ToolName } from "./tools";
 
 export type TrayShortcutAction =
   | "firstNote"
+  | "recentNote"
   | "mainWindow"
   | "timer"
   | "reminder"
@@ -120,6 +121,7 @@ const trayShortcutSettingsStorageKey = "petaldesk.tray-shortcut-settings.v1";
 const editorModes: readonly EditorMode[] = ["typora", "plain"];
 const trayShortcutActions: readonly TrayShortcutAction[] = [
   "firstNote",
+  "recentNote",
   "mainWindow",
   "timer",
   "reminder",
@@ -461,7 +463,7 @@ export const notesApi = {
     if (isTauriRuntime()) return command<AppInfo>("get_app_info");
     return {
       workspacePath: "浏览器演示数据",
-      version: "0.4.1",
+      version: "0.4.2",
       defaultEditorMode: readBrowserDefaultEditorMode(),
       trayShortcutSettings: readBrowserTrayShortcutSettings(),
       recoveredDrafts: 0,

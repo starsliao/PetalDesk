@@ -11,13 +11,13 @@ use crate::storage::{
     atomic_write, atomic_write_json, ensure_managed_subdirectory, INTERNAL_DATA_DIR,
 };
 use argon2::{Algorithm as Argon2Algorithm, Argon2, Params as Argon2Params, Version};
-use base64::engine::general_purpose::STANDARD_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use chrono::{SecondsFormat, Utc};
 use data_encoding::BASE32_NOPAD;
-use image::{ImageReader, Limits};
+use image::{ImageEncoder, ImageReader, Limits};
 use quircs::Quirc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,7 +39,10 @@ const VAULT_FILE: &str = "vault.json";
 const SETTINGS_FILE: &str = "settings.json";
 const BACKUP_DIR: &str = "backups";
 const CONFLICT_DIR: &str = "conflicts";
-const VAULT_SCHEMA_VERSION: u32 = 2;
+// Version 2 is still accepted so an existing encrypted vault can be opened;
+// the next successful write upgrades its payload and envelope to version 3.
+const VAULT_SCHEMA_VERSION: u32 = 3;
+const LEGACY_VAULT_SCHEMA_VERSION: u32 = 2;
 const SETTINGS_SCHEMA_VERSION: u32 = 1;
 const VAULT_AAD: &[u8] = b"PetalDesk MFA vault v2";
 const RECOVERY_KEY_AAD: &[u8] = b"PetalDesk MFA recovery key v2";
@@ -63,11 +66,16 @@ const RECOVERY_PASSWORD_MAX_BYTES: usize = 1024;
 const MAX_VAULT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_VAULT_ENTRIES: usize = 10_000;
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
+const MAX_TIMESTAMP_BYTES: usize = 64;
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_IMAGE_WIDTH: u32 = 12_000;
 const MAX_IMAGE_HEIGHT: u32 = 12_000;
 const MAX_IMAGE_ALLOC: u64 = 128 * 1024 * 1024;
 const MAX_QR_SESSIONS: usize = 32;
+// Batch URI import deliberately shares the QR/session ceiling.  This keeps a
+// single paste from evicting all other pending imports or growing unbounded
+// secret-bearing state in memory.
+const MAX_BATCH_URI_BYTES: usize = 512 * 1024;
 const IMPORT_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
 const CLIPBOARD_MAX_SECONDS: Duration = Duration::from_secs(30);
 const CLIPBOARD_RETRY_COUNT: usize = 10;
@@ -219,6 +227,70 @@ pub struct MfaRevealResult {
     pub valid_until: u64,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MfaEntryExport {
+    pub id: String,
+    pub name: String,
+    pub issuer: String,
+    pub account_name: String,
+    pub icon_emoji: String,
+    pub algorithm: MfaAlgorithm,
+    pub digits: u32,
+    pub period: u64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub secret_base32: String,
+    pub otpauth_uri: String,
+    pub qr_png_data_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MfaTrashEntrySummary {
+    pub id: String,
+    pub name: String,
+    pub issuer: String,
+    pub account_name: String,
+    pub icon_emoji: String,
+    pub pinned: bool,
+    pub algorithm: MfaAlgorithm,
+    pub digits: u32,
+    pub period: u64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub deleted_at: String,
+}
+
+impl std::fmt::Debug for MfaEntryExport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MfaEntryExport")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("issuer", &self.issuer)
+            .field("account_name", &self.account_name)
+            .field("icon_emoji", &self.icon_emoji)
+            .field("algorithm", &self.algorithm)
+            .field("digits", &self.digits)
+            .field("period", &self.period)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("secret_base32", &"<redacted>")
+            .field("otpauth_uri", &"<redacted>")
+            .field("qr_png_data_url", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for MfaEntryExport {
+    fn drop(&mut self) {
+        self.secret_base32.zeroize();
+        self.otpauth_uri.zeroize();
+        self.qr_png_data_url.zeroize();
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MfaImportPreview {
@@ -234,6 +306,20 @@ pub struct MfaImportPreview {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MfaImportLineError {
+    pub line: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MfaBatchImportResult {
+    pub previews: Vec<MfaImportPreview>,
+    pub errors: Vec<MfaImportLineError>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MfaManualImportRequest {
@@ -245,6 +331,13 @@ pub struct MfaManualImportRequest {
     pub algorithm: MfaAlgorithm,
     pub digits: u32,
     pub period: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MfaImportCommitRequest {
+    pub session_id: String,
+    pub icon_emoji: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -304,6 +397,15 @@ struct RecoveryKeyEnvelope {
 struct VaultPayload {
     schema_version: u32,
     entries: Vec<StoredEntry>,
+    #[serde(default)]
+    trash: Vec<TrashedEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TrashedEntry {
+    deleted_at: String,
+    entry: StoredEntry,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -863,6 +965,76 @@ impl MfaStore {
         self.remember_imports(vec![parsed], epoch)
     }
 
+    /// Parses one standard otpauth URI per non-empty line.  Invalid lines are
+    /// reported individually so a single malformed account does not discard
+    /// the valid accounts in the same paste.  Secrets are never included in
+    /// the result or in line-level error messages.
+    pub fn preview_uris(&self, text: &str) -> AppResult<MfaBatchImportResult> {
+        let epoch = self.require_active_epoch()?;
+        if text.len() > MAX_BATCH_URI_BYTES {
+            return Err(AppError::invalid("批量验证器链接内容过长，请分批导入。"));
+        }
+
+        let mut pending = Vec::new();
+        let mut errors = Vec::new();
+        let mut seen_links = HashMap::<[u8; 32], usize>::new();
+        let mut non_empty_lines = 0usize;
+
+        for (line_index, raw_line) in text.lines().enumerate() {
+            let line_number = line_index + 1;
+            // A copied first line can contain a UTF-8 BOM.  It is not part of
+            // the URI and should not turn an otherwise valid paste invalid.
+            let line = raw_line.trim().trim_start_matches('\u{feff}').trim();
+            if line.is_empty() {
+                continue;
+            }
+            non_empty_lines += 1;
+            if non_empty_lines > MAX_QR_SESSIONS {
+                errors.push(MfaImportLineError {
+                    line: line_number,
+                    message: format!(
+                        "一次最多导入 {MAX_QR_SESSIONS} 个账户，本行及后续内容已跳过。"
+                    ),
+                });
+                break;
+            }
+
+            let mut parsed = match parse_otpauth_uri(line) {
+                Ok(value) => value,
+                Err(error) => {
+                    errors.push(MfaImportLineError {
+                        line: line_number,
+                        message: error.message,
+                    });
+                    continue;
+                }
+            };
+
+            // Skip only an exactly repeated normalized line.  Two distinct
+            // keys for the same issuer/account can be legitimate during key
+            // rotation, so account display fields must not be used for
+            // de-duplication.  Retain only a digest, never another plaintext
+            // copy of the secret-bearing URI.
+            let link_hash: [u8; 32] = Sha256::digest(line.as_bytes()).into();
+            if let Some(first_line) = seen_links.get(&link_hash) {
+                errors.push(MfaImportLineError {
+                    line: line_number,
+                    message: format!("与第 {first_line} 行链接重复，已跳过。"),
+                });
+                continue;
+            }
+            seen_links.insert(link_hash, line_number);
+
+            // Batch imports intentionally get varied icons.  Single URI and
+            // manual imports retain their existing explicit/default icon.
+            parsed.entry.icon_emoji = random_batch_icon();
+            pending.push(parsed);
+        }
+
+        let previews = self.remember_imports(pending, epoch)?;
+        Ok(MfaBatchImportResult { previews, errors })
+    }
+
     pub fn preview_manual(
         &self,
         request: MfaManualImportRequest,
@@ -926,7 +1098,7 @@ impl MfaStore {
             if saw_migration {
                 return Err(AppError::new(
                     "mfa_migration_unsupported",
-                    "第一版只支持标准单账户 TOTP 二维码，不支持 Google 批量迁移二维码。",
+                    "未识别到可导入的 TOTP 账户。",
                 ));
             }
             return Err(generic_qr_error());
@@ -948,32 +1120,160 @@ impl MfaStore {
     ) -> AppResult<MfaEntrySummary> {
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
         self.validate_epoch(epoch)?;
-        let pending = {
-            let mut imports = lock_unpoisoned(&self.imports);
-            purge_expired_imports(&mut imports);
-            imports
-                .remove(session_id)
-                .ok_or_else(|| AppError::not_found("导入预览已经过期，请重新识别。"))?
-        };
-        let mut entry = pending.entry;
-        entry.icon_emoji = normalize_icon(icon_emoji);
-        entry.updated_at = now_iso();
         let mut runtime = lock_unpoisoned(&self.runtime);
         self.ensure_unlocked_at(&mut runtime, epoch)?;
         let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
-        if vault.payload.entries.len() >= MAX_VAULT_ENTRIES {
+        if vault
+            .payload
+            .entries
+            .len()
+            .saturating_add(vault.payload.trash.len())
+            >= MAX_VAULT_ENTRIES
+        {
             return Err(AppError::new(
                 "mfa_vault_entry_limit",
                 "MFA 账户数量已达到安全上限。",
             ));
         }
+
+        let mut imports = lock_unpoisoned(&self.imports);
+        purge_expired_imports(&mut imports);
+        let pending = imports
+            .remove(session_id)
+            .ok_or_else(|| AppError::not_found("导入预览已经过期，请重新识别。"))?;
+        let PendingImport {
+            mut entry,
+            expires_at,
+        } = pending;
+        let original_icon = entry.icon_emoji.clone();
+        let original_updated_at = entry.updated_at.clone();
+        entry.icon_emoji = normalize_icon(icon_emoji);
+        entry.updated_at = now_iso();
         let summary = summary(&entry);
         vault.payload.entries.push(entry);
         if let Err(error) = self.save_vault(vault) {
-            let _ = vault.payload.entries.pop();
+            let mut entry = vault
+                .payload
+                .entries
+                .pop()
+                .expect("the pending MFA entry was appended immediately before save");
+            entry.icon_emoji = original_icon;
+            entry.updated_at = original_updated_at;
+            imports.insert(session_id.to_string(), PendingImport { entry, expires_at });
             return Err(error);
         }
         Ok(summary)
+    }
+
+    #[cfg(test)]
+    pub fn commit_imports(
+        &self,
+        requests: Vec<MfaImportCommitRequest>,
+    ) -> AppResult<Vec<MfaEntrySummary>> {
+        let epoch = self.require_active_epoch()?;
+        self.commit_imports_at(requests, epoch)
+    }
+
+    fn commit_imports_at(
+        &self,
+        requests: Vec<MfaImportCommitRequest>,
+        epoch: u64,
+    ) -> AppResult<Vec<MfaEntrySummary>> {
+        if requests.is_empty() {
+            return Err(AppError::invalid("请选择至少一个要导入的 MFA 账户。"));
+        }
+        if requests.len() > MAX_QR_SESSIONS {
+            return Err(AppError::invalid(format!(
+                "一次最多导入 {MAX_QR_SESSIONS} 个 MFA 账户。"
+            )));
+        }
+        let mut requested_ids = HashSet::with_capacity(requests.len());
+        for request in &requests {
+            if request.session_id.is_empty() || !requested_ids.insert(request.session_id.as_str()) {
+                return Err(AppError::invalid("批量导入包含空白或重复的预览标识。"));
+            }
+        }
+
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        self.validate_epoch(epoch)?;
+
+        // Validate the vault and its capacity before consuming any pending
+        // session, so setup/password/capacity errors leave the preview intact.
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        self.ensure_unlocked_at(&mut runtime, epoch)?;
+        let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
+        if vault
+            .payload
+            .entries
+            .len()
+            .checked_add(vault.payload.trash.len())
+            .and_then(|count| count.checked_add(requests.len()))
+            .is_none_or(|count| count > MAX_VAULT_ENTRIES)
+        {
+            return Err(AppError::new(
+                "mfa_vault_entry_limit",
+                "MFA 账户数量已达到安全上限。",
+            ));
+        }
+
+        let mut imports = lock_unpoisoned(&self.imports);
+        purge_expired_imports(&mut imports);
+        if requests
+            .iter()
+            .any(|request| !imports.contains_key(&request.session_id))
+        {
+            return Err(AppError::not_found(
+                "一个或多个导入预览已经过期，请重新识别。",
+            ));
+        }
+
+        let mut removed = Vec::with_capacity(requests.len());
+        for request in &requests {
+            let pending = imports
+                .remove(&request.session_id)
+                .expect("all pending MFA import sessions were checked above");
+            removed.push((request.session_id.clone(), pending));
+        }
+
+        let restore_metadata = removed
+            .iter()
+            .map(|(session_id, pending)| {
+                (
+                    session_id.clone(),
+                    pending.expires_at,
+                    pending.entry.icon_emoji.clone(),
+                    pending.entry.updated_at.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for ((_, pending), request) in removed.iter_mut().zip(&requests) {
+            pending.entry.icon_emoji = normalize_icon(&request.icon_emoji);
+            pending.entry.updated_at = now_iso();
+        }
+        let summaries = removed
+            .iter()
+            .map(|(_, pending)| summary(&pending.entry))
+            .collect::<Vec<_>>();
+        let original_entry_count = vault.payload.entries.len();
+        vault
+            .payload
+            .entries
+            .extend(removed.into_iter().map(|(_, pending)| pending.entry));
+
+        if let Err(error) = self.save_vault(vault) {
+            let rolled_back = vault.payload.entries.split_off(original_entry_count);
+            for ((session_id, expires_at, original_icon, original_updated_at), mut entry) in
+                restore_metadata.into_iter().zip(rolled_back)
+            {
+                entry.icon_emoji = original_icon;
+                entry.updated_at = original_updated_at;
+                imports.insert(session_id, PendingImport { entry, expires_at });
+            }
+            return Err(error);
+        }
+
+        Ok(summaries)
     }
 
     pub fn cancel_import(&self, session_id: &str) -> AppResult<()> {
@@ -1069,11 +1369,125 @@ impl MfaStore {
             .position(|entry| entry.id == entry_id)
             .ok_or_else(|| AppError::not_found("没有找到这个 MFA 账户。"))?;
         let removed = vault.payload.entries.remove(index);
+        vault.payload.trash.insert(
+            0,
+            TrashedEntry {
+                deleted_at: now_iso(),
+                entry: removed,
+            },
+        );
         if let Err(error) = self.save_vault(vault) {
-            vault.payload.entries.insert(index, removed);
+            let trashed = vault.payload.trash.remove(0);
+            vault.payload.entries.insert(index, trashed.entry);
             return Err(error);
         }
         Ok(())
+    }
+
+    fn list_trash_at(&self, epoch: u64) -> AppResult<Vec<MfaTrashEntrySummary>> {
+        self.validate_epoch(epoch)?;
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        self.ensure_unlocked_at(&mut runtime, epoch)?;
+        let vault = runtime.vault.as_ref().ok_or_else(generic_vault_error)?;
+        Ok(vault.payload.trash.iter().map(trash_summary).collect())
+    }
+
+    fn restore_entry_at(&self, entry_id: &str, epoch: u64) -> AppResult<MfaEntrySummary> {
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        self.validate_epoch(epoch)?;
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        self.ensure_unlocked_at(&mut runtime, epoch)?;
+        let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
+        let index = vault
+            .payload
+            .trash
+            .iter()
+            .position(|entry| entry.entry.id == entry_id)
+            .ok_or_else(|| AppError::not_found("回收站中没有找到这个 MFA 账户。"))?;
+        let removed = vault.payload.trash.remove(index);
+        let deleted_at = removed.deleted_at.clone();
+        let result = summary(&removed.entry);
+        let target_index = if removed.entry.pinned {
+            0
+        } else {
+            vault
+                .payload
+                .entries
+                .iter()
+                .take_while(|entry| entry.pinned)
+                .count()
+        };
+        vault.payload.entries.insert(target_index, removed.entry);
+        if let Err(error) = self.save_vault(vault) {
+            let restored = vault.payload.entries.remove(target_index);
+            vault.payload.trash.insert(
+                index,
+                TrashedEntry {
+                    deleted_at,
+                    entry: restored,
+                },
+            );
+            return Err(error);
+        }
+        Ok(result)
+    }
+
+    fn permanently_delete_entry_at(&self, entry_id: &str, epoch: u64) -> AppResult<()> {
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        self.validate_epoch(epoch)?;
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        self.ensure_unlocked_at(&mut runtime, epoch)?;
+        let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
+        let index = vault
+            .payload
+            .trash
+            .iter()
+            .position(|entry| entry.entry.id == entry_id)
+            .ok_or_else(|| AppError::not_found("回收站中没有找到这个 MFA 账户。"))?;
+        let removed = vault.payload.trash.remove(index);
+        if let Err(error) = self.save_vault(vault) {
+            vault.payload.trash.insert(index, removed);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn empty_trash_at(&self, epoch: u64) -> AppResult<()> {
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        self.validate_epoch(epoch)?;
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        self.ensure_unlocked_at(&mut runtime, epoch)?;
+        let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
+        let removed = std::mem::take(&mut vault.payload.trash);
+        if let Err(error) = self.save_vault(vault) {
+            vault.payload.trash = removed;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn list_trash(&self) -> AppResult<Vec<MfaTrashEntrySummary>> {
+        let epoch = self.require_active_epoch()?;
+        self.list_trash_at(epoch)
+    }
+
+    #[cfg(test)]
+    fn restore_entry(&self, entry_id: &str) -> AppResult<MfaEntrySummary> {
+        let epoch = self.require_active_epoch()?;
+        self.restore_entry_at(entry_id, epoch)
+    }
+
+    #[cfg(test)]
+    fn permanently_delete_entry(&self, entry_id: &str) -> AppResult<()> {
+        let epoch = self.require_active_epoch()?;
+        self.permanently_delete_entry_at(entry_id, epoch)
+    }
+
+    #[cfg(test)]
+    fn empty_trash(&self) -> AppResult<()> {
+        let epoch = self.require_active_epoch()?;
+        self.empty_trash_at(epoch)
     }
 
     pub fn reveal_code(&self, entry_id: &str) -> AppResult<MfaRevealResult> {
@@ -1098,6 +1512,45 @@ impl MfaStore {
             code,
             valid_until: valid_until.saturating_mul(1_000),
         })
+    }
+
+    #[cfg(test)]
+    fn export_entry(&self, entry_id: &str, password: &str) -> AppResult<MfaEntryExport> {
+        let epoch = self.require_active_epoch()?;
+        self.export_entry_at(entry_id, password, epoch)
+    }
+
+    fn export_entry_at(
+        &self,
+        entry_id: &str,
+        password: &str,
+        epoch: u64,
+    ) -> AppResult<MfaEntryExport> {
+        // Export intentionally uses one generic invalid-password response for
+        // both malformed and incorrect attempts.  It must not reveal password
+        // policy details or whether a requested entry exists before auth.
+        if validate_recovery_password(password).is_err() {
+            return Err(invalid_recovery_password_error());
+        }
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        self.validate_epoch(epoch)?;
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        self.ensure_unlocked_at(&mut runtime, epoch)?;
+        let vault = runtime.vault.as_ref().ok_or_else(generic_vault_error)?;
+        verify_current_recovery_password(vault, password)?;
+        let entry = vault
+            .payload
+            .entries
+            .iter()
+            .find(|entry| entry.id == entry_id)
+            .ok_or_else(|| AppError::not_found("没有找到这个 MFA 账户。"))?;
+        let entry_summary = summary(entry);
+        let secret = Zeroizing::new(entry.secret.clone());
+        drop(runtime);
+
+        let result = build_mfa_entry_export(entry_summary, &secret)?;
+        self.validate_epoch(epoch)?;
+        Ok(result)
     }
 
     fn copy_entry_code_at(&self, entry_id: &str, epoch: u64) -> AppResult<()> {
@@ -1518,6 +1971,7 @@ fn new_empty_vault() -> AppResult<UnlockedVault> {
         payload: VaultPayload {
             schema_version: VAULT_SCHEMA_VERSION,
             entries: Vec::new(),
+            trash: Vec::new(),
         },
         key,
         dpapi_wrapped_key,
@@ -1551,7 +2005,10 @@ fn parse_envelope(bytes: &[u8]) -> Result<VaultEnvelope, LocalUnlockError> {
     }
     let envelope: VaultEnvelope =
         serde_json::from_slice(bytes).map_err(|_| LocalUnlockError::InvalidEnvelope)?;
-    if envelope.schema_version != VAULT_SCHEMA_VERSION {
+    if !matches!(
+        envelope.schema_version,
+        LEGACY_VAULT_SCHEMA_VERSION | VAULT_SCHEMA_VERSION
+    ) {
         return Err(LocalUnlockError::InvalidEnvelope);
     }
     validate_recovery_key_envelope(&envelope.recovery_wrapped_key)
@@ -1637,14 +2094,32 @@ fn decrypt_vault_payload(
             )
             .map_err(|_| generic_vault_error())?,
     );
-    let payload: VaultPayload =
+    let mut payload: VaultPayload =
         serde_json::from_slice(&plaintext).map_err(|_| generic_vault_error())?;
-    if payload.schema_version != VAULT_SCHEMA_VERSION || payload.entries.len() > MAX_VAULT_ENTRIES {
+    if !matches!(
+        payload.schema_version,
+        LEGACY_VAULT_SCHEMA_VERSION | VAULT_SCHEMA_VERSION
+    ) || payload.entries.len().saturating_add(payload.trash.len()) > MAX_VAULT_ENTRIES
+    {
         return Err(generic_vault_error());
     }
     for entry in &payload.entries {
         validate_stored_entry(entry)?;
     }
+    let mut ids = HashSet::with_capacity(payload.entries.len() + payload.trash.len());
+    for entry in &payload.entries {
+        if !ids.insert(entry.id.as_str()) {
+            return Err(generic_vault_error());
+        }
+    }
+    for deleted in &payload.trash {
+        validate_stored_entry(&deleted.entry)?;
+        if !is_valid_vault_timestamp(&deleted.deleted_at) || !ids.insert(deleted.entry.id.as_str())
+        {
+            return Err(generic_vault_error());
+        }
+    }
+    payload.schema_version = VAULT_SCHEMA_VERSION;
     Ok(payload)
 }
 
@@ -1839,6 +2314,34 @@ fn unwrap_recovery_key(
     Ok(key)
 }
 
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (left, right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
+fn verify_current_recovery_password(vault: &UnlockedVault, password: &str) -> AppResult<()> {
+    let wrapper = vault
+        .recovery_wrapped_key
+        .as_ref()
+        .ok_or_else(recovery_setup_required_error)?;
+    let recovered = unwrap_recovery_key(wrapper, password).map_err(|error| match error {
+        RecoveryUnlockError::InvalidPassword => invalid_recovery_password_error(),
+        RecoveryUnlockError::InvalidEnvelope | RecoveryUnlockError::InvalidPayload => {
+            generic_vault_error()
+        }
+    })?;
+    if !constant_time_eq(&recovered, &vault.key) {
+        return Err(invalid_recovery_password_error());
+    }
+    Ok(())
+}
+
 fn bytes_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -1856,6 +2359,12 @@ fn validate_stored_entry(entry: &StoredEntry) -> AppResult<()> {
         return Err(generic_vault_error());
     }
     Ok(())
+}
+
+fn is_valid_vault_timestamp(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_TIMESTAMP_BYTES
+        && chrono::DateTime::parse_from_rfc3339(value).is_ok()
 }
 
 fn preserve_corrupt_file(path: &Path) {
@@ -1893,6 +2402,107 @@ fn preserve_corrupt_path(path: &Path) -> AppResult<()> {
         .map_err(|error| AppError::io("保留损坏的 MFA 保险库", error))
 }
 
+fn mfa_export_error() -> AppError {
+    AppError::new(
+        "mfa_export_error",
+        "无法生成这个账户的标准验证器导出，请检查账户信息。",
+    )
+}
+
+fn algorithm_uri_name(algorithm: MfaAlgorithm) -> &'static str {
+    match algorithm {
+        MfaAlgorithm::Sha1 => "SHA1",
+        MfaAlgorithm::Sha256 => "SHA256",
+        MfaAlgorithm::Sha512 => "SHA512",
+    }
+}
+
+fn build_otpauth_uri(summary: &MfaEntrySummary, secret_base32: &str) -> String {
+    let account = if summary.account_name.is_empty() {
+        summary.name.as_str()
+    } else {
+        summary.account_name.as_str()
+    };
+    let label = if summary.issuer.is_empty() {
+        account.to_string()
+    } else {
+        format!("{}:{account}", summary.issuer)
+    };
+    let encoded_label =
+        percent_encoding::utf8_percent_encode(&label, percent_encoding::NON_ALPHANUMERIC);
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("secret", secret_base32);
+    query.append_pair("issuer", &summary.issuer);
+    query.append_pair("algorithm", algorithm_uri_name(summary.algorithm));
+    query.append_pair("digits", &summary.digits.to_string());
+    query.append_pair("period", &summary.period.to_string());
+    let query = Zeroizing::new(query.finish());
+    format!("otpauth://totp/{encoded_label}?{}", query.as_str())
+}
+
+fn render_otpauth_qr_data_url(uri: &str) -> AppResult<String> {
+    let code = qrcode::QrCode::with_error_correction_level(uri.as_bytes(), qrcode::EcLevel::M)
+        .map_err(|_| mfa_export_error())?;
+    let mut image = code
+        .render::<image::Luma<u8>>()
+        .min_dimensions(384, 384)
+        .quiet_zone(true)
+        .build();
+    let mut png = Zeroizing::new(Vec::new());
+    let encoded = image::codecs::png::PngEncoder::new(&mut *png).write_image(
+        image.as_raw(),
+        image.width(),
+        image.height(),
+        image::ExtendedColorType::L8,
+    );
+    image.as_mut().fill(0);
+    encoded.map_err(|_| mfa_export_error())?;
+    let encoded_png = Zeroizing::new(STANDARD.encode(png.as_slice()));
+    Ok(format!("data:image/png;base64,{}", encoded_png.as_str()))
+}
+
+fn build_mfa_entry_export(entry: MfaEntrySummary, secret: &[u8]) -> AppResult<MfaEntryExport> {
+    let mut secret_base32 = Zeroizing::new(BASE32_NOPAD.encode(secret));
+    let mut otpauth_uri = Zeroizing::new(build_otpauth_uri(&entry, &secret_base32));
+
+    // Refuse to return a URI that our own strict importer cannot read back
+    // exactly.  This catches unsupported labels before a misleading QR is
+    // shown to the user.
+    let parsed = parse_otpauth_uri(&otpauth_uri).map_err(|_| mfa_export_error())?;
+    let expected_account = if entry.account_name.is_empty() {
+        entry.name.as_str()
+    } else {
+        entry.account_name.as_str()
+    };
+    if parsed.entry.issuer != entry.issuer
+        || parsed.entry.account_name != expected_account
+        || parsed.entry.algorithm != entry.algorithm
+        || parsed.entry.digits != entry.digits
+        || parsed.entry.period != entry.period
+        || !constant_time_eq(&parsed.entry.secret, secret)
+    {
+        return Err(mfa_export_error());
+    }
+    drop(parsed);
+
+    let mut qr_png_data_url = Zeroizing::new(render_otpauth_qr_data_url(&otpauth_uri)?);
+    Ok(MfaEntryExport {
+        id: entry.id,
+        name: entry.name,
+        issuer: entry.issuer,
+        account_name: entry.account_name,
+        icon_emoji: entry.icon_emoji,
+        algorithm: entry.algorithm,
+        digits: entry.digits,
+        period: entry.period,
+        created_at: entry.created_at,
+        updated_at: entry.updated_at,
+        secret_base32: std::mem::take(&mut *secret_base32),
+        otpauth_uri: std::mem::take(&mut *otpauth_uri),
+        qr_png_data_url: std::mem::take(&mut *qr_png_data_url),
+    })
+}
+
 fn summary(entry: &StoredEntry) -> MfaEntrySummary {
     MfaEntrySummary {
         id: entry.id.clone(),
@@ -1906,6 +2516,24 @@ fn summary(entry: &StoredEntry) -> MfaEntrySummary {
         period: entry.period,
         created_at: entry.created_at.clone(),
         updated_at: entry.updated_at.clone(),
+    }
+}
+
+fn trash_summary(entry: &TrashedEntry) -> MfaTrashEntrySummary {
+    let active = summary(&entry.entry);
+    MfaTrashEntrySummary {
+        id: active.id,
+        name: active.name,
+        issuer: active.issuer,
+        account_name: active.account_name,
+        icon_emoji: active.icon_emoji,
+        pinned: active.pinned,
+        algorithm: active.algorithm,
+        digits: active.digits,
+        period: active.period,
+        created_at: active.created_at,
+        updated_at: active.updated_at,
+        deleted_at: entry.deleted_at.clone(),
     }
 }
 
@@ -1997,6 +2625,19 @@ struct ParsedEntryInput {
     secret: Vec<u8>,
 }
 
+const BATCH_IMPORT_ICONS: &[&str] = &[
+    "🔐", "🔑", "🛡️", "🌸", "⭐", "💼", "🏠", "👤", "🐙", "☁️", "📧", "💬", "🛒", "🏦", "🎮", "🧰",
+    "🟣", "🔵", "🟢", "🟡", "🟠", "🔴", "⚫", "⚪",
+];
+
+fn random_batch_icon() -> String {
+    // Uuid v4 already uses a cryptographically random source in the platform
+    // implementation, and avoids introducing another dependency just for a
+    // cosmetic per-preview choice.
+    let index = (Uuid::new_v4().as_u128() as usize) % BATCH_IMPORT_ICONS.len();
+    BATCH_IMPORT_ICONS[index].to_string()
+}
+
 impl std::fmt::Debug for ParsedImport {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -2031,7 +2672,7 @@ fn parse_otpauth_uri(uri: &str) -> AppResult<ParsedImport> {
     if scheme.eq_ignore_ascii_case("otpauth-migration") {
         return Err(AppError::new(
             "mfa_migration_unsupported",
-            "第一版只支持标准单账户 TOTP 二维码，不支持 Google 批量迁移二维码。",
+            "未识别到可导入的 TOTP 账户。",
         ));
     }
     if !scheme.eq_ignore_ascii_case("otpauth") {
@@ -2950,6 +3591,16 @@ pub fn preview_mfa_uri(
 }
 
 #[tauri::command]
+pub fn preview_mfa_uris(
+    store: State<'_, MfaStore>,
+    window: WebviewWindow,
+    uris: SensitiveText,
+) -> AppResult<MfaBatchImportResult> {
+    ensure_mfa_window(&window)?;
+    store.preview_uris(uris.as_str())
+}
+
+#[tauri::command]
 pub fn preview_mfa_manual(
     store: State<'_, MfaStore>,
     window: WebviewWindow,
@@ -3047,6 +3698,21 @@ pub async fn commit_mfa_import(
 }
 
 #[tauri::command]
+pub async fn commit_mfa_imports(
+    app: AppHandle,
+    window: WebviewWindow,
+    imports: Vec<MfaImportCommitRequest>,
+) -> AppResult<Vec<MfaEntrySummary>> {
+    ensure_mfa_window(&window)?;
+    let epoch = app.state::<MfaStore>().require_active_epoch()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<MfaStore>().commit_imports_at(imports, epoch)
+    })
+    .await
+    .map_err(|_| AppError::new("mfa_task_error", "批量保存 MFA 账户任务异常结束。"))?
+}
+
+#[tauri::command]
 pub fn cancel_mfa_import(
     store: State<'_, MfaStore>,
     window: WebviewWindow,
@@ -3087,6 +3753,58 @@ pub async fn delete_mfa_entry(
 }
 
 #[tauri::command]
+pub async fn list_mfa_trash(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> AppResult<Vec<MfaTrashEntrySummary>> {
+    ensure_mfa_window(&window)?;
+    let epoch = app.state::<MfaStore>().require_active_epoch()?;
+    tauri::async_runtime::spawn_blocking(move || app.state::<MfaStore>().list_trash_at(epoch))
+        .await
+        .map_err(|_| AppError::new("mfa_task_error", "读取 MFA 回收站任务异常结束。"))?
+}
+
+#[tauri::command]
+pub async fn restore_mfa_entry(
+    app: AppHandle,
+    window: WebviewWindow,
+    entry_id: String,
+) -> AppResult<MfaEntrySummary> {
+    ensure_mfa_window(&window)?;
+    let epoch = app.state::<MfaStore>().require_active_epoch()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<MfaStore>().restore_entry_at(&entry_id, epoch)
+    })
+    .await
+    .map_err(|_| AppError::new("mfa_task_error", "恢复 MFA 账户任务异常结束。"))?
+}
+
+#[tauri::command]
+pub async fn permanently_delete_mfa_entry(
+    app: AppHandle,
+    window: WebviewWindow,
+    entry_id: String,
+) -> AppResult<()> {
+    ensure_mfa_window(&window)?;
+    let epoch = app.state::<MfaStore>().require_active_epoch()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<MfaStore>()
+            .permanently_delete_entry_at(&entry_id, epoch)
+    })
+    .await
+    .map_err(|_| AppError::new("mfa_task_error", "永久删除 MFA 账户任务异常结束。"))?
+}
+
+#[tauri::command]
+pub async fn empty_mfa_trash(app: AppHandle, window: WebviewWindow) -> AppResult<()> {
+    ensure_mfa_window(&window)?;
+    let epoch = app.state::<MfaStore>().require_active_epoch()?;
+    tauri::async_runtime::spawn_blocking(move || app.state::<MfaStore>().empty_trash_at(epoch))
+        .await
+        .map_err(|_| AppError::new("mfa_task_error", "清空 MFA 回收站任务异常结束。"))?
+}
+
+#[tauri::command]
 pub fn reveal_mfa_code(
     store: State<'_, MfaStore>,
     window: WebviewWindow,
@@ -3094,6 +3812,23 @@ pub fn reveal_mfa_code(
 ) -> AppResult<MfaRevealResult> {
     ensure_mfa_window(&window)?;
     store.reveal_code(&entry_id)
+}
+
+#[tauri::command]
+pub async fn export_mfa_entry(
+    app: AppHandle,
+    window: WebviewWindow,
+    entry_id: String,
+    password: SensitiveText,
+) -> AppResult<MfaEntryExport> {
+    ensure_mfa_window(&window)?;
+    let epoch = app.state::<MfaStore>().require_active_epoch()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<MfaStore>()
+            .export_entry_at(&entry_id, password.as_str(), epoch)
+    })
+    .await
+    .map_err(|_| AppError::new("mfa_task_error", "导出 MFA 账户任务异常结束。"))?
 }
 
 #[tauri::command]
@@ -3236,6 +3971,74 @@ mod tests {
     }
 
     #[test]
+    fn batch_uri_preview_reports_lines_and_only_deduplicates_identical_links() {
+        let root = tempfile::tempdir().unwrap();
+        let store = MfaStore::load(root.path()).unwrap();
+        store.activate();
+        let first = "otpauth://totp/PetalDesk%3Aalice?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=PetalDesk";
+        // The same displayed account with a different key is legitimate, for
+        // example while an MFA key is being rotated.
+        let rotated = "otpauth://totp/PetalDesk%3Aalice?secret=JBSWY3DPEHPK3PXP&issuer=PetalDesk";
+        let text = format!("\n{first}\r\nhttps://example.com/not-totp\n  {first}  \n{rotated}\n");
+
+        let result = store.preview_uris(&text).unwrap();
+
+        assert_eq!(result.previews.len(), 2);
+        assert_eq!(result.errors.len(), 2);
+        assert_eq!(result.errors[0].line, 3);
+        assert_eq!(result.errors[1].line, 4);
+        assert!(result.errors[1].message.contains("第 2 行"));
+        assert_ne!(result.previews[0].session_id, result.previews[1].session_id);
+        assert!(result.previews.iter().all(|preview| preview
+            .icon_emoji
+            .as_deref()
+            .is_some_and(|icon| BATCH_IMPORT_ICONS.contains(&icon))));
+
+        let serialized_errors = serde_json::to_string(&result.errors).unwrap();
+        assert!(!serialized_errors.contains("GEZDGNBV"));
+        assert!(!serialized_errors.contains("JBSWY3DP"));
+    }
+
+    #[test]
+    fn batch_uri_preview_limits_secret_bearing_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let store = MfaStore::load(root.path()).unwrap();
+        store.activate();
+        let mut text = (0..MAX_QR_SESSIONS)
+            .map(|index| format!(
+                "otpauth://totp/PetalDesk%3Aaccount-{index}?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=PetalDesk"
+            ))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Stay below the byte limit while exercising a line count large
+        // enough to expose response amplification if every overflow line were
+        // returned to the WebView separately.
+        text.push('\n');
+        text.push_str(&"x\n".repeat(200_000));
+        assert!(text.len() < MAX_BATCH_URI_BYTES);
+
+        let result = store.preview_uris(&text).unwrap();
+
+        assert_eq!(result.previews.len(), MAX_QR_SESSIONS);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].line, MAX_QR_SESSIONS + 1);
+        assert!(result.errors[0].message.contains("后续"));
+        assert_eq!(lock_unpoisoned(&store.imports).len(), MAX_QR_SESSIONS);
+    }
+
+    #[test]
+    fn oversized_batch_uri_text_is_rejected_before_parsing() {
+        let root = tempfile::tempdir().unwrap();
+        let store = MfaStore::load(root.path()).unwrap();
+        store.activate();
+        let error = store
+            .preview_uris(&"x".repeat(MAX_BATCH_URI_BYTES + 1))
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_input");
+        assert!(lock_unpoisoned(&store.imports).is_empty());
+    }
+
+    #[test]
     fn oversized_files_are_rejected_before_deserialization() {
         let root = tempfile::tempdir().unwrap();
         let vault_path = root.path().join("oversized-vault.json");
@@ -3297,6 +4100,24 @@ mod tests {
         );
         let preview = store.preview_uri(&uri).unwrap().remove(0);
         store.commit_import(&preview.session_id, "🌸").unwrap()
+    }
+
+    #[cfg(windows)]
+    fn test_stored_entry(id: String) -> StoredEntry {
+        StoredEntry {
+            id,
+            name: "test".to_string(),
+            issuer: String::new(),
+            account_name: String::new(),
+            icon_emoji: "🔐".to_string(),
+            pinned: false,
+            algorithm: MfaAlgorithm::Sha1,
+            digits: 6,
+            period: 30,
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+            updated_at: "2026-01-01T00:00:00.000Z".to_string(),
+            secret: RFC_SECRET.as_bytes().to_vec(),
+        }
     }
 
     #[cfg(windows)]
@@ -3837,6 +4658,7 @@ mod tests {
         let after_delete = store.list_entries().unwrap();
         assert_eq!(after_delete.len(), 1);
         assert_eq!(after_delete[0].id, entry.id);
+        assert!(store.list_trash().unwrap().is_empty());
     }
 
     #[cfg(windows)]
@@ -3886,6 +4708,453 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn authenticated_entry_export_round_trips_through_uri_and_qr() {
+        let (_root, store) = test_store();
+        let entry = import_public_rfc_entry(&store, "export-round-trip");
+
+        let exported = store.export_entry(&entry.id, RECOVERY_PASSWORD).unwrap();
+
+        assert_eq!(exported.id, entry.id);
+        assert_eq!(exported.name, entry.name);
+        assert_eq!(exported.secret_base32, "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ");
+        let parsed = parse_otpauth_uri(&exported.otpauth_uri).unwrap();
+        assert_eq!(parsed.entry.issuer, entry.issuer);
+        assert_eq!(parsed.entry.account_name, entry.account_name);
+        assert_eq!(parsed.entry.algorithm, entry.algorithm);
+        assert_eq!(parsed.entry.digits, entry.digits);
+        assert_eq!(parsed.entry.period, entry.period);
+        assert_eq!(parsed.entry.secret, RFC_SECRET.as_bytes());
+
+        let encoded_png = exported
+            .qr_png_data_url
+            .strip_prefix("data:image/png;base64,")
+            .unwrap();
+        let mut png = STANDARD.decode(encoded_png).unwrap();
+        let mut gray = ImageReader::new(Cursor::new(&png))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap()
+            .to_luma8();
+        let payloads = decode_qr_payloads(gray.width(), gray.height(), gray.as_raw()).unwrap();
+        assert!(payloads
+            .iter()
+            .any(|payload| payload.as_slice() == exported.otpauth_uri.as_bytes()));
+        gray.as_mut().fill(0);
+        png.zeroize();
+
+        let debug = format!("{exported:?}");
+        assert!(!debug.contains(&exported.secret_base32));
+        assert!(!debug.contains(&exported.otpauth_uri));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deleted_entries_are_encrypted_in_trash_and_can_be_restored_or_purged() {
+        let (root, store) = test_store();
+        let first = import_public_rfc_entry(&store, "trash-first");
+        let second = import_public_rfc_entry(&store, "trash-second");
+
+        store.delete_entry(&first.id).unwrap();
+        assert_eq!(
+            store
+                .list_entries()
+                .unwrap()
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![second.id.as_str()]
+        );
+        let trash = store.list_trash().unwrap();
+        assert_eq!(trash.len(), 1);
+        assert_eq!(trash[0].id, first.id);
+        assert!(!trash[0].deleted_at.is_empty());
+        assert!(!serde_json::to_string(&trash).unwrap().contains("secret"));
+        drop(store);
+
+        let reopened = MfaStore::load(root.path()).unwrap();
+        reopened.activate();
+        assert_eq!(reopened.list_trash().unwrap()[0].id, first.id);
+        let restored = reopened.restore_entry(&first.id).unwrap();
+        assert_eq!(restored.id, first.id);
+        assert!(reopened.list_trash().unwrap().is_empty());
+        assert!(reopened
+            .list_entries()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.id == first.id));
+
+        reopened.delete_entry(&first.id).unwrap();
+        reopened.permanently_delete_entry(&first.id).unwrap();
+        assert!(reopened.list_trash().unwrap().is_empty());
+        assert!(reopened.restore_entry(&first.id).is_err());
+
+        reopened.delete_entry(&second.id).unwrap();
+        assert_eq!(reopened.list_trash().unwrap().len(), 1);
+        reopened.empty_trash().unwrap();
+        assert!(reopened.list_trash().unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trash_mutations_roll_back_exactly_when_persistence_conflicts() {
+        let (_root, store) = test_store();
+        let first = import_public_rfc_entry(&store, "trash-rollback-first");
+        let second = import_public_rfc_entry(&store, "trash-rollback-second");
+        store.delete_entry(&first.id).unwrap();
+        store.delete_entry(&second.id).unwrap();
+
+        let original_vault = std::fs::read(&store.vault_path).unwrap();
+        let snapshot = || {
+            let runtime = lock_unpoisoned(&store.runtime);
+            serde_json::to_vec(&runtime.vault.as_ref().unwrap().payload).unwrap()
+        };
+        let expected_payload = snapshot();
+
+        atomic_write(&store.vault_path, b"restore-conflict").unwrap();
+        let restore_error = store.restore_entry(&first.id).unwrap_err();
+        assert_eq!(restore_error.code, "mfa_vault_conflict");
+        assert_eq!(snapshot(), expected_payload);
+
+        atomic_write(&store.vault_path, &original_vault).unwrap();
+        atomic_write(&store.vault_path, b"permanent-delete-conflict").unwrap();
+        let delete_error = store.permanently_delete_entry(&first.id).unwrap_err();
+        assert_eq!(delete_error.code, "mfa_vault_conflict");
+        assert_eq!(snapshot(), expected_payload);
+
+        atomic_write(&store.vault_path, &original_vault).unwrap();
+        atomic_write(&store.vault_path, b"empty-trash-conflict").unwrap();
+        let empty_error = store.empty_trash().unwrap_err();
+        assert_eq!(empty_error.code, "mfa_vault_conflict");
+        assert_eq!(snapshot(), expected_payload);
+    }
+
+    #[test]
+    fn trash_timestamps_are_bounded_rfc3339_values() {
+        assert!(is_valid_vault_timestamp("2026-08-02T12:34:56.789Z"));
+        assert!(!is_valid_vault_timestamp(""));
+        assert!(!is_valid_vault_timestamp("not-a-timestamp"));
+        assert!(!is_valid_vault_timestamp(
+            &"2".repeat(MAX_TIMESTAMP_BYTES + 1)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_vault_payload_is_upgraded_without_losing_entries() {
+        let (_root, store) = test_store();
+        let entry = import_public_rfc_entry(&store, "legacy-schema");
+        let mut bytes = std::fs::read(&store.vault_path).unwrap();
+        let mut vault = decrypt_envelope_local(&bytes).unwrap();
+        vault.payload.schema_version = LEGACY_VAULT_SCHEMA_VERSION;
+        bytes = serialize_vault(&vault).unwrap();
+        let mut envelope: VaultEnvelope = serde_json::from_slice(&bytes).unwrap();
+        envelope.schema_version = LEGACY_VAULT_SCHEMA_VERSION;
+        bytes = serde_json::to_vec(&envelope).unwrap();
+
+        let migrated = decrypt_envelope_local(&bytes).unwrap();
+
+        assert_eq!(migrated.payload.schema_version, VAULT_SCHEMA_VERSION);
+        assert!(migrated.payload.trash.is_empty());
+        assert_eq!(migrated.payload.entries.len(), 1);
+        assert_eq!(migrated.payload.entries[0].id, entry.id);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn entry_export_requires_the_current_password_before_entry_lookup() {
+        let (_root, store) = test_store();
+        let entry = import_public_rfc_entry(&store, "export-auth");
+        let wrong_password = "definitely-wrong-password";
+
+        let wrong = store.export_entry(&entry.id, wrong_password).unwrap_err();
+        assert_eq!(wrong.code, "mfa_recovery_password_invalid");
+        assert!(!wrong.to_string().contains(wrong_password));
+
+        let unknown = store
+            .export_entry("missing-entry", RECOVERY_PASSWORD)
+            .unwrap_err();
+        assert_eq!(unknown.code, "not_found");
+
+        let unknown_without_auth = store
+            .export_entry("missing-entry", wrong_password)
+            .unwrap_err();
+        assert_eq!(unknown_without_auth.code, "mfa_recovery_password_invalid");
+
+        const NEW_PASSWORD: &str = "petaldesk-export-new-recovery-password";
+        store.configure_recovery_password(NEW_PASSWORD).unwrap();
+        assert_eq!(
+            store
+                .export_entry(&entry.id, RECOVERY_PASSWORD)
+                .unwrap_err()
+                .code,
+            "mfa_recovery_password_invalid"
+        );
+        assert_eq!(
+            store.export_entry(&entry.id, NEW_PASSWORD).unwrap().id,
+            entry.id
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn entry_export_preserves_escaped_parameters_and_algorithm_settings() {
+        let (_root, store) = test_store();
+        let name = "工作验证器";
+        let issuer = "研发 / Cloud & Co";
+        let account = "alice+tag@example.com / 中文";
+        let preview = store
+            .preview_manual(MfaManualImportRequest {
+                name: name.to_string(),
+                issuer: issuer.to_string(),
+                account_name: account.to_string(),
+                secret: SensitiveText("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".to_string()),
+                icon_emoji: "🛡️".to_string(),
+                algorithm: MfaAlgorithm::Sha512,
+                digits: 8,
+                period: 45,
+            })
+            .unwrap()
+            .remove(0);
+        let saved = store
+            .commit_import(&preview.session_id, preview.icon_emoji.as_deref().unwrap())
+            .unwrap();
+
+        let exported = store.export_entry(&saved.id, RECOVERY_PASSWORD).unwrap();
+
+        assert_eq!(exported.name, name);
+        assert_eq!(exported.issuer, issuer);
+        assert_eq!(exported.account_name, account);
+        assert_eq!(exported.icon_emoji, "🛡️");
+        assert!(exported.otpauth_uri.contains("%2F"));
+        assert!(exported.otpauth_uri.contains("%26"));
+        let parsed_url = url::Url::parse(&exported.otpauth_uri).unwrap();
+        let parameters = parsed_url
+            .query_pairs()
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(parameters.get("issuer").map(String::as_str), Some(issuer));
+        assert_eq!(
+            parameters.get("algorithm").map(String::as_str),
+            Some("SHA512")
+        );
+        assert_eq!(parameters.get("digits").map(String::as_str), Some("8"));
+        assert_eq!(parameters.get("period").map(String::as_str), Some("45"));
+
+        let parsed = parse_otpauth_uri(&exported.otpauth_uri).unwrap();
+        assert_eq!(parsed.entry.issuer, issuer);
+        assert_eq!(parsed.entry.account_name, account);
+        assert_eq!(parsed.entry.algorithm, MfaAlgorithm::Sha512);
+        assert_eq!(parsed.entry.digits, 8);
+        assert_eq!(parsed.entry.period, 45);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn batch_import_commits_all_accounts_with_one_vault_update() {
+        let (_root, store) = test_store();
+        let input = [
+            "otpauth://totp/PetalDesk%3Abatch-one?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=PetalDesk",
+            "otpauth://totp/PetalDesk%3Abatch-two?secret=JBSWY3DPEHPK3PXP&issuer=PetalDesk",
+        ]
+        .join("\n");
+        let result = store.preview_uris(&input).unwrap();
+        assert!(result.errors.is_empty());
+        let requests = result
+            .previews
+            .iter()
+            .map(|preview| MfaImportCommitRequest {
+                session_id: preview.session_id.clone(),
+                icon_emoji: preview.icon_emoji.clone().unwrap(),
+            })
+            .collect();
+
+        let saved = store.commit_imports(requests).unwrap();
+
+        assert_eq!(saved.len(), 2);
+        assert_eq!(store.list_entries().unwrap().len(), 2);
+        assert!(lock_unpoisoned(&store.imports).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn batch_import_validation_does_not_consume_any_session() {
+        let (_root, store) = test_store();
+        let result = store
+            .preview_uris(
+                "otpauth://totp/PetalDesk%3Avalid-one?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=PetalDesk\n\
+                 otpauth://totp/PetalDesk%3Avalid-two?secret=JBSWY3DPEHPK3PXP&issuer=PetalDesk",
+            )
+            .unwrap();
+        let valid_request = MfaImportCommitRequest {
+            session_id: result.previews[0].session_id.clone(),
+            icon_emoji: "🌸".to_string(),
+        };
+        let error = store
+            .commit_imports(vec![
+                valid_request,
+                MfaImportCommitRequest {
+                    session_id: "missing-session".to_string(),
+                    icon_emoji: "🔐".to_string(),
+                },
+            ])
+            .unwrap_err();
+
+        assert_eq!(error.code, "not_found");
+        assert_eq!(lock_unpoisoned(&store.imports).len(), 2);
+        assert!(store.list_entries().unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn batch_import_restores_every_session_when_persistence_fails() {
+        let (_root, store) = test_store();
+        let original_vault = std::fs::read(&store.vault_path).unwrap();
+        let result = store
+            .preview_uris(
+                "otpauth://totp/PetalDesk%3Arollback-one?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=PetalDesk\n\
+                 otpauth://totp/PetalDesk%3Arollback-two?secret=JBSWY3DPEHPK3PXP&issuer=PetalDesk",
+            )
+            .unwrap();
+        {
+            let mut imports = lock_unpoisoned(&store.imports);
+            for (index, preview) in result.previews.iter().enumerate() {
+                let pending = imports.get_mut(&preview.session_id).unwrap();
+                pending.entry.icon_emoji = format!("original-{index}");
+                pending.entry.updated_at = format!("2026-01-0{}T00:00:00.000Z", index + 1);
+            }
+        }
+        let original_sessions = {
+            let imports = lock_unpoisoned(&store.imports);
+            result
+                .previews
+                .iter()
+                .map(|preview| {
+                    let pending = imports.get(&preview.session_id).unwrap();
+                    (
+                        preview.session_id.clone(),
+                        pending.entry.icon_emoji.clone(),
+                        pending.entry.updated_at.clone(),
+                        pending.expires_at,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let requests = result
+            .previews
+            .iter()
+            .enumerate()
+            .map(|(index, preview)| MfaImportCommitRequest {
+                session_id: preview.session_id.clone(),
+                icon_emoji: ["⭐", "☁️"][index].to_string(),
+            })
+            .collect::<Vec<_>>();
+        atomic_write(&store.vault_path, b"externally-replaced-vault").unwrap();
+
+        let error = store.commit_imports(requests.clone()).unwrap_err();
+
+        assert_eq!(error.code, "mfa_vault_conflict");
+        assert!(store.list_entries().unwrap().is_empty());
+        {
+            let imports = lock_unpoisoned(&store.imports);
+            assert_eq!(imports.len(), 2);
+            for (session_id, icon, updated_at, expires_at) in &original_sessions {
+                let pending = imports.get(session_id).unwrap();
+                assert_eq!(&pending.entry.icon_emoji, icon);
+                assert_eq!(&pending.entry.updated_at, updated_at);
+                assert_eq!(&pending.expires_at, expires_at);
+            }
+        }
+        assert_eq!(
+            std::fs::read(&store.vault_path).unwrap(),
+            b"externally-replaced-vault"
+        );
+
+        atomic_write(&store.vault_path, &original_vault).unwrap();
+        let saved = store.commit_imports(requests).unwrap();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0].icon_emoji, "⭐");
+        assert_eq!(saved[1].icon_emoji, "☁️");
+        assert_eq!(store.list_entries().unwrap().len(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn single_import_save_failure_restores_the_original_preview() {
+        let (_root, store) = test_store();
+        let original_vault = std::fs::read(&store.vault_path).unwrap();
+        let preview = store
+            .preview_uri("otpauth://totp/PetalDesk%3Asingle-rollback?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=PetalDesk")
+            .unwrap()
+            .remove(0);
+        let original_expiry = {
+            let mut imports = lock_unpoisoned(&store.imports);
+            let pending = imports.get_mut(&preview.session_id).unwrap();
+            pending.entry.icon_emoji = "original-icon".to_string();
+            pending.entry.updated_at = "2026-01-01T00:00:00.000Z".to_string();
+            pending.expires_at
+        };
+        atomic_write(&store.vault_path, b"externally-replaced-vault").unwrap();
+
+        let error = store.commit_import(&preview.session_id, "⭐").unwrap_err();
+
+        assert_eq!(error.code, "mfa_vault_conflict");
+        assert!(store.list_entries().unwrap().is_empty());
+        {
+            let imports = lock_unpoisoned(&store.imports);
+            let pending = imports.get(&preview.session_id).unwrap();
+            assert_eq!(pending.entry.icon_emoji, "original-icon");
+            assert_eq!(pending.entry.updated_at, "2026-01-01T00:00:00.000Z");
+            assert_eq!(pending.expires_at, original_expiry);
+        }
+
+        atomic_write(&store.vault_path, &original_vault).unwrap();
+        let saved = store.commit_import(&preview.session_id, "⭐").unwrap();
+        assert_eq!(saved.icon_emoji, "⭐");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn batch_import_capacity_counts_trash_without_consuming_previews() {
+        let (_root, store) = test_store();
+        let result = store
+            .preview_uris(
+                "otpauth://totp/PetalDesk%3Acapacity-one?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=PetalDesk\n\
+                 otpauth://totp/PetalDesk%3Acapacity-two?secret=JBSWY3DPEHPK3PXP&issuer=PetalDesk",
+            )
+            .unwrap();
+        let requests = result
+            .previews
+            .iter()
+            .map(|preview| MfaImportCommitRequest {
+                session_id: preview.session_id.clone(),
+                icon_emoji: preview.icon_emoji.clone().unwrap(),
+            })
+            .collect::<Vec<_>>();
+        {
+            let mut runtime = lock_unpoisoned(&store.runtime);
+            store.ensure_unlocked(&mut runtime).unwrap();
+            let vault = runtime.vault.as_mut().unwrap();
+            vault.payload.trash = (0..MAX_VAULT_ENTRIES - 1)
+                .map(|index| TrashedEntry {
+                    deleted_at: "2026-01-01T00:00:00.000Z".to_string(),
+                    entry: test_stored_entry(format!("trash-{index}")),
+                })
+                .collect();
+        }
+
+        let error = store.commit_imports(requests).unwrap_err();
+
+        assert_eq!(error.code, "mfa_vault_entry_limit");
+        assert_eq!(lock_unpoisoned(&store.imports).len(), 2);
+        let runtime = lock_unpoisoned(&store.runtime);
+        let vault = runtime.vault.as_ref().unwrap();
+        assert!(vault.payload.entries.is_empty());
+        assert_eq!(vault.payload.trash.len(), MAX_VAULT_ENTRIES - 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn entry_limit_rejects_data_that_the_next_launch_could_not_open() {
         let (_root, store) = test_store();
         {
@@ -3893,20 +5162,7 @@ mod tests {
             store.ensure_unlocked(&mut runtime).unwrap();
             let vault = runtime.vault.as_mut().unwrap();
             vault.payload.entries = (0..MAX_VAULT_ENTRIES)
-                .map(|index| StoredEntry {
-                    id: format!("entry-{index}"),
-                    name: "test".to_string(),
-                    issuer: String::new(),
-                    account_name: String::new(),
-                    icon_emoji: "🔐".to_string(),
-                    pinned: false,
-                    algorithm: MfaAlgorithm::Sha1,
-                    digits: 6,
-                    period: 30,
-                    created_at: "2026-01-01T00:00:00.000Z".to_string(),
-                    updated_at: "2026-01-01T00:00:00.000Z".to_string(),
-                    secret: RFC_SECRET.as_bytes().to_vec(),
-                })
+                .map(|index| test_stored_entry(format!("entry-{index}")))
                 .collect();
         }
         let preview = store
@@ -3916,6 +5172,7 @@ mod tests {
         let error = store.commit_import(&preview.session_id, "🔐").unwrap_err();
         assert_eq!(error.code, "mfa_vault_entry_limit");
         assert_eq!(store.list_entries().unwrap().len(), MAX_VAULT_ENTRIES);
+        assert!(lock_unpoisoned(&store.imports).contains_key(&preview.session_id));
     }
 
     #[cfg(windows)]

@@ -51,6 +51,7 @@
 
   const trayActionOptions: ReadonlyArray<{ value: TrayShortcutAction; label: string }> = [
     { value: "firstNote", label: "首个便签" },
+    { value: "recentNote", label: "最近便签" },
     { value: "mainWindow", label: "主界面" },
     { value: "timer", label: "计时器" },
     { value: "reminder", label: "提醒" },
@@ -198,7 +199,7 @@
 
         <section class="settings-section" aria-labelledby="tray-settings-title">
           <h3 id="tray-settings-title">托盘双击动作</h3>
-          <p class="section-description">按住对应按键并双击任务栏通知区域的飞花图标</p>
+          <p class="section-description">“双击”动作也用于桌面快捷方式启动或再次打开飞花</p>
           <div class="tray-shortcut-grid">
             <label>
               <span>双击</span>

@@ -359,6 +359,7 @@ fn spawn_open_tool(app: &tauri::AppHandle, tool: models::ToolName) {
 fn spawn_tray_action(app: &tauri::AppHandle, action: models::TrayShortcutAction) {
     match action {
         models::TrayShortcutAction::FirstNote => spawn_show_first_note_or_main(app),
+        models::TrayShortcutAction::RecentNote => spawn_show_last_note_or_main(app),
         models::TrayShortcutAction::MainWindow => {
             let app = app.clone();
             tauri::async_runtime::spawn_blocking(move || show_main_window(&app));
@@ -371,6 +372,14 @@ fn spawn_tray_action(app: &tauri::AppHandle, action: models::TrayShortcutAction)
             spawn_open_tool(app, models::ToolName::Screenshot)
         }
     }
+}
+
+fn spawn_primary_activation_action(app: &tauri::AppHandle) {
+    let action = app
+        .state::<WorkspaceStore>()
+        .tray_shortcut_settings()
+        .double_click;
+    spawn_tray_action(app, action);
 }
 
 fn spawn_create_note(app: &tauri::AppHandle) {
@@ -604,7 +613,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(
             |app, _arguments, _cwd| {
                 trace_activation("single_instance:callback_start");
-                spawn_show_last_note_or_main(app);
+                spawn_primary_activation_action(app);
                 trace_activation("single_instance:callback_end");
             },
         ))
@@ -628,10 +637,10 @@ pub fn run() {
             {
                 // `RunEvent::Ready` can arrive before WebView2 has finished
                 // initializing its first controller. Waiting for the hidden
-                // main page to finish loading avoids losing the first note
-                // window on fast, installed launches.
+                // main page to finish loading avoids losing the configured
+                // activation target on fast, installed launches.
                 trace_activation("main_page:finished");
-                spawn_show_last_note_or_main(webview.app_handle());
+                spawn_primary_activation_action(webview.app_handle());
             }
         })
         .setup(setup_tray)
@@ -756,12 +765,19 @@ pub fn run() {
             mfa::scan_mfa_screen_qr,
             mfa::preview_mfa_qr_image,
             mfa::preview_mfa_uri,
+            mfa::preview_mfa_uris,
             mfa::preview_mfa_manual,
             mfa::commit_mfa_import,
+            mfa::commit_mfa_imports,
             mfa::cancel_mfa_import,
             mfa::update_mfa_entry,
             mfa::delete_mfa_entry,
+            mfa::list_mfa_trash,
+            mfa::restore_mfa_entry,
+            mfa::permanently_delete_mfa_entry,
+            mfa::empty_mfa_trash,
             mfa::reveal_mfa_code,
+            mfa::export_mfa_entry,
             mfa::copy_mfa_code,
             mfa::lock_mfa_vault,
             screenshot::get_screenshot_settings,

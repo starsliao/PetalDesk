@@ -66,6 +66,7 @@ describe("ScreenshotSettingsDialog", () => {
     expect(shiftDoubleClick).toHaveValue("mainWindow");
     expect(Array.from(doubleClick.querySelectorAll("option"), (option) => option.value)).toEqual([
       "firstNote",
+      "recentNote",
       "mainWindow",
       "timer",
       "reminder",

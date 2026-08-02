@@ -1443,6 +1443,7 @@ trait CaptureWindowActivation {
     fn unminimize_for_capture(&self) -> AppResult<()>;
     fn focus_for_capture(&self) -> AppResult<()>;
     fn ensure_foreground_for_capture(&self) -> AppResult<()>;
+    fn hide_after_failed_capture(&self);
 }
 
 impl CaptureWindowActivation for WebviewWindow {
@@ -1464,13 +1465,42 @@ impl CaptureWindowActivation for WebviewWindow {
     fn ensure_foreground_for_capture(&self) -> AppResult<()> {
         ensure_capture_window_foreground(self)
     }
+
+    fn hide_after_failed_capture(&self) {
+        let _ = self.hide();
+    }
 }
 
 fn present_capture_window_steps(window: &impl CaptureWindowActivation) -> AppResult<()> {
-    window.show_for_capture()?;
-    window.unminimize_for_capture()?;
-    window.focus_for_capture()?;
-    window.ensure_foreground_for_capture()
+    let result = (|| {
+        window.show_for_capture()?;
+        window.unminimize_for_capture()?;
+        // Activate the top-level HWND first. Calling Tauri's focus helper before
+        // Win32 activation can leave the previous PetalDesk WebView as the active
+        // child when the shortcut was pressed inside the app.
+        window.ensure_foreground_for_capture()?;
+        // A top-level SetFocus(hwnd) is not enough for WebView2: the final focus
+        // call lets Tauri focus the embedded WebView child after activation.
+        window.focus_for_capture()
+    })();
+    if result.is_err() {
+        window.hide_after_failed_capture();
+    }
+    result
+}
+
+fn input_attachment_plan(
+    current_thread: u32,
+    foreground_thread: u32,
+    target_thread: u32,
+) -> (bool, bool) {
+    let attach_foreground =
+        current_thread != 0 && foreground_thread != 0 && current_thread != foreground_thread;
+    let attach_target = current_thread != 0
+        && target_thread != 0
+        && current_thread != target_thread
+        && foreground_thread != target_thread;
+    (attach_foreground, attach_target)
 }
 
 fn ensure_foreground_with(
@@ -1513,6 +1543,10 @@ fn ensure_capture_window_foreground(window: &WebviewWindow) -> AppResult<()> {
     if unsafe { IsWindow(hwnd) } == 0 {
         return Err(AppError::new("window_error", "截图窗口句柄已失效"));
     }
+    let target_thread = unsafe { GetWindowThreadProcessId(hwnd, std::ptr::null_mut()) };
+    if target_thread == 0 {
+        return Err(AppError::new("window_error", "无法读取截图窗口输入线程"));
+    }
 
     let activate_directly = || {
         unsafe {
@@ -1536,11 +1570,26 @@ fn ensure_capture_window_foreground(window: &WebviewWindow) -> AppResult<()> {
         } else {
             unsafe { GetWindowThreadProcessId(foreground, std::ptr::null_mut()) }
         };
-        let _foreground_attachment = ThreadInputAttachment::attach(
-            current_thread,
-            foreground_thread,
-            "连接截图前台输入线程",
-        )?;
+        let (attach_foreground, attach_target) =
+            input_attachment_plan(current_thread, foreground_thread, target_thread);
+        let _foreground_attachment = if attach_foreground {
+            ThreadInputAttachment::attach(
+                current_thread,
+                foreground_thread,
+                "连接截图前台输入线程",
+            )?
+        } else {
+            None
+        };
+        // When the shortcut came from another PetalDesk WebView, the target
+        // capture window may have a different GUI thread in the same process.
+        // Joining only the foreground thread leaves SetForegroundWindow able
+        // to raise the frame but does not transfer keyboard focus to WebView2.
+        let _target_attachment = if attach_target {
+            ThreadInputAttachment::attach(current_thread, target_thread, "连接截图目标输入线程")?
+        } else {
+            None
+        };
         unsafe {
             let _ = BringWindowToTop(hwnd);
             let _ = SetForegroundWindow(hwnd);
@@ -2154,6 +2203,10 @@ mod tests {
         fn ensure_foreground_for_capture(&self) -> AppResult<()> {
             self.run("foreground")
         }
+
+        fn hide_after_failed_capture(&self) {
+            self.operations.borrow_mut().push("hide");
+        }
     }
 
     #[test]
@@ -2164,7 +2217,7 @@ mod tests {
 
         assert_eq!(
             *window.operations.borrow(),
-            vec!["show", "unminimize", "focus", "foreground"]
+            vec!["show", "unminimize", "foreground", "focus"]
         );
     }
 
@@ -2176,7 +2229,10 @@ mod tests {
 
         assert_eq!(error.code, "window_error");
         assert!(error.message.contains("unminimize failed"));
-        assert_eq!(*window.operations.borrow(), vec!["show", "unminimize"]);
+        assert_eq!(
+            *window.operations.borrow(),
+            vec!["show", "unminimize", "hide"]
+        );
     }
 
     #[test]
@@ -2246,6 +2302,17 @@ mod tests {
         let error = ensure_foreground_with(|| false, || Ok(()), || Ok(())).unwrap_err();
 
         assert_eq!(error.code, "window_activation_failed");
+    }
+
+    #[test]
+    fn foreground_activation_includes_target_thread_for_same_process_windows() {
+        // A PetalDesk WebView can own a different GUI thread from the
+        // screenshot window even though both windows belong to this process.
+        assert_eq!(input_attachment_plan(10, 10, 20), (false, true));
+        assert_eq!(input_attachment_plan(10, 30, 20), (true, true));
+        assert_eq!(input_attachment_plan(10, 30, 30), (true, false));
+        assert_eq!(input_attachment_plan(10, 0, 20), (false, true));
+        assert_eq!(input_attachment_plan(0, 30, 20), (false, false));
     }
 
     #[derive(Clone)]

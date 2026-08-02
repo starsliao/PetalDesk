@@ -87,10 +87,23 @@
   let linkModifierActive = $state(false);
   let linkContextMenu = $state<{ url: string; x: number; y: number } | null>(null);
   let previewAssetUrls: Readonly<Record<string, string>> = {};
+  let selectionCopyTimer: ReturnType<typeof setTimeout> | undefined;
+  let composingText = false;
 
   const linkContextMenuWidth = 176;
   const linkContextMenuHeight = 42;
   const linkContextMenuMargin = 6;
+  const selectionCopyDelayMs = 120;
+  const selectionNavigationKeys = new Set([
+    "ArrowLeft",
+    "ArrowRight",
+    "ArrowUp",
+    "ArrowDown",
+    "Home",
+    "End",
+    "PageUp",
+    "PageDown",
+  ]);
 
   const modeCompartment = new Compartment();
   const readonlyCompartment = new Compartment();
@@ -158,7 +171,7 @@
   }
 
   function moveCursorToWidget(view: EditorView, position: number, event: MouseEvent): void {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || view.state.readOnly) return;
     event.preventDefault();
     view.dispatch({ selection: EditorSelection.cursor(position), scrollIntoView: true });
     view.focus();
@@ -778,6 +791,96 @@
     closeLinkContextMenu();
   }
 
+  function editorSelectionText(): string {
+    if (!view) return "";
+    return view.state.selection.ranges
+      .filter((range) => !range.empty)
+      .map((range) => view!.state.sliceDoc(range.from, range.to))
+      .join("\n");
+  }
+
+  // DOM selection is needed for rendered widgets and read-only content, while
+  // CodeMirror state is the reliable source for keyboard selection.
+  function domSelectionText(): string | null | undefined {
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) return undefined;
+    if (!selection.anchorNode || !selection.focusNode || !view) return undefined;
+    if (
+      !view.contentDOM.contains(selection.anchorNode)
+      || !view.contentDOM.contains(selection.focusNode)
+    ) {
+      return null;
+    }
+    return selection.isCollapsed ? "" : selection.toString();
+  }
+
+  function selectedEditorText(source: "pointer" | "keyboard"): string {
+    const domText = domSelectionText();
+    const stateText = editorSelectionText();
+    if (source === "keyboard") {
+      if (stateText.trim().length > 0) return stateText;
+      return domText && domText.trim().length > 0 ? domText : "";
+    }
+    if (domText === null) return "";
+    if (domText !== undefined && domText.trim().length > 0) return domText;
+    return stateText;
+  }
+
+  function cancelSelectionCopy(): void {
+    if (selectionCopyTimer) clearTimeout(selectionCopyTimer);
+    selectionCopyTimer = undefined;
+  }
+
+  function scheduleSelectionCopy(source: "pointer" | "keyboard"): void {
+    cancelSelectionCopy();
+    if (composingText || view?.composing) return;
+    const selectedText = selectedEditorText(source);
+    if (selectedText.trim().length === 0) return;
+
+    selectionCopyTimer = setTimeout(() => {
+      selectionCopyTimer = undefined;
+      if (composingText || view?.composing) return;
+      if (!navigator.clipboard?.writeText) return;
+      try {
+        void navigator.clipboard.writeText(selectedText).catch(() => undefined);
+      } catch {
+        // Clipboard permissions can change while editing; selection must remain usable.
+      }
+    }, selectionCopyDelayMs);
+  }
+
+  function eventTargetsEditorContent(event: Event): boolean {
+    return Boolean(view && event.target instanceof Node && view.contentDOM.contains(event.target));
+  }
+
+  function handleSelectionPointerUp(event: PointerEvent | MouseEvent): void {
+    if (event.button === 0 && eventTargetsEditorContent(event)) {
+      scheduleSelectionCopy("pointer");
+    } else {
+      cancelSelectionCopy();
+    }
+  }
+
+  function handleSelectionKeyUp(event: KeyboardEvent): void {
+    if (!eventTargetsEditorContent(event) || event.isComposing || event.keyCode === 229) {
+      cancelSelectionCopy();
+      return;
+    }
+    const extendsSelection = event.shiftKey && selectionNavigationKeys.has(event.key);
+    const selectsAll = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a";
+    if (extendsSelection || selectsAll) scheduleSelectionCopy("keyboard");
+  }
+
+  function handleCompositionStart(): void {
+    composingText = true;
+    cancelSelectionCopy();
+  }
+
+  function handleCompositionEnd(): void {
+    composingText = false;
+    cancelSelectionCopy();
+  }
+
   async function importFiles(files: FileList | File[]): Promise<void> {
     if (!view || !onasset || readonly || mode !== "typora") return;
     const images = Array.from(files).filter((file) => file.type.startsWith("image/"));
@@ -885,6 +988,7 @@
             value = internalValue;
             onchange?.(internalValue);
           }
+          if (update.docChanged) cancelSelectionCopy();
           if (update.docChanged || update.selectionSet) updateHistoryState();
         }),
         EditorView.theme({
@@ -904,15 +1008,20 @@
     });
 
     view = new EditorView({ state, parent: editorHost });
+    const selectionPointerEvent = typeof window.PointerEvent === "undefined" ? "mouseup" : "pointerup";
     editorHost.addEventListener("paste", handlePaste);
     editorHost.addEventListener("drop", handleDrop);
     editorHost.addEventListener("dragover", handleDragOver);
     editorHost.addEventListener("keydown", updateLinkModifier);
     editorHost.addEventListener("keyup", updateLinkModifier);
+    editorHost.addEventListener("keyup", handleSelectionKeyUp);
+    editorHost.addEventListener(selectionPointerEvent, handleSelectionPointerUp, true);
     editorHost.addEventListener("mousemove", updateLinkModifier);
     editorHost.addEventListener("mouseleave", clearLinkModifier);
     editorHost.addEventListener("blur", clearLinkModifier, true);
     editorHost.addEventListener("contextmenu", handleEditorContextMenu);
+    editorHost.addEventListener("compositionstart", handleCompositionStart);
+    editorHost.addEventListener("compositionend", handleCompositionEnd);
     document.addEventListener("mousedown", closeLinkContextMenuOutside, true);
     window.addEventListener("keydown", handleWindowKeyDown);
     window.addEventListener("keyup", updateLinkModifier);
@@ -930,16 +1039,21 @@
       editorHost.removeEventListener("dragover", handleDragOver);
       editorHost.removeEventListener("keydown", updateLinkModifier);
       editorHost.removeEventListener("keyup", updateLinkModifier);
+      editorHost.removeEventListener("keyup", handleSelectionKeyUp);
+      editorHost.removeEventListener(selectionPointerEvent, handleSelectionPointerUp, true);
       editorHost.removeEventListener("mousemove", updateLinkModifier);
       editorHost.removeEventListener("mouseleave", clearLinkModifier);
       editorHost.removeEventListener("blur", clearLinkModifier, true);
       editorHost.removeEventListener("contextmenu", handleEditorContextMenu);
+      editorHost.removeEventListener("compositionstart", handleCompositionStart);
+      editorHost.removeEventListener("compositionend", handleCompositionEnd);
       document.removeEventListener("mousedown", closeLinkContextMenuOutside, true);
       window.removeEventListener("keydown", handleWindowKeyDown);
       window.removeEventListener("keyup", updateLinkModifier);
       window.removeEventListener("blur", handleWindowBlur);
       window.removeEventListener("resize", closeLinkContextMenu);
       window.visualViewport?.removeEventListener("resize", closeLinkContextMenu);
+      cancelSelectionCopy();
       view?.destroy();
       view = undefined;
     };

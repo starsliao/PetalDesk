@@ -14,8 +14,17 @@
 pnpm package:windows
 ```
 
-Version `0.4.1` adds configurable tray double-click actions plus manual ordering
-and pinning for MFA accounts. Version `0.4.0` introduced portable MFA recovery
+Version `0.4.2` adds line-oriented batch URI import for MFA accounts and assigns
+varied default icons to batch-added accounts. Individual MFA accounts can now be
+exported as a Base32 secret, complete `otpauth://` URI, and QR code after recovery
+password verification. Deleted MFA accounts move to the encrypted trash, where
+they can be restored; permanent deletion and emptying the trash require a second
+confirmation. Notes also copy selected text automatically. This release lets
+desktop activation reuse the configurable tray double-click action, adds a
+recent-note target, and fixes screenshot-window focus when the shortcut is
+pressed inside PetalDesk.
+Version `0.4.1` added configurable tray double-click actions plus manual ordering and pinning for MFA accounts.
+Version `0.4.0` introduced portable MFA recovery
 and hardened local data migration. The MFA tool supports standard
 RFC 6238 TOTP accounts, screen/image/URI/manual import, hidden-by-default codes,
 and safe clipboard cleanup. The encrypted vault keeps a random data key behind
@@ -47,15 +56,16 @@ When repository secrets `AMO_JWT_ISSUER` and `AMO_JWT_SECRET` are both present,
 it also requests an unlisted AMO signature and attaches the resulting signed
 XPI. The unsigned ZIP must not be presented as an installable Firefox package.
 
-The `0.4.1` installer can be installed directly over an earlier PetalDesk
+The `0.4.2` installer can be installed directly over an earlier PetalDesk
 version. On first launch it migrates legacy note metadata and the previous
 Gantt JSON layout into `.petaldesk/`, preserving the note Markdown and a
 migration backup. Same-machine upgrades do not require an MFA recovery
-password; that password is only used when the encrypted data directory moves
-to a different Windows user or computer.
+password; that password is used when the encrypted data directory moves to a
+different Windows user or computer, and when a user explicitly exports one MFA
+account.
 
 安装包输出到 `src-tauri/target/release/bundle/nsis/`，构建目录不会提交到 Git。推送 `v*` 标签后，`.github/workflows/release.yml` 会在 Windows Runner 中重新构建，并把安装包发布到 GitHub Releases。
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.4.1>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.4.2>

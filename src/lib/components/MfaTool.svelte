@@ -7,16 +7,20 @@
     Copy,
     Eye,
     EyeOff,
+    FileOutput,
     GripVertical,
     Image,
     KeyRound,
     Keyboard,
+    Link2,
     LoaderCircle,
     Pencil,
     Pin,
     PinOff,
     Plus,
     RefreshCw,
+    QrCode,
+    RotateCcw,
     ScanLine,
     Search,
     ShieldCheck,
@@ -34,9 +38,12 @@
     type MfaAlgorithm,
     type MfaApi,
     type MfaEntrySummary,
+    type MfaEntryExport,
+    type MfaTrashEntrySummary,
     type MfaImportPreview,
     type MfaRevealResult,
     type MfaStatus,
+    type MfaUriPreviewError,
   } from "../mfa";
 
   interface Props {
@@ -103,6 +110,15 @@
   let recoveryPasswordInput = $state<HTMLInputElement | null>(null);
   let recoveryReturnFocus: HTMLElement | null = null;
 
+  let exportTarget = $state<MfaEntrySummary | null>(null);
+  let exportResult = $state<MfaEntryExport | null>(null);
+  let exportPassword = $state("");
+  let exportError = $state("");
+  let exportBusy = $state(false);
+  let exportDialog = $state<HTMLElement | null>(null);
+  let exportPasswordInput = $state<HTMLInputElement | null>(null);
+  let exportReturnFocus: HTMLElement | null = null;
+
   let addOpen = $state(false);
   let addMethod = $state<AddMethod>("screen");
   let importBusy = $state(false);
@@ -110,6 +126,9 @@
   let selectedSessionId = $state("");
   let importEmoji = $state("🔐");
   let uriText = $state("");
+  let uriPreviewErrors = $state<MfaUriPreviewError[]>([]);
+  let bulkUriImport = $state(false);
+  let importError = $state("");
   let dragActive = $state(false);
   let imageInput = $state<HTMLInputElement | null>(null);
   let manualName = $state("");
@@ -136,6 +155,18 @@
   let editReturnFocus: HTMLElement | null = null;
   let deleteReturnFocus: HTMLElement | null = null;
 
+  let trashOpen = $state(false);
+  let trashEntries = $state<MfaTrashEntrySummary[]>([]);
+  let trashCount = $state(0);
+  let trashLoading = $state(false);
+  let trashError = $state("");
+  let trashBusyIds = $state<Record<string, true>>({});
+  let trashDialog = $state<HTMLElement | null>(null);
+  let pendingPermanentDelete = $state<MfaTrashEntrySummary | null>(null);
+  let pendingEmptyTrash = $state(false);
+  let emptyTrashBusy = $state(false);
+  let trashReturnFocus: HTMLElement | null = null;
+
   let filteredEntries = $derived.by(() => {
     const query = searchText.trim().toLocaleLowerCase();
     if (!query) return entries;
@@ -146,6 +177,9 @@
   let pinBusy = $derived(Object.keys(pinningIds).length > 0);
 
   let selectedPreview = $derived(previews.find((preview) => preview.sessionId === selectedSessionId) ?? null);
+  let previewWarnings = $derived(bulkUriImport
+    ? previews.flatMap((preview) => preview.warnings.map((warning) => `${preview.name}：${warning}`))
+    : selectedPreview?.warnings ?? []);
 
   function reasonMessage(reason: unknown, fallback: string): string {
     return reason instanceof Error && reason.message ? reason.message : fallback;
@@ -205,12 +239,16 @@
       syncRecoveryDialog(nextStatus);
       if (!nextStatus.available || nextStatus.recoveryState === "password-required") {
         entries = [];
+        trashEntries = [];
+        trashCount = 0;
         revealed = {};
         error = "";
         return;
       }
-      const nextEntries = await api.list();
+      const [nextEntries, nextTrash] = await Promise.all([api.list(), api.listTrash()]);
       entries = nextEntries;
+      trashCount = nextTrash.length;
+      if (trashOpen) trashEntries = nextTrash;
       const validIds = new Set(nextEntries.map((entry) => entry.id));
       revealed = Object.fromEntries(Object.entries(revealed).filter(([id]) => validIds.has(id)));
       error = "";
@@ -373,7 +411,7 @@
 
   function showContextMenu(entry: MfaEntrySummary, x: number, y: number, returnFocus: HTMLElement | null): void {
     const width = 170;
-    const height = 210;
+    const height = 246;
     contextReturnFocus = returnFocus;
     contextMenu = {
       entryId: entry.id,
@@ -611,6 +649,67 @@
     void tick().then(() => editNameInput?.focus());
   }
 
+  function clearExportState(): void {
+    exportPassword = "";
+    exportResult = null;
+    exportError = "";
+  }
+
+  function startExport(entry: MfaEntrySummary): void {
+    if (pinBusy || reordering) return;
+    exportReturnFocus = contextReturnFocus;
+    closeContextMenu();
+    clearExportState();
+    exportTarget = entry;
+    void tick().then(() => exportPasswordInput?.focus());
+  }
+
+  function closeExport(): void {
+    if (exportBusy) return;
+    clearExportState();
+    exportTarget = null;
+    focusElementAfterRender(exportReturnFocus);
+    exportReturnFocus = null;
+  }
+
+  async function submitExportPassword(): Promise<void> {
+    const target = exportTarget;
+    if (!target || exportBusy || exportResult) return;
+    if (!exportPassword) {
+      exportError = "请输入 MFA 恢复密码。";
+      exportPasswordInput?.focus();
+      return;
+    }
+    exportBusy = true;
+    exportError = "";
+    try {
+      exportResult = await api.exportEntry(target.id, exportPassword);
+      exportPassword = "";
+      await tick();
+      exportDialog?.querySelector<HTMLButtonElement>('[aria-label="复制密钥"]')?.focus();
+    } catch (reason) {
+      exportPassword = "";
+      exportError = reasonMessage(reason, "恢复密码不正确，无法导出这个账户。");
+      await tick();
+      exportPasswordInput?.focus();
+    } finally {
+      exportBusy = false;
+    }
+  }
+
+  async function copyExportValue(kind: "secret" | "uri"): Promise<void> {
+    const result = exportResult;
+    if (!result || exportBusy) return;
+    const value = kind === "secret" ? result.secretBase32 : result.otpauthUri;
+    try {
+      await navigator.clipboard.writeText(value);
+      showToast(kind === "secret" ? "密钥已复制" : "验证器链接已复制");
+      exportError = "";
+    } catch (reason) {
+      exportError = reasonMessage(reason, kind === "secret" ? "复制密钥失败。" : "复制验证器链接失败。");
+    }
+  }
+
   function closeEdit(): void {
     if (editBusy) return;
     editing = null;
@@ -668,16 +767,117 @@
     try {
       await api.delete(entry.id);
       entries = entries.filter((item) => item.id !== entry.id);
+      trashCount += 1;
       hideCode(entry.id);
       if (editing?.id === entry.id) editing = null;
       pendingDelete = null;
       restoreDeleteFocus();
-      showToast("账户已删除");
+      showToast("账户已移入回收站");
       error = "";
     } catch (reason) {
       error = reasonMessage(reason, "删除账户失败。");
     } finally {
       deleteBusy = false;
+    }
+  }
+
+  function formatDeletedAt(value: string): string {
+    const date = new Date(value);
+    if (!Number.isFinite(date.getTime())) return value;
+    return new Intl.DateTimeFormat("zh-CN", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(date);
+  }
+
+  async function openTrash(): Promise<void> {
+    if (status && !status.available) return;
+    trashReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    closeContextMenu();
+    trashOpen = true;
+    trashLoading = true;
+    trashError = "";
+    error = "";
+    try {
+      trashEntries = await api.listTrash();
+      trashCount = trashEntries.length;
+    } catch (reason) {
+      error = reasonMessage(reason, "无法读取 MFA 回收站。");
+      trashOpen = false;
+    } finally {
+      trashLoading = false;
+      if (trashOpen) void tick().then(() => trashDialog?.querySelector<HTMLElement>("button")?.focus());
+    }
+  }
+
+  function closeTrash(): void {
+    if (trashLoading || emptyTrashBusy || Object.keys(trashBusyIds).length > 0) return;
+    trashOpen = false;
+    trashEntries = [];
+    trashError = "";
+    pendingPermanentDelete = null;
+    pendingEmptyTrash = false;
+    focusElementAfterRender(trashReturnFocus);
+    trashReturnFocus = null;
+  }
+
+  async function restoreTrashEntry(entry: MfaTrashEntrySummary): Promise<void> {
+    if (trashBusyIds[entry.id] || emptyTrashBusy) return;
+    trashBusyIds = setBusy(trashBusyIds, entry.id, true);
+    try {
+      await api.restore(entry.id);
+      trashEntries = trashEntries.filter((item) => item.id !== entry.id);
+      trashCount = Math.max(0, trashCount - 1);
+      entries = await api.list();
+      showToast(`已恢复“${entry.name}”`);
+      trashError = "";
+    } catch (reason) {
+      trashError = reasonMessage(reason, "恢复 MFA 账户失败。");
+    } finally {
+      trashBusyIds = setBusy(trashBusyIds, entry.id, false);
+    }
+  }
+
+  function requestPermanentDelete(entry: MfaTrashEntrySummary): void {
+    if (trashBusyIds[entry.id] || emptyTrashBusy) return;
+    pendingPermanentDelete = entry;
+  }
+
+  async function confirmPermanentDelete(): Promise<void> {
+    const entry = pendingPermanentDelete;
+    if (!entry || trashBusyIds[entry.id] || emptyTrashBusy) return;
+    trashBusyIds = setBusy(trashBusyIds, entry.id, true);
+    try {
+      await api.permanentlyDelete(entry.id);
+      trashEntries = trashEntries.filter((item) => item.id !== entry.id);
+      trashCount = Math.max(0, trashCount - 1);
+      pendingPermanentDelete = null;
+      showToast(`已永久删除“${entry.name}”`);
+      trashError = "";
+    } catch (reason) {
+      trashError = reasonMessage(reason, "永久删除 MFA 账户失败。");
+    } finally {
+      trashBusyIds = setBusy(trashBusyIds, entry.id, false);
+    }
+  }
+
+  async function confirmEmptyTrash(): Promise<void> {
+    if (!pendingEmptyTrash || emptyTrashBusy || Object.keys(trashBusyIds).length > 0) return;
+    emptyTrashBusy = true;
+    try {
+      await api.emptyTrash();
+      trashEntries = [];
+      trashCount = 0;
+      pendingEmptyTrash = false;
+      showToast("MFA 回收站已清空");
+      trashError = "";
+    } catch (reason) {
+      trashError = reasonMessage(reason, "清空 MFA 回收站失败。");
+    } finally {
+      emptyTrashBusy = false;
     }
   }
 
@@ -696,6 +896,9 @@
     const sessions = previews.map((preview) => preview.sessionId);
     previews = [];
     selectedSessionId = "";
+    uriPreviewErrors = [];
+    bulkUriImport = false;
+    importError = "";
     await Promise.all(sessions.map((sessionId) => api.cancelImport(sessionId).catch(() => undefined)));
   }
 
@@ -711,6 +914,9 @@
     importEmoji = "🔐";
     previews = [];
     selectedSessionId = "";
+    uriPreviewErrors = [];
+    bulkUriImport = false;
+    importError = "";
     resetSensitiveInputs();
     closeContextMenu();
     error = "";
@@ -772,6 +978,7 @@
     if (importBusy) return;
     importBusy = true;
     error = "";
+    importError = "";
     try {
       await discardPreviews();
       const result = await request();
@@ -780,7 +987,7 @@
       selectedSessionId = result[0].sessionId;
       importEmoji = result[0].iconEmoji || importEmoji || "🔐";
     } catch (reason) {
-      error = reasonMessage(reason, "识别账户失败。");
+      importError = reasonMessage(reason, "识别账户失败。");
     } finally {
       importBusy = false;
       manualSecret = "";
@@ -792,17 +999,41 @@
   }
 
   async function previewUri(): Promise<void> {
-    const uri = uriText.trim();
-    if (!uri) {
-      error = "请粘贴 otpauth://totp 链接。";
+    if (!uriText.trim()) {
+      importError = "请粘贴 otpauth://totp 链接。";
       return;
     }
-    if (uri.toLocaleLowerCase().startsWith("otpauth-migration://")) {
-      error = "第一版暂不支持 Google Authenticator 批量迁移二维码，请添加标准单账户二维码。";
+    if (importBusy) return;
+    const sourceText = uriText;
+    const nonEmptyLines = sourceText.split(/\r?\n/).filter((line) => line.trim());
+    if (nonEmptyLines.length === 1) {
+      await acceptPreviews(() => api.previewUri(nonEmptyLines[0].trim()));
+      if (previews.length > 0) uriText = "";
       return;
     }
-    await acceptPreviews(() => api.previewUri(uri));
-    uriText = "";
+    importBusy = true;
+    error = "";
+    importError = "";
+    try {
+      await discardPreviews();
+      const result = await api.previewUris(sourceText);
+      uriPreviewErrors = result.errors;
+      bulkUriImport = true;
+      if (result.previews.length === 0) {
+        importError = result.errors.length > 0
+          ? "没有识别到可导入的 TOTP 链接，请根据行号修正。"
+          : "没有识别到可导入的 TOTP 链接。";
+        return;
+      }
+      previews = result.previews;
+      selectedSessionId = result.previews[0].sessionId;
+      importEmoji = result.previews[0].iconEmoji || importEmoji || "🔐";
+      uriText = "";
+    } catch (reason) {
+      importError = reasonMessage(reason, "识别验证器链接失败。");
+    } finally {
+      importBusy = false;
+    }
   }
 
   function isSupportedImage(file: File): boolean {
@@ -855,8 +1086,8 @@
       return;
     }
     if (addMethod === "manual") return;
-    const text = event.clipboardData?.getData("text/plain").trim() ?? "";
-    if (text.toLocaleLowerCase().startsWith("otpauth")) {
+    const text = event.clipboardData?.getData("text/plain") ?? "";
+    if (text.trim().toLocaleLowerCase().startsWith("otpauth")) {
       event.preventDefault();
       addMethod = "uri";
       uriText = text;
@@ -882,8 +1113,8 @@
           }
         }
       }
-      const text = (await navigator.clipboard.readText()).trim();
-      if (!text) throw new Error("剪贴板里没有链接或二维码图片。");
+      const text = await navigator.clipboard.readText();
+      if (!text.trim()) throw new Error("剪贴板里没有链接或二维码图片。");
       addMethod = "uri";
       uriText = text;
       await previewUri();
@@ -914,29 +1145,46 @@
   }
 
   async function commitImport(): Promise<void> {
-    if (!selectedPreview || importBusy) return;
+    if (importBusy || previews.length === 0 || (!bulkUriImport && !selectedPreview)) return;
     importBusy = true;
     error = "";
+    importError = "";
     try {
-      const saved = await api.commitImport(selectedPreview.sessionId, selectedEmoji(importEmoji));
-      entries = [...entries, saved];
-      const remainingSessions = previews
-        .filter((preview) => preview.sessionId !== selectedPreview.sessionId)
-        .map((preview) => preview.sessionId);
-      await Promise.all(remainingSessions.map((sessionId) => api.cancelImport(sessionId).catch(() => undefined)));
+      const savedEntries = bulkUriImport
+        ? await api.commitImports(previews.map((preview) => ({
+          sessionId: preview.sessionId,
+          iconEmoji: selectedEmoji(preview.iconEmoji || "🔐"),
+        })))
+        : [await api.commitImport(selectedPreview!.sessionId, selectedEmoji(importEmoji))];
+      if (savedEntries.length === 0) throw new Error("后端未返回已导入的账户。");
+      entries = [...entries, ...savedEntries];
+      if (!bulkUriImport) {
+        const remainingSessions = previews
+          .filter((preview) => preview.sessionId !== selectedPreview!.sessionId)
+          .map((preview) => preview.sessionId);
+        await Promise.all(remainingSessions.map((sessionId) => api.cancelImport(sessionId).catch(() => undefined)));
+      }
+      const importedCount = savedEntries.length;
       previews = [];
       selectedSessionId = "";
+      uriPreviewErrors = [];
+      bulkUriImport = false;
+      importError = "";
       resetSensitiveInputs();
       addOpen = false;
       focusElementAfterRender(addReturnFocus);
       try {
-        await api.copy(saved.id);
-        showToast("账户已添加，首个验证码已复制");
+        await api.copy(savedEntries[0].id);
+        showToast(importedCount > 1
+          ? `已添加 ${importedCount} 个账户，首个验证码已复制`
+          : "账户已添加，首个验证码已复制");
       } catch {
-        showToast("账户已添加，但首个验证码复制失败");
+        showToast(importedCount > 1
+          ? `已添加 ${importedCount} 个账户，但首个验证码复制失败`
+          : "账户已添加，但首个验证码复制失败");
       }
     } catch (reason) {
-      error = reasonMessage(reason, "添加账户失败。");
+      importError = reasonMessage(reason, bulkUriImport ? "批量添加账户失败，未写入任何账户。" : "添加账户失败。");
     } finally {
       importBusy = false;
     }
@@ -951,6 +1199,7 @@
     revealed = {};
     resetSensitiveInputs();
     clearRecoveryInputs();
+    clearExportState();
     if (!api.isDesktop()) return;
     try {
       const { getCurrentWindow } = await import("@tauri-apps/api/window");
@@ -983,6 +1232,14 @@
     }
     if (recoveryDialogMode && !recoveryBusy) {
       cancelRecoveryDialog();
+      return;
+    }
+    if (exportTarget && !exportBusy) {
+      closeExport();
+      return;
+    }
+    if (trashOpen && !trashLoading && !emptyTrashBusy && Object.keys(trashBusyIds).length === 0) {
+      closeTrash();
       return;
     }
     if (contextMenu) {
@@ -1058,6 +1315,7 @@
       revealed = {};
       resetSensitiveInputs();
       clearRecoveryInputs();
+      clearExportState();
       void api.lock();
     };
   });
@@ -1085,6 +1343,17 @@
       <input bind:value={searchText} type="search" placeholder="搜索" aria-label="搜索账户" />
     </label>
     <div class="window-actions">
+      <button
+        type="button"
+        class="trash-action"
+        aria-label={trashCount > 0 ? `打开 MFA 回收站，${trashCount} 项` : "打开 MFA 回收站"}
+        title="回收站"
+        disabled={Boolean(status && !status.available)}
+        onclick={() => void openTrash()}
+      >
+        <Trash2 size={18} aria-hidden="true" />
+        {#if trashCount > 0}<span aria-hidden="true">{trashCount > 99 ? "99+" : trashCount}</span>{/if}
+      </button>
       {#if status?.recoveryState === "ready" && status.protection !== "browser-demo"}
         <button type="button" aria-label="修改 MFA 恢复密码" title="修改恢复密码" onclick={openRecoveryPasswordChange}>
           <KeyRound size={18} aria-hidden="true" />
@@ -1256,6 +1525,9 @@
         <button type="button" role="menuitem" disabled={pinBusy || reordering} onclick={() => togglePinnedFromContext(entry)}>
           {#if entry.pinned}<PinOff size={15} aria-hidden="true" /> 取消置顶{:else}<Pin size={15} aria-hidden="true" /> 置顶{/if}
         </button>
+        <button type="button" role="menuitem" disabled={pinBusy || reordering} onclick={() => startExport(entry)}>
+          <FileOutput size={15} aria-hidden="true" /> 导出
+        </button>
         <button type="button" role="menuitem" disabled={pinBusy || reordering} onclick={() => startEdit(entry)}>
           <Pencil size={15} aria-hidden="true" /> 编辑
         </button>
@@ -1264,6 +1536,83 @@
         </button>
       </div>
     {/if}
+  {/if}
+
+  {#if trashOpen}
+    <div class="modal-backdrop trash-backdrop" role="presentation">
+      <div
+        bind:this={trashDialog}
+        class="modal trash-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="mfa-trash-title"
+        tabindex="-1"
+        onkeydown={(event) => trapDialogFocus(event, trashDialog)}
+      >
+        <header class="modal-header">
+          <div>
+            <h2 id="mfa-trash-title">MFA 回收站</h2>
+            <p>{trashCount > 0 ? `${trashCount} 个已删除账户` : "删除的账户会先保存在这里"}</p>
+          </div>
+          <button type="button" aria-label="关闭 MFA 回收站" disabled={trashLoading || emptyTrashBusy || Object.keys(trashBusyIds).length > 0} onclick={closeTrash}>
+            <X size={18} aria-hidden="true" />
+          </button>
+        </header>
+        <div class="trash-toolbar">
+          <span>回收站内的账户仍受 MFA 保险库加密保护</span>
+          <button
+            type="button"
+            class="trash-clear-button"
+            disabled={trashEntries.length === 0 || trashLoading || emptyTrashBusy || Object.keys(trashBusyIds).length > 0}
+            onclick={() => (pendingEmptyTrash = true)}
+          >
+            <Trash2 size={14} aria-hidden="true" /> 清空
+          </button>
+        </div>
+        {#if trashError}
+          <div class="trash-error" role="alert"><AlertTriangle size={15} aria-hidden="true" /><span>{trashError}</span></div>
+        {/if}
+        <div class="trash-content">
+          {#if trashLoading}
+            <div class="trash-empty" aria-busy="true"><LoaderCircle class="spinner" size={23} aria-hidden="true" /><span>正在读取回收站…</span></div>
+          {:else if trashEntries.length === 0}
+            <div class="trash-empty"><Trash2 size={28} aria-hidden="true" /><strong>回收站是空的</strong></div>
+          {:else}
+            <div class="trash-list" aria-label="已删除的 MFA 账户">
+              {#each trashEntries as entry (entry.id)}
+                <article class="trash-entry">
+                  <div class="trash-entry-icon" aria-hidden="true">{entry.iconEmoji || "🔐"}</div>
+                  <div class="trash-entry-main">
+                    <strong>{entry.name}</strong>
+                    <span title={metadata(entry)}>{metadata(entry)}</span>
+                    <small>删除于 {formatDeletedAt(entry.deletedAt)}</small>
+                  </div>
+                  <div class="trash-entry-actions">
+                    <button
+                      type="button"
+                      aria-label={`恢复“${entry.name}”`}
+                      title="恢复"
+                      disabled={Boolean(trashBusyIds[entry.id]) || emptyTrashBusy}
+                      onclick={() => void restoreTrashEntry(entry)}
+                    >
+                      {#if trashBusyIds[entry.id]}<LoaderCircle class="spinner" size={16} aria-hidden="true" />{:else}<RotateCcw size={16} aria-hidden="true" />{/if}
+                    </button>
+                    <button
+                      type="button"
+                      class="danger"
+                      aria-label={`永久删除“${entry.name}”`}
+                      title="永久删除"
+                      disabled={Boolean(trashBusyIds[entry.id]) || emptyTrashBusy}
+                      onclick={() => requestPermanentDelete(entry)}
+                    ><Trash2 size={16} aria-hidden="true" /></button>
+                  </div>
+                </article>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      </div>
+    </div>
   {/if}
 
   {#if recoveryDialogMode}
@@ -1354,6 +1703,113 @@
     </div>
   {/if}
 
+  {#if exportTarget}
+    <div class="modal-backdrop export-backdrop" role="presentation">
+      <div
+        bind:this={exportDialog}
+        class="modal export-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="mfa-export-title"
+        tabindex="-1"
+        onkeydown={(event) => trapDialogFocus(event, exportDialog)}
+      >
+        <header class="modal-header">
+          <div>
+            <h2 id="mfa-export-title">导出“{exportTarget.name}”</h2>
+            <p>{exportResult ? "可导入其他支持 TOTP 的验证器" : "需要先验证当前 MFA 恢复密码"}</p>
+          </div>
+          <button type="button" aria-label="关闭导出账户" disabled={exportBusy} onclick={closeExport}>
+            <X size={18} aria-hidden="true" />
+          </button>
+        </header>
+
+        {#if exportResult}
+          <div class="export-content">
+            <div class="export-warning">
+              <AlertTriangle size={17} aria-hidden="true" />
+              <span>密钥、链接和二维码都能生成此账户的验证码，请仅在可信设备上使用。</span>
+            </div>
+            <div class="export-account">
+              <span class="preview-icon" aria-hidden="true">{exportResult.iconEmoji || "🔐"}</span>
+              <div>
+                <strong>{exportResult.name}</strong>
+                <span>{metadata(exportResult)}</span>
+                <small>{exportResult.algorithm.toUpperCase()} · {exportResult.digits} 位 · {exportResult.period} 秒</small>
+              </div>
+            </div>
+            <section class="export-value" aria-labelledby="mfa-export-secret-label">
+              <div class="export-value-heading">
+                <strong id="mfa-export-secret-label">密钥</strong>
+                <button type="button" aria-label="复制密钥" title="复制密钥" onclick={() => void copyExportValue("secret")}>
+                  <Copy size={16} aria-hidden="true" />
+                </button>
+              </div>
+              <code>{exportResult.secretBase32}</code>
+            </section>
+            <section class="export-value" aria-labelledby="mfa-export-uri-label">
+              <div class="export-value-heading">
+                <strong id="mfa-export-uri-label">完整 otpauth 链接</strong>
+                <button type="button" aria-label="复制完整 otpauth 链接" title="复制链接" onclick={() => void copyExportValue("uri")}>
+                  <Link2 size={16} aria-hidden="true" />
+                </button>
+              </div>
+              <code class="uri-value">{exportResult.otpauthUri}</code>
+            </section>
+            <section class="export-qr" aria-labelledby="mfa-export-qr-label">
+              <div>
+                <QrCode size={18} aria-hidden="true" />
+                <strong id="mfa-export-qr-label">验证器二维码</strong>
+              </div>
+              <img src={exportResult.qrPngDataUrl} alt={`${exportResult.name} 的 TOTP 导入二维码`} />
+            </section>
+            {#if exportError}
+              <div class="recovery-error" role="alert"><AlertTriangle size={15} aria-hidden="true" /><span>{exportError}</span></div>
+            {/if}
+          </div>
+          <div class="modal-actions">
+            <button class="primary-button" type="button" onclick={closeExport}>完成</button>
+          </div>
+        {:else}
+          <form novalidate onsubmit={(event) => { event.preventDefault(); void submitExportPassword(); }}>
+            <div class="export-password-content">
+              <div class="recovery-intro">
+                <div class="recovery-icon"><FileOutput size={23} aria-hidden="true" /></div>
+                <div class="recovery-copy">
+                  <strong>验证后显示此账户的迁移信息</strong>
+                  <p>验证过程不会修改恢复密码，也不会更改账户数据。</p>
+                </div>
+              </div>
+              <label class="field">
+                <span>恢复密码</span>
+                <input
+                  bind:this={exportPasswordInput}
+                  bind:value={exportPassword}
+                  type="password"
+                  minlength="12"
+                  maxlength="256"
+                  autocomplete="current-password"
+                  aria-label="导出恢复密码"
+                  required
+                />
+              </label>
+              {#if exportError}
+                <div class="recovery-error" role="alert"><AlertTriangle size={15} aria-hidden="true" /><span>{exportError}</span></div>
+              {/if}
+            </div>
+            <div class="modal-actions">
+              <button class="secondary-button" type="button" disabled={exportBusy} onclick={closeExport}>取消</button>
+              <button class="primary-button" type="submit" disabled={exportBusy || !exportPassword}>
+                {#if exportBusy}<LoaderCircle class="spinner" size={15} aria-hidden="true" />{:else}<FileOutput size={15} aria-hidden="true" />{/if}
+                验证并导出
+              </button>
+            </div>
+          </form>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
   {#if addOpen}
     <div class="modal-backdrop" role="presentation">
       <div
@@ -1394,6 +1850,9 @@
 
         {#if previews.length === 0}
           <div class="method-panel" role="tabpanel">
+            {#if importError}
+              <div class="import-operation-error" role="alert"><AlertTriangle size={15} aria-hidden="true" /><span>{importError}</span></div>
+            {/if}
             {#if addMethod === "screen"}
               <div class="method-hero">
                 <div class="hero-icon"><ScanLine size={30} aria-hidden="true" /></div>
@@ -1406,10 +1865,16 @@
               </div>
             {:else if addMethod === "uri"}
               <label class="field full-field">
-                <span>验证器链接</span>
-                <textarea bind:value={uriText} rows="4" spellcheck="false" autocomplete="off" placeholder="otpauth://totp/…"></textarea>
-                <small>仅支持标准单账户 TOTP，不支持 Google 批量迁移链接。</small>
+                <span>验证器链接（一行一个）</span>
+                <textarea bind:value={uriText} rows="7" spellcheck="false" autocomplete="off" aria-label="验证器链接（一行一个）" placeholder={'otpauth://totp/Example%3Aalice?secret=…\notpauth://totp/Example%3Abob?secret=…'}></textarea>
+                <small>可一次识别多个标准 TOTP 链接；空行会忽略。</small>
               </label>
+              {#if uriPreviewErrors.length}
+                <div class="uri-preview-errors" role="alert" aria-label="链接识别错误">
+                  <AlertTriangle size={15} aria-hidden="true" />
+                  <div><strong>以下链接未识别</strong><ul>{#each uriPreviewErrors as item}<li><b>第 {item.line} 行</b><span>{item.message}</span></li>{/each}</ul></div>
+                </div>
+              {/if}
               <div class="panel-actions">
                 <button class="secondary-button" type="button" disabled={importBusy} onclick={() => void readClipboard()}><ClipboardPaste size={15} aria-hidden="true" />读取剪贴板</button>
                 <button class="primary-button" type="button" disabled={importBusy || !uriText.trim()} onclick={() => void previewUri()}>
@@ -1465,40 +1930,63 @@
           </div>
         {:else}
           <div class="preview-panel">
+            {#if importError}
+              <div class="import-operation-error" role="alert"><AlertTriangle size={15} aria-hidden="true" /><span>{importError}</span></div>
+            {/if}
             <div class="preview-heading">
-              <div><strong>确认识别结果</strong><span>{previews.length > 1 ? `识别到 ${previews.length} 个标准账户，请选择一个` : "密钥不会显示在预览中"}</span></div>
+              <div><strong>确认识别结果</strong><span>{bulkUriImport ? `将一次导入 ${previews.length} 个账户，每项已分配独立图标` : previews.length > 1 ? `识别到 ${previews.length} 个标准账户，请选择一个` : "密钥不会显示在预览中"}</span></div>
               <button class="text-button" type="button" disabled={importBusy} onclick={() => void discardPreviews()}>重新识别</button>
             </div>
-            <div class="preview-list" role="radiogroup" aria-label="选择导入账户">
-              {#each previews as preview (preview.sessionId)}
-                <label class:selected={selectedSessionId === preview.sessionId} class="preview-card">
-                  <input type="radio" name="mfa-preview" value={preview.sessionId} bind:group={selectedSessionId} />
-                  <span class="preview-icon">{preview.iconEmoji || "🔐"}</span>
-                  <span class="preview-main"><strong>{preview.name}</strong><span>{metadata(preview)}</span><small>{preview.algorithm.toUpperCase()} · {preview.digits} 位 · {preview.period} 秒</small></span>
-                  {#if selectedSessionId === preview.sessionId}<Check size={18} aria-label="已选择" />{/if}
-                </label>
-              {/each}
-            </div>
-            {#if selectedPreview?.warnings.length}
-              <div class="preview-warnings" role="status">
-                <AlertTriangle size={16} aria-hidden="true" />
-                <ul>{#each selectedPreview.warnings as warning}<li>{warning}</li>{/each}</ul>
+            {#if bulkUriImport}
+              <div class="preview-list" role="list" aria-label="将导入的账户">
+                {#each previews as preview (preview.sessionId)}
+                  <div class="preview-card bulk-preview-card" role="listitem">
+                    <span class="preview-icon">{preview.iconEmoji || "🔐"}</span>
+                    <span class="preview-main"><strong>{preview.name}</strong><span>{metadata(preview)}</span><small>{preview.algorithm.toUpperCase()} · {preview.digits} 位 · {preview.period} 秒</small></span>
+                    <Check size={17} aria-label="将导入" />
+                  </div>
+                {/each}
+              </div>
+            {:else}
+              <div class="preview-list" role="radiogroup" aria-label="选择导入账户">
+                {#each previews as preview (preview.sessionId)}
+                  <label class:selected={selectedSessionId === preview.sessionId} class="preview-card">
+                    <input type="radio" name="mfa-preview" value={preview.sessionId} bind:group={selectedSessionId} />
+                    <span class="preview-icon">{preview.iconEmoji || "🔐"}</span>
+                    <span class="preview-main"><strong>{preview.name}</strong><span>{metadata(preview)}</span><small>{preview.algorithm.toUpperCase()} · {preview.digits} 位 · {preview.period} 秒</small></span>
+                    {#if selectedSessionId === preview.sessionId}<Check size={18} aria-label="已选择" />{/if}
+                  </label>
+                {/each}
               </div>
             {/if}
-            <div class="emoji-section">
-              <span>选择图标</span>
-              {#each emojiGroups as group}
-                <div class="emoji-group"><small>{group.label}</small><div class="emoji-row">
-                  {#each group.values as emoji}<button type="button" class:selected={importEmoji === emoji} aria-label={`使用 ${emoji} 图标`} onclick={() => setImportEmoji(emoji)}>{emoji}</button>{/each}
-                </div></div>
-              {/each}
-              <label class="custom-emoji wide"><span>自定义 Emoji</span><input value={importEmoji} maxlength="8" aria-label="自定义 Emoji" oninput={(event) => setImportEmoji((event.currentTarget as HTMLInputElement).value)} /></label>
-            </div>
+            {#if uriPreviewErrors.length}
+              <div class="uri-preview-errors compact" role="alert" aria-label="链接识别错误">
+                <AlertTriangle size={15} aria-hidden="true" />
+                <div><strong>已跳过以下链接</strong><ul>{#each uriPreviewErrors as item}<li><b>第 {item.line} 行</b><span>{item.message}</span></li>{/each}</ul></div>
+              </div>
+            {/if}
+            {#if previewWarnings.length}
+              <div class="preview-warnings" role="status">
+                <AlertTriangle size={16} aria-hidden="true" />
+                <ul>{#each previewWarnings as warning}<li>{warning}</li>{/each}</ul>
+              </div>
+            {/if}
+            {#if !bulkUriImport}
+              <div class="emoji-section">
+                <span>选择图标</span>
+                {#each emojiGroups as group}
+                  <div class="emoji-group"><small>{group.label}</small><div class="emoji-row">
+                    {#each group.values as emoji}<button type="button" class:selected={importEmoji === emoji} aria-label={`使用 ${emoji} 图标`} onclick={() => setImportEmoji(emoji)}>{emoji}</button>{/each}
+                  </div></div>
+                {/each}
+                <label class="custom-emoji wide"><span>自定义 Emoji</span><input value={importEmoji} maxlength="8" aria-label="自定义 Emoji" oninput={(event) => setImportEmoji((event.currentTarget as HTMLInputElement).value)} /></label>
+              </div>
+            {/if}
             <div class="modal-actions">
               <button class="secondary-button" type="button" disabled={importBusy} onclick={() => void closeAdd()}>取消</button>
-              <button class="primary-button" type="button" disabled={importBusy || !selectedPreview} onclick={() => void commitImport()}>
+              <button class="primary-button" type="button" disabled={importBusy || (bulkUriImport ? previews.length === 0 : !selectedPreview)} onclick={() => void commitImport()}>
                 {#if importBusy}<LoaderCircle class="spinner" size={15} aria-hidden="true" />{:else}<Check size={15} aria-hidden="true" />{/if}
-                添加并复制验证码
+                {bulkUriImport ? `添加 ${previews.length} 个账户并复制首个验证码` : "添加并复制验证码"}
               </button>
             </div>
           </div>
@@ -1538,12 +2026,30 @@
   {#if toast}<div class="toast" role="status"><Check size={15} aria-hidden="true" />{toast}</div>{/if}
   <ConfirmDialog
     open={Boolean(pendingDelete)}
-    title={pendingDelete ? `删除“${pendingDelete.name}”？` : "删除 MFA 账户？"}
-    detail="删除后无法恢复，之后需要重新扫描二维码或输入密钥才能添加。"
-    confirmLabel="删除账户"
+    title={pendingDelete ? `将“${pendingDelete.name}”移入回收站？` : "删除 MFA 账户？"}
+    detail="账户会保留在加密的 MFA 回收站中，可以从右上角回收站恢复。"
+    confirmLabel="移入回收站"
     busy={deleteBusy}
     oncancel={() => { if (!deleteBusy) { pendingDelete = null; restoreDeleteFocus(); } }}
     onconfirm={confirmDelete}
+  />
+  <ConfirmDialog
+    open={Boolean(pendingPermanentDelete)}
+    title={pendingPermanentDelete ? `永久删除“${pendingPermanentDelete.name}”？` : "永久删除 MFA 账户？"}
+    detail="密钥将从 MFA 保险库中永久移除，此操作无法恢复。"
+    confirmLabel="永久删除"
+    busy={Boolean(pendingPermanentDelete && trashBusyIds[pendingPermanentDelete.id])}
+    oncancel={() => { if (!pendingPermanentDelete || !trashBusyIds[pendingPermanentDelete.id]) pendingPermanentDelete = null; }}
+    onconfirm={confirmPermanentDelete}
+  />
+  <ConfirmDialog
+    open={pendingEmptyTrash}
+    title="清空 MFA 回收站？"
+    detail={`回收站中的 ${trashEntries.length} 个账户及其密钥将被永久删除，此操作无法恢复。`}
+    confirmLabel="清空回收站"
+    busy={emptyTrashBusy}
+    oncancel={() => { if (!emptyTrashBusy) pendingEmptyTrash = false; }}
+    onconfirm={confirmEmptyTrash}
   />
 </section>
 
@@ -1563,6 +2069,8 @@
   .window-actions button:hover, .modal-header > button:hover, .error-banner button:hover { color: #202020; background: #e7e7e7; }
   .window-actions button:disabled { opacity: .45; cursor: default; }
   .window-actions .primary-icon { color: #5c3fa3; }
+  .window-actions .trash-action { position: relative; }
+  .window-actions .trash-action > span { position: absolute; top: 1px; right: 0; min-width: 14px; height: 14px; padding: 0 3px; color: #fff; font-size: 8px; font-weight: 700; line-height: 14px; text-align: center; background: #b42318; border: 1px solid #fff; border-radius: 7px; }
   .window-actions button:last-child:hover { color: #fff; background: #c42b1c; }
   main { min-width: 0; min-height: 0; padding: 14px; overflow: auto; }
   .error-banner { min-height: 38px; padding: 7px 7px 7px 10px; margin-bottom: 10px; gap: 8px; color: #8c1d14; font-size: 12.5px; line-height: 1.4; background: #fff0ed; border: 1px solid #f1c1bb; border-radius: 6px; }
@@ -1624,12 +2132,14 @@
   .entry-context-menu button.danger { color: #b42318; }
   .entry-context-menu button.danger:hover { background: #fff0ed; }
   .modal-backdrop { position: fixed; z-index: 30; inset: 0; display: grid; padding: 18px; place-items: center; background: rgb(27 24 31 / 38%); backdrop-filter: blur(2px); }
-  .recovery-backdrop { z-index: 70; }
+  .recovery-backdrop, .export-backdrop, .trash-backdrop { z-index: 70; }
   .modal { display: flex; width: min(640px, 100%); max-height: 100%; min-height: 0; overflow: hidden; flex-direction: column; background: #f8f8f8; border: 1px solid #c7c5c9; border-radius: 10px; box-shadow: 0 18px 54px rgb(0 0 0 / 24%); }
   .add-modal { min-height: min(520px, 100%); }
   .edit-modal { width: min(500px, 100%); }
   .recovery-modal { width: min(510px, 100%); }
-  .recovery-modal form { display: flex; min-height: 0; flex-direction: column; }
+  .export-modal { width: min(560px, 100%); }
+  .trash-modal { width: min(570px, 100%); min-height: min(440px, 100%); }
+  .recovery-modal form, .export-modal form { display: flex; min-height: 0; flex-direction: column; }
   .edit-form { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; overflow: hidden; }
   .modal-header { display: flex; flex: 0 0 auto; min-height: 61px; padding: 11px 10px 10px 15px; align-items: center; justify-content: space-between; gap: 12px; background: #fff; border-bottom: 1px solid #dedde0; }
   .modal-header h2 { margin: 0; color: #29262d; font-size: 15px; font-weight: 650; }
@@ -1661,6 +2171,48 @@
   .recovery-warning { color: #76520b; background: #fff8df; border: 1px solid #ead69a; }
   .recovery-error { color: #8c1d14; background: #fff0ed; border: 1px solid #f1c1bb; }
   .recovery-warning :global(svg), .recovery-error :global(svg) { flex: 0 0 auto; margin-top: 1px; }
+  .export-password-content, .export-content { display: grid; min-height: 0; padding: 17px; gap: 12px; overflow: auto; }
+  .export-warning { display: flex; padding: 9px 10px; align-items: flex-start; gap: 8px; color: #794b08; font-size: 10.5px; line-height: 1.45; background: #fff8df; border: 1px solid #ead69a; border-radius: 6px; }
+  .export-warning :global(svg) { flex: 0 0 auto; margin-top: 1px; }
+  .export-account { display: grid; padding: 9px 10px; grid-template-columns: 38px minmax(0, 1fr); align-items: center; gap: 10px; background: #f2edf8; border: 1px solid #ddd2e9; border-radius: 7px; }
+  .export-account > div { display: grid; min-width: 0; gap: 2px; }
+  .export-account strong, .export-account span, .export-account small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .export-account strong { color: #332b3d; font-size: 12.5px; }
+  .export-account span { color: #716879; font-size: 10.5px; }
+  .export-account small { color: #8b8291; font-size: 9.5px; }
+  .export-value { display: grid; min-width: 0; gap: 6px; }
+  .export-value-heading { display: flex; min-height: 28px; align-items: center; justify-content: space-between; gap: 8px; }
+  .export-value-heading strong { color: #4d4752; font-size: 11.5px; }
+  .export-value-heading button { display: grid; width: 30px; height: 28px; padding: 0; place-items: center; color: #5c3e88; background: #f1ebf8; border: 1px solid #ddd0eb; border-radius: 5px; cursor: pointer; }
+  .export-value-heading button:hover, .export-value-heading button:focus-visible { color: #402665; background: #e8ddf4; outline: 0; box-shadow: 0 0 0 2px rgb(104 69 173 / 16%); }
+  .export-value code { display: block; min-height: 38px; padding: 9px 10px; overflow-wrap: anywhere; color: #28232e; font-family: "Cascadia Mono", "Segoe UI Mono", Consolas, monospace; font-size: 10.5px; line-height: 1.55; background: #fff; border: 1px solid #d5d1d9; border-radius: 6px; user-select: text; }
+  .export-value code.uri-value { max-height: 82px; overflow: auto; }
+  .export-qr { display: grid; justify-items: center; gap: 9px; }
+  .export-qr > div { display: flex; align-items: center; gap: 7px; color: #4d4752; font-size: 11.5px; }
+  .export-qr img { width: min(230px, 74vw); height: min(230px, 74vw); image-rendering: pixelated; background: #fff; border: 8px solid #fff; border-radius: 6px; box-shadow: 0 0 0 1px #d7d3da; }
+  .trash-toolbar { display: flex; min-height: 42px; padding: 7px 14px; align-items: center; justify-content: space-between; gap: 10px; color: #766f7a; font-size: 10.5px; background: #f2f1f3; border-bottom: 1px solid #dedce0; }
+  .trash-clear-button { display: inline-flex; min-height: 28px; padding: 4px 8px; align-items: center; gap: 5px; color: #9f2d22; background: #fff; border: 1px solid #d5c8c6; border-radius: 5px; cursor: pointer; }
+  .trash-clear-button:hover, .trash-clear-button:focus-visible { color: #8f2118; background: #fff0ed; border-color: #dfaaa4; outline: 0; }
+  .trash-clear-button:disabled { color: #aaa; background: #f7f7f7; border-color: #ddd; cursor: default; }
+  .trash-error { display: flex; padding: 8px 10px; margin: 10px 14px 0; align-items: flex-start; gap: 7px; color: #8c1d14; font-size: 10.5px; line-height: 1.45; background: #fff0ed; border: 1px solid #f1c1bb; border-radius: 6px; }
+  .trash-error :global(svg) { flex: 0 0 auto; margin-top: 1px; }
+  .trash-content { flex: 1 1 auto; min-height: 0; padding: 12px 14px 14px; overflow: auto; }
+  .trash-empty { display: flex; min-height: 260px; align-items: center; justify-content: center; flex-direction: column; gap: 8px; color: #88818d; font-size: 11px; }
+  .trash-empty strong { color: #514a56; font-size: 12.5px; }
+  .trash-list { display: grid; gap: 7px; }
+  .trash-entry { display: grid; min-height: 66px; padding: 8px 8px 8px 10px; grid-template-columns: 38px minmax(0, 1fr) auto; align-items: center; gap: 9px; background: #fff; border: 1px solid #dad7dc; border-radius: 7px; }
+  .trash-entry-icon { display: grid; width: 36px; height: 36px; place-items: center; font-size: 19px; background: #f0ecf5; border-radius: 50%; }
+  .trash-entry-main { display: grid; min-width: 0; gap: 1px; }
+  .trash-entry-main strong, .trash-entry-main span, .trash-entry-main small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .trash-entry-main strong { color: #302c34; font-size: 12px; }
+  .trash-entry-main span { color: #777079; font-size: 10px; }
+  .trash-entry-main small { color: #98919a; font-size: 9px; }
+  .trash-entry-actions { display: flex; gap: 3px; }
+  .trash-entry-actions button { display: grid; width: 31px; height: 31px; padding: 0; place-items: center; color: #5c3e88; background: transparent; border: 0; border-radius: 5px; cursor: pointer; }
+  .trash-entry-actions button:hover, .trash-entry-actions button:focus-visible { background: #eee7f7; outline: 0; }
+  .trash-entry-actions button.danger { color: #ac3025; }
+  .trash-entry-actions button.danger:hover, .trash-entry-actions button.danger:focus-visible { background: #fff0ed; }
+  .trash-entry-actions button:disabled { color: #aaa; cursor: wait; opacity: .65; }
   .full-field { grid-column: 1 / -1; }
   .manual-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
   .panel-actions, .modal-actions { flex: 0 0 auto; justify-content: flex-end; gap: 8px; margin-top: 14px; }
@@ -1671,6 +2223,15 @@
   .drop-zone span { color: #8a838f; font-size: 10.5px; }
   .drop-zone:hover, .drop-zone.drag-active { color: #563881; background: #f7f2fd; border-color: #8f71bb; }
   .drop-zone:disabled { opacity: .6; cursor: wait; }
+  .import-operation-error { display: flex; min-height: 36px; padding: 8px 10px; margin-bottom: 10px; align-items: flex-start; gap: 7px; color: #8c1d14; font-size: 11px; line-height: 1.45; background: #fff0ed; border: 1px solid #f1c1bb; border-radius: 6px; }
+  .import-operation-error :global(svg), .uri-preview-errors > :global(svg) { flex: 0 0 auto; margin-top: 1px; }
+  .uri-preview-errors { display: grid; padding: 9px 10px; margin-top: 10px; grid-template-columns: 16px minmax(0, 1fr); align-items: start; gap: 8px; color: #794b08; font-size: 10.5px; line-height: 1.45; background: #fff8df; border: 1px solid #ead69a; border-radius: 6px; }
+  .uri-preview-errors.compact { margin-top: 9px; }
+  .uri-preview-errors strong { color: #684109; font-size: 11px; }
+  .uri-preview-errors ul { display: grid; padding: 0; margin: 5px 0 0; gap: 4px; list-style: none; }
+  .uri-preview-errors li { display: grid; min-width: 0; grid-template-columns: 54px minmax(0, 1fr); gap: 5px; }
+  .uri-preview-errors li b { font-weight: 650; white-space: nowrap; }
+  .uri-preview-errors li span { overflow-wrap: anywhere; }
   .preview-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
   .preview-heading > div { display: grid; gap: 2px; }
   .preview-heading strong { color: #312d35; font-size: 13px; }
@@ -1679,6 +2240,8 @@
   .text-button:hover { background: #eee7f7; }
   .preview-list { display: grid; max-height: 190px; gap: 6px; overflow: auto; }
   .preview-card { display: grid; min-height: 64px; padding: 8px 10px; grid-template-columns: auto 38px minmax(0, 1fr) 20px; align-items: center; gap: 9px; background: #fff; border: 1px solid #d8d5da; border-radius: 7px; cursor: pointer; }
+  .preview-card.bulk-preview-card { grid-template-columns: 38px minmax(0, 1fr) 20px; cursor: default; }
+  .bulk-preview-card > :global(svg) { color: #5d3c91; }
   .preview-card.selected { background: #f8f4fc; border-color: #9d81c1; box-shadow: 0 0 0 1px rgb(112 73 170 / 10%); }
   .preview-card input { accent-color: #6845ad; }
   .preview-icon { display: grid; width: 36px; height: 36px; place-items: center; font-size: 20px; background: #eee9f4; border-radius: 50%; }

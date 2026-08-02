@@ -4201,7 +4201,7 @@ mod tests {
     fn persists_tray_shortcut_settings_in_the_data_directory() {
         let (_root, store) = store();
         let settings = TrayShortcutSettings {
-            double_click: TrayShortcutAction::MainWindow,
+            double_click: TrayShortcutAction::RecentNote,
             alt_double_click: TrayShortcutAction::Timer,
             ctrl_double_click: TrayShortcutAction::Screenshot,
             shift_double_click: TrayShortcutAction::Reminder,

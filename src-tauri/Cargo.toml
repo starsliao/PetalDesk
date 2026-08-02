@@ -1,6 +1,6 @@
 [package]
 name = "petaldesk"
-version = "0.4.1"
+version = "0.4.2"
 description = "飞花 - PetalDesk local Markdown notes and desktop tools"
 authors = ["飞花 - PetalDesk contributors"]
 edition = "2021"
@@ -57,6 +57,7 @@ url = "2.5"
 uuid = { version = "1", features = ["v4", "serde"] }
 zeroize = { version = "1.8", features = ["derive"] }
 png = "0.17"
+qrcode = { version = "0.14.1", default-features = false, features = ["image"] }
 rfd = { version = "=0.16.0", default-features = false, features = ["common-controls-v6"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -76,7 +77,6 @@ windows-sys = { version = "0.60", features = [
 ] }
 
 [dev-dependencies]
-qrcode = { version = "0.14.1", default-features = false, features = ["image"] }
 tempfile = "3"
 
 [profile.release]

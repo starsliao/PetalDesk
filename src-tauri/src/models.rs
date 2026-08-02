@@ -23,6 +23,7 @@ pub enum ToolName {
 #[serde(rename_all = "camelCase")]
 pub enum TrayShortcutAction {
     FirstNote,
+    RecentNote,
     MainWindow,
     Timer,
     Reminder,

@@ -28,11 +28,31 @@ export interface MfaEntrySummary {
   updatedAt: string;
 }
 
+export interface MfaTrashEntrySummary extends MfaEntrySummary {
+  deletedAt: string;
+}
+
 export interface MfaRevealResult {
   id: string;
   code: string;
   /** Unix milliseconds, Unix seconds, or an ISO timestamp from older backends. */
   validUntil: number | string;
+}
+
+export interface MfaEntryExport {
+  id: string;
+  name: string;
+  issuer: string;
+  accountName: string;
+  iconEmoji: string;
+  algorithm: MfaAlgorithm;
+  digits: number;
+  period: number;
+  createdAt: string;
+  updatedAt: string;
+  secretBase32: string;
+  otpauthUri: string;
+  qrPngDataUrl: string;
 }
 
 export interface MfaImportPreview {
@@ -45,6 +65,21 @@ export interface MfaImportPreview {
   digits: number;
   period: number;
   warnings: string[];
+}
+
+export interface MfaUriPreviewError {
+  line: number;
+  message: string;
+}
+
+export interface MfaUriPreviewResult {
+  previews: MfaImportPreview[];
+  errors: MfaUriPreviewError[];
+}
+
+export interface MfaImportCommit {
+  sessionId: string;
+  iconEmoji: string;
 }
 
 export interface MfaManualImportRequest {
@@ -70,17 +105,24 @@ export interface MfaApi {
   isDesktop(): boolean;
   getStatus(): Promise<MfaStatus>;
   list(): Promise<MfaEntrySummary[]>;
+  listTrash(): Promise<MfaTrashEntrySummary[]>;
   scanScreenQr(): Promise<MfaImportPreview[]>;
   previewQrImage(bytes: Uint8Array, mediaType?: string): Promise<MfaImportPreview[]>;
   previewUri(uri: string): Promise<MfaImportPreview[]>;
+  previewUris(uris: string): Promise<MfaUriPreviewResult>;
   previewManual(request: MfaManualImportRequest): Promise<MfaImportPreview[]>;
   commitImport(sessionId: string, iconEmoji: string): Promise<MfaEntrySummary>;
+  commitImports(imports: MfaImportCommit[]): Promise<MfaEntrySummary[]>;
   cancelImport(sessionId: string): Promise<void>;
   update(request: MfaEntryUpdateRequest): Promise<MfaEntrySummary>;
   delete(id: string): Promise<void>;
+  restore(id: string): Promise<MfaEntrySummary>;
+  permanentlyDelete(id: string): Promise<void>;
+  emptyTrash(): Promise<void>;
   reorder(orderedIds: string[]): Promise<MfaEntrySummary[]>;
   setPinned(id: string, pinned: boolean): Promise<MfaEntrySummary[]>;
   reveal(id: string): Promise<MfaRevealResult>;
+  exportEntry(id: string, password: string): Promise<MfaEntryExport>;
   copy(id: string): Promise<void>;
   configureRecoveryPassword(password: string): Promise<void>;
   unlockWithRecoveryPassword(password: string): Promise<void>;
@@ -142,6 +184,18 @@ function normalizedPreview(value: MfaImportPreview): MfaImportPreview {
 
 function previewList(value: MfaImportPreview | MfaImportPreview[]): MfaImportPreview[] {
   return (Array.isArray(value) ? value : [value]).map(normalizedPreview);
+}
+
+function normalizedUriPreviewResult(value: MfaUriPreviewResult): MfaUriPreviewResult {
+  return {
+    previews: previewList(value.previews ?? []),
+    errors: Array.isArray(value.errors)
+      ? value.errors.map((item) => ({
+        line: Math.max(1, Math.trunc(Number(item.line) || 1)),
+        message: String(item.message || "无法识别这一行链接。"),
+      }))
+      : [],
+  };
 }
 
 export function validUntilMilliseconds(value: number | string): number {
@@ -244,14 +298,16 @@ export function createBrowserMfaApi(): MfaApi {
       updatedAt: nowIso(),
     },
   ];
+  let trash: MfaTrashEntrySummary[] = [];
   const previews = new Map<string, MfaImportPreview>();
+  const batchEmojis = ["🔐", "🔑", "🛡️", "⭐", "☁️", "💼", "🏠", "🧰"];
 
   const remember = (preview: MfaImportPreview): MfaImportPreview[] => {
     previews.set(preview.sessionId, preview);
     return [structuredClone(preview)];
   };
 
-  const previewFromText = (uri: string): MfaImportPreview[] => {
+  const previewFromText = (uri: string, iconEmoji?: string): MfaImportPreview[] => {
     let issuer = "PetalDesk Demo";
     let accountName = "demo@example.com";
     let name = "演示账户";
@@ -269,7 +325,36 @@ export function createBrowserMfaApi(): MfaApi {
       if (error instanceof Error && error.message.includes("第一版")) throw error;
       throw new Error("请输入有效的 otpauth://totp 单账户链接。");
     }
-    return remember(demoPreview({ name, issuer, accountName }));
+    return remember(demoPreview({ name, issuer, accountName, iconEmoji }));
+  };
+
+  const commitPreviewBatch = (imports: MfaImportCommit[]): MfaEntrySummary[] => {
+    if (imports.length === 0) throw new Error("没有可导入的账户。");
+    if (new Set(imports.map((item) => item.sessionId)).size !== imports.length) {
+      throw new Error("导入列表包含重复账户。");
+    }
+    const selected = imports.map((item) => {
+      const preview = previews.get(item.sessionId);
+      if (!preview) throw new Error("导入预览已经过期，请重新识别。");
+      return { preview, iconEmoji: item.iconEmoji };
+    });
+    const timestamp = nowIso();
+    const saved = selected.map(({ preview, iconEmoji }) => ({
+      id: crypto.randomUUID(),
+      name: preview.name,
+      issuer: preview.issuer,
+      accountName: preview.accountName,
+      iconEmoji: iconEmoji || preview.iconEmoji || "🔐",
+      pinned: false,
+      algorithm: preview.algorithm,
+      digits: preview.digits,
+      period: preview.period,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    } satisfies MfaEntrySummary));
+    entries = [...entries, ...saved];
+    for (const item of imports) previews.delete(item.sessionId);
+    return structuredClone(saved);
   };
 
   return {
@@ -288,6 +373,9 @@ export function createBrowserMfaApi(): MfaApi {
     async list() {
       return structuredClone(entries);
     },
+    async listTrash() {
+      return structuredClone(trash);
+    },
     async scanScreenQr() {
       return remember(demoPreview({ name: "屏幕扫码演示", iconEmoji: "📷" }));
     },
@@ -296,6 +384,25 @@ export function createBrowserMfaApi(): MfaApi {
     },
     async previewUri(uri) {
       return previewFromText(uri);
+    },
+    async previewUris(uris) {
+      const result: MfaUriPreviewResult = { previews: [], errors: [] };
+      let emojiIndex = 0;
+      for (const [index, rawLine] of uris.split(/\r?\n/).entries()) {
+        const uri = rawLine.trim();
+        if (!uri) continue;
+        try {
+          const [preview] = previewFromText(uri, batchEmojis[emojiIndex % batchEmojis.length]);
+          emojiIndex += 1;
+          if (preview) result.previews.push(preview);
+        } catch (error) {
+          result.errors.push({
+            line: index + 1,
+            message: errorMessage(error),
+          });
+        }
+      }
+      return result;
     },
     async previewManual(request) {
       if (!request.secret.trim()) throw new Error("请输入密钥。");
@@ -310,25 +417,10 @@ export function createBrowserMfaApi(): MfaApi {
       }));
     },
     async commitImport(sessionId, iconEmoji) {
-      const preview = previews.get(sessionId);
-      if (!preview) throw new Error("导入预览已经过期，请重新识别。");
-      const timestamp = nowIso();
-      const entry: MfaEntrySummary = {
-        id: crypto.randomUUID(),
-        name: preview.name,
-        issuer: preview.issuer,
-        accountName: preview.accountName,
-        iconEmoji: iconEmoji || preview.iconEmoji || "🔐",
-        pinned: false,
-        algorithm: preview.algorithm,
-        digits: preview.digits,
-        period: preview.period,
-        createdAt: timestamp,
-        updatedAt: timestamp,
-      };
-      entries = [...entries, entry];
-      previews.delete(sessionId);
-      return structuredClone(entry);
+      return commitPreviewBatch([{ sessionId, iconEmoji }])[0];
+    },
+    async commitImports(imports) {
+      return commitPreviewBatch(imports);
     },
     async cancelImport(sessionId) {
       previews.delete(sessionId);
@@ -347,7 +439,27 @@ export function createBrowserMfaApi(): MfaApi {
       return structuredClone(entries[index]);
     },
     async delete(id) {
+      const deleted = entries.find((entry) => entry.id === id);
+      if (!deleted) throw new Error("没有找到这个账户。");
       entries = entries.filter((entry) => entry.id !== id);
+      trash = [{ ...deleted, deletedAt: nowIso() }, ...trash];
+    },
+    async restore(id) {
+      const deleted = trash.find((entry) => entry.id === id);
+      if (!deleted) throw new Error("回收站中没有找到这个账户。");
+      const { deletedAt: _deletedAt, ...restored } = deleted;
+      trash = trash.filter((entry) => entry.id !== id);
+      entries = restored.pinned
+        ? [restored, ...entries]
+        : [...entries, restored];
+      return structuredClone(restored);
+    },
+    async permanentlyDelete(id) {
+      if (!trash.some((entry) => entry.id === id)) throw new Error("回收站中没有找到这个账户。");
+      trash = trash.filter((entry) => entry.id !== id);
+    },
+    async emptyTrash() {
+      trash = [];
     },
     async reorder(orderedIds) {
       if (orderedIds.length !== entries.length || new Set(orderedIds).size !== entries.length) {
@@ -376,6 +488,9 @@ export function createBrowserMfaApi(): MfaApi {
       const entry = entries.find((item) => item.id === id);
       if (!entry) throw new Error("没有找到这个账户。");
       return demoCode(entry.id, entry.digits, entry.period);
+    },
+    async exportEntry() {
+      throw new Error("浏览器预览不包含可导出的真实密钥，请在 Windows 客户端使用。");
     },
     async copy(id) {
       const entry = entries.find((item) => item.id === id);
@@ -408,6 +523,11 @@ export const mfaApi: MfaApi = {
     return command<MfaEntrySummary[]>("list_mfa_entries");
   },
 
+  async listTrash() {
+    if (!isDesktopRuntime()) return browserApi.listTrash();
+    return command<MfaTrashEntrySummary[]>("list_mfa_trash");
+  },
+
   async scanScreenQr() {
     if (!isDesktopRuntime()) return browserApi.scanScreenQr();
     return previewList(await command<MfaImportPreview | MfaImportPreview[]>("scan_mfa_screen_qr"));
@@ -430,6 +550,11 @@ export const mfaApi: MfaApi = {
     return previewList(await command<MfaImportPreview | MfaImportPreview[]>("preview_mfa_uri", { uri }));
   },
 
+  async previewUris(uris) {
+    if (!isDesktopRuntime()) return browserApi.previewUris(uris);
+    return normalizedUriPreviewResult(await command<MfaUriPreviewResult>("preview_mfa_uris", { uris }));
+  },
+
   async previewManual(request) {
     if (!isDesktopRuntime()) return browserApi.previewManual(request);
     return previewList(await command<MfaImportPreview | MfaImportPreview[]>("preview_mfa_manual", { request }));
@@ -438,6 +563,11 @@ export const mfaApi: MfaApi = {
   async commitImport(sessionId, iconEmoji) {
     if (!isDesktopRuntime()) return browserApi.commitImport(sessionId, iconEmoji);
     return command<MfaEntrySummary>("commit_mfa_import", { sessionId, iconEmoji });
+  },
+
+  async commitImports(imports) {
+    if (!isDesktopRuntime()) return browserApi.commitImports(imports);
+    return command<MfaEntrySummary[]>("commit_mfa_imports", { imports });
   },
 
   async cancelImport(sessionId) {
@@ -455,6 +585,21 @@ export const mfaApi: MfaApi = {
     await command<void>("delete_mfa_entry", { entryId: id });
   },
 
+  async restore(id) {
+    if (!isDesktopRuntime()) return browserApi.restore(id);
+    return command<MfaEntrySummary>("restore_mfa_entry", { entryId: id });
+  },
+
+  async permanentlyDelete(id) {
+    if (!isDesktopRuntime()) return browserApi.permanentlyDelete(id);
+    await command<void>("permanently_delete_mfa_entry", { entryId: id });
+  },
+
+  async emptyTrash() {
+    if (!isDesktopRuntime()) return browserApi.emptyTrash();
+    await command<void>("empty_mfa_trash");
+  },
+
   async reorder(orderedIds) {
     if (!isDesktopRuntime()) return browserApi.reorder(orderedIds);
     return command<MfaEntrySummary[]>("reorder_mfa_entries", { orderedIds });
@@ -468,6 +613,11 @@ export const mfaApi: MfaApi = {
   async reveal(id) {
     if (!isDesktopRuntime()) return browserApi.reveal(id);
     return command<MfaRevealResult>("reveal_mfa_code", { entryId: id });
+  },
+
+  async exportEntry(id, password) {
+    if (!isDesktopRuntime()) return browserApi.exportEntry(id, password);
+    return command<MfaEntryExport>("export_mfa_entry", { entryId: id, password });
   },
 
   async copy(id) {
