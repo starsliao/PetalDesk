@@ -15,6 +15,12 @@ pub(crate) const UPDATE_STATE_EVENT: &str = "updater_state_changed";
 pub(crate) const PREPARE_INSTALL_EVENT: &str = "updater_prepare_install";
 const STARTUP_CHECK_DELAY: Duration = Duration::from_secs(30);
 const PERIODIC_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// First retry delay after a failed automatic cycle; doubles per consecutive
+/// failure. Without backoff an outage that fails fast (offline, DNS failure,
+/// 5xx manifest) turns the scheduler into a tight retry loop.
+const FAILURE_RETRY_BASE_DELAY: Duration = Duration::from_secs(5 * 60);
+/// Ceiling for the doubling above, so retries never outpace the normal cycle.
+const FAILURE_RETRY_MAX_DELAY: Duration = PERIODIC_CHECK_INTERVAL;
 const INSTALL_PREPARATION_TIMEOUT: Duration = Duration::from_secs(8);
 const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(150);
 
@@ -523,7 +529,9 @@ pub async fn set_update_settings(
     if auto_update {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
-            run_automatic_cycle(app).await;
+            // One-shot kick when the user enables auto-update; the scheduler
+            // owns retries, and failures are already logged inside.
+            let _ = run_automatic_cycle(app).await;
         });
     }
 
@@ -631,9 +639,17 @@ pub fn start_scheduler(app: AppHandle) {
     #[cfg(windows)]
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(STARTUP_CHECK_DELAY).await;
+        let mut retry_delay = FAILURE_RETRY_BASE_DELAY;
         loop {
-            run_automatic_cycle(app.clone()).await;
-            tokio::time::sleep(PERIODIC_CHECK_INTERVAL).await;
+            let delay = if run_automatic_cycle(app.clone()).await.is_err() {
+                let delay = retry_delay;
+                retry_delay = (retry_delay * 2).min(FAILURE_RETRY_MAX_DELAY);
+                delay
+            } else {
+                retry_delay = FAILURE_RETRY_BASE_DELAY;
+                PERIODIC_CHECK_INTERVAL
+            };
+            tokio::time::sleep(delay).await;
         }
     });
 
@@ -723,19 +739,23 @@ async fn perform_download(app: AppHandle) -> AppResult<UpdateState> {
 }
 
 #[cfg(windows)]
-async fn run_automatic_cycle(app: AppHandle) {
+/// Runs one automatic check/download cycle.
+///
+/// Reports failure to the caller so the scheduler can back off; a disabled
+/// updater or an idle action counts as success, not as something to retry.
+async fn run_automatic_cycle(app: AppHandle) -> Result<(), ()> {
     if !app.state::<WorkspaceStore>().auto_update_enabled() {
-        return;
+        return Ok(());
     }
     let action = app.state::<UpdaterManager>().automatic_action();
     let result = match action {
-        AutomaticAction::None => return,
-        AutomaticAction::Check => perform_check(app.clone(), true).await,
-        AutomaticAction::Download => perform_download(app.clone()).await,
+        AutomaticAction::None => return Ok(()),
+        AutomaticAction::Check => perform_check(app.clone(), true).await.map(|_| ()),
+        AutomaticAction::Download => perform_download(app.clone()).await.map(|_| ()),
     };
-    if let Err(error) = result {
+    result.map_err(|error| {
         eprintln!("自动更新任务失败: {error}");
-    }
+    })
 }
 
 #[cfg(windows)]

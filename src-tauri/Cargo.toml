@@ -1,6 +1,6 @@
 [package]
 name = "petaldesk"
-version = "0.5.2"
+version = "0.5.3"
 description = "飞花 - PetalDesk local Markdown notes and desktop tools"
 authors = ["飞花 - PetalDesk contributors"]
 edition = "2021"

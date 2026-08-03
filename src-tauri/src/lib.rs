@@ -26,8 +26,9 @@ use crate::timer::TimerStore;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
-use std::time::{Duration, SystemTime};
+use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::{LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 use tauri::menu::{Menu, MenuItem, Submenu};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
@@ -42,19 +43,29 @@ const OPEN_SCREENSHOT_MENU_ID: &str = "open-tool:screenshot";
 const ABOUT_MENU_ID: &str = "about";
 const MAX_TRAY_NOTE_TITLE_CHARS: usize = 80;
 const ACTIVATION_FALLBACK_DELAY: Duration = Duration::from_secs(2);
+/// Minimum spacing between two native tray menu rebuilds. Rebuilding hops to
+/// the UI thread once per menu item, so bursts of autosaves must not translate
+/// into bursts of synchronous main-thread round trips.
+const TRAY_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(2);
 static ACTIVATION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static ACTIVATION_GENERATION: AtomicU64 = AtomicU64::new(0);
 static INITIAL_ACTIVATION_SCHEDULED: AtomicBool = AtomicBool::new(false);
 
-#[derive(Default)]
-struct TrayRefreshState {
-    running: bool,
-    pending: bool,
-}
+/// Signature of everything the tray menu actually displays. Rebuilds are
+/// skipped when it is unchanged, so body-only autosaves cost nothing.
+static TRAY_MENU_SIGNATURE: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
-static TRAY_REFRESH_STATE: LazyLock<Mutex<TrayRefreshState>> =
-    LazyLock::new(|| Mutex::new(TrayRefreshState::default()));
+/// Tray refreshes run on one dedicated long-lived thread instead of Tauri's
+/// shared `spawn_blocking` pool: a refresh can block for a while on the UI
+/// thread, and starving that pool would also stall every note save.
+static TRAY_REFRESH_SENDER: OnceLock<SyncSender<()>> = OnceLock::new();
 
+/// Clears `ACTIVATION_IN_FLIGHT` on drop.
+///
+/// Construct this on the caller's side of `spawn_blocking` and move it into the
+/// closure. Built inside the closure instead, a task dropped before its body
+/// ever runs (a saturated blocking pool, or shutdown) would leak the flag as
+/// `true` and silently swallow every later activation.
 struct ActivationInFlightGuard;
 
 impl Drop for ActivationInFlightGuard {
@@ -245,8 +256,9 @@ fn spawn_show_last_note_or_main(app: &tauri::AppHandle) {
             show_main_window(&fallback_app);
         }
     });
+    let in_flight = ActivationInFlightGuard;
     tauri::async_runtime::spawn_blocking(move || {
-        let _in_flight = ActivationInFlightGuard;
+        let _in_flight = in_flight;
         trace_activation("activation:worker_start");
         show_last_note_or_main(&app);
         trace_activation("activation:worker_end");
@@ -275,8 +287,9 @@ fn spawn_show_first_note_or_main(app: &tauri::AppHandle) {
             show_main_window(&fallback_app);
         }
     });
+    let in_flight = ActivationInFlightGuard;
     tauri::async_runtime::spawn_blocking(move || {
-        let _in_flight = ActivationInFlightGuard;
+        let _in_flight = in_flight;
         trace_activation("activation_first:worker_start");
         show_first_note_or_main(&app);
         trace_activation("activation_first:worker_end");
@@ -331,12 +344,26 @@ fn spawn_tray_action(app: &tauri::AppHandle, action: models::TrayShortcutAction)
     }
 }
 
+/// Reads the configured action on a worker, then performs it.
+///
+/// This must never run on the event-loop thread. The Windows single-instance
+/// handshake delivers `WM_COPYDATA` synchronously on the primary's message
+/// pump, and the secondary's `SendMessageW` has no timeout: it only reaches
+/// `exit(0)` after the primary's callback returns. Blocking here — even on an
+/// uncontended-looking `RwLock` read, which parks behind any queued writer —
+/// stalls the pump, so relaunches pile up as live processes that never got as
+/// far as creating a tray icon, while every queued click goes undispatched.
 fn spawn_primary_activation_action(app: &tauri::AppHandle) {
-    let action = app
-        .state::<WorkspaceStore>()
-        .tray_shortcut_settings()
-        .double_click;
-    spawn_tray_action(app, action);
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        trace_activation("single_instance:worker_start");
+        let action = app
+            .state::<WorkspaceStore>()
+            .tray_shortcut_settings()
+            .double_click;
+        spawn_tray_action(&app, action);
+        trace_activation("single_instance:worker_end");
+    });
 }
 
 fn spawn_create_note(app: &tauri::AppHandle) {
@@ -355,10 +382,13 @@ fn spawn_create_note(app: &tauri::AppHandle) {
     });
 }
 
-fn build_tray_menu(app: &tauri::AppHandle) -> Result<Menu<tauri::Wry>, Box<dyn std::error::Error>> {
+fn build_tray_menu(
+    app: &tauri::AppHandle,
+    notes: Vec<models::NoteSummary>,
+    screenshot_shortcut: &str,
+) -> Result<Menu<tauri::Wry>, Box<dyn std::error::Error>> {
     let show = MenuItem::with_id(app, "show", "打开 飞花", true, None::<&str>)?;
     let note_list = Submenu::with_id(app, "note-list", "便签列表", true)?;
-    let notes = app.state::<WorkspaceStore>().list_notes()?;
     if notes.is_empty() {
         let empty = MenuItem::with_id(app, "no-notes", "暂无便签", false, None::<&str>)?;
         note_list.append(&empty)?;
@@ -380,10 +410,7 @@ fn build_tray_menu(app: &tauri::AppHandle) -> Result<Menu<tauri::Wry>, Box<dyn s
     let reminder = MenuItem::with_id(app, OPEN_REMINDER_MENU_ID, "提醒", true, None::<&str>)?;
     let gantt = MenuItem::with_id(app, OPEN_GANTT_MENU_ID, "任务甘特图", true, None::<&str>)?;
     let mfa = MenuItem::with_id(app, OPEN_MFA_MENU_ID, "MFA 验证器", true, None::<&str>)?;
-    let screenshot_label = format!(
-        "截图({})",
-        app.state::<ScreenshotStore>().settings().shortcut
-    );
+    let screenshot_label = format!("截图({screenshot_shortcut})");
     let screenshot = MenuItem::with_id(
         app,
         OPEN_SCREENSHOT_MENU_ID,
@@ -405,64 +432,103 @@ fn build_tray_menu(app: &tauri::AppHandle) -> Result<Menu<tauri::Wry>, Box<dyn s
     )?)
 }
 
+/// Requests a tray menu rebuild. Cheap and safe to call from event callbacks:
+/// the actual work happens on a dedicated thread, is throttled, and is skipped
+/// entirely when the rendered menu would be identical.
 pub(crate) fn refresh_tray_menu(app: &tauri::AppHandle) {
-    // Menu construction reads the workspace and synchronously hops to the UI
-    // thread for each native item, so never run it inside an event callback.
-    // Coalesce bursts (for example, several autosaves) into one refresh and a
-    // final follow-up pass instead of queuing unbounded UI work.
-    let should_spawn = {
-        let mut state = TRAY_REFRESH_STATE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.pending = true;
-        if state.running {
-            false
-        } else {
-            state.running = true;
-            true
-        }
-    };
-    if !should_spawn {
-        return;
-    }
-    let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || loop {
-        {
-            let mut state = TRAY_REFRESH_STATE
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.pending = false;
-        }
-        refresh_tray_menu_now(&app);
-        let continue_refresh = {
-            let mut state = TRAY_REFRESH_STATE
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state.pending {
-                true
-            } else {
-                state.running = false;
-                false
+    let sender = TRAY_REFRESH_SENDER.get_or_init(|| start_tray_refresh_worker(app.clone()));
+    // Capacity 1: a queued request already means "rebuild once more after the
+    // current pass", so dropping further requests loses no information.
+    let _ = sender.try_send(());
+}
+
+fn start_tray_refresh_worker(app: tauri::AppHandle) -> SyncSender<()> {
+    let (sender, receiver) = sync_channel::<()>(1);
+    let spawn_result = std::thread::Builder::new()
+        .name("petaldesk-tray-refresh".to_string())
+        .spawn(move || {
+            let mut last_refresh: Option<Instant> = None;
+            while receiver.recv().is_ok() {
+                // Space out consecutive rebuilds. Autosave bursts collapse into
+                // a single trailing refresh instead of one refresh per keystroke
+                // pause.
+                if let Some(elapsed) = last_refresh.map(|at| at.elapsed()) {
+                    if let Some(wait) = TRAY_REFRESH_MIN_INTERVAL.checked_sub(elapsed) {
+                        std::thread::sleep(wait);
+                    }
+                }
+                // Drain requests that arrived while throttling so they collapse
+                // into this single rebuild.
+                while receiver.try_recv().is_ok() {}
+                refresh_tray_menu_now(&app);
+                last_refresh = Some(Instant::now());
             }
-        };
-        if !continue_refresh {
-            break;
-        }
-    });
+        });
+    if let Err(error) = spawn_result {
+        eprintln!("无法启动托盘菜单刷新线程: {error}");
+    }
+    sender
+}
+
+/// Describes the visible tray menu so an unchanged menu can be left in place.
+/// Only what the menu renders belongs here: note order, note titles and the
+/// screenshot shortcut label.
+fn tray_menu_signature(notes: &[models::NoteSummary], screenshot_shortcut: &str) -> String {
+    let mut signature = String::with_capacity(notes.len() * 48);
+    signature.push_str(screenshot_shortcut);
+    for note in notes {
+        signature.push('\u{1f}');
+        signature.push_str(&note.id);
+        signature.push('\u{1e}');
+        signature.push_str(&tray_note_label(&note.title));
+    }
+    signature
 }
 
 fn refresh_tray_menu_now(app: &tauri::AppHandle) {
-    let Ok(menu) = build_tray_menu(app) else {
+    // Building the menu costs one synchronous UI-thread hop per item, plus one
+    // deferred main-thread drop per item of the outgoing menu. Skipping
+    // unchanged rebuilds keeps body-only autosaves off the UI thread entirely.
+    let Ok(notes) = app.state::<WorkspaceStore>().list_notes() else {
         return;
     };
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        let _ = tray.set_menu(Some(menu));
+    let shortcut = app.state::<ScreenshotStore>().settings().shortcut;
+    let signature = tray_menu_signature(&notes, &shortcut);
+    {
+        let current = TRAY_MENU_SIGNATURE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.as_deref() == Some(signature.as_str()) {
+            return;
+        }
     }
+    let Ok(menu) = build_tray_menu(app, notes, &shortcut) else {
+        return;
+    };
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    if tray.set_menu(Some(menu)).is_err() {
+        return;
+    }
+    // Record only after the menu is actually installed, so a failed rebuild is
+    // retried by the next request instead of being cached as current.
+    *TRAY_MENU_SIGNATURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(signature);
 }
 
 fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     screenshot::setup(app)?;
-    let menu = build_tray_menu(app.handle())?;
+    let notes = app.state::<WorkspaceStore>().list_notes()?;
+    let shortcut = app.state::<ScreenshotStore>().settings().shortcut;
+    // Seed the signature with what the initial menu renders so the first
+    // refresh request does not rebuild an identical menu.
+    *TRAY_MENU_SIGNATURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some(tray_menu_signature(&notes, &shortcut));
+    let menu = build_tray_menu(app.handle(), notes, &shortcut)?;
     let mut tray = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
         .show_menu_on_left_click(!cfg!(windows))
@@ -498,11 +564,16 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 ..
             } = event
             {
-                let app = tray.app_handle();
-                let settings = app.state::<WorkspaceStore>().tray_shortcut_settings();
-                if let Some(action) = current_tray_double_click_action(settings) {
-                    spawn_tray_action(app, action);
-                }
+                // Runs on the event-loop thread, so read the settings on a
+                // worker: blocking here stops the message pump and with it
+                // every tray click and single-instance handshake.
+                let app = tray.app_handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let settings = app.state::<WorkspaceStore>().tray_shortcut_settings();
+                    if let Some(action) = current_tray_double_click_action(settings) {
+                        spawn_tray_action(&app, action);
+                    }
+                });
             }
         });
     if let Some(icon) = app.default_window_icon() {
@@ -572,11 +643,10 @@ pub fn run() {
         MfaStore::load(&data_storage_path).expect("无法初始化飞花 - PetalDesk MFA 验证器");
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(
-            |app, _arguments, _cwd| {
-                trace_activation("single_instance:callback_start");
-                spawn_primary_activation_action(app);
-                trace_activation("single_instance:callback_end");
-            },
+            // Keep this body free of file I/O and locks: it runs synchronously
+            // on the message pump while the relaunched process waits inside
+            // SendMessageW. Tracing happens on the worker instead.
+            |app, _arguments, _cwd| spawn_primary_activation_action(app),
         ))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -857,6 +927,66 @@ mod tests {
             &generation,
             second
         ));
+    }
+
+    fn summary(id: &str, title: &str) -> models::NoteSummary {
+        models::NoteSummary {
+            id: id.to_string(),
+            title: title.to_string(),
+            excerpt: String::new(),
+            editor_mode: models::DEFAULT_EDITOR_MODE.to_string(),
+            color: "yellow".to_string(),
+            pinned: false,
+            read_only: false,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            schema_version: models::SCHEMA_VERSION,
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn tray_signature_ignores_changes_the_menu_does_not_render() {
+        let notes = vec![summary("a", "第一"), summary("b", "第二")];
+        let baseline = tray_menu_signature(&notes, "F1");
+
+        // A body-only autosave bumps revision and updated_at but renders the
+        // same menu, so it must not trigger a rebuild.
+        let mut edited = notes.clone();
+        edited[0].revision = 9;
+        edited[0].updated_at = "2026-08-04T10:00:00Z".to_string();
+        edited[0].excerpt = "新的正文".to_string();
+        edited[0].color = "blue".to_string();
+        assert_eq!(tray_menu_signature(&edited, "F1"), baseline);
+
+        // Anything the menu shows must change it.
+        let mut renamed = notes.clone();
+        renamed[0].title = "改名".to_string();
+        assert_ne!(tray_menu_signature(&renamed, "F1"), baseline);
+        assert_ne!(tray_menu_signature(&notes, "F2"), baseline);
+        assert_ne!(
+            tray_menu_signature(&[notes[1].clone(), notes[0].clone()], "F1"),
+            baseline
+        );
+        assert_ne!(tray_menu_signature(&notes[..1], "F1"), baseline);
+    }
+
+    #[test]
+    fn tray_signature_separates_adjacent_note_fields() {
+        // Without delimiters these two lists would collapse to the same string.
+        let left = vec![summary("a", "bc")];
+        let right = vec![summary("ab", "c")];
+        assert_ne!(
+            tray_menu_signature(&left, "F1"),
+            tray_menu_signature(&right, "F1")
+        );
+
+        let split = vec![summary("a", ""), summary("", "b")];
+        let joined = vec![summary("a", "b")];
+        assert_ne!(
+            tray_menu_signature(&split, "F1"),
+            tray_menu_signature(&joined, "F1")
+        );
     }
 
     #[test]
