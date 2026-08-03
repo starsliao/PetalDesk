@@ -1,5 +1,6 @@
 ﻿param(
-    [switch]$SkipAppBuild
+    [switch]$SkipAppBuild,
+    [switch]$RequireUpdaterSignature
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,6 +23,17 @@ $windowsConfigPath = Join-Path $tauriRoot "tauri.windows.conf.json"
 $storagePathHooks = Join-Path $tauriRoot "nsis\storage-path.nsh"
 $installerDisplayName = "飞花 - PetalDesk"
 $desktopShortcutName = "飞花"
+$updaterPrivateKey = [Environment]::GetEnvironmentVariable("TAURI_SIGNING_PRIVATE_KEY")
+$updaterPrivateKeyPassword = [Environment]::GetEnvironmentVariable("TAURI_SIGNING_PRIVATE_KEY_PASSWORD")
+
+if ([string]::IsNullOrWhiteSpace($updaterPrivateKey)) {
+    if (-not [string]::IsNullOrEmpty($updaterPrivateKeyPassword)) {
+        throw "已设置 TAURI_SIGNING_PRIVATE_KEY_PASSWORD，但缺少 TAURI_SIGNING_PRIVATE_KEY。"
+    }
+    if ($RequireUpdaterSignature) {
+        throw "发布构建缺少 TAURI_SIGNING_PRIVATE_KEY，无法生成 Windows 自动更新签名。"
+    }
+}
 
 function Invoke-CheckedCommand {
     param(
@@ -889,11 +901,36 @@ Invoke-CheckedCommand -Command $makensis -Arguments $makensisArguments -WorkingD
 $installerName = "{0}_{1}_x64-setup.exe" -f $config.productName, $config.version
 $bundleDir = Join-Path $releaseDir "bundle\nsis"
 $finalInstaller = Join-Path $bundleDir $installerName
+$finalInstallerSignature = "$finalInstaller.sig"
 New-Item -ItemType Directory -Path $bundleDir -Force | Out-Null
 Get-ChildItem -LiteralPath $bundleDir -Filter "PetalDesk_*_x64-setup.exe" -File |
+    Where-Object { $_.Name.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase) } |
     Where-Object { $_.FullName -ne $finalInstaller } |
     Remove-Item -Force
+Get-ChildItem -LiteralPath $bundleDir -Filter "PetalDesk_*_x64-setup.exe.sig" -File |
+    Remove-Item -Force
 Copy-Item -LiteralPath $nsisOutput -Destination $finalInstaller -Force
+
+# This installer is rebuilt by makensis after Tauri's bundle step, so any
+# signature produced before this point would describe the wrong bytes. Sign the
+# final customized NSIS executable only after it has been copied into bundle/.
+if ([string]::IsNullOrWhiteSpace($updaterPrivateKey)) {
+    Write-Warning "未设置 TAURI_SIGNING_PRIVATE_KEY；已生成仅供本地安装测试的未签名安装包。"
+}
+else {
+    Invoke-CheckedCommand -Command "pnpm.cmd" -Arguments @(
+        "tauri", "signer", "sign", $finalInstaller
+    ) -WorkingDirectory $projectRoot
+
+    if (-not (Test-Path -LiteralPath $finalInstallerSignature -PathType Leaf)) {
+        throw "Tauri signer 未生成最终安装包签名：$finalInstallerSignature"
+    }
+    $signatureText = [System.IO.File]::ReadAllText($finalInstallerSignature).Trim()
+    if ([string]::IsNullOrWhiteSpace($signatureText)) {
+        throw "最终安装包签名为空：$finalInstallerSignature"
+    }
+    Write-Host "自动更新签名已生成：$finalInstallerSignature"
+}
 
 $file = Get-Item -LiteralPath $finalInstaller
 $sha256 = [System.Security.Cryptography.SHA256]::Create()

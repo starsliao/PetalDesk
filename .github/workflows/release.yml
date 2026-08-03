@@ -40,6 +40,10 @@ jobs:
           }
           Write-Host "All release versions match $tag."
 
+      - name: Test updater manifest tooling
+        shell: pwsh
+        run: '& "./scripts/test-windows-updater-manifest.ps1"'
+
   windows:
     needs: validate
     runs-on: windows-latest
@@ -69,11 +73,18 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build Windows installer
+      - name: Build signed Windows installer
+        shell: pwsh
         env:
           PETALDESK_CHROME_EXTENSION_ID: ${{ secrets.PETALDESK_CHROME_EXTENSION_ID }}
           PETALDESK_EDGE_EXTENSION_ID: ${{ secrets.PETALDESK_EDGE_EXTENSION_ID }}
-        run: pnpm package:windows
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "scripts\build-windows-installer.ps1" -RequireUpdaterSignature
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows installer build failed with exit code $LASTEXITCODE."
+          }
 
       - name: Build Firefox extension package
         shell: pwsh
@@ -96,11 +107,18 @@ jobs:
         shell: pwsh
         run: |
           $assetsDirectory = New-Item -ItemType Directory -Path "release-assets" -Force
-          $installers = @(Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "PetalDesk_*_x64-setup.exe" -File)
+          $installers = @(Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "PetalDesk_*_x64-setup.exe" -File |
+            Where-Object { $_.Name.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase) })
           if ($installers.Count -ne 1) {
             throw "Expected one Windows installer, found $($installers.Count)."
           }
           Copy-Item -LiteralPath $installers[0].FullName -Destination $assetsDirectory.FullName
+
+          $updaterSignature = Get-Item -LiteralPath "$($installers[0].FullName).sig" -ErrorAction Stop
+          if ($updaterSignature.Length -eq 0) {
+            throw "Windows updater signature is empty: $($updaterSignature.FullName)"
+          }
+          Copy-Item -LiteralPath $updaterSignature.FullName -Destination $assetsDirectory.FullName
 
           $firefoxArchives = @(Get-ChildItem -Path "browser-extension/dist/artifacts" -Filter "PetalDesk_Firefox_AMO-upload_*.zip" -File)
           if ($firefoxArchives.Count -ne 1) {
@@ -223,6 +241,9 @@ jobs:
     needs: [windows, macos]
     runs-on: ubuntu-latest
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
       - name: Download release assets
         uses: actions/download-artifact@v4
         with:
@@ -230,7 +251,7 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Publish GitHub Release
+      - name: Prepare draft GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -239,13 +260,108 @@ jobs:
           set -euo pipefail
           tag="${{ github.ref_name }}"
           version="${tag#v}"
-          mapfile -t assets < <(find release-assets -maxdepth 1 -type f | sort)
-          if [[ "${#assets[@]}" -lt 3 ]]; then
-            echo "Expected Windows, macOS and Firefox release assets." >&2
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$tag" --json isDraft --jq '.isDraft')"
+            if [[ "$is_draft" != "true" ]]; then
+              echo "Release $tag is already published. Published releases are immutable; create a new version instead of replacing updater assets." >&2
+              exit 1
+            fi
+          else
+            gh release create "$tag" --verify-tag --draft --title "飞花 - PetalDesk $version" --generate-notes
+          fi
+
+          gh release view "$tag" --json body --jq '.body // ""' > release-notes.md
+
+      - name: Generate and validate Windows updater manifest
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.Substring(1)
+          $installers = @(Get-ChildItem -LiteralPath "release-assets" -Filter "PetalDesk_*_x64-setup.exe" -File |
+            Where-Object { $_.Name.EndsWith(".exe", [System.StringComparison]::OrdinalIgnoreCase) })
+          if ($installers.Count -ne 1) {
+            throw "Expected one Windows installer, found $($installers.Count)."
+          }
+          $signaturePath = "$($installers[0].FullName).sig"
+          if (-not (Test-Path -LiteralPath $signaturePath -PathType Leaf)) {
+            throw "Missing Windows updater signature: $signaturePath"
+          }
+
+          & "./scripts/New-WindowsUpdaterManifest.ps1" `
+            -Version $version `
+            -InstallerPath $installers[0].FullName `
+            -SignaturePath $signaturePath `
+            -Repository "${{ github.repository }}" `
+            -Tag $tag `
+            -NotesPath "release-notes.md" `
+            -OutputPath "release-assets/latest.json"
+
+          & "./scripts/Test-WindowsUpdaterManifest.ps1" `
+            -Version $version `
+            -ManifestPath "release-assets/latest.json" `
+            -InstallerPath $installers[0].FullName `
+            -SignaturePath $signaturePath `
+            -Repository "${{ github.repository }}" `
+            -Tag $tag
+
+      - name: Upload signed assets and publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          shopt -s nullglob
+
+          windows_installers=(release-assets/PetalDesk_*_x64-setup.exe)
+          windows_signatures=(release-assets/PetalDesk_*_x64-setup.exe.sig)
+          macos_images=(release-assets/PetalDesk_*_universal.dmg)
+          firefox_archives=(release-assets/PetalDesk_Firefox_AMO-upload_*.zip)
+          if [[ "${#windows_installers[@]}" -ne 1 || "${#windows_signatures[@]}" -ne 1 ]]; then
+            echo "Expected exactly one signed Windows updater payload." >&2
             exit 1
           fi
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "${assets[@]}" --clobber
-          else
-            gh release create "$tag" "${assets[@]}" --title "飞花 - PetalDesk $version" --generate-notes
+          if [[ "${#macos_images[@]}" -ne 1 || "${#firefox_archives[@]}" -ne 1 ]]; then
+            echo "Expected exactly one macOS DMG and one Firefox archive." >&2
+            exit 1
           fi
+          if [[ ! -s release-assets/latest.json ]]; then
+            echo "Missing Windows updater manifest: release-assets/latest.json" >&2
+            exit 1
+          fi
+
+          # Keep the release as a draft while uploading. Upload latest.json last,
+          # then publish once every payload and signature is already available.
+          mapfile -t payload_assets < <(find release-assets -maxdepth 1 -type f ! -name latest.json | sort)
+          gh release upload "$tag" "${payload_assets[@]}" --clobber
+          gh release upload "$tag" release-assets/latest.json --clobber
+          gh release edit "$tag" --draft=false --latest
+
+      - name: Verify public updater assets
+        shell: bash
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          version="${tag#v}"
+          installer_name="PetalDesk_${version}_x64-setup.exe"
+          latest_url="https://github.com/${GH_REPO}/releases/latest/download/latest.json"
+
+          curl --fail --silent --show-error --location --retry 12 --retry-delay 5 --retry-all-errors \
+            "$latest_url" --output remote-latest.json
+          jq -e --arg version "$version" \
+            '.version == $version and (.platforms | keys == ["windows-x86_64"])' \
+            remote-latest.json >/dev/null
+
+          expected_url="https://github.com/${GH_REPO}/releases/download/${tag}/${installer_name}"
+          jq -e --arg url "$expected_url" \
+            '.platforms["windows-x86_64"].url == $url and (.platforms["windows-x86_64"].signature | length > 0)' \
+            remote-latest.json >/dev/null
+
+          for asset in "$installer_name" "${installer_name}.sig" latest.json; do
+            curl --fail --silent --show-error --location --head --retry 12 --retry-delay 5 --retry-all-errors \
+              "https://github.com/${GH_REPO}/releases/download/${tag}/${asset}" >/dev/null
+          done
