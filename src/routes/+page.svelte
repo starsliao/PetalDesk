@@ -3,6 +3,7 @@
   import { AlertCircle, FolderOpen, LoaderCircle } from "@lucide/svelte";
   import "$lib/styles/app.css";
   import { NoteShell, NotesList, TrashView } from "$lib/components";
+  import AboutDialog from "$lib/components/AboutDialog.svelte";
   import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
   import ScreenshotSettingsDialog from "$lib/components/ScreenshotSettingsDialog.svelte";
   import LongCaptureControl from "$lib/screenshot/LongCaptureControl.svelte";
@@ -24,6 +25,11 @@
   import { extractLocalImagePaths, type EditorMode } from "$lib/editor";
   import { screenshotApi, type ScreenshotSettings } from "$lib/screenshot";
   import { parseToolName, type ToolName } from "$lib/tools";
+  import {
+    prepareCurrentWindowForUpdate,
+    updaterApi,
+    type UpdateInstallPreparation,
+  } from "$lib/updater";
 
   type NoteEditorComponent = typeof import("$lib/components/NoteEditor.svelte").default;
   type GanttToolComponent = typeof import("$lib/components/GanttTool.svelte").default;
@@ -120,6 +126,7 @@
   let pendingRestartPath = $state<string | null>(null);
   let restarting = $state(false);
   let settingsOpen = $state(false);
+  let aboutOpen = $state(false);
   let settingsBusy = $state(false);
   let settingsError = $state<string | null>(null);
   let screenshotShortcut = $state("F1");
@@ -295,6 +302,12 @@
           showToast(payload.message || `截图快捷键 ${shortcut} 注册失败，请在设置中重试`);
         }),
       );
+      desktopCleanups.push(
+        await listen("open_about_dialog", () => {
+          settingsOpen = false;
+          aboutOpen = true;
+        }),
+      );
 
       if (noteId) {
         const windowHandle = getCurrentWindow();
@@ -329,6 +342,46 @@
     // this is only a safety net for a missed event. Polling it every few seconds
     // duplicated that scan once per open window.
     externalPollTimer = setInterval(() => void pollExternalChanges(), 60_000);
+  }
+
+  async function registerUpdaterPreparation(): Promise<() => void> {
+    if (!updaterApi.isSupported()) return () => undefined;
+    const [{ listen }, { getCurrentWindow }] = await Promise.all([
+      import("@tauri-apps/api/event"),
+      import("@tauri-apps/api/window"),
+    ]);
+    const windowLabel = getCurrentWindow().label;
+    const unlisten = await listen<UpdateInstallPreparation>("updater_prepare_install", async ({ payload }) => {
+      let ok = true;
+      let error: string | undefined;
+      try {
+        await prepareCurrentWindowForUpdate();
+        if (!isToolWindow) {
+          await flushSave();
+          if (saveError) throw new Error(saveError);
+          await notesApi.saveWindowState();
+        }
+      } catch (reason) {
+        ok = false;
+        error = errorMessage(reason);
+      }
+      try {
+        await updaterApi.acknowledgeInstall(payload.requestId, windowLabel, ok, error);
+      } catch {
+        // The backend may have cancelled or timed out while this window saved.
+      }
+    });
+    try {
+      await updaterApi.registerInstallWindow();
+    } catch (error) {
+      unlisten();
+      throw error;
+    }
+    return () => {
+      // Keep the listener alive until the backend no longer includes this window
+      // in an installation preparation snapshot.
+      void updaterApi.unregisterInstallWindow().finally(unlisten);
+    };
   }
 
   function isEditorMode(value: unknown): value is EditorMode {
@@ -795,10 +848,18 @@
   }
 
   onMount(() => {
+    let disposed = false;
+    let updaterCleanup: (() => void) | undefined;
+    void registerUpdaterPreparation()
+      .then((cleanup) => {
+        if (disposed) cleanup();
+        else updaterCleanup = cleanup;
+      })
+      .catch(() => undefined);
+
     if (isToolWindow) {
       const timerPage = toolName === "timer";
       const transparentPage = timerPage || longCaptureOutlineId !== null;
-      let disposed = false;
       document.documentElement.classList.toggle("timer-tool-page", timerPage);
       document.body.classList.toggle("timer-tool-page", timerPage);
       document.documentElement.classList.toggle("transparent-tool-page", transparentPage);
@@ -822,6 +883,7 @@
       }
       return () => {
         disposed = true;
+        updaterCleanup?.();
         document.documentElement.classList.remove("timer-tool-page");
         document.body.classList.remove("timer-tool-page");
         document.documentElement.classList.remove("transparent-tool-page");
@@ -843,6 +905,8 @@
     window.addEventListener("beforeunload", beforeUnload);
     document.addEventListener("visibilitychange", visibilityChange);
     return () => {
+      disposed = true;
+      updaterCleanup?.();
       if (saveTimer) clearTimeout(saveTimer);
       if (searchTimer) clearTimeout(searchTimer);
       if (toastTimer) clearTimeout(toastTimer);
@@ -1051,9 +1115,21 @@
     onsave={saveSettings}
     oneditormodechange={(mode) => void changeDefaultEditorMode(mode)}
     ondatastoragechange={() => void chooseDataStoragePath()}
+    onaboutopen={() => {
+      if (settingsBusy) return;
+      settingsOpen = false;
+      aboutOpen = true;
+    }}
     oncancel={() => {
       if (!settingsBusy) settingsOpen = false;
     }}
+  />
+{/if}
+
+{#if !isToolWindow && aboutOpen}
+  <AboutDialog
+    currentVersion={appInfo?.version ?? ""}
+    onclose={() => (aboutOpen = false)}
   />
 {/if}
 

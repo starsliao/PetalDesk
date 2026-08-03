@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { List, Pause, Play, RotateCcw, Trash2, X } from "@lucide/svelte";
   import { notesApi } from "../bridge";
+  import { addUpdateInstallPreparation } from "../updater";
   import {
     DEFAULT_TIMER_DIGIT_OPACITY,
     MAX_TIMER_DIGIT_OPACITY,
@@ -34,6 +35,7 @@
   let closeRecorded = false;
   let desktopPersistence = false;
   let persistenceQueue: Promise<void> = Promise.resolve();
+  let lastPersistenceError: unknown = null;
 
   const COLLAPSED_MAX_WIDTH = 320;
   const COLLAPSED_MAX_HEIGHT = 194;
@@ -120,19 +122,21 @@
       : store?.persistedState() ?? null;
     if (!state) return;
     const data: TimerData = { ...state, digitOpacity };
-    persistenceQueue = persistenceQueue
-      .then(async () => {
+    persistenceQueue = persistenceQueue.then(async () => {
+      try {
         await notesApi.saveTimerData(data);
-      })
-      .catch(() => undefined);
+        lastPersistenceError = null;
+      } catch (error) {
+        // Keep later saves flowing, but retain the failure so an application
+        // update cannot exit the process while the newest state is only in memory.
+        lastPersistenceError = error;
+      }
+    });
   }
 
-  async function flushTimerPersistence(): Promise<void> {
-    try {
-      await persistenceQueue;
-    } catch {
-      // A transient persistence failure must not trap an otherwise closable tool window.
-    }
+  async function flushTimerPersistence(requireSuccess = false): Promise<void> {
+    await persistenceQueue;
+    if (requireSuccess && lastPersistenceError) throw lastPersistenceError;
   }
 
   function createDesktopTimerStorage(data: TimerData): TimerStorage {
@@ -297,9 +301,11 @@
     };
     window.addEventListener("beforeunload", handleBeforeUnload);
     document.addEventListener("visibilitychange", handleVisibilityChange);
+    const removeUpdatePreparation = addUpdateInstallPreparation(() => flushTimerPersistence(true));
 
     return () => {
       disposed = true;
+      removeUpdatePreparation();
       window.removeEventListener("beforeunload", handleBeforeUnload);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       document.documentElement.classList.remove("timer-tool-window");

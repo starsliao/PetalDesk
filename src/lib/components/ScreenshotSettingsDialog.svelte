@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { FileText, FolderOpen, Keyboard, RotateCcw, X } from "@lucide/svelte";
+  import { FileText, FolderOpen, Info, Keyboard, RotateCcw, X } from "@lucide/svelte";
   import {
     DEFAULT_TRAY_SHORTCUT_SETTINGS,
     type TrayShortcutAction,
@@ -24,6 +24,7 @@
     oncancel?: () => void;
     oneditormodechange?: (mode: EditorMode) => void | Promise<void>;
     ondatastoragechange?: () => void | Promise<void>;
+    onaboutopen?: () => void;
   }
 
   let {
@@ -39,6 +40,7 @@
     oncancel,
     oneditormodechange,
     ondatastoragechange,
+    onaboutopen,
   }: Props = $props();
 
   let draft = $state("F1");
@@ -280,6 +282,25 @@
             恢复默认 F1
           </button>
         </section>
+
+        <section class="settings-section" aria-labelledby="about-settings-title">
+          <h3 id="about-settings-title">关于</h3>
+          <div class="setting-row about-row">
+            <div class="setting-copy">
+              <strong>关于与更新</strong>
+              <span>查看当前版本、自动更新设置和更新进度</span>
+            </div>
+            <button
+              type="button"
+              class="open-about-button"
+              disabled={submitting}
+              onclick={onaboutopen}
+            >
+              <Info size={15} aria-hidden="true" />
+              打开关于与更新
+            </button>
+          </div>
+        </section>
       </div>
 
       {#if error}
@@ -335,7 +356,8 @@
   .storage-path,
   .mode-selector,
   .shortcut-recorder,
-  .reset-button {
+  .reset-button,
+  .open-about-button {
     display: flex;
     align-items: center;
   }
@@ -539,7 +561,8 @@
   }
 
   .change-path-button:hover:not(:disabled),
-  .mode-selector button:hover:not(:disabled):not(.active) {
+  .mode-selector button:hover:not(:disabled):not(.active),
+  .open-about-button:hover:not(:disabled) {
     background: var(--app-surface-hover);
   }
 
@@ -585,6 +608,20 @@
 
   .reset-button:disabled {
     opacity: 0.48;
+  }
+
+  .open-about-button {
+    min-height: 34px;
+    padding: 5px 10px;
+    flex: 0 0 auto;
+    justify-content: center;
+    gap: 6px;
+    color: var(--app-accent);
+    font-size: 12px;
+    font-weight: 650;
+    background: #fff;
+    border: 1px solid var(--app-border-strong);
+    border-radius: 4px;
   }
 
   .error {
@@ -639,7 +676,8 @@
 
     .mode-selector,
     .shortcut-recorder,
-    .change-path-button {
+    .change-path-button,
+    .open-about-button {
       width: 100%;
     }
 

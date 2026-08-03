@@ -24,7 +24,7 @@ const BACKUP_LIMIT: usize = 5;
 /// charge it at most once per interval per note.
 const BACKUP_MIN_INTERVAL: Duration = Duration::from_secs(180);
 const EXTERNAL_FULL_HASH_INTERVAL: Duration = Duration::from_secs(60);
-const DATA_CONFIG_SCHEMA_VERSION: u32 = 2;
+const DATA_CONFIG_SCHEMA_VERSION: u32 = 3;
 const NOTE_ORDER_SCHEMA_VERSION: u32 = 1;
 const STORAGE_POINTER_FILE: &str = "storage-path.txt";
 pub(crate) const INTERNAL_DATA_DIR: &str = ".petaldesk";
@@ -44,6 +44,8 @@ struct DataStorageConfig {
     default_editor_mode: String,
     #[serde(default)]
     tray_shortcuts: TrayShortcutSettings,
+    #[serde(default = "default_auto_update")]
+    auto_update: bool,
 }
 
 impl Default for DataStorageConfig {
@@ -52,12 +54,17 @@ impl Default for DataStorageConfig {
             schema_version: DATA_CONFIG_SCHEMA_VERSION,
             default_editor_mode: DEFAULT_EDITOR_MODE.to_string(),
             tray_shortcuts: TrayShortcutSettings::default(),
+            auto_update: default_auto_update(),
         }
     }
 }
 
 fn data_config_schema_version() -> u32 {
     DATA_CONFIG_SCHEMA_VERSION
+}
+
+fn default_auto_update() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +124,7 @@ pub struct WorkspaceStore {
     workspace: RwLock<PathBuf>,
     default_editor_mode: RwLock<String>,
     tray_shortcuts: RwLock<TrayShortcutSettings>,
+    auto_update: RwLock<bool>,
     app_data: PathBuf,
     startup_recovery: RwLock<Vec<RecoveredDraft>>,
     mutation_lock: Mutex<()>,
@@ -167,6 +175,7 @@ impl WorkspaceStore {
             workspace: RwLock::new(workspace),
             default_editor_mode: RwLock::new(data_config.default_editor_mode),
             tray_shortcuts: RwLock::new(data_config.tray_shortcuts),
+            auto_update: RwLock::new(data_config.auto_update),
             app_data,
             startup_recovery: RwLock::new(Vec::new()),
             mutation_lock: Mutex::new(()),
@@ -194,6 +203,7 @@ impl WorkspaceStore {
             workspace: RwLock::new(prepare_workspace(workspace)?),
             default_editor_mode: RwLock::new(DEFAULT_EDITOR_MODE.to_string()),
             tray_shortcuts: RwLock::new(TrayShortcutSettings::default()),
+            auto_update: RwLock::new(default_auto_update()),
             app_data: app_data.to_path_buf(),
             startup_recovery: RwLock::new(Vec::new()),
             mutation_lock: Mutex::new(()),
@@ -272,6 +282,35 @@ impl WorkspaceStore {
         Ok(settings)
     }
 
+    pub fn auto_update_enabled(&self) -> bool {
+        *self
+            .auto_update
+            .read()
+            .expect("auto update settings lock poisoned")
+    }
+
+    pub fn set_auto_update_enabled(&self, enabled: bool) -> AppResult<bool> {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .expect("workspace mutation lock poisoned");
+        let previous = {
+            let mut stored = self
+                .auto_update
+                .write()
+                .expect("auto update settings lock poisoned");
+            std::mem::replace(&mut *stored, enabled)
+        };
+        if let Err(error) = self.save_data_storage_config() {
+            *self
+                .auto_update
+                .write()
+                .expect("auto update settings lock poisoned") = previous;
+            return Err(error);
+        }
+        Ok(enabled)
+    }
+
     pub fn startup_recovery(&self) -> Vec<RecoveredDraft> {
         self.startup_recovery
             .read()
@@ -296,6 +335,7 @@ impl WorkspaceStore {
                     schema_version: DATA_CONFIG_SCHEMA_VERSION,
                     default_editor_mode: self.default_editor_mode(),
                     tray_shortcuts: self.tray_shortcut_settings(),
+                    auto_update: self.auto_update_enabled(),
                 },
             )?;
         }
@@ -1472,6 +1512,7 @@ impl WorkspaceStore {
                 schema_version: DATA_CONFIG_SCHEMA_VERSION,
                 default_editor_mode: self.default_editor_mode(),
                 tray_shortcuts: self.tray_shortcut_settings(),
+                auto_update: self.auto_update_enabled(),
             },
         )
     }
@@ -2155,6 +2196,7 @@ fn migrate_legacy_storage(
                 schema_version: DATA_CONFIG_SCHEMA_VERSION,
                 default_editor_mode,
                 tray_shortcuts: TrayShortcutSettings::default(),
+                auto_update: default_auto_update(),
             },
         )?;
     }
@@ -4221,6 +4263,21 @@ mod tests {
     }
 
     #[test]
+    fn automatic_updates_default_on_and_persist_in_the_data_directory() {
+        let (_root, store) = store();
+
+        assert!(store.auto_update_enabled());
+        assert!(!store.set_auto_update_enabled(false).unwrap());
+        assert!(!store.auto_update_enabled());
+
+        let config =
+            read_json::<DataStorageConfig>(&data_storage_config_path(&store.workspace_path()))
+                .unwrap();
+        assert_eq!(config.schema_version, DATA_CONFIG_SCHEMA_VERSION);
+        assert!(!config.auto_update);
+    }
+
+    #[test]
     fn old_data_config_receives_default_tray_shortcuts() {
         let root = TempDir::new().unwrap();
         let workspace = prepare_workspace(root.path()).unwrap();
@@ -4234,6 +4291,7 @@ mod tests {
         assert_eq!(config.schema_version, DATA_CONFIG_SCHEMA_VERSION);
         assert_eq!(config.default_editor_mode, "plain");
         assert_eq!(config.tray_shortcuts, TrayShortcutSettings::default());
+        assert!(config.auto_update);
     }
 
     #[test]

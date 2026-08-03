@@ -6,17 +6,19 @@
 
 <https://starsliao.github.io/PetalDesk/>
 
-## 0.5.1 平台范围
+## 0.5.2 平台范围
 
-Windows 10/11 x64 与 macOS 12+ 共享便签、甘特图、计时器、提醒、系统通知、MFA 和普通截图能力。`0.5.1` 增加便签窗口内的便签列表切换入口，并允许 Markdown 与受控 HTML 图片加载经过安全过滤、采用 `no-referrer` 策略的 HTTP/HTTPS 外链。Windows 继续提供长截图、自动滚动、Chrome / Edge / Firefox 浏览器增强和 Native Messaging Host。macOS 使用 Keychain 提供 MFA 本机免密解锁，并支持普通区域截图，但当前不提供长截图、浏览器联动或 Native Messaging 注册。
+Windows 10/11 x64 与 macOS 12+ 共享便签、甘特图、计时器、提醒、系统通知、MFA 和普通截图能力。`0.5.2` 是 Windows 自动更新桥接版本，新增 Tauri 签名更新包、后台检查与下载、关于页面手动检查及默认开启的自动更新选项。Windows 继续提供长截图、自动滚动、Chrome / Edge / Firefox 浏览器增强和 Native Messaging Host。macOS 使用 Keychain 提供 MFA 本机免密解锁，并支持普通区域截图，但当前不提供长截图、浏览器联动、Native Messaging 注册或自动更新。
 
 macOS Release 是一个 Universal DMG，内部同时包含 `x86_64-apple-darwin` 与 `aarch64-apple-darwin`，所以 Intel 和 Apple Silicon 不需要两个安装包。当前发布资产为：
 
-- `PetalDesk_0.5.1_x64-setup.exe`
-- `PetalDesk_0.5.1_universal.dmg`
-- `PetalDesk_Firefox_AMO-upload_0.5.1.zip`
+- `PetalDesk_0.5.2_x64-setup.exe`
+- `PetalDesk_0.5.2_x64-setup.exe.sig`
+- `latest.json`
+- `PetalDesk_0.5.2_universal.dmg`
+- `PetalDesk_Firefox_AMO-upload_0.5.2.zip`
 
-Windows 上的 `0.5.1` 可以直接覆盖旧版本。macOS 的 `0.5.0` 是首个公开版本，`0.5.1` 可以直接覆盖升级。保险库继续兼容已有 DPAPI 包装；迁移到 macOS 后输入一次恢复密码即可创建 Keychain 本机保护，且不会丢弃 Windows DPAPI 元数据。反向迁移时同样只重绑当前平台保护。
+Windows 上的 `0.5.2` 可以直接覆盖旧版本；现有用户手动安装这一次后，后续 Windows 版本可通过客户端自动更新。macOS 的 `0.5.0` 是首个公开版本，`0.5.2` 可以直接覆盖升级。保险库继续兼容已有 DPAPI 包装；迁移到 macOS 后输入一次恢复密码即可创建 Keychain 本机保护，且不会丢弃 Windows DPAPI 元数据。反向迁移时同样只重绑当前平台保护。
 
 ## 本地构建
 
@@ -85,4 +87,4 @@ npm --prefix browser-extension run package:firefox
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.5.1>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.5.2>

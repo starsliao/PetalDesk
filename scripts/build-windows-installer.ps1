@@ -918,8 +918,14 @@ if ([string]::IsNullOrWhiteSpace($updaterPrivateKey)) {
     Write-Warning "未设置 TAURI_SIGNING_PRIVATE_KEY；已生成仅供本地安装测试的未签名安装包。"
 }
 else {
+    # The Tauri CLI prompts on stdin when --password is omitted, even for an
+    # unencrypted updater key. Always pass the value explicitly so CI and local
+    # non-interactive release builds cannot hang at the signing step. Use the
+    # `--password=value` form because Windows PowerShell rejects an empty string
+    # inside a mandatory string-array parameter before invoking the command.
+    $signerPassword = if ($null -eq $updaterPrivateKeyPassword) { "" } else { $updaterPrivateKeyPassword }
     Invoke-CheckedCommand -Command "pnpm.cmd" -Arguments @(
-        "tauri", "signer", "sign", $finalInstaller
+        "tauri", "signer", "sign", "--password=$signerPassword", $finalInstaller
     ) -WorkingDirectory $projectRoot
 
     if (-not (Test-Path -LiteralPath $finalInstallerSignature -PathType Leaf)) {

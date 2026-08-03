@@ -43,7 +43,23 @@ describe("ScreenshotSettingsDialog", () => {
     expect(rendered.getByRole("heading", { name: "飞花 - PetalDesk 数据存储" })).toBeInTheDocument();
     expect(rendered.getByRole("heading", { name: "托盘双击动作" })).toBeInTheDocument();
     expect(rendered.getByRole("heading", { name: "截图" })).toBeInTheDocument();
+    expect(rendered.getByRole("heading", { name: "关于" })).toBeInTheDocument();
     expect(rendered.getByText("C:\\Users\\tester\\Documents\\PetalDesk")).toBeInTheDocument();
+  });
+
+  it("opens the independent about and update dialog without saving other settings", async () => {
+    const onsave = vi.fn();
+    const onaboutopen = vi.fn();
+    const rendered = render(ScreenshotSettingsDialog, {
+      open: true,
+      onsave,
+      onaboutopen,
+    });
+
+    await fireEvent.click(rendered.getByRole("button", { name: "打开关于与更新" }));
+
+    expect(onaboutopen).toHaveBeenCalledOnce();
+    expect(onsave).not.toHaveBeenCalled();
   });
 
   it("configures every tray double-click modifier and saves it with the screenshot shortcut", async () => {

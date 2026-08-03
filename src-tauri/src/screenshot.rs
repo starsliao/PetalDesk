@@ -850,6 +850,13 @@ fn cancel_screenshot_capture_inner(app: &AppHandle, session_id: Option<&str>) ->
     cancel_screenshot_capture_locked(app, &store, session_id)
 }
 
+/// Stops any active screenshot session before an application update or exit.
+/// The operation is intentionally idempotent so callers can use it during
+/// shutdown even when the capture window has already disappeared.
+pub(crate) fn shutdown(app: &AppHandle) {
+    let _ = cancel_screenshot_capture_inner(app, None);
+}
+
 /// Cancels the active screenshot while the caller owns `ScreenshotStore::lock_start()`.
 fn cancel_screenshot_capture_locked(
     app: &AppHandle,

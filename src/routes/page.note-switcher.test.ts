@@ -21,7 +21,7 @@ describe("independent note window switcher", () => {
     const createdAt = "2026-08-03T08:00:00.000Z";
     vi.spyOn(notesApi, "appInfo").mockResolvedValue({
       workspacePath: "E:/notes",
-      version: "0.5.1",
+      version: "0.5.2",
       defaultEditorMode: "typora",
       trayShortcutSettings: {
         doubleClick: "firstNote",

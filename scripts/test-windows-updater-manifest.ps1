@@ -53,13 +53,13 @@ try {
             -Repository $repository
     }
     catch {
-        $rejectedUnexpectedPlatform = $_.Exception.Message.Contains("只能发布 windows-x86_64")
+        $rejectedUnexpectedPlatform = $_.Exception.Message.Contains("only publish windows-x86_64")
     }
     if (-not $rejectedUnexpectedPlatform) {
-        throw "清单校验器未拒绝意外加入的 macOS 更新平台。"
+        throw "The manifest validator did not reject an unexpected macOS update platform."
     }
 
-    Write-Host "Windows 自动更新清单脚本测试通过。"
+    Write-Host "Windows updater manifest script tests passed."
 }
 finally {
     if (Test-Path -LiteralPath $temporaryRoot) {

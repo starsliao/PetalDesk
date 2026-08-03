@@ -12,6 +12,7 @@ mod reminders;
 mod screenshot;
 mod storage;
 mod timer;
+mod updater;
 #[cfg(windows)]
 mod window_activation;
 
@@ -171,64 +172,6 @@ fn current_tray_double_click_action(
 ) -> Option<models::TrayShortcutAction> {
     tray_action_for_modifiers(settings, false, false, false)
 }
-
-fn about_message(last_updated: Option<SystemTime>) -> String {
-    let last_updated = last_updated
-        .map(chrono::DateTime::<chrono::Local>::from)
-        .map(|value| value.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| "未知".to_string());
-    format!(
-        "名称：飞花 - PetalDesk\r\n版本：{}\r\n最后更新时间：{last_updated}",
-        env!("CARGO_PKG_VERSION")
-    )
-}
-
-#[cfg(target_os = "windows")]
-fn show_about_dialog() {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND,
-    };
-
-    let last_updated = std::env::current_exe()
-        .ok()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .and_then(|metadata| metadata.modified().ok());
-    let message = about_message(last_updated);
-    let message = message
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let title = "关于飞花 - PetalDesk"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-
-    unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            message.as_ptr(),
-            title.as_ptr(),
-            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
-        );
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn show_about_dialog() {
-    let last_updated = std::env::current_exe()
-        .ok()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .and_then(|metadata| metadata.modified().ok());
-    let _ = rfd::MessageDialog::new()
-        .set_title("关于飞花 - PetalDesk")
-        .set_description(about_message(last_updated).replace("\r\n", "\n"))
-        .set_level(rfd::MessageLevel::Info)
-        .set_buttons(rfd::MessageButtons::Ok)
-        .show();
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn show_about_dialog() {}
 
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -527,7 +470,10 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_main_window(app),
             "new-note" => spawn_create_note(app),
-            ABOUT_MENU_ID => show_about_dialog(),
+            ABOUT_MENU_ID => {
+                show_main_window(app);
+                let _ = app.emit_to("main", "open_about_dialog", ());
+            }
             "quit" => {
                 let app = app.clone();
                 tauri::async_runtime::spawn_blocking(move || {
@@ -604,6 +550,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     reminders::start_scheduler(app.handle().clone());
+    updater::start_scheduler(app.handle().clone());
     Ok(())
 }
 
@@ -623,7 +570,7 @@ pub fn run() {
         .expect("无法初始化飞花 - PetalDesk 长截图工具");
     let mfa_store =
         MfaStore::load(&data_storage_path).expect("无法初始化飞花 - PetalDesk MFA 验证器");
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(
             |app, _arguments, _cwd| {
                 trace_activation("single_instance:callback_start");
@@ -642,6 +589,10 @@ pub fn run() {
         .manage(screenshot_store)
         .manage(long_screenshot_store)
         .manage(mfa_store)
+        .manage(updater::UpdaterManager::default());
+    #[cfg(windows)]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    let app = builder
         .on_page_load(|webview, payload| {
             if webview.label() == "main"
                 && payload.event() == tauri::webview::PageLoadEvent::Finished
@@ -760,6 +711,16 @@ pub fn run() {
             commands::open_tool_window,
             commands::close_note_window,
             commands::save_window_state,
+            updater::get_update_settings,
+            updater::set_update_settings,
+            updater::get_update_state,
+            updater::check_for_updates,
+            updater::download_update,
+            updater::postpone_update,
+            updater::register_update_install_window,
+            updater::unregister_update_install_window,
+            updater::acknowledge_update_install,
+            updater::install_update_and_restart,
             reminders::list_reminders,
             reminders::upsert_reminder,
             reminders::delete_reminder,
@@ -976,13 +937,5 @@ mod tests {
             Some(models::TrayShortcutAction::MainWindow)
         );
         assert_eq!(tray_action_for_modifiers(settings, true, true, false), None);
-    }
-
-    #[test]
-    fn about_message_contains_product_version_and_time_fallback() {
-        let message = about_message(None);
-        assert!(message.contains("名称：飞花 - PetalDesk"));
-        assert!(message.contains(&format!("版本：{}", env!("CARGO_PKG_VERSION"))));
-        assert!(message.contains("最后更新时间：未知"));
     }
 }

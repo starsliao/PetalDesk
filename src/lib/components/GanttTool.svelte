@@ -28,6 +28,7 @@
     type GanttTask,
     type UpsertGanttTaskRequest,
   } from "../gantt";
+  import { addUpdateInstallPreparation } from "../updater";
 
   interface Props {
     api?: GanttApi;
@@ -1110,8 +1111,13 @@
 
     const handleBeforeUnload = () => void flushAll();
     window.addEventListener("beforeunload", handleBeforeUnload);
+    const removeUpdatePreparation = addUpdateInstallPreparation(async () => {
+      await flushAll();
+      if (error) throw new Error(error);
+    });
     return () => {
       disposed = true;
+      removeUpdatePreparation();
       unlisten?.();
       window.removeEventListener("petaldesk:gantt-changed", handleChanged);
       window.removeEventListener("beforeunload", handleBeforeUnload);
