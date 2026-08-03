@@ -107,6 +107,8 @@
   let noteId = $state<string | null>(null);
   let mainView = $state<MainView>("notes");
   let notes = $state<NoteListItem[]>([]);
+  let noteSwitcherNotes = $state<NoteListItem[]>([]);
+  let noteSwitcherLoading = $state(false);
   let trash = $state<TrashItem[]>([]);
   let listLoading = $state(false);
   let reorderingNotes = $state(false);
@@ -205,6 +207,18 @@
       trash = deleted;
     } finally {
       listLoading = false;
+    }
+  }
+
+  async function refreshNoteSwitcher(): Promise<void> {
+    if (!noteId || noteSwitcherLoading) return;
+    noteSwitcherLoading = true;
+    try {
+      noteSwitcherNotes = await notesApi.listNotes();
+    } catch (error) {
+      showToast(errorMessage(error));
+    } finally {
+      noteSwitcherLoading = false;
     }
   }
 
@@ -960,6 +974,9 @@
       pinned={activeNote.meta.pinned}
       editorMode={noteEditorMode}
       {screenshotShortcut}
+      notes={noteSwitcherNotes}
+      currentNoteId={activeNote.id}
+      notesLoading={noteSwitcherLoading}
       readonly={activeNote.meta.readOnly}
       {saving}
       {saveError}
@@ -970,6 +987,8 @@
       onreadonlychange={setReadOnly}
       ontogglepin={setPinned}
       ontoolopen={openTool}
+      onnotesopen={refreshNoteSwitcher}
+      onnoteopen={openNote}
       ondelete={requestDeleteActiveNote}
       onclose={() => void closeCurrentWindow()}
     >

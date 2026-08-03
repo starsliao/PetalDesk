@@ -804,7 +804,7 @@ fn long_capture_capability(bridge: Option<&BrowserBridge>) -> LongCaptureCapabil
 
 #[cfg(target_os = "macos")]
 fn long_capture_unsupported_reason() -> &'static str {
-    "macOS 0.5.0 基础版暂不提供长截图；普通截图可以正常使用"
+    "macOS 当前版本暂不提供长截图；普通截图可以正常使用"
 }
 
 #[cfg(not(target_os = "macos"))]

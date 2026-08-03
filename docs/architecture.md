@@ -30,7 +30,7 @@ PetalDesk 面向读取频繁、写入较少的桌面使用场景，不为第三�
 
 便签、甘特图、计时器、提醒和系统通知在 Windows 与 macOS 共享同一业务层。普通截图也同时支持两个平台：Windows 使用现有 Win32 捕获链路，macOS 使用系统屏幕捕获并依赖“屏幕录制”权限；编辑、复制、保存和贴图沿用共享流程。
 
-Windows 继续保留长截图、自动滚动、浏览器扩展和 Native Messaging Host。macOS 0.5.0 不打包或注册 Native Messaging Host，也不提供长截图和浏览器联动，能力查询会让前端隐藏或禁用相应入口。平台代码通过 Rust 条件编译和独立 Tauri 配置隔离，macOS DMG 的加入不会改变 Windows NSIS、DPAPI、Win32 截图与浏览器增强链路。
+Windows 继续保留长截图、自动滚动、浏览器扩展和 Native Messaging Host。macOS 当前版本不打包或注册 Native Messaging Host，也不提供长截图和浏览器联动，能力查询会让前端隐藏或禁用相应入口。平台代码通过 Rust 条件编译和独立 Tauri 配置隔离，macOS DMG 的加入不会改变 Windows NSIS、DPAPI、Win32 截图与浏览器增强链路。
 
 macOS Release 使用 `universal-apple-darwin` 目标，把 `x86_64-apple-darwin` 与 `aarch64-apple-darwin` 合并为一个 Universal 应用和 DMG。Intel 与 Apple Silicon 用户下载同一个文件即可。
 

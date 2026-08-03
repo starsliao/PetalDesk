@@ -50,6 +50,26 @@ describe("renderMarkdown", () => {
     expect(mapped).toContain('<img src="data:image/png;base64,aGVsbG8="');
   });
 
+  it("renders HTTP and HTTPS Markdown images without allowing unsafe protocols", () => {
+    const html = renderMarkdown([
+      "![HTTP 图片](http://example.com/image.png)",
+      "![安全图片](https://example.com/image.png)",
+      "![危险图片](javascript:alert(1))",
+      "![本地文件](file:///C:/secret.png)",
+      "![协议相对地址](//example.com/image.png)",
+    ].join("\n\n"));
+    const document = new DOMParser().parseFromString(html, "text/html");
+    const images = document.querySelectorAll<HTMLImageElement>("img");
+
+    expect(images).toHaveLength(2);
+    expect(images[0]?.getAttribute("src")).toBe("http://example.com/image.png");
+    expect(images[1]?.getAttribute("src")).toBe("https://example.com/image.png");
+    expect(Array.from(images).every((image) => image.getAttribute("referrerpolicy") === "no-referrer")).toBe(true);
+    expect(html).not.toContain('src="javascript:');
+    expect(html).not.toContain('src="file:');
+    expect(html).not.toContain('src="//example.com');
+  });
+
   it("rejects file URLs supplied in an asset mapping", () => {
     const html = renderMarkdown("![截图](assets/example.png)", {
       assetUrls: { "assets/example.png": "file:///C:/secret.png" },
@@ -117,7 +137,7 @@ describe("renderMarkdown", () => {
     expect(images[1]?.getAttribute("loading")).toBe("lazy");
   });
 
-  it("keeps HTML images on the existing local asset boundary", () => {
+  it("renders safe local and remote HTML images while rejecting unsafe sources", () => {
     const html = renderMarkdown([
       '<img src="assets/example.png" alt="安全图片" width="500" onerror="alert(1)" style="position:fixed">',
       '<img src="https://example.com/tracker.png" alt="远程图片">',
@@ -128,14 +148,14 @@ describe("renderMarkdown", () => {
     const document = new DOMParser().parseFromString(html, "text/html");
     const image = document.querySelector<HTMLImageElement>("img");
 
-    expect(document.querySelectorAll("img")).toHaveLength(1);
+    expect(document.querySelectorAll("img")).toHaveLength(2);
     expect(image?.getAttribute("alt")).toBe("安全图片");
     expect(image?.getAttribute("width")).toBe("500");
     expect(image?.hasAttribute("onerror")).toBe(false);
     expect(image?.hasAttribute("style")).toBe(false);
-    expect(document.querySelectorAll(".md-image-placeholder")).toHaveLength(2);
+    expect(document.querySelectorAll(".md-image-placeholder")).toHaveLength(1);
     expect(document.querySelector('img[src^="file:"]')).toBeNull();
-    expect(document.querySelector('img[src^="https:"]')).toBeNull();
+    expect(document.querySelector('img[src^="https:"]')?.getAttribute("alt")).toBe("远程图片");
   });
 
   it("escapes unsupported raw HTML and removes invalid image dimensions", () => {

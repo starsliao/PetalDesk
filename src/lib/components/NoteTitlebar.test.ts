@@ -111,16 +111,22 @@ describe("NoteTitlebar utility controls", () => {
 
   it("opens a compact tools menu immediately before close and launches the selected tool", async () => {
     const ontoolopen = vi.fn();
+    const onnotesopen = vi.fn();
+    const onnoteopen = vi.fn();
     const { getByRole, queryByRole } = render(NoteTitlebar, {
       title: "便签",
       color: "yellow",
       ontoolopen,
+      onnotesopen,
+      onnoteopen,
       onclose: vi.fn(),
     });
     const toolsButton = getByRole("button", { name: "小工具" });
+    const notesButton = getByRole("button", { name: "便签列表" });
     const closeButton = getByRole("button", { name: "关闭窗口" });
 
-    expect(toolsButton.parentElement?.nextElementSibling).toBe(closeButton);
+    expect(toolsButton.parentElement?.nextElementSibling).toBe(notesButton.parentElement);
+    expect(notesButton.parentElement?.nextElementSibling).toBe(closeButton);
     await fireEvent.click(toolsButton);
 
     expect(getByRole("menu", { name: "小工具" })).toBeInTheDocument();
@@ -132,6 +138,84 @@ describe("NoteTitlebar utility controls", () => {
     await fireEvent.click(getByRole("menuitem", { name: "任务甘特图" }));
     expect(ontoolopen).toHaveBeenCalledWith("gantt");
     expect(queryByRole("menu", { name: "小工具" })).not.toBeInTheDocument();
+  });
+
+  it("loads all notes, marks the current note, and opens a selected note", async () => {
+    const onnotesopen = vi.fn().mockResolvedValue(undefined);
+    const onnoteopen = vi.fn().mockResolvedValue(undefined);
+    const longTitle = "这是一个用于验证标题截断提示的非常非常长的便签标题";
+    const { getByRole, queryByRole, container } = render(NoteTitlebar, {
+      title: "当前便签",
+      color: "yellow",
+      currentNoteId: "note-current",
+      notes: [
+        {
+          id: "note-current",
+          title: "当前便签",
+          color: "yellow",
+          pinned: true,
+          updatedAt: "2026-08-03T08:00:00.000Z",
+        },
+        {
+          id: "note-other",
+          title: longTitle,
+          color: "blue",
+          pinned: false,
+          updatedAt: "2026-08-03T09:00:00.000Z",
+        },
+      ],
+      onnotesopen,
+      onnoteopen,
+      onclose: vi.fn(),
+    });
+
+    await fireEvent.click(getByRole("button", { name: "便签列表" }));
+
+    expect(onnotesopen).toHaveBeenCalledOnce();
+    expect(getByRole("menu", { name: "便签列表" })).toBeInTheDocument();
+    expect(getByRole("menuitem", { name: /当前便签/ })).toHaveAttribute("aria-current", "page");
+    const other = getByRole("menuitem", { name: longTitle });
+    expect(other).toHaveAttribute("title", longTitle);
+    expect(container.querySelector('[data-note-id="note-current"] .note-color-dot')).toHaveAttribute(
+      "data-color",
+      "yellow",
+    );
+
+    await fireEvent.click(other);
+
+    expect(onnoteopen).toHaveBeenCalledWith("note-other");
+    expect(queryByRole("menu", { name: "便签列表" })).not.toBeInTheDocument();
+  });
+
+  it("shows loading and empty states and closes the note list with Escape or outside click", async () => {
+    const rendered = render(NoteTitlebar, {
+      title: "便签",
+      color: "gray",
+      notes: [],
+      notesLoading: true,
+      onnotesopen: vi.fn(),
+      onnoteopen: vi.fn(),
+    });
+
+    await fireEvent.click(rendered.getByRole("button", { name: "便签列表" }));
+    expect(rendered.getByRole("status")).toHaveTextContent("正在加载便签");
+
+    await rendered.rerender({
+      title: "便签",
+      color: "gray",
+      notes: [],
+      notesLoading: false,
+      onnotesopen: vi.fn(),
+      onnoteopen: vi.fn(),
+    });
+    expect(rendered.getByText("暂无便签")).toBeInTheDocument();
+
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(rendered.queryByRole("menu", { name: "便签列表" })).not.toBeInTheDocument();
+
+    await fireEvent.click(rendered.getByRole("button", { name: "便签列表" }));
+    await fireEvent.click(document.body);
+    expect(rendered.queryByRole("menu", { name: "便签列表" })).not.toBeInTheDocument();
   });
 
   it("shows the configured screenshot shortcut in the tools menu", async () => {

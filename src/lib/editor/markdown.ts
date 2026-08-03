@@ -1,7 +1,7 @@
 import DOMPurify from "dompurify";
 import MarkdownIt from "markdown-it";
 
-const SAFE_IMAGE_URL = /^(?:blob:|data:image\/(?:png|gif|jpe?g|webp);base64,|\.\.?\/|\/)/i;
+const SAFE_IMAGE_URL = /^(?:https?:\/\/|blob:|data:image\/(?:png|gif|jpe?g|webp);base64,|\.\.?\/|\/)/i;
 const SAFE_LINK_URL = /^(?:https?:|mailto:|tel:|#|\.\.?\/|\/)/i;
 
 export interface RenderMarkdownOptions {
@@ -94,14 +94,18 @@ function resolveImageSource(
   source: string,
   assetUrls: Readonly<Record<string, string>>,
 ): string | null {
+  const trimmed = source.trim();
   const normalized = normalizeAssetPath(source);
   const mapped = assetUrls[source] ?? assetUrls[normalized];
   if (mapped && SAFE_IMAGE_URL.test(mapped) && !mapped.toLowerCase().startsWith("file:")) {
     return mapped;
   }
 
-  if (source.toLowerCase().startsWith("data:image/") && SAFE_IMAGE_URL.test(source)) {
-    return source;
+  if (
+    (/^https?:\/\//i.test(trimmed) || trimmed.toLowerCase().startsWith("data:image/"))
+    && SAFE_IMAGE_URL.test(trimmed)
+  ) {
+    return trimmed;
   }
 
   return null;
@@ -190,7 +194,7 @@ function renderImage(
   const height = safeImageDimension(dimensions.height);
   const widthAttribute = width ? ` width="${width}"` : "";
   const heightAttribute = height ? ` height="${height}"` : "";
-  return `<img src="${parser.utils.escapeHtml(source)}" alt="${alt}"${titleAttribute}${widthAttribute}${heightAttribute} loading="lazy" decoding="async">`;
+  return `<img src="${parser.utils.escapeHtml(source)}" alt="${alt}"${titleAttribute}${widthAttribute}${heightAttribute} loading="lazy" decoding="async" referrerpolicy="no-referrer">`;
 }
 
 function renderSafeHtmlImage(
@@ -375,6 +379,7 @@ export function renderMarkdown(
       "height",
       "loading",
       "rel",
+      "referrerpolicy",
       "role",
       "src",
       "target",

@@ -3,6 +3,7 @@
   import {
     FilePenLine,
     FileText,
+    List as ListIcon,
     Lock,
     LockOpen,
     Palette,
@@ -21,7 +22,7 @@
   import type { EditorMode } from "$lib/editor";
   import { formatShortcut } from "$lib/shortcuts";
   import { TOOL_MENU_ITEMS, toolMenuItemLabel, type ToolName } from "$lib/tools";
-  import type { NoteColor } from "./types";
+  import type { NoteColor, NoteListItem } from "./types";
 
   interface Props {
     title?: string;
@@ -30,6 +31,9 @@
     readonly?: boolean;
     editorMode?: EditorMode;
     screenshotShortcut?: string;
+    notes?: readonly NoteListItem[];
+    currentNoteId?: string;
+    notesLoading?: boolean;
     onnew?: () => void;
     ontitlechange?: (title: string) => void;
     oncolorchange?: (color: NoteColor) => void;
@@ -37,6 +41,8 @@
     onreadonlychange?: (readonly: boolean) => void;
     ontogglepin?: (pinned: boolean) => void;
     ontoolopen?: (tool: ToolName) => void | Promise<void>;
+    onnotesopen?: () => void | Promise<void>;
+    onnoteopen?: (id: string) => void | Promise<void>;
     ondelete?: () => void;
     onclose?: () => void;
   }
@@ -48,6 +54,9 @@
     readonly = false,
     editorMode = "typora",
     screenshotShortcut = "F1",
+    notes = [],
+    currentNoteId,
+    notesLoading = false,
     onnew,
     ontitlechange,
     oncolorchange,
@@ -55,6 +64,8 @@
     onreadonlychange,
     ontogglepin,
     ontoolopen,
+    onnotesopen,
+    onnoteopen,
     ondelete,
     onclose,
   }: Props = $props();
@@ -63,6 +74,8 @@
   let colorControl = $state<HTMLDivElement>();
   let toolsOpen = $state(false);
   let toolsControl = $state<HTMLDivElement>();
+  let notesOpen = $state(false);
+  let notesControl = $state<HTMLDivElement>();
   let editingTitle = $state(false);
   let titleDraft = $state("无标题便签");
   let lastTitle = $state<string | null>(null);
@@ -128,6 +141,7 @@
     if (event.key === "Escape") {
       if (colorOpen) colorOpen = false;
       if (toolsOpen) toolsOpen = false;
+      if (notesOpen) notesOpen = false;
     }
   }
 
@@ -138,11 +152,26 @@
     if (toolsOpen && !toolsControl?.contains(event.target as Node)) {
       toolsOpen = false;
     }
+    if (notesOpen && !notesControl?.contains(event.target as Node)) {
+      notesOpen = false;
+    }
   }
 
   async function openTool(tool: ToolName): Promise<void> {
     toolsOpen = false;
     await ontoolopen?.(tool);
+  }
+
+  async function openNote(id: string): Promise<void> {
+    notesOpen = false;
+    await onnoteopen?.(id);
+  }
+
+  async function toggleNotes(): Promise<void> {
+    colorOpen = false;
+    toolsOpen = false;
+    notesOpen = !notesOpen;
+    if (notesOpen) await onnotesopen?.();
   }
 </script>
 
@@ -244,6 +273,7 @@
           data-tooltip-placement="bottom"
           onclick={() => {
             toolsOpen = false;
+            notesOpen = false;
             colorOpen = !colorOpen;
           }}
         >
@@ -296,6 +326,7 @@
           data-tooltip-placement="bottom"
           onclick={() => {
             colorOpen = false;
+            notesOpen = false;
             toolsOpen = !toolsOpen;
           }}
         >
@@ -319,6 +350,53 @@
                 <span>{toolMenuItemLabel(item, formatShortcut(screenshotShortcut))}</span>
               </button>
             {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
+
+    {#if onnotesopen && onnoteopen}
+      <div class="notes-control" bind:this={notesControl}>
+        <button
+          type="button"
+          class="icon-button"
+          aria-label="便签列表"
+          aria-expanded={notesOpen}
+          aria-haspopup="menu"
+          data-tooltip="便签列表"
+          data-tooltip-placement="bottom"
+          onclick={() => void toggleNotes()}
+        >
+          <ListIcon size={16} aria-hidden="true" />
+        </button>
+        {#if notesOpen}
+          <div class="notes-menu" role="menu" aria-label="便签列表">
+            <div class="notes-menu-title">全部便签</div>
+            {#if notesLoading}
+              <div class="notes-menu-state" role="status">正在加载便签…</div>
+            {:else if notes.length === 0}
+              <div class="notes-menu-state">暂无便签</div>
+            {:else}
+              {#each notes as item (item.id)}
+                <button
+                  type="button"
+                  role="menuitem"
+                  class:current={item.id === currentNoteId}
+                  aria-current={item.id === currentNoteId ? "page" : undefined}
+                  data-note-id={item.id}
+                  title={item.title || "无标题便签"}
+                  onclick={() => void openNote(item.id)}
+                >
+                  <span class="note-color-dot" data-color={item.color} aria-hidden="true"></span>
+                  <span class="note-menu-label">{item.title || "无标题便签"}</span>
+                  {#if item.pinned}
+                    <span class="note-menu-pin" aria-label="已置顶">
+                      <Pin size={13} fill="currentColor" aria-hidden="true" />
+                    </span>
+                  {/if}
+                </button>
+              {/each}
+            {/if}
           </div>
         {/if}
       </div>
@@ -465,6 +543,10 @@
     position: relative;
   }
 
+  .notes-control {
+    position: relative;
+  }
+
   .tools-menu {
     position: fixed;
     z-index: 210;
@@ -500,6 +582,98 @@
   .tools-menu button:focus-visible {
     background: var(--app-surface-hover, #f5f5f5);
     outline: 0;
+  }
+
+  .notes-menu {
+    position: fixed;
+    z-index: 210;
+    top: 43px;
+    right: 8px;
+    display: grid;
+    width: min(270px, calc(100vw - 16px));
+    max-height: calc(100vh - 55px);
+    padding: 5px;
+    overflow-y: auto;
+    color: var(--app-fg, #202020);
+    background: var(--app-surface, #ffffff);
+    border: 1px solid var(--app-border, #d8d8d8);
+    border-radius: 6px;
+    box-shadow: var(--shadow-flyout, 0 8px 24px rgb(0 0 0 / 16%));
+  }
+
+  .notes-menu-title {
+    padding: 5px 8px 4px;
+    color: var(--app-muted, #6b6b6b);
+    font-size: 11px;
+    font-weight: 600;
+  }
+
+  .notes-menu button {
+    display: flex;
+    width: 100%;
+    min-width: 0;
+    min-height: 32px;
+    padding: 5px 8px;
+    align-items: center;
+    gap: 8px;
+    color: inherit;
+    font-size: 12.5px;
+    text-align: left;
+    background: transparent;
+    border: 0;
+    border-radius: 4px;
+    cursor: default;
+  }
+
+  .notes-menu button:hover,
+  .notes-menu button:focus-visible,
+  .notes-menu button.current {
+    background: var(--app-surface-hover, #f5f5f5);
+    outline: 0;
+  }
+
+  .notes-menu button.current {
+    color: var(--app-accent, #0067c0);
+    font-weight: 600;
+  }
+
+  .note-color-dot {
+    display: block;
+    flex: 0 0 auto;
+    width: 10px;
+    height: 10px;
+    background: #e8eaed;
+    border: 1px solid rgb(0 0 0 / 16%);
+    border-radius: 50%;
+  }
+
+  .note-color-dot[data-color="yellow"] { background: #f6d95d; }
+  .note-color-dot[data-color="pink"] { background: #f5a9bf; }
+  .note-color-dot[data-color="blue"] { background: #9bc9f5; }
+  .note-color-dot[data-color="green"] { background: #a9dca1; }
+  .note-color-dot[data-color="purple"] { background: #c8adf5; }
+  .note-color-dot[data-color="gray"] { background: #c8ccd1; }
+  .note-color-dot[data-color="charcoal"] { background: #666666; }
+
+  .note-menu-label {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .note-menu-pin {
+    flex: 0 0 auto;
+    margin-left: auto;
+    color: var(--app-muted, #777777);
+  }
+
+  .notes-menu-state {
+    padding: 12px 8px;
+    color: var(--app-muted, #777777);
+    font-size: 12px;
+    text-align: center;
   }
 
   .delete-button:hover {

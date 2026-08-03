@@ -3,7 +3,7 @@
   import type { EditorMode } from "$lib/editor";
   import type { ToolName } from "$lib/tools";
   import NoteTitlebar from "./NoteTitlebar.svelte";
-  import type { NoteColor } from "./types";
+  import type { NoteColor, NoteListItem } from "./types";
 
   interface Props {
     title?: string;
@@ -12,6 +12,9 @@
     readonly?: boolean;
     editorMode?: EditorMode;
     screenshotShortcut?: string;
+    notes?: readonly NoteListItem[];
+    currentNoteId?: string;
+    notesLoading?: boolean;
     saving?: boolean;
     saveError?: string | null;
     children: Snippet;
@@ -22,6 +25,8 @@
     onreadonlychange?: (readonly: boolean) => void;
     ontogglepin?: (pinned: boolean) => void;
     ontoolopen?: (tool: ToolName) => void | Promise<void>;
+    onnotesopen?: () => void | Promise<void>;
+    onnoteopen?: (id: string) => void | Promise<void>;
     ondelete?: () => void;
     onclose?: () => void;
   }
@@ -33,6 +38,9 @@
     readonly = false,
     editorMode = "typora",
     screenshotShortcut = "F1",
+    notes = [],
+    currentNoteId,
+    notesLoading = false,
     saving = false,
     saveError = null,
     children,
@@ -43,6 +51,8 @@
     onreadonlychange,
     ontogglepin,
     ontoolopen,
+    onnotesopen,
+    onnoteopen,
     ondelete,
     onclose,
   }: Props = $props();
@@ -56,6 +66,9 @@
     {readonly}
     {editorMode}
     {screenshotShortcut}
+    {notes}
+    {currentNoteId}
+    {notesLoading}
     {onnew}
     {ontitlechange}
     {oncolorchange}
@@ -63,6 +76,8 @@
     {onreadonlychange}
     {ontogglepin}
     {ontoolopen}
+    {onnotesopen}
+    {onnoteopen}
     {ondelete}
     {onclose}
   />
