@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PetalDesk ambiguous-form fixture</title>
+    <style>
+      body { max-width: 32rem; margin: 3rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; color: #17202a; }
+      form, label { display: grid; gap: 0.65rem; }
+      input, button { min-height: 2.5rem; padding: 0.5rem; font: inherit; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Ambiguous login form</h1>
+      <form id="ambiguous-form">
+        <label>Account <input name="accountA" type="text"></label>
+        <label>Member ID <input name="accountB" type="text"></label>
+        <label>Password <input name="passwordA" type="password"></label>
+        <label>Security password <input name="passwordB" type="password"></label>
+        <button type="submit">Continue</button>
+      </form>
+      <p>This intentionally ambiguous fixture verifies that PetalDesk asks for confirmation instead of guessing.</p>
+    </main>
+    <script>
+      document.querySelector("#ambiguous-form").addEventListener("submit", (event) => event.preventDefault());
+    </script>
+  </body>
+</html>

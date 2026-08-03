@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="飞花 - PetalDesk 浏览器增强隐私政策" />
+    <meta name="theme-color" content="#f7f7f5" />
+    <link rel="icon" href="./assets/app-icon.svg" type="image/svg+xml" />
+    <title>隐私政策 | 飞花 - PetalDesk</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #242426;
+        --muted: #656567;
+        --line: #d9d9d5;
+        --paper: #f7f7f5;
+        --white: #ffffff;
+        --blue: #0875c9;
+        font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", -apple-system, "Segoe UI", Arial, sans-serif;
+        font-synthesis: none;
+      }
+
+      * { box-sizing: border-box; }
+      body { margin: 0; min-width: 320px; color: var(--ink); background: var(--paper); line-height: 1.7; letter-spacing: 0; }
+      a { color: var(--blue); text-underline-offset: 3px; }
+      header { border-bottom: 1px solid var(--line); background: var(--white); }
+      nav, main, footer { width: min(calc(100% - 40px), 820px); margin-inline: auto; }
+      nav { display: flex; align-items: center; justify-content: space-between; min-height: 66px; gap: 20px; }
+      .brand { display: inline-flex; align-items: center; gap: 10px; color: var(--ink); text-decoration: none; font-weight: 800; }
+      .brand img { width: 34px; height: 34px; border-radius: 7px; }
+      .back { color: var(--muted); font-size: 14px; }
+      main { padding-block: 58px 72px; }
+      h1 { margin: 0; max-width: 680px; font-size: clamp(32px, 5vw, 52px); line-height: 1.15; letter-spacing: 0; }
+      .lead { margin: 18px 0 0; max-width: 680px; color: var(--muted); font-size: 18px; }
+      .updated { margin: 12px 0 42px; color: var(--muted); font-size: 14px; }
+      section { padding-block: 26px; border-top: 1px solid var(--line); }
+      h2 { margin: 0 0 10px; font-size: 22px; letter-spacing: 0; }
+      h3 { margin: 24px 0 8px; font-size: 17px; letter-spacing: 0; }
+      p { margin: 0 0 12px; }
+      ul { margin: 8px 0 0; padding-left: 22px; }
+      li + li { margin-top: 7px; }
+      .english { margin-top: 34px; }
+      footer { padding-block: 24px 40px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; }
+      @media (max-width: 560px) {
+        nav, main, footer { width: min(calc(100% - 28px), 820px); }
+        main { padding-top: 42px; }
+        .back { max-width: 120px; text-align: right; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <nav aria-label="主导航">
+        <a class="brand" href="./index.html"><img src="./assets/app-icon.svg" alt="" />飞花 - PetalDesk</a>
+        <a class="back" href="./index.html">返回产品网站</a>
+      </nav>
+    </header>
+
+    <main>
+      <h1>浏览器增强隐私政策</h1>
+      <p class="lead">飞花浏览器增强只与同一台 Windows 电脑上的飞花桌面应用通信，不运营云端账号，也不把浏览数据或凭据上传到飞花服务器。</p>
+      <p class="updated">最后更新：2026 年 8 月 4 日</p>
+
+      <section>
+        <h2>适用范围</h2>
+        <p>本政策适用于 Firefox 上的“飞花 - PetalDesk 浏览器增强”。它为飞花桌面应用提供长截图、经用户确认的密码填充，以及经用户明确授权的登录信息检测。</p>
+      </section>
+
+      <section>
+        <h2>处理的信息</h2>
+        <ul>
+          <li>长截图所需的网站活动数据，例如滚动位置、视口尺寸和页面稳定状态。</li>
+          <li>用于把密码请求绑定到正确页面的精确网址 origin、标签页、文档和 frame 标识。</li>
+          <li>仅在用户开启密码功能并授予 Firefox 可选权限后处理的用户名和密码。</li>
+        </ul>
+        <p>扩展不会为广告、分析或画像收集页面正文、完整浏览历史、付款信息、健康信息、位置或广告标识符。</p>
+      </section>
+
+      <section>
+        <h2>使用方式</h2>
+        <ul>
+          <li>长截图数据通过 Firefox Native Messaging 发送给本机飞花进程，用于完成用户主动发起的截图。</li>
+          <li>密码填充先显示不含密码的页面确认提示。用户确认后，桌面应用才提供一次性凭据；扩展只填写字段，绝不自动提交表单。</li>
+          <li>登录检测开启后，扩展把短时登录候选交给本机加密保险库判断是否完全相同、需要新增或需要更新。</li>
+        </ul>
+        <p>扩展不会绕过验证码、Passkey、短信验证、安全密钥或多因素认证。</p>
+      </section>
+
+      <section>
+        <h2>存储与保留</h2>
+        <p>扩展不会把密码或登录候选写入 Firefox storage、磁盘或旧的截图文件通信目录。包含密码的登录候选最多在扩展内存中保留 30 秒；两步登录中的纯用户名阶段最多保留 2 分钟，只用于同一标签页和精确 origin 的下一步。它们都会在超时、页面关闭或连接断开时清除。填充完成或取消后，扩展立即丢弃相关消息引用。</p>
+        <p>用户选择保存的凭据由飞花桌面应用写入本地 XChaCha20-Poly1305 加密保险库，保留与删除由用户在飞花中控制。</p>
+      </section>
+
+      <section>
+        <h2>传输、共享与安全控制</h2>
+        <p>扩展不出售、出租或向远程第三方传输个人信息。Native Messaging 只连接当前 Windows 用户下注册的飞花本机程序。</p>
+        <ul>
+          <li>密码操作要求 scheme、主机和端口完全匹配，并绑定单次会话与目标页面。</li>
+          <li>每次填充都需要页面内确认，且不会自动提交。</li>
+          <li>HTTPS 为默认要求；HTTP 必须在飞花中逐 origin 明确允许并持续显示风险提示。</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>用户选择与联系</h2>
+        <p>用户可以拒绝或撤销 Firefox 的可选身份验证信息权限、关闭登录检测、删除已保存账户，或卸载扩展。拒绝密码权限不会影响长截图。</p>
+        <p>隐私与支持问题请通过 <a href="https://github.com/starsliao/PetalDesk/issues">PetalDesk GitHub Issues</a> 联系项目维护者。</p>
+      </section>
+
+      <div class="english" lang="en">
+        <section>
+          <h2>PetalDesk Browser Companion Privacy Notice</h2>
+          <p>Last updated: August 4, 2026</p>
+          <p>PetalDesk Browser Companion communicates only with the PetalDesk desktop application on the same Windows computer. It has no PetalDesk cloud account and does not upload browsing data or credentials to a PetalDesk server.</p>
+        </section>
+
+        <section>
+          <h2>Information handled and purpose</h2>
+          <p>The extension handles website activity needed for user-initiated long screenshots; exact origins and tab, document, and frame identifiers needed to bind a password request; and usernames and passwords only after the user enables password features and grants Firefox's optional authentication-information permission.</p>
+          <p>A fill offer contains no password. Credentials are requested only after the user confirms the in-page prompt. The extension fills fields but never submits a form. When login detection is enabled, a short-lived candidate is sent to the local encrypted vault to decide whether it is unchanged, new, or an update.</p>
+        </section>
+
+        <section>
+          <h2>Storage, sharing, and retention</h2>
+          <p>Credentials and login candidates are not written to Firefox storage, disk, or the legacy screenshot file bridge. Candidates containing a password remain in extension memory for no more than 30 seconds and are cleared on timeout, pagehide, tab close, disconnect, or a user decision. A username-only stage for a two-step login may remain for up to two minutes and is bound to the same tab and exact origin; it is cleared on timeout, tab close, disconnect, or a new origin. Saved credentials remain in the encrypted local PetalDesk vault.</p>
+          <p>The extension does not sell, rent, or remotely transmit personal information. Native Messaging transfers data only to the registered PetalDesk executable under the same Windows user account.</p>
+        </section>
+
+        <section>
+          <h2>Controls and contact</h2>
+          <p>Password operations require an exact scheme, host, and port match, a bound target page, and visible confirmation. HTTPS is required by default; HTTP requires a separate per-origin opt-in. The extension never bypasses CAPTCHA, passkeys, SMS verification, security keys, or MFA.</p>
+          <p>Users may revoke the optional permission, disable login detection, delete accounts, or uninstall the extension. Questions can be filed through <a href="https://github.com/starsliao/PetalDesk/issues">PetalDesk GitHub Issues</a>.</p>
+        </section>
+      </div>
+    </main>
+
+    <footer>飞花 - PetalDesk · 本地优先 · 数据保留在用户设备上</footer>
+  </body>
+</html>

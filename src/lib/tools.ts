@@ -3,6 +3,7 @@ export const TOOL_MENU_ITEMS = [
   { name: "reminder", label: "提醒" },
   { name: "gantt", label: "任务甘特图" },
   { name: "mfa", label: "MFA 验证器" },
+  { name: "passwords", label: "密码管理器" },
   { name: "screenshot", label: "截图" },
 ] as const;
 

@@ -10,6 +10,7 @@ pub(crate) const TIMER_WINDOW_LABEL: &str = "timer";
 pub(crate) const REMINDER_WINDOW_LABEL: &str = "reminder";
 pub(crate) const GANTT_WINDOW_LABEL: &str = "gantt";
 pub(crate) const MFA_WINDOW_LABEL: &str = "mfa";
+pub(crate) const PASSWORD_WINDOW_LABEL: &str = "passwords";
 const TIMER_DEFAULT_WIDTH: f64 = 320.0;
 const TIMER_DEFAULT_HEIGHT: f64 = 140.0;
 const TIMER_MIN_VISIBLE_WIDTH: f64 = 48.0;
@@ -24,6 +25,7 @@ static TIMER_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 static REMINDER_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 static GANTT_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 static MFA_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
+static PASSWORD_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 
 const SLOW_BACKGROUND_OPERATION: Duration = Duration::from_secs(2);
 
@@ -196,6 +198,7 @@ pub async fn set_data_storage_path(
 pub async fn restart_app(app: AppHandle) -> AppResult<()> {
     tauri::async_runtime::spawn_blocking(move || {
         app.state::<crate::mfa::MfaStore>().lock();
+        app.state::<crate::passwords::PasswordStore>().lock();
         crate::long_screenshot::shutdown(&app);
         app.restart()
     })
@@ -385,6 +388,7 @@ pub async fn open_tool_window(app: AppHandle, tool: ToolName) -> AppResult<Strin
         ToolName::Reminder => open_reminder_window_inner(&app, &app.state()),
         ToolName::Gantt => open_gantt_window_inner(&app, &app.state()),
         ToolName::Mfa => open_mfa_window_inner(&app, &app.state()),
+        ToolName::Passwords => open_password_window_inner(&app, &app.state()),
         ToolName::Screenshot => crate::screenshot::start_capture_inner(&app)
             .map(|_| crate::screenshot::CAPTURE_WINDOW_LABEL.to_string()),
     })
@@ -670,6 +674,74 @@ pub fn open_mfa_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResu
         .set_capture_excluded(protected);
     let _ = window.set_focus();
     Ok(MFA_WINDOW_LABEL.to_string())
+}
+
+pub fn open_password_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResult<String> {
+    let _creation_guard = lock_window_creation(&PASSWORD_WINDOW_CREATION_LOCK);
+    if let Some(window) = app.get_webview_window(PASSWORD_WINDOW_LABEL) {
+        window.show().map_err(|error| {
+            AppError::new("window_error", format!("显示密码管理器失败: {error}"))
+        })?;
+        let _ = window.unminimize();
+        app.state::<crate::passwords::PasswordStore>().activate();
+        let _ = protect_sensitive_window(&window);
+        let _ = window.set_focus();
+        return Ok(PASSWORD_WINDOW_LABEL.to_string());
+    }
+
+    let url = WebviewUrl::App("?tool=passwords".into());
+    let mut builder = WebviewWindowBuilder::new(app, PASSWORD_WINDOW_LABEL, url)
+        .title("密码管理器 - 飞花 - PetalDesk")
+        .decorations(false)
+        .resizable(true)
+        .inner_size(820.0, 640.0)
+        .min_inner_size(620.0, 440.0)
+        .skip_taskbar(false);
+    if let Some(state) = store.window_state(PASSWORD_WINDOW_LABEL) {
+        builder = builder
+            .position(state.x, state.y)
+            .inner_size(state.width, state.height)
+            .maximized(state.maximized);
+    } else {
+        builder = builder.center();
+    }
+
+    let password_store = app.state::<crate::passwords::PasswordStore>();
+    password_store.activate();
+    let window = match builder.build() {
+        Ok(window) => window,
+        Err(error) => {
+            let closing_epoch = password_store.deactivate();
+            password_store.clear_deactivated_state(closing_epoch);
+            return Err(AppError::new(
+                "window_error",
+                format!("创建密码管理器失败: {error}"),
+            ));
+        }
+    };
+    let _ = protect_sensitive_window(&window);
+    let _ = window.set_focus();
+    Ok(PASSWORD_WINDOW_LABEL.to_string())
+}
+
+#[cfg(windows)]
+fn protect_sensitive_window(window: &tauri::WebviewWindow) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowDisplayAffinity;
+
+    const WDA_EXCLUDEFROMCAPTURE: u32 = 0x0000_0011;
+    const WDA_MONITOR: u32 = 0x0000_0001;
+    let Ok(handle) = window.hwnd() else {
+        return false;
+    };
+    unsafe {
+        SetWindowDisplayAffinity(handle.0, WDA_EXCLUDEFROMCAPTURE) != 0
+            || SetWindowDisplayAffinity(handle.0, WDA_MONITOR) != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn protect_sensitive_window(_window: &tauri::WebviewWindow) -> bool {
+    false
 }
 
 #[cfg(windows)]

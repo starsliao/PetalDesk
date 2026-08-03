@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PetalDesk failed-login fixture</title>
+    <style>
+      body { max-width: 28rem; margin: 3rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; color: #17202a; }
+      form, label { display: grid; gap: 0.75rem; }
+      input, button { min-height: 2.5rem; padding: 0.5rem; font: inherit; }
+      #error { color: #a93226; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Failed login</h1>
+      <form id="failed-form">
+        <label>Email <input name="username" type="email" autocomplete="username" required></label>
+        <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+        <button type="submit">Sign in</button>
+      </form>
+      <p>This fixture deliberately keeps the form visible to produce a low-confidence result.</p>
+    </main>
+    <script>
+      document.querySelector("#failed-form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        let error = document.querySelector("#error");
+        if (!error) {
+          error = document.createElement("p");
+          error.id = "error";
+          event.currentTarget.after(error);
+        }
+        error.textContent = "Fixture login failed. Please try again.";
+      });
+    </script>
+  </body>
+</html>

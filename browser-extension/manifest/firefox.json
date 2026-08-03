@@ -1,8 +1,16 @@
 {
   "manifest_version": 3,
-  "name": "飞花 - PetalDesk 长截图",
-  "version": "0.5.3",
-  "description": "飞花 - PetalDesk 浏览器长截图增强，支持 Chrome、Edge 和 Firefox。",
+  "name": "飞花 - PetalDesk 浏览器增强",
+  "version": "0.6.0",
+  "description": "飞花 Firefox 浏览器增强，支持长截图和经确认的密码填充。",
+  "homepage_url": "https://starsliao.github.io/PetalDesk/",
+  "icons": {
+    "16": "assets/icons/petaldesk-16.png",
+    "32": "assets/icons/petaldesk-32.png",
+    "48": "assets/icons/petaldesk-48.png",
+    "96": "assets/icons/petaldesk-96.png",
+    "128": "assets/icons/petaldesk-128.png"
+  },
   "permissions": [
     "nativeMessaging",
     "tabs"
@@ -13,8 +21,17 @@
   "background": {
     "scripts": [
       "shared/browser-api.js",
+      "shared/password-templates.js",
+      "background/password-bridge.js",
       "background/native-bridge.js"
     ]
+  },
+  "action": {
+    "default_title": "飞花：授权密码管理",
+    "default_icon": {
+      "16": "assets/icons/petaldesk-16.png",
+      "32": "assets/icons/petaldesk-32.png"
+    }
   },
   "content_scripts": [
     {
@@ -23,7 +40,9 @@
       ],
       "js": [
         "shared/scroll-core.js",
-        "content/capture-session.js"
+        "shared/password-templates.js",
+        "content/capture-session.js",
+        "content/password-manager.js"
       ],
       "run_at": "document_idle",
       "all_frames": true
@@ -34,9 +53,8 @@
       "id": "petaldesk-capture@petaldesk.app",
       "strict_min_version": "140.0",
       "data_collection_permissions": {
-        "required": [
-          "websiteActivity"
-        ]
+        "required": ["websiteActivity"],
+        "optional": ["authenticationInfo"]
       }
     }
   }

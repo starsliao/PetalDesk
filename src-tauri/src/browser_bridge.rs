@@ -443,7 +443,8 @@ fn unix_time_ms() -> u128 {
 }
 
 fn validate_command(command: &str) -> Result<(), String> {
-    if command.is_empty()
+    if command.starts_with("password.")
+        || command.is_empty()
         || command.len() > 64
         || !command
             .bytes()
@@ -795,6 +796,7 @@ mod tests {
         assert!(is_safe_identifier("request-42_test"));
         assert!(!is_safe_identifier("../request"));
         assert!(validate_command("capture.status").is_ok());
+        assert!(validate_command("password.provideCredentials").is_err());
         assert!(validate_command("../status").is_err());
     }
 }

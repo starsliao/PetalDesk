@@ -16,6 +16,7 @@ pub enum ToolName {
     Reminder,
     Gantt,
     Mfa,
+    Passwords,
     Screenshot,
 }
 
@@ -29,6 +30,7 @@ pub enum TrayShortcutAction {
     Reminder,
     Gantt,
     Mfa,
+    Passwords,
     Screenshot,
 }
 

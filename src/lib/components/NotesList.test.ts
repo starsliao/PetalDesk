@@ -82,6 +82,7 @@ describe("NotesList header actions", () => {
     expect(getByRole("menuitem", { name: "计时器" })).toBeInTheDocument();
     expect(getByRole("menuitem", { name: "提醒" })).toBeInTheDocument();
     expect(getByRole("menuitem", { name: "任务甘特图" })).toBeInTheDocument();
+    expect(getByRole("menuitem", { name: "密码管理器" })).toBeInTheDocument();
     const screenshot = getByRole("menuitem", { name: "截图(F1)" });
     expect(screenshot).toBeInTheDocument();
 

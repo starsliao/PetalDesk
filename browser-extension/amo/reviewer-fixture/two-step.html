@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PetalDesk two-step login fixture</title>
+    <style>
+      body { max-width: 28rem; margin: 3rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; color: #17202a; }
+      form, label { display: grid; gap: 0.75rem; }
+      input, button { min-height: 2.5rem; padding: 0.5rem; font: inherit; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Two-step login</h1>
+      <form id="username-step">
+        <label>Email <input name="username" type="email" autocomplete="username" required></label>
+        <button type="submit">Continue</button>
+      </form>
+      <p>All values remain in this page and are never sent to the server.</p>
+    </main>
+    <template id="password-template">
+      <form id="password-step">
+        <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+        <button type="submit">Sign in</button>
+      </form>
+    </template>
+    <script>
+      const main = document.querySelector("main");
+      document.querySelector("#username-step").addEventListener("submit", (event) => {
+        event.preventDefault();
+        event.currentTarget.replaceWith(document.querySelector("#password-template").content.cloneNode(true));
+        document.querySelector("#password-step").addEventListener("submit", (passwordEvent) => {
+          passwordEvent.preventDefault();
+          const status = document.createElement("p");
+          status.textContent = "Fixture login succeeded.";
+          passwordEvent.currentTarget.replaceWith(status);
+        });
+      });
+    </script>
+  </body>
+</html>

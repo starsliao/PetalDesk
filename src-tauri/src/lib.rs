@@ -1,5 +1,6 @@
 pub mod browser_bridge;
 pub mod browser_native_host;
+mod browser_secret_bridge;
 mod commands;
 mod error;
 mod gantt;
@@ -7,7 +8,10 @@ mod long_screenshot;
 mod long_screenshot_input;
 mod mfa;
 mod models;
+mod password_browser;
+mod passwords;
 mod phase_match;
+mod recovery;
 mod reminders;
 mod screenshot;
 mod storage;
@@ -19,6 +23,8 @@ mod window_activation;
 use crate::gantt::GanttStore;
 use crate::long_screenshot::LongScreenshotStore;
 use crate::mfa::MfaStore;
+use crate::password_browser::PasswordBrowserService;
+use crate::passwords::PasswordStore;
 use crate::reminders::ReminderStore;
 use crate::screenshot::ScreenshotStore;
 use crate::storage::WorkspaceStore;
@@ -39,6 +45,7 @@ const OPEN_TIMER_MENU_ID: &str = "open-tool:timer";
 const OPEN_REMINDER_MENU_ID: &str = "open-tool:reminder";
 const OPEN_GANTT_MENU_ID: &str = "open-tool:gantt";
 const OPEN_MFA_MENU_ID: &str = "open-tool:mfa";
+const OPEN_PASSWORD_MENU_ID: &str = "open-tool:passwords";
 const OPEN_SCREENSHOT_MENU_ID: &str = "open-tool:screenshot";
 const ABOUT_MENU_ID: &str = "about";
 const MAX_TRAY_NOTE_TITLE_CHARS: usize = 80;
@@ -140,6 +147,7 @@ fn tool_from_tray_menu_id(menu_id: &str) -> Option<models::ToolName> {
         OPEN_REMINDER_MENU_ID => Some(models::ToolName::Reminder),
         OPEN_GANTT_MENU_ID => Some(models::ToolName::Gantt),
         OPEN_MFA_MENU_ID => Some(models::ToolName::Mfa),
+        OPEN_PASSWORD_MENU_ID => Some(models::ToolName::Passwords),
         OPEN_SCREENSHOT_MENU_ID => Some(models::ToolName::Screenshot),
         _ => None,
     }
@@ -320,6 +328,9 @@ fn spawn_open_tool(app: &tauri::AppHandle, tool: models::ToolName) {
         models::ToolName::Mfa => {
             let _ = commands::open_mfa_window_inner(&app, &app.state());
         }
+        models::ToolName::Passwords => {
+            let _ = commands::open_password_window_inner(&app, &app.state());
+        }
         models::ToolName::Screenshot => {
             let _ = screenshot::start_capture_inner(&app);
         }
@@ -338,6 +349,7 @@ fn spawn_tray_action(app: &tauri::AppHandle, action: models::TrayShortcutAction)
         models::TrayShortcutAction::Reminder => spawn_open_tool(app, models::ToolName::Reminder),
         models::TrayShortcutAction::Gantt => spawn_open_tool(app, models::ToolName::Gantt),
         models::TrayShortcutAction::Mfa => spawn_open_tool(app, models::ToolName::Mfa),
+        models::TrayShortcutAction::Passwords => spawn_open_tool(app, models::ToolName::Passwords),
         models::TrayShortcutAction::Screenshot => {
             spawn_open_tool(app, models::ToolName::Screenshot)
         }
@@ -410,6 +422,8 @@ fn build_tray_menu(
     let reminder = MenuItem::with_id(app, OPEN_REMINDER_MENU_ID, "提醒", true, None::<&str>)?;
     let gantt = MenuItem::with_id(app, OPEN_GANTT_MENU_ID, "任务甘特图", true, None::<&str>)?;
     let mfa = MenuItem::with_id(app, OPEN_MFA_MENU_ID, "MFA 验证器", true, None::<&str>)?;
+    let passwords =
+        MenuItem::with_id(app, OPEN_PASSWORD_MENU_ID, "密码管理器", true, None::<&str>)?;
     let screenshot_label = format!("截图({screenshot_shortcut})");
     let screenshot = MenuItem::with_id(
         app,
@@ -422,6 +436,7 @@ fn build_tray_menu(
     tools.append(&reminder)?;
     tools.append(&gantt)?;
     tools.append(&mfa)?;
+    tools.append(&passwords)?;
     tools.append(&screenshot)?;
     let new_note = MenuItem::with_id(app, "new-note", "新建便签", true, None::<&str>)?;
     let about = MenuItem::with_id(app, ABOUT_MENU_ID, "关于", true, None::<&str>)?;
@@ -519,7 +534,18 @@ fn refresh_tray_menu_now(app: &tauri::AppHandle) {
 }
 
 fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let data_storage_path = app.state::<WorkspaceStore>().data_storage_path();
+    recovery::recover_interrupted_shared_recovery(&data_storage_path)?;
+    app.manage(MfaStore::load(&data_storage_path)?);
+    app.manage(PasswordStore::load(&data_storage_path)?);
+    // Start the secret endpoint only after the single-instance plugin has
+    // accepted this process as primary. A secondary launch exits during plugin
+    // setup and must never overwrite the primary process endpoint.
+    app.manage(PasswordBrowserService::start());
     screenshot::setup(app)?;
+    password_browser::start_event_dispatcher(app.handle().clone());
+    app.state::<PasswordStore>()
+        .start_idle_sweeper(app.handle().clone());
     let notes = app.state::<WorkspaceStore>().list_notes()?;
     let shortcut = app.state::<ScreenshotStore>().settings().shortcut;
     // Seed the signature with what the initial menu renders so the first
@@ -544,6 +570,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let app = app.clone();
                 tauri::async_runtime::spawn_blocking(move || {
                     app.state::<MfaStore>().lock();
+                    app.state::<PasswordStore>().lock();
                     long_screenshot::shutdown(&app);
                     app.exit(0);
                 });
@@ -639,8 +666,6 @@ pub fn run() {
         ScreenshotStore::load(&data_storage_path).expect("无法初始化飞花 - PetalDesk 截图工具");
     let long_screenshot_store = LongScreenshotStore::load(&data_storage_path)
         .expect("无法初始化飞花 - PetalDesk 长截图工具");
-    let mfa_store =
-        MfaStore::load(&data_storage_path).expect("无法初始化飞花 - PetalDesk MFA 验证器");
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(
             // Keep this body free of file I/O and locks: it runs synchronously
@@ -658,7 +683,6 @@ pub fn run() {
         .manage(timer_store)
         .manage(screenshot_store)
         .manage(long_screenshot_store)
-        .manage(mfa_store)
         .manage(updater::UpdaterManager::default());
     #[cfg(windows)]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
@@ -756,6 +780,15 @@ pub fn run() {
                             .state::<MfaStore>()
                             .clear_deactivated_state(closing_epoch);
                     });
+                } else if label == commands::PASSWORD_WINDOW_LABEL {
+                    app.state::<PasswordBrowserService>().suspend_capture();
+                    let closing_epoch = app.state::<PasswordStore>().deactivate();
+                    let password_app = app.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        password_app
+                            .state::<PasswordStore>()
+                            .clear_deactivated_state(closing_epoch);
+                    });
                 }
             }
         })
@@ -825,6 +858,25 @@ pub fn run() {
             mfa::export_mfa_entry,
             mfa::copy_mfa_code,
             mfa::lock_mfa_vault,
+            passwords::get_password_status,
+            passwords::list_password_entries,
+            passwords::create_password_entry,
+            passwords::update_password_entry,
+            passwords::delete_password_entry,
+            passwords::reveal_password,
+            passwords::copy_password_username,
+            passwords::copy_password_secret,
+            passwords::generate_password,
+            passwords::set_password_capture_enabled,
+            passwords::evaluate_password_capture,
+            passwords::configure_password_recovery_password,
+            passwords::unlock_passwords_with_recovery_password,
+            passwords::lock_password_vault,
+            password_browser::get_password_browser_status,
+            password_browser::start_password_fill,
+            password_browser::cancel_password_fill,
+            password_browser::start_password_template_recording,
+            password_browser::cancel_password_template_recording,
             screenshot::get_screenshot_settings,
             screenshot::set_screenshot_shortcut,
             screenshot::update_screenshot_settings,
@@ -871,10 +923,12 @@ pub fn run() {
                 {
                     let _ = api;
                     app.state::<MfaStore>().lock();
+                    app.state::<PasswordStore>().lock();
                     long_screenshot::shutdown(app);
                 }
             } else {
                 app.state::<MfaStore>().lock();
+                app.state::<PasswordStore>().lock();
             }
             // Explicit quit and restart paths finish long-capture cleanup on a
             // worker thread before requesting process exit. Repeating that

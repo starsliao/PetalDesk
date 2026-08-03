@@ -3,6 +3,7 @@
   import {
     FilePenLine,
     FileText,
+    KeyRound,
     List as ListIcon,
     Lock,
     LockOpen,
@@ -344,6 +345,8 @@
                   <ChartGantt size={15} aria-hidden="true" />
                 {:else if item.name === "mfa"}
                   <ShieldCheck size={15} aria-hidden="true" />
+                {:else if item.name === "passwords"}
+                  <KeyRound size={15} aria-hidden="true" />
                 {:else}
                   <ScanLine size={15} aria-hidden="true" />
                 {/if}

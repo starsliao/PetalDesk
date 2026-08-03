@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "飞花 - PetalDesk 长截图",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "description": "飞花 - PetalDesk 浏览器长截图增强，支持 Chrome、Edge 和 Firefox。",
   "minimum_chrome_version": "109",
   "permissions": [

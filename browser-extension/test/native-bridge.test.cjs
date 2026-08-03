@@ -46,7 +46,7 @@ function loadBridge(family = "chrome") {
       return port;
     },
     getManifest() {
-      return { version: "0.5.2" };
+      return { version: "0.6.0" };
     },
   };
   const callbackTabs = {
@@ -80,6 +80,25 @@ function loadBridge(family = "chrome") {
     },
     setTimeout,
   };
+  let passwordDisconnects = 0;
+  if (family === "firefox") {
+    context.PetalDeskPasswordBridge = {
+      createPasswordBridge() {
+        return {
+          capabilities: [],
+          disconnect() {
+            passwordDisconnects += 1;
+          },
+          route() {
+            throw new Error("not used by this harness");
+          },
+          supportsCommand() {
+            return false;
+          },
+        };
+      },
+    };
+  }
   if (family === "firefox") {
     context.browser = { runtime, tabs: promiseTabs };
   } else {
@@ -103,6 +122,7 @@ function loadBridge(family = "chrome") {
     selectTab(tabId) {
       selectedTabId = tabId;
     },
+    passwordDisconnects: () => passwordDisconnects,
   };
 }
 
@@ -145,6 +165,18 @@ test("native protocol rejects an incompatible command version", async () => {
   assert.equal(bridge.postedMessages[1].id, "request-2");
   assert.equal(bridge.postedMessages[1].ok, false);
   assert.match(bridge.postedMessages[1].error.message, /version/i);
+});
+
+test("secret pipe lifecycle disconnect clears the Firefox password bridge", async () => {
+  const bridge = loadBridge("firefox");
+  await sendNativeRequest(bridge, {
+    protocolVersion: 1,
+    type: "extension.event",
+    event: "secretDisconnected",
+    payload: { reason: "secret-pipe-unavailable" },
+  });
+  assert.equal(bridge.passwordDisconnects(), 1);
+  assert.equal(bridge.postedMessages.length, 1);
 });
 
 test("capture commands stay bound to the tab and frame selected by prepare", async () => {

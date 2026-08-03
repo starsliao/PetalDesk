@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="安装飞花 - PetalDesk Firefox 浏览器增强" />
+    <meta name="theme-color" content="#f7f7f5" />
+    <link rel="icon" href="./assets/app-icon.svg" type="image/svg+xml" />
+    <title>Firefox 浏览器增强 | 飞花 - PetalDesk</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #242426;
+        --muted: #656567;
+        --line: #d9d9d5;
+        --paper: #f7f7f5;
+        --white: #ffffff;
+        --blue: #0875c9;
+        --blue-hover: #0066ae;
+        --yellow: #fff4bf;
+        font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", -apple-system, "Segoe UI", Arial, sans-serif;
+        font-synthesis: none;
+      }
+
+      * { box-sizing: border-box; }
+      body { margin: 0; min-width: 320px; color: var(--ink); background: var(--paper); line-height: 1.65; letter-spacing: 0; }
+      a { color: inherit; text-underline-offset: 3px; }
+      header { border-bottom: 1px solid var(--line); background: var(--white); }
+      nav, .inner, footer { width: min(calc(100% - 40px), 920px); margin-inline: auto; }
+      nav { display: flex; align-items: center; justify-content: space-between; min-height: 66px; gap: 20px; }
+      .brand { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; font-weight: 800; }
+      .brand img { width: 34px; height: 34px; border-radius: 7px; }
+      .back { color: var(--muted); font-size: 14px; }
+      .intro { padding-block: 64px 52px; background: var(--white); border-bottom: 1px solid var(--line); }
+      h1 { margin: 0; max-width: 760px; font-size: clamp(34px, 6vw, 58px); line-height: 1.12; letter-spacing: 0; }
+      .lead { max-width: 690px; margin: 18px 0 28px; color: var(--muted); font-size: 18px; }
+      .actions { display: flex; flex-wrap: wrap; gap: 10px; }
+      .primary, .secondary { display: inline-flex; align-items: center; justify-content: center; min-height: 42px; padding: 9px 16px; border: 1px solid var(--blue); border-radius: 6px; font-weight: 700; text-decoration: none; }
+      .primary { color: var(--white); background: var(--blue); }
+      .primary:hover { background: var(--blue-hover); border-color: var(--blue-hover); }
+      .secondary { color: var(--blue); background: var(--white); }
+      .status { padding-block: 18px; background: var(--yellow); border-bottom: 1px solid #e2ce73; }
+      .status p { margin: 0; font-size: 14px; }
+      main { padding-block: 42px 66px; }
+      section { padding-block: 24px; border-bottom: 1px solid var(--line); }
+      h2 { margin: 0 0 12px; font-size: 22px; letter-spacing: 0; }
+      p { margin: 0 0 12px; }
+      ol, ul { margin: 8px 0 0; padding-left: 24px; }
+      li + li { margin-top: 8px; }
+      code { padding: 1px 4px; border-radius: 3px; background: #e9e9e5; }
+      footer { padding-block: 24px 40px; color: var(--muted); font-size: 14px; }
+      footer a { color: var(--blue); }
+      @media (max-width: 560px) {
+        nav, .inner, footer { width: min(calc(100% - 28px), 920px); }
+        .intro { padding-top: 46px; }
+        .actions a { width: 100%; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <nav aria-label="主导航">
+        <a class="brand" href="./index.html"><img src="./assets/app-icon.svg" alt="" />飞花 - PetalDesk</a>
+        <a class="back" href="./index.html">返回产品网站</a>
+      </nav>
+    </header>
+
+    <div class="intro">
+      <div class="inner">
+        <h1>飞花 Firefox 浏览器增强</h1>
+        <p class="lead">同一个扩展提供网页长截图，以及经用户确认的密码填充和登录信息保存提示。密码能力首版支持 Windows 与 Firefox Desktop 140 或更高版本。</p>
+        <div class="actions">
+          <a class="primary" href="https://addons.mozilla.org/firefox/search/?q=PetalDesk">在 Firefox Add-ons 查找 PetalDesk</a>
+          <a class="secondary" href="https://github.com/starsliao/PetalDesk/releases/latest">下载飞花桌面端</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="status">
+      <div class="inner">
+        <p>首版 AMO 提交材料已准备，待发布者在 Developer Hub 完成最终提交。若安装链接暂时不可用，请稍后从本页重试。GitHub Release 中的 <code>AMO-upload</code> ZIP 用于商店审核，不能替代 AMO 签名安装。</p>
+      </div>
+    </div>
+
+    <main class="inner">
+      <section>
+        <h2>安装条件</h2>
+        <ul>
+          <li>Windows 10/11 x64 上已安装飞花 - PetalDesk 0.6.0 或更高版本。</li>
+          <li>Firefox Desktop 140 或更高版本；Android、Chrome 与 Edge 暂不提供密码能力。</li>
+          <li>安装扩展时由 Firefox 显示权限，并由用户本人确认。</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>连接与授权</h2>
+        <ol>
+          <li>从 Firefox Add-ons 安装扩展，保持飞花桌面端运行。</li>
+          <li>打开飞花密码管理器；标题栏显示“Firefox 已连接”后可以打开站点。</li>
+          <li>首次使用填充或登录检测时，按飞花中的提示点击 Firefox 工具栏飞花图标，并确认可选的身份验证信息权限。</li>
+        </ol>
+      </section>
+
+      <section>
+        <h2>安全边界</h2>
+        <p>填充前页面会再次显示目标 origin 与账户名；扩展只填写字段，不会自动提交。登录候选仅在内存中短时保留，凭据不会写入 Firefox storage 或截图文件通信目录，也不会上传到飞花服务器。</p>
+      </section>
+    </main>
+
+    <footer>
+      <a href="./privacy.html">浏览器增强隐私政策</a> · <a href="https://github.com/starsliao/PetalDesk/issues">问题反馈</a>
+    </footer>
+  </body>
+</html>

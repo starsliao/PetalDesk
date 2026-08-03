@@ -6,19 +6,20 @@
 
 <https://starsliao.github.io/PetalDesk/>
 
-## 0.5.2 平台范围
+## 0.6.0 平台范围
 
-Windows 10/11 x64 与 macOS 12+ 共享便签、甘特图、计时器、提醒、系统通知、MFA 和普通截图能力。`0.5.2` 是 Windows 自动更新桥接版本，新增 Tauri 签名更新包、后台检查与下载、关于页面手动检查及默认开启的自动更新选项。Windows 继续提供长截图、自动滚动、Chrome / Edge / Firefox 浏览器增强和 Native Messaging Host。macOS 使用 Keychain 提供 MFA 本机免密解锁，并支持普通区域截图，但当前不提供长截图、浏览器联动、Native Messaging 注册或自动更新。
+Windows 10/11 x64 与 macOS 12+ 共享便签、甘特图、计时器、提醒、系统通知、MFA 和普通截图能力。`0.6.0` 在 Windows 新增本地密码保险库，并把经确认的自动填充和登录信息检测整合进 Firefox 长截图扩展；Chrome/Edge 的密码能力延期。Windows 继续提供长截图、自动滚动和 Native Messaging Host。macOS 使用 Keychain 提供 MFA 本机免密解锁，并支持普通区域截图，但当前不提供密码管理器、长截图、浏览器联动、Native Messaging 注册或自动更新。
 
 macOS Release 是一个 Universal DMG，内部同时包含 `x86_64-apple-darwin` 与 `aarch64-apple-darwin`，所以 Intel 和 Apple Silicon 不需要两个安装包。当前发布资产为：
 
-- `PetalDesk_0.5.2_x64-setup.exe`
-- `PetalDesk_0.5.2_x64-setup.exe.sig`
+- `PetalDesk_0.6.0_x64-setup.exe`
+- `PetalDesk_0.6.0_x64-setup.exe.sig`
 - `latest.json`
-- `PetalDesk_0.5.2_universal.dmg`
-- `PetalDesk_Firefox_AMO-upload_0.5.2.zip`
+- `PetalDesk_0.6.0_universal.dmg`
+- `PetalDesk_Firefox_AMO-upload_0.6.0.zip`
+- `PetalDesk_Firefox_AMO-source_0.6.0.zip`
 
-Windows 上的 `0.5.2` 可以直接覆盖旧版本；现有用户手动安装这一次后，后续 Windows 版本可通过客户端自动更新。macOS 的 `0.5.0` 是首个公开版本，`0.5.2` 可以直接覆盖升级。保险库继续兼容已有 DPAPI 包装；迁移到 macOS 后输入一次恢复密码即可创建 Keychain 本机保护，且不会丢弃 Windows DPAPI 元数据。反向迁移时同样只重绑当前平台保护。
+Windows `0.5.2` 及后续版本可以通过客户端自动更新到 `0.6.0`，无需先在本机手工打包或安装。macOS 的 `0.5.0` 是首个公开版本，`0.6.0` 可以直接覆盖升级。MFA 保险库继续兼容已有 DPAPI/Keychain 包装；Windows 密码保险库使用独立数据密钥，并与 MFA 协调恢复密码。
 
 ## 本地构建
 
@@ -77,14 +78,21 @@ Windows 包始终包含并注册 Firefox Native Messaging Host。构建 Chromium
 
 安装器不会安装浏览器扩展本身。公开 Firefox 版本还应发布 AMO 签名的 `browser-extension/dist/firefox` 构建；稳定 Gecko ID 已与 Host allowlist 对齐。Chrome 与 Edge 共用 Chromium 扩展构建，Firefox 使用独立 manifest 与签名 XPI。以上流程只适用于 Windows，macOS DMG 不包含或注册 Native Messaging Host。
 
+公开页面使用以下稳定地址，客户端和审核材料不写死尚未确认的 AMO slug：
+
+- Firefox 扩展安装页：<https://starsliao.github.io/PetalDesk/firefox.html>
+- 浏览器增强隐私政策：<https://starsliao.github.io/PetalDesk/privacy.html>
+
+首次发布时应先把包含这两个页面的 `main` 分支推送并等待 Pages 部署成功，再创建 `v0.6.0` 标签和提交 AMO，避免审核材料引用尚未上线的页面。
+
 本地生成带版本号的 AMO 上传包：
 
 ```powershell
 npm --prefix browser-extension run package:firefox
 ```
 
-标签工作流总会附加明确标识的未签名 AMO 上传 ZIP。仓库同时配置 `AMO_JWT_ISSUER` 与 `AMO_JWT_SECRET` 时，还会请求 AMO unlisted 签名并附加签名后的 XPI；未签名 ZIP 不能作为可直接安装的 Firefox 扩展对外提供。
+标签工作流总会附加明确标识的未签名 AMO 上传 ZIP 和审核源码 ZIP，但不会自动提交 AMO。首版应等 GitHub Release、Windows 安装包、隐私页和安装页全部公开后，再由产品所有者在 AMO Developer Hub 手工上传，避免桌面发布失败时提前占用不可重复的扩展版本号。未签名 ZIP 仅用于 AMO 上传，不能作为可直接安装的 Firefox 扩展对外提供。后续若增加 API 自动提交，应放在桌面 Release 成功后的独立工作流中，并单独处理 AMO 已存在同版本的幂等情况。
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.5.2>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.6.0>

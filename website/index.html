@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="飞花 - PetalDesk 是一款面向 Windows 与 macOS 的本地便签和效率工具，支持 Markdown、普通截图、计时器、提醒、任务甘特图，以及由 DPAPI 或 Keychain 保护的本地 MFA 验证器。"
+      content="飞花 - PetalDesk 是一款面向 Windows 与 macOS 的本地便签和效率工具，支持 Markdown、截图、计时器、提醒、任务甘特图、本地 MFA，以及 Windows 本地密码管理器与 Firefox 安全填充。"
     />
     <meta name="theme-color" content="#f7f7f5" />
     <link rel="icon" href="./assets/app-icon.svg" type="image/svg+xml" />
@@ -1284,7 +1284,7 @@
           <a
             class="nav-download"
             href="#download"
-          >下载 0.5.2</a>
+          >下载 0.6.0</a>
         </div>
       </nav>
     </header>
@@ -1301,12 +1301,12 @@
             <div class="hero-actions">
               <a
                 class="primary-action"
-                href="https://github.com/starsliao/PetalDesk/releases/download/v0.5.2/PetalDesk_0.5.2_x64-setup.exe"
+                href="https://github.com/starsliao/PetalDesk/releases/download/v0.6.0/PetalDesk_0.6.0_x64-setup.exe"
                 download
               >Windows x64</a>
               <a
                 class="secondary-action"
-                href="https://github.com/starsliao/PetalDesk/releases/download/v0.5.2/PetalDesk_0.5.2_universal.dmg"
+                href="https://github.com/starsliao/PetalDesk/releases/download/v0.6.0/PetalDesk_0.6.0_universal.dmg"
                 download
               >macOS Universal</a>
             </div>
@@ -1412,7 +1412,7 @@
               </h2>
             </div>
             <p class="section-intro">
-              从托盘或便签窗口随时打开。计时、提醒、任务规划、MFA 验证与截图各自专注，不把主界面变成拥挤的控制台。
+              从托盘或便签窗口随时打开。计时、提醒、任务规划、MFA、密码管理与截图各自专注，不把主界面变成拥挤的控制台。
             </p>
           </div>
 
@@ -1439,6 +1439,11 @@
             </article>
             <article class="tool-item">
               <span class="tool-number">05</span>
+              <h3>密码管理器</h3>
+              <p>Windows 本地加密保存多个站点账户。Firefox 扩展在页面再次确认后填充但不提交，也可经明确授权提示新增或更新登录信息。</p>
+            </article>
+            <article class="tool-item">
+              <span class="tool-number">06</span>
               <h3>截图</h3>
               <p>Windows 与 macOS 都能直接框选，再标注、复制、保存或贴图。长截图、浏览器增强与 Native Messaging 仅在 Windows 提供。</p>
             </article>
@@ -1485,7 +1490,7 @@
               </h2>
             </div>
             <p class="section-intro">
-              飞花 - PetalDesk 把便签、附件、设置和小工具数据统一放进“飞花 - PetalDesk 数据存储”。它按本地读多写少设计，换电脑或平台时复制整个目录即可；MFA 本机免密，迁移时输入一次恢复密码。
+              飞花 - PetalDesk 把便签、附件、设置和小工具数据统一放进“飞花 - PetalDesk 数据存储”。它按本地读多写少设计；MFA 与密码库使用独立数据密钥，并协调同一恢复密码。
             </p>
           </div>
 
@@ -1502,7 +1507,7 @@
                 <span class="data-point-number">02</span>
                 <div>
                   <strong>普通数据一个目录完成迁移</strong>
-                  <p>复制完整数据目录并重新指定路径即可；MFA 密钥不会降级为明文，跨电脑或平台后输入恢复密码即可重新绑定 DPAPI 或 Keychain，导出密钥也不能绕过恢复密码验证。</p>
+                  <p>复制完整数据目录并重新指定路径即可；MFA 与密码数据不会降级为明文，迁移后输入恢复密码即可重新绑定本机保护。</p>
                 </div>
               </li>
               <li>
@@ -1532,7 +1537,8 @@
    │  │  ├─ gantt.json
    │  │  ├─ backups/
    │  │  └─ conflicts/
-   │  └─ mfa/ (认证加密保险库)
+   │  ├─ mfa/ (认证加密保险库)
+   │  └─ passwords/ (独立密码保险库)
    ├─ state/
    │  ├─ note-order.json
    │  └─ windows.json
@@ -1545,7 +1551,7 @@
                 Windows 的 `%LOCALAPPDATA%\PetalDesk` 或 macOS 的 `~/Library/Application Support/PetalDesk` 只保存当前数据目录指针、可重建索引和调试日志，不属于需要迁移的业务内容。
               </p>
               <p class="directory-note">
-                Windows 可直接覆盖安装 0.5.2；这是自动更新桥接版本，现有用户手动安装这一次后，后续版本可以在飞花内完成检查、下载和重启安装。macOS 0.5.0 是首个公开版本，0.5.2 可直接覆盖升级。首次启动会自动兼容旧便签元数据和旧甘特图文件，并在写入新格式前保留迁移备份。同机升级不需要 MFA 恢复密码。
+                已安装 0.5.2 或更高版本的 Windows 用户可以在飞花内自动更新到 0.6.0，无需重新下载安装。macOS 0.5.0 是首个公开版本，0.6.0 可直接覆盖升级。首次启动会自动兼容旧便签元数据和旧甘特图文件，并在写入新格式前保留迁移备份。同机升级不需要 MFA 恢复密码。
               </p>
             </div>
           </div>
@@ -1564,17 +1570,17 @@
             <div class="download-option">
               <a
                 class="download-action"
-                href="https://github.com/starsliao/PetalDesk/releases/download/v0.5.2/PetalDesk_0.5.2_x64-setup.exe"
+                href="https://github.com/starsliao/PetalDesk/releases/download/v0.6.0/PetalDesk_0.6.0_x64-setup.exe"
                 download
-              >下载 Windows x64 版 0.5.2</a>
+              >下载 Windows x64 版 0.6.0</a>
               <div class="download-meta">Windows 10 / 11 · x64 · 联网安装包</div>
             </div>
             <div class="download-option">
               <a
                 class="download-action"
-                href="https://github.com/starsliao/PetalDesk/releases/download/v0.5.2/PetalDesk_0.5.2_universal.dmg"
+                href="https://github.com/starsliao/PetalDesk/releases/download/v0.6.0/PetalDesk_0.6.0_universal.dmg"
                 download
-              >下载 macOS 版 0.5.2</a>
+              >下载 macOS 版 0.6.0</a>
               <div class="download-meta">macOS 12+ · Intel + Apple Silicon · Universal DMG</div>
             </div>
           </div>
@@ -1589,6 +1595,8 @@
           <span>飞花 - PetalDesk</span>
         </div>
         <span>本地优先 · 数据可见 · Windows 与 macOS 桌面体验</span>
+        <a href="./firefox.html">Firefox 扩展</a>
+        <a href="./privacy.html">隐私政策</a>
       </div>
     </footer>
   </body>

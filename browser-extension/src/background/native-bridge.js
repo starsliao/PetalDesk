@@ -23,6 +23,14 @@
   let reconnectDelayMs = 1_000;
   const activeSessions = new Map();
   let defaultSessionKey = null;
+  const passwordBridge = api.browserFamily === "firefox"
+    && root.PetalDeskPasswordBridge
+    ? root.PetalDeskPasswordBridge.createPasswordBridge({
+      api,
+      postToNative,
+      protocolVersion: PROTOCOL_VERSION,
+    })
+    : null;
 
   function errorMessage(error) {
     return error instanceof Error ? error.message : String(error || "Unknown error");
@@ -30,13 +38,15 @@
 
   function postToNative(message) {
     if (!nativePort) {
-      return;
+      return false;
     }
 
     try {
       nativePort.postMessage(message);
+      return true;
     } catch (error) {
       console.warn("PetalDesk native response failed", error);
+      return false;
     }
   }
 
@@ -72,6 +82,10 @@
         browser: api.browserFamily,
         extensionId: api.extensionId,
       };
+    }
+
+    if (passwordBridge && passwordBridge.supportsCommand(command)) {
+      return passwordBridge.route(request);
     }
 
     if (!COMMANDS.has(command)) {
@@ -148,6 +162,13 @@
 
   async function onNativeMessage(request) {
     reconnectDelayMs = 1_000;
+    if (request && request.type === "extension.event") {
+      if (request.event === "secretDisconnected") {
+        cancelActiveSessions();
+        if (passwordBridge) passwordBridge.disconnect();
+      }
+      return;
+    }
     const id = request && request.id != null ? request.id : null;
     try {
       const requestVersion = request && (request.protocolVersion ?? request.version);
@@ -169,7 +190,7 @@
         id,
         ok: false,
         error: {
-          code: "CAPTURE_COMMAND_FAILED",
+          code: error && error.code ? error.code : "CAPTURE_COMMAND_FAILED",
           message: errorMessage(error),
         },
       });
@@ -201,6 +222,9 @@
         api.consumeRuntimeLastError();
         nativePort = null;
         cancelActiveSessions();
+        if (passwordBridge) {
+          passwordBridge.disconnect();
+        }
         scheduleReconnect();
       });
       postToNative({
@@ -209,7 +233,10 @@
         browser: api.browserFamily,
         extensionVersion: api.extensionVersion,
         extensionId: api.extensionId,
-        capabilities: Array.from(COMMANDS),
+        capabilities: [
+          ...Array.from(COMMANDS),
+          ...(passwordBridge ? Array.from(passwordBridge.capabilities) : []),
+        ],
       });
     } catch (error) {
       nativePort = null;

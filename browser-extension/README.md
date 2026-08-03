@@ -1,8 +1,9 @@
-# 飞花 - PetalDesk 浏览器长截图扩展
+# 飞花 - PetalDesk 浏览器增强扩展
 
 This directory contains the shared WebExtension implementation used by the
-飞花 - PetalDesk long-capture browser enhancement. The extension has no runtime npm
-dependencies. Release packaging downloads the pinned `web-ext@10.5.0` tool via
+飞花 - PetalDesk browser enhancement. Firefox v1 adds the password-manager
+companion to the existing long-capture feature. The extension has no runtime
+npm dependencies. Release packaging downloads the pinned `web-ext@10.5.0` tool via
 `npx` for AMO validation, archives, and optional signing.
 
 ## Build and test
@@ -18,24 +19,33 @@ npm run package:firefox
 The build creates two unpacked extensions:
 
 - `dist/chromium`: Chrome and Edge Manifest V3 extension.
-- `dist/firefox`: Firefox Manifest V3 extension with the stable Gecko ID
-  `petaldesk-capture@petaldesk.app`.
+- `dist/firefox`: Firefox Manifest V3 extension with long capture and password
+  features, using the stable Gecko ID `petaldesk-capture@petaldesk.app`.
 
 `npm run package:firefox` validates the Firefox build and creates a versioned
-`dist/artifacts/PetalDesk_Firefox_AMO-upload_*.zip`. This ZIP is for AMO upload;
-it is not a signed, user-installable extension. To request an unlisted signed
-XPI from AMO, set `AMO_JWT_ISSUER` and `AMO_JWT_SECRET`, then run:
+`dist/artifacts/PetalDesk_Firefox_AMO-upload_*.zip`. This ZIP is for a public AMO
+listed upload; it is not a signed, user-installable extension. The same command
+also creates `PetalDesk_Firefox_AMO-source_*.zip` with readable source, tests,
+build scripts, and reviewer fixtures. API signing is optional and requires an
+explicit channel. After setting `AMO_JWT_ISSUER` and
+`AMO_JWT_SECRET`, run one of:
 
 ```powershell
-.\scripts\package-firefox.ps1 -Sign
+.\scripts\package-firefox.ps1 -Sign -Channel Listed
+.\scripts\package-firefox.ps1 -Sign -Channel Unlisted
 ```
 
-The signed output is written to `dist/signed/*-signed.xpi`. Chrome/Edge store
-publication and their production extension IDs remain separate release steps.
-The Firefox manifest declares AMO data collection permission `websiteActivity`
-because it sends scroll geometry to the registered Native Messaging host. That
-host is on the same machine; the extension does not send page content to a
-remote service.
+Unlisted signing downloads an XPI under `dist/signed`. Listed API submission may
+not return an XPI until Mozilla makes it available. Without `-Sign`, packaging
+never requires AMO credentials or performs an external submission. Chrome/Edge
+password publication remains a later release step.
+
+The Firefox manifest declares required `websiteActivity` for scroll geometry
+and optional `authenticationInfo` for usernames/passwords. Authentication
+access is requested only from a directly clicked toolbar action after PetalDesk
+arms the consent flow. The Native Messaging host is on the same machine; the
+extension does not send data to a remote service. AMO listing, privacy,
+permission, and reviewer drafts are in `amo/`.
 
 ## Capture protocol
 
@@ -80,3 +90,43 @@ desktop application can fall back to its general capture engine.
 
 Native host templates and Windows registration instructions are under
 `native-host/`.
+
+## Password protocol
+
+Firefox advertises `password-fill` and `password-capture` plus these commands:
+
+- `password.open`
+- `password.offerFill`
+- `password.provideCredentials`
+- `password.cancelFill`
+- `password.requestConsent`
+- `password.setCaptureEnabled`
+- `password.captureMatch`
+- `password.saveResult`
+- `password.resolveCapture`
+- `password.startTemplateRecording`
+- `password.cancelTemplateRecording`
+- `password.getStatus`
+
+Password events use
+`{ "type": "extension.event", "event": "...", "payload": { ... } }`.
+The event names are `tabReady`, `fillConfirm`, `fillResult`,
+`captureCandidate`, `saveDecision`, `consentRequired`, `consentChanged`,
+`templateRecordingReady`, `templateRecordingProgress`,
+`templateRecordingResult`, and `templateRecordingCancelled`.
+`password.captureMatch` can return `new`, `update`, `same`, `select`, or
+`username-required`; a `select` decision is completed by a bound `replace`
+save action. `password.saveResult` keeps a failed candidate available for a
+short retry window and clears it only after a confirmed success.
+
+The two-phase fill protocol is mandatory: `password.offerFill` contains no
+password; after the page overlay produces `fillConfirm`, the host sends one
+`password.provideCredentials` command. The request is bound to one session,
+tab, top-level frame, document, and exact origin. Content scripts fill fields
+and dispatch `input`/`change` events but never submit the form. Login candidates
+stay in extension memory for at most 30 seconds. A username captured on the
+first page of a two-step login can remain in memory for at most two minutes on
+the same tab and exact origin. Neither value is written to extension storage.
+`password.offerFill.userTemplate` is either `null` or a complete constrained
+template object; legacy string template IDs are rejected instead of silently
+falling back to generic field detection.

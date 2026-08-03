@@ -101,7 +101,7 @@ describe("browser note styles", () => {
   });
 
   it("defaults to Typora mode and persists a new global selection", async () => {
-    expect((await notesApi.appInfo()).version).toBe("0.5.2");
+    expect((await notesApi.appInfo()).version).toBe("0.6.0");
     expect((await notesApi.appInfo()).defaultEditorMode).toBe("typora");
 
     await expect(notesApi.setDefaultEditorMode("plain")).resolves.toBe("plain");
@@ -250,6 +250,7 @@ describe("browser note styles", () => {
     await notesApi.openToolWindow("reminder");
     await notesApi.openToolWindow("gantt");
     await notesApi.openToolWindow("mfa");
+    await notesApi.openToolWindow("passwords");
     await notesApi.openToolWindow("screenshot");
 
     expect(open).toHaveBeenNthCalledWith(
@@ -278,6 +279,12 @@ describe("browser note styles", () => {
     );
     expect(open).toHaveBeenNthCalledWith(
       5,
+      expect.objectContaining({ search: "?tool=passwords" }),
+      "petaldesk-tool-passwords",
+      "popup,width=860,height=650",
+    );
+    expect(open).toHaveBeenNthCalledWith(
+      6,
       expect.objectContaining({ search: "?tool=screenshot" }),
       "petaldesk-tool-screenshot",
       expect.stringMatching(/^popup,width=\d+,height=\d+$/),

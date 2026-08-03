@@ -25,9 +25,15 @@ jobs:
           $expected = $tag.Substring(1)
           $cargo = Get-Content "src-tauri/Cargo.toml" -Raw
           $cargoVersion = [regex]::Match($cargo, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          $cargoLock = Get-Content "src-tauri/Cargo.lock" -Raw
+          $cargoLockVersion = [regex]::Match(
+            $cargoLock,
+            '(?ms)\[\[package\]\]\s*name\s*=\s*"petaldesk"\s*version\s*=\s*"([^"]+)"'
+          ).Groups[1].Value
           $versions = [ordered]@{
             "package.json" = (Get-Content "package.json" -Raw | ConvertFrom-Json).version
             "src-tauri/Cargo.toml" = $cargoVersion
+            "src-tauri/Cargo.lock" = $cargoLockVersion
             "src-tauri/tauri.conf.json" = (Get-Content "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json).version
             "browser-extension/package.json" = (Get-Content "browser-extension/package.json" -Raw | ConvertFrom-Json).version
             "browser-extension/manifest/chromium.json" = (Get-Content "browser-extension/manifest/chromium.json" -Raw | ConvertFrom-Json).version
@@ -88,20 +94,11 @@ jobs:
 
       - name: Build Firefox extension package
         shell: pwsh
-        env:
-          AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
-          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
         run: |
-          $signArguments = @()
-          $hasIssuer = -not [string]::IsNullOrWhiteSpace($env:AMO_JWT_ISSUER)
-          $hasSecret = -not [string]::IsNullOrWhiteSpace($env:AMO_JWT_SECRET)
-          if ($hasIssuer -ne $hasSecret) {
-            throw "Configure both AMO_JWT_ISSUER and AMO_JWT_SECRET, or neither."
+          & ".\browser-extension\scripts\package-firefox.ps1"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Firefox extension packaging failed with exit code $LASTEXITCODE."
           }
-          if ($hasIssuer) {
-            $signArguments += "-Sign"
-          }
-          & ".\browser-extension\scripts\package-firefox.ps1" @signArguments
 
       - name: Collect Windows release assets
         shell: pwsh
@@ -125,6 +122,12 @@ jobs:
             throw "Expected one Firefox AMO upload archive, found $($firefoxArchives.Count)."
           }
           Copy-Item -LiteralPath $firefoxArchives[0].FullName -Destination $assetsDirectory.FullName
+
+          $firefoxSourceArchives = @(Get-ChildItem -Path "browser-extension/dist/artifacts" -Filter "PetalDesk_Firefox_AMO-source_*.zip" -File)
+          if ($firefoxSourceArchives.Count -ne 1) {
+            throw "Expected one Firefox AMO source archive, found $($firefoxSourceArchives.Count)."
+          }
+          Copy-Item -LiteralPath $firefoxSourceArchives[0].FullName -Destination $assetsDirectory.FullName
 
           $signedFirefoxPackages = @(Get-ChildItem -Path "browser-extension/dist/signed" -Filter "PetalDesk_Firefox_*-signed.xpi" -File -ErrorAction SilentlyContinue)
           if ($signedFirefoxPackages.Count -gt 1) {
@@ -319,12 +322,13 @@ jobs:
           windows_signatures=(release-assets/PetalDesk_*_x64-setup.exe.sig)
           macos_images=(release-assets/PetalDesk_*_universal.dmg)
           firefox_archives=(release-assets/PetalDesk_Firefox_AMO-upload_*.zip)
+          firefox_source_archives=(release-assets/PetalDesk_Firefox_AMO-source_*.zip)
           if [[ "${#windows_installers[@]}" -ne 1 || "${#windows_signatures[@]}" -ne 1 ]]; then
             echo "Expected exactly one signed Windows updater payload." >&2
             exit 1
           fi
-          if [[ "${#macos_images[@]}" -ne 1 || "${#firefox_archives[@]}" -ne 1 ]]; then
-            echo "Expected exactly one macOS DMG and one Firefox archive." >&2
+          if [[ "${#macos_images[@]}" -ne 1 || "${#firefox_archives[@]}" -ne 1 || "${#firefox_source_archives[@]}" -ne 1 ]]; then
+            echo "Expected exactly one macOS DMG, one Firefox upload archive and one Firefox source archive." >&2
             exit 1
           fi
           if [[ ! -s release-assets/latest.json ]]; then
@@ -339,6 +343,10 @@ jobs:
           gh release upload "$tag" release-assets/latest.json --clobber
           gh release edit "$tag" --draft=false --latest
 
+  verify-public-assets:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
       - name: Verify public updater assets
         shell: bash
         env:
@@ -348,20 +356,39 @@ jobs:
           tag="${{ github.ref_name }}"
           version="${tag#v}"
           installer_name="PetalDesk_${version}_x64-setup.exe"
+          macos_name="PetalDesk_${version}_universal.dmg"
+          firefox_upload_name="PetalDesk_Firefox_AMO-upload_${version}.zip"
+          firefox_source_name="PetalDesk_Firefox_AMO-source_${version}.zip"
           latest_url="https://github.com/${GH_REPO}/releases/latest/download/latest.json"
 
-          curl --fail --silent --show-error --location --retry 12 --retry-delay 5 --retry-all-errors \
-            "$latest_url" --output remote-latest.json
-          jq -e --arg version "$version" \
-            '.version == $version and (.platforms | keys == ["windows-x86_64"])' \
-            remote-latest.json >/dev/null
-
           expected_url="https://github.com/${GH_REPO}/releases/download/${tag}/${installer_name}"
-          jq -e --arg url "$expected_url" \
-            '.platforms["windows-x86_64"].url == $url and (.platforms["windows-x86_64"].signature | length > 0)' \
-            remote-latest.json >/dev/null
+          for attempt in {1..24}; do
+            if curl --fail --silent --show-error --location --retry 3 --retry-delay 2 --retry-all-errors \
+                "$latest_url" --output remote-latest.json \
+              && jq -e --arg version "$version" --arg url "$expected_url" \
+                '.version == $version
+                  and (.platforms | keys == ["windows-x86_64"])
+                  and .platforms["windows-x86_64"].url == $url
+                  and (.platforms["windows-x86_64"].signature | length > 0)' \
+                remote-latest.json >/dev/null; then
+              break
+            fi
+            if [[ "$attempt" -eq 24 ]]; then
+              echo "Latest release redirect did not expose updater version ${version} in time." >&2
+              cat remote-latest.json >&2 || true
+              exit 1
+            fi
+            echo "Waiting for releases/latest to expose ${tag} (attempt ${attempt}/24)..."
+            sleep 5
+          done
 
-          for asset in "$installer_name" "${installer_name}.sig" latest.json; do
+          for asset in \
+            "$installer_name" \
+            "${installer_name}.sig" \
+            "$macos_name" \
+            "$firefox_upload_name" \
+            "$firefox_source_name" \
+            latest.json; do
             curl --fail --silent --show-error --location --head --retry 12 --retry-delay 5 --retry-all-errors \
               "https://github.com/${GH_REPO}/releases/download/${tag}/${asset}" >/dev/null
           done

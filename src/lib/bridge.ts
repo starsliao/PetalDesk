@@ -463,7 +463,7 @@ export const notesApi = {
     if (isTauriRuntime()) return command<AppInfo>("get_app_info");
     return {
       workspacePath: "浏览器演示数据",
-      version: "0.5.2",
+      version: "0.6.0",
       defaultEditorMode: readBrowserDefaultEditorMode(),
       trayShortcutSettings: readBrowserTrayShortcutSettings(),
       recoveredDrafts: 0,
@@ -700,6 +700,8 @@ export const notesApi = {
             ? "popup,width=980,height=600"
             : tool === "mfa"
               ? "popup,width=520,height=640"
+              : tool === "passwords"
+                ? "popup,width=860,height=650"
               : `popup,width=${Math.max(640, screen.availWidth)},height=${Math.max(480, screen.availHeight)}`;
     window.open(url, `petaldesk-tool-${tool}`, dimensions);
   },

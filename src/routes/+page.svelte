@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, type Component } from "svelte";
   import { AlertCircle, FolderOpen, LoaderCircle } from "@lucide/svelte";
   import "$lib/styles/app.css";
   import { NoteShell, NotesList, TrashView } from "$lib/components";
@@ -34,6 +34,7 @@
   type NoteEditorComponent = typeof import("$lib/components/NoteEditor.svelte").default;
   type GanttToolComponent = typeof import("$lib/components/GanttTool.svelte").default;
   type MfaToolComponent = typeof import("$lib/components/MfaTool.svelte").default;
+  type PasswordManagerToolComponent = Component<Record<string, never>>;
   type ScreenshotToolComponent = typeof import("$lib/components/ScreenshotTool.svelte").default;
   type PinnedScreenshotComponent = typeof import("$lib/components/PinnedScreenshot.svelte").default;
 
@@ -106,6 +107,7 @@
   let initialized = $state(false);
   let GanttTool = $state<GanttToolComponent | null>(null);
   let MfaTool = $state<MfaToolComponent | null>(null);
+  let PasswordManagerTool = $state<PasswordManagerToolComponent | null>(null);
   let ScreenshotTool = $state<ScreenshotToolComponent | null>(null);
   let PinnedScreenshot = $state<PinnedScreenshotComponent | null>(null);
   let fatalError = $state("");
@@ -880,6 +882,10 @@
         void import("$lib/components/MfaTool.svelte").then((module) => {
           if (!disposed) MfaTool = module.default;
         });
+      } else if (toolName === "passwords") {
+        void import("$lib/components/PasswordManagerTool.svelte").then((module) => {
+          if (!disposed) PasswordManagerTool = module.default;
+        });
       }
       return () => {
         disposed = true;
@@ -934,6 +940,8 @@
             ? "任务甘特图 - 飞花 - PetalDesk"
             : toolName === "mfa"
               ? "MFA 验证器 - 飞花 - PetalDesk"
+              : toolName === "passwords"
+                ? "密码管理器 - 飞花 - PetalDesk"
               : toolName === "screenshot"
                 ? longCaptureControlId
                   ? "长截图控制 - 飞花 - PetalDesk"
@@ -1006,6 +1014,16 @@
   <main class="mfa-tool-window">
     {#if MfaTool}
       <MfaTool />
+    {:else}
+      <div class="tool-loading" aria-busy="true">
+        <LoaderCircle class="spinner" size={20} aria-hidden="true" />
+      </div>
+    {/if}
+  </main>
+{:else if toolName === "passwords"}
+  <main class="password-tool-window">
+    {#if PasswordManagerTool}
+      <PasswordManagerTool />
     {:else}
       <div class="tool-loading" aria-busy="true">
         <LoaderCircle class="spinner" size={20} aria-hidden="true" />
@@ -1191,7 +1209,8 @@
 
   .reminder-tool-window,
   .gantt-tool-window,
-  .mfa-tool-window {
+  .mfa-tool-window,
+  .password-tool-window {
     width: 100vw;
     height: 100vh;
     min-width: 0;

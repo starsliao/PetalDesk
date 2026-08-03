@@ -10,6 +10,7 @@ const outputRoot = join(projectRoot, "dist");
 const sharedFiles = [
   ["shared/scroll-core.js", "shared/scroll-core.js"],
   ["shared/browser-api.js", "shared/browser-api.js"],
+  ["shared/password-templates.js", "shared/password-templates.js"],
   ["content/capture-session.js", "content/capture-session.js"],
   ["background/native-bridge.js", "background/native-bridge.js"],
 ];
@@ -23,7 +24,15 @@ const variants = [
   {
     name: "firefox",
     manifest: "firefox.json",
-    files: [],
+    files: [
+      ["content/password-manager.js", "content/password-manager.js"],
+      ["background/password-bridge.js", "background/password-bridge.js"],
+      ["../assets/icons/petaldesk-16.png", "assets/icons/petaldesk-16.png"],
+      ["../assets/icons/petaldesk-32.png", "assets/icons/petaldesk-32.png"],
+      ["../assets/icons/petaldesk-48.png", "assets/icons/petaldesk-48.png"],
+      ["../assets/icons/petaldesk-96.png", "assets/icons/petaldesk-96.png"],
+      ["../assets/icons/petaldesk-128.png", "assets/icons/petaldesk-128.png"],
+    ],
   },
 ];
 

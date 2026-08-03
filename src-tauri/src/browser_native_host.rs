@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs;
+use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -11,6 +12,8 @@ const PROTOCOL_VERSION: u32 = 1;
 const MAX_NATIVE_MESSAGE_BYTES: usize = 1024 * 1024;
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const SECRET_ENDPOINT_MAX_FUTURE: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +38,21 @@ struct ExtensionMessage {
     result: Option<Value>,
     #[serde(default)]
     error: Option<Value>,
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    payload: Option<Value>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SecretEndpoint {
+    version: u32,
+    pipe_name: String,
+    token: String,
+    process_id: u32,
+    expires_at_unix_ms: u128,
 }
 
 #[derive(Debug, Serialize)]
@@ -111,11 +129,41 @@ where
         }
     });
 
+    let (secret_command_tx, secret_command_rx) = mpsc::channel::<Value>();
+    let (secret_outbound_tx, secret_outbound_rx) = mpsc::sync_channel::<Value>(128);
+    #[cfg(windows)]
+    start_secret_connector(
+        connection_id.clone(),
+        browser.to_string(),
+        secret_command_tx,
+        secret_outbound_rx,
+    );
+    #[cfg(not(windows))]
+    {
+        drop(secret_command_tx);
+        drop(secret_outbound_rx);
+    }
+
     let _cleanup = SessionCleanup(paths.clone());
     let mut last_heartbeat = SystemTime::now();
+    let mut secret_request_ids = HashSet::new();
+    let mut legacy_request_ids = HashSet::new();
     loop {
         while let Ok(message) = incoming_rx.try_recv() {
             let message = message?;
+            if message.kind == "extension.event" {
+                let Some(event) = message.event else {
+                    continue;
+                };
+                let _ = secret_outbound_tx.try_send(serde_json::json!({
+                    "version": PROTOCOL_VERSION,
+                    "type": "secret.event",
+                    "event": event,
+                    "payload": message.payload,
+                    "queuedAtUnixMs": unix_time_ms(),
+                }));
+                continue;
+            }
             if message.kind != "extension.response" {
                 continue;
             }
@@ -123,6 +171,21 @@ where
                 continue;
             };
             if !is_safe_identifier(id) {
+                continue;
+            }
+            if secret_request_ids.remove(id) {
+                let _ = secret_outbound_tx.try_send(serde_json::json!({
+                    "version": PROTOCOL_VERSION,
+                    "type": "secret.response",
+                    "id": id,
+                    "ok": message.ok.unwrap_or(false),
+                    "result": message.result,
+                    "error": message.error,
+                    "queuedAtUnixMs": unix_time_ms(),
+                }));
+                continue;
+            }
+            if !legacy_request_ids.remove(id) {
                 continue;
             }
             let response = serde_json::json!({
@@ -135,12 +198,51 @@ where
             atomic_write_json(&paths.responses.join(format!("{id}.json")), &response)?;
         }
 
+        while let Ok(command) = secret_command_rx.try_recv() {
+            if command.get("type").and_then(Value::as_str) == Some("secret.lifecycle") {
+                write_native_message(
+                    &mut output,
+                    &serde_json::json!({
+                        "version": PROTOCOL_VERSION,
+                        "type": "extension.event",
+                        "event": command.get("event").and_then(Value::as_str),
+                        "payload": command.get("payload").cloned().unwrap_or(Value::Null),
+                    }),
+                )?;
+                continue;
+            }
+            let Some(id) = command.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !is_safe_identifier(id) {
+                continue;
+            }
+            secret_request_ids.insert(id.to_string());
+            write_native_message(&mut output, &command)?;
+        }
+
         for command_path in pending_commands(&paths.commands)? {
             let bytes =
                 fs::read(&command_path).map_err(|error| format!("读取浏览器指令失败: {error}"))?;
             let command: Value = serde_json::from_slice(&bytes)
                 .map_err(|error| format!("浏览器指令格式无效: {error}"))?;
+            if is_password_spool_command(&command) {
+                fs::remove_file(&command_path)
+                    .map_err(|error| format!("清理被拒绝的密码指令失败: {error}"))?;
+                continue;
+            }
+            let Some(id) = command.get("id").and_then(Value::as_str) else {
+                fs::remove_file(&command_path)
+                    .map_err(|error| format!("清理无效浏览器指令失败: {error}"))?;
+                continue;
+            };
+            if !is_safe_identifier(id) {
+                fs::remove_file(&command_path)
+                    .map_err(|error| format!("清理无效浏览器指令失败: {error}"))?;
+                continue;
+            }
             write_native_message(&mut output, &command)?;
+            legacy_request_ids.insert(id.to_string());
             fs::remove_file(&command_path)
                 .map_err(|error| format!("清理已发送浏览器指令失败: {error}"))?;
         }
@@ -173,6 +275,13 @@ fn bridge_root() -> Result<PathBuf, String> {
     dirs::data_local_dir()
         .ok_or_else(|| "无法确定当前用户的本地数据目录".to_string())
         .map(|root| root.join("PetalDesk").join("browser-bridge"))
+}
+
+fn unix_time_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 #[derive(Clone)]
@@ -253,6 +362,14 @@ fn is_safe_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn is_password_spool_command(command: &Value) -> bool {
+    command
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name.starts_with("password."))
+        || command.get("type").and_then(Value::as_str) == Some("secret.command")
 }
 
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
@@ -342,6 +459,231 @@ fn write_native_message<W: Write, T: Serialize>(writer: &mut W, value: &T) -> Re
         .map_err(|error| format!("发送浏览器扩展消息失败: {error}"))
 }
 
+#[cfg(windows)]
+fn start_secret_connector(
+    connection_id: String,
+    browser: String,
+    command_sender: mpsc::Sender<Value>,
+    outbound_receiver: mpsc::Receiver<Value>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("petaldesk-password-native-pipe".to_string())
+        .spawn(move || {
+            let _ = command_sender.send(serde_json::json!({
+                "type": "secret.lifecycle",
+                "event": "secretDisconnected",
+                "payload": { "reason": "secret-pipe-unavailable" },
+            }));
+            loop {
+                let endpoint = match read_secret_endpoint() {
+                    Ok(endpoint) => endpoint,
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                };
+                let mut pipe = match OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&endpoint.pipe_name)
+                {
+                    Ok(pipe) => pipe,
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                };
+                if write_secret_frame(
+                    &mut pipe,
+                    &serde_json::json!({
+                        "version": PROTOCOL_VERSION,
+                        "type": "secret.hello",
+                        "token": endpoint.token,
+                        "connectionId": connection_id.clone(),
+                        "browser": browser.clone(),
+                        "processId": std::process::id(),
+                    }),
+                )
+                .is_err()
+                {
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+                let ready = match read_secret_frame(&mut pipe) {
+                    Ok(Some(value)) => value,
+                    _ => {
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                };
+                if ready.get("type").and_then(Value::as_str) != Some("secret.ready") {
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+                let _ = command_sender.send(serde_json::json!({
+                    "type": "secret.lifecycle",
+                    "event": "secretConnected",
+                    "payload": {},
+                }));
+
+                let mut reader = match pipe.try_clone() {
+                    Ok(reader) => reader,
+                    Err(_) => continue,
+                };
+                let (closed_tx, closed_rx) = mpsc::sync_channel(1);
+                let reader_commands = command_sender.clone();
+                let reader_thread = std::thread::spawn(move || {
+                    loop {
+                        match read_secret_frame(&mut reader) {
+                            Ok(Some(command))
+                                if command.get("type").and_then(Value::as_str)
+                                    == Some("secret.command") =>
+                            {
+                                if reader_commands.send(command).is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(Some(_)) => {}
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                    let _ = closed_tx.send(());
+                });
+
+                loop {
+                    if closed_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    match outbound_receiver.recv_timeout(Duration::from_millis(250)) {
+                        Ok(message) => {
+                            let queued_at = message
+                                .get("queuedAtUnixMs")
+                                .and_then(Value::as_u64)
+                                .map(u128::from)
+                                .unwrap_or_else(unix_time_ms);
+                            if unix_time_ms().saturating_sub(queued_at) > 30_000 {
+                                continue;
+                            }
+                            if write_secret_frame(&mut pipe, &message).is_err() {
+                                break;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                drop(pipe);
+                let _ = reader_thread.join();
+                let _ = command_sender.send(serde_json::json!({
+                    "type": "secret.lifecycle",
+                    "event": "secretDisconnected",
+                    "payload": { "reason": "secret-pipe-closed" },
+                }));
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+}
+
+#[cfg(windows)]
+fn read_secret_endpoint() -> Result<SecretEndpoint, String> {
+    let path = bridge_root()?.join("secret-endpoint.json");
+    let metadata = fs::metadata(&path)
+        .map_err(|error| format!("browser secret endpoint is unavailable: {error}"))?;
+    if metadata.len() == 0 || metadata.len() > 64 * 1024 {
+        return Err("browser secret endpoint length is invalid".to_string());
+    }
+    let endpoint: SecretEndpoint = serde_json::from_slice(
+        &fs::read(path)
+            .map_err(|error| format!("failed to read browser secret endpoint: {error}"))?,
+    )
+    .map_err(|error| format!("browser secret endpoint is invalid: {error}"))?;
+    if !secret_endpoint_is_valid_at(
+        &endpoint,
+        is_process_alive(endpoint.process_id),
+        unix_time_ms(),
+    ) {
+        return Err("browser secret endpoint was rejected".to_string());
+    }
+    Ok(endpoint)
+}
+
+#[cfg(windows)]
+fn secret_endpoint_is_valid_at(
+    endpoint: &SecretEndpoint,
+    process_alive: bool,
+    now_unix_ms: u128,
+) -> bool {
+    endpoint.version == PROTOCOL_VERSION
+        && endpoint.pipe_name.len() <= 256
+        && endpoint
+            .pipe_name
+            .starts_with(r"\\.\pipe\PetalDesk-password-")
+        && (32..=128).contains(&endpoint.token.len())
+        && endpoint.process_id != 0
+        && endpoint.expires_at_unix_ms > now_unix_ms
+        && endpoint.expires_at_unix_ms.saturating_sub(now_unix_ms)
+            <= SECRET_ENDPOINT_MAX_FUTURE.as_millis()
+        && process_alive
+}
+
+#[cfg(windows)]
+fn is_process_alive(process_id: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        return false;
+    }
+    let mut exit_code = 0_u32;
+    let alive = unsafe { GetExitCodeProcess(process, &mut exit_code) } != 0
+        && exit_code == STILL_ACTIVE as u32;
+    unsafe { CloseHandle(process) };
+    alive
+}
+
+#[cfg(windows)]
+fn read_secret_frame<R: Read>(reader: &mut R) -> Result<Option<Value>, String> {
+    let mut length = [0_u8; 4];
+    match reader.read_exact(&mut length) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(format!("failed to read browser secret message: {error}")),
+    }
+    let length = u32::from_le_bytes(length) as usize;
+    if length == 0 || length > MAX_NATIVE_MESSAGE_BYTES {
+        return Err(format!(
+            "browser secret message length is invalid: {length}"
+        ));
+    }
+    let mut bytes = vec![0_u8; length];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|error| format!("failed to read browser secret message: {error}"))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("browser secret message is invalid: {error}"))
+}
+
+#[cfg(windows)]
+fn write_secret_frame<W: Write>(writer: &mut W, value: &Value) -> Result<(), String> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| format!("failed to encode browser secret message: {error}"))?;
+    if bytes.is_empty() || bytes.len() > MAX_NATIVE_MESSAGE_BYTES {
+        return Err(format!(
+            "browser secret message length is invalid: {}",
+            bytes.len()
+        ));
+    }
+    writer
+        .write_all(&(bytes.len() as u32).to_le_bytes())
+        .and_then(|_| writer.write_all(&bytes))
+        .and_then(|_| writer.flush())
+        .map_err(|error| format!("failed to write browser secret message: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +734,45 @@ mod tests {
         assert!(is_safe_identifier("request-42_test"));
         assert!(!is_safe_identifier("../request"));
         assert!(!is_safe_identifier("request.json"));
+    }
+
+    #[test]
+    fn password_commands_are_never_accepted_from_the_file_spool() {
+        assert!(is_password_spool_command(&serde_json::json!({
+            "type": "command",
+            "id": "password-request",
+            "command": "password.provideCredentials",
+            "payload": { "password": "must-stay-in-memory" }
+        })));
+        assert!(is_password_spool_command(&serde_json::json!({
+            "type": "secret.command",
+            "id": "secret-request",
+            "command": "capture.start"
+        })));
+        assert!(!is_password_spool_command(&serde_json::json!({
+            "type": "command",
+            "id": "capture-request",
+            "command": "capture.start"
+        })));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn endpoint_requires_a_live_owner_and_a_bounded_unexpired_ttl() {
+        let now = 1_000_000_u128;
+        let mut endpoint = SecretEndpoint {
+            version: PROTOCOL_VERSION,
+            pipe_name: r"\\.\pipe\PetalDesk-password-test".to_string(),
+            token: "x".repeat(48),
+            process_id: std::process::id(),
+            expires_at_unix_ms: now + 60_000,
+        };
+        assert!(secret_endpoint_is_valid_at(&endpoint, true, now));
+        assert!(!secret_endpoint_is_valid_at(&endpoint, false, now));
+        endpoint.expires_at_unix_ms = now;
+        assert!(!secret_endpoint_is_valid_at(&endpoint, true, now));
+        endpoint.expires_at_unix_ms = now + SECRET_ENDPOINT_MAX_FUTURE.as_millis() + 1;
+        assert!(!secret_endpoint_is_valid_at(&endpoint, true, now));
+        assert!(is_process_alive(std::process::id()));
     }
 }

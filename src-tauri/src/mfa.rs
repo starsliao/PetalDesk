@@ -819,6 +819,203 @@ impl MfaStore {
         Ok(result)
     }
 
+    pub(crate) fn shared_recovery_transaction_lock(&self) -> MutexGuard<'_, ()> {
+        lock_unpoisoned(&self.lifecycle_lock)
+    }
+
+    pub(crate) fn shared_recovery_is_configured_locked(&self) -> AppResult<bool> {
+        if lock_unpoisoned(&self.runtime)
+            .vault
+            .as_ref()
+            .is_some_and(|vault| vault.recovery_wrapped_key.is_some())
+        {
+            return Ok(true);
+        }
+        if self.vault_path.exists() {
+            read_envelope(&self.vault_path)?;
+            return Ok(true);
+        }
+        if self.backup_candidates_exist() {
+            return Err(generic_vault_error());
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn shared_recovery_vault_path(&self) -> &Path {
+        &self.vault_path
+    }
+
+    pub(crate) fn shared_recovery_backup_path(&self) -> &Path {
+        &self.backup_path
+    }
+
+    pub(crate) fn shared_recovery_snapshot_locked(&self) -> AppResult<Option<Vec<u8>>> {
+        if self.vault_path.exists() {
+            read_bounded_vault_bytes(&self.vault_path).map(Some)
+        } else if self.backup_candidates_exist() {
+            Err(generic_vault_error())
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(crate) fn refresh_after_shared_recovery_restore(&self) {
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        runtime.vault = None;
+        runtime.recovered_from_backup = false;
+        runtime.recovery_state = if self.vault_path.exists() {
+            if read_envelope(&self.vault_path).is_ok() {
+                MfaRecoveryState::Ready
+            } else {
+                MfaRecoveryState::Unavailable
+            }
+        } else {
+            MfaRecoveryState::SetupRequired
+        };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verify_shared_recovery_password(&self, password: &str) -> AppResult<()> {
+        validate_recovery_password(password)?;
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        self.verify_shared_recovery_password_locked(password)
+    }
+
+    pub(crate) fn verify_shared_recovery_password_locked(&self, password: &str) -> AppResult<()> {
+        validate_recovery_password(password)?;
+        let runtime = lock_unpoisoned(&self.runtime);
+        if let Some(vault) = runtime.vault.as_ref() {
+            return verify_current_recovery_password(vault, password);
+        }
+        drop(runtime);
+        if !self.vault_path.exists() {
+            return Err(recovery_setup_required_error());
+        }
+        let bytes = read_bounded_vault_bytes(&self.vault_path)?;
+        decrypt_envelope_with_recovery(&bytes, password)
+            .map(|_| ())
+            .map_err(|error| match error {
+                RecoveryUnlockError::InvalidPassword => invalid_recovery_password_error(),
+                RecoveryUnlockError::InvalidEnvelope | RecoveryUnlockError::InvalidPayload => {
+                    generic_vault_error()
+                }
+            })
+    }
+
+    #[cfg(any(test, not(windows)))]
+    pub(crate) fn configure_shared_recovery_password(
+        &self,
+        password: &str,
+        current_password: Option<&str>,
+    ) -> AppResult<()> {
+        validate_recovery_password(password)?;
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        self.configure_shared_recovery_password_locked(password, current_password)
+    }
+
+    pub(crate) fn configure_shared_recovery_password_locked(
+        &self,
+        password: &str,
+        current_password: Option<&str>,
+    ) -> AppResult<()> {
+        validate_recovery_password(password)?;
+        let original = if self.vault_path.exists() {
+            Some(read_bounded_vault_bytes(&self.vault_path)?)
+        } else {
+            if self.backup_candidates_exist() {
+                return Err(generic_vault_error());
+            }
+            None
+        };
+        let mut vault = match original.as_deref() {
+            Some(bytes) => decrypt_envelope_with_recovery(
+                bytes,
+                current_password.ok_or_else(invalid_recovery_password_error)?,
+            )
+            .map_err(|error| match error {
+                RecoveryUnlockError::InvalidPassword => invalid_recovery_password_error(),
+                RecoveryUnlockError::InvalidEnvelope | RecoveryUnlockError::InvalidPayload => {
+                    generic_vault_error()
+                }
+            })?,
+            None if current_password.is_none() => new_empty_vault()?,
+            None => return Err(recovery_setup_required_error()),
+        };
+        vault.recovery_wrapped_key = Some(wrap_recovery_key(&vault.key, password)?);
+        let replacement = serialize_vault(&vault)?;
+        let original_hash = original.as_deref().map(bytes_hash);
+        if !self.shared_recovery_disk_matches(original_hash.as_deref()) {
+            return Err(AppError::new(
+                "mfa_vault_conflict",
+                "MFA 保险库已被外部修改，请重新打开并确认数据。",
+            ));
+        }
+        if self.vault_path.exists() {
+            self.rotate_backup()?;
+        }
+        if !self.shared_recovery_disk_matches(original_hash.as_deref()) {
+            return Err(AppError::new(
+                "mfa_vault_conflict",
+                "MFA 保险库已被外部修改，请重新打开并确认数据。",
+            ));
+        }
+        atomic_write(&self.vault_path, &replacement)?;
+        if let Err(error) = self.reset_backups_to_current(&replacement) {
+            let rollback = match original.as_deref() {
+                Some(bytes) => atomic_write(&self.vault_path, bytes)
+                    .and_then(|_| self.reset_backups_to_current(bytes)),
+                None => self.rollback_initial_recovery_write(),
+            };
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(AppError::new(
+                    "mfa_recovery_rollback_failed",
+                    "恢复密码更新失败，且 MFA 保险库无法自动回滚，请立即保留数据目录并重试。",
+                )
+                .with_details(serde_json::json!({
+                    "updateError": error.message,
+                    "rollbackError": rollback_error.message,
+                }))),
+            };
+        }
+        vault.disk_hash = Some(bytes_hash(&replacement));
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        runtime.recovery_state = MfaRecoveryState::Ready;
+        runtime.recovered_from_backup = false;
+        if self.session_active.load(Ordering::Acquire) {
+            runtime.vault = Some(vault);
+        } else {
+            runtime.vault = None;
+        }
+        Ok(())
+    }
+
+    fn shared_recovery_disk_matches(&self, expected: Option<&str>) -> bool {
+        match expected {
+            Some(expected) => std::fs::read(&self.vault_path)
+                .ok()
+                .is_some_and(|bytes| bytes_hash(&bytes) == expected),
+            None => !self.vault_path.exists(),
+        }
+    }
+
+    fn rollback_initial_recovery_write(&self) -> AppResult<()> {
+        if self.vault_path.exists() {
+            std::fs::remove_file(&self.vault_path)
+                .map_err(|error| AppError::io("回滚 MFA 保险库", error))?;
+        }
+        for entry in std::fs::read_dir(&self.backup_path)
+            .map_err(|error| AppError::io("读取 MFA 备份目录", error))?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        {
+            std::fs::remove_file(entry.path())
+                .map_err(|error| AppError::io("回滚 MFA 保险库备份", error))?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn configure_recovery_password(&self, password: &str) -> AppResult<MfaStatus> {
         let epoch = self.require_active_epoch()?;
@@ -835,6 +1032,7 @@ impl MfaStore {
         self.configure_recovery_password_at(password, Some(current_password), epoch)
     }
 
+    #[cfg(test)]
     fn configure_recovery_password_at(
         &self,
         password: &str,
@@ -3854,11 +4052,13 @@ pub async fn configure_mfa_recovery_password(
     ensure_mfa_window(&window)?;
     let epoch = app.state::<MfaStore>().require_active_epoch()?;
     tauri::async_runtime::spawn_blocking(move || {
-        app.state::<MfaStore>().configure_recovery_password_at(
+        crate::recovery::configure_recovery_password_from_mfa(
+            &app.state::<MfaStore>(),
+            &app.state::<crate::passwords::PasswordStore>(),
             password.as_str(),
             current_password.as_ref().map(SensitiveText::as_str),
-            epoch,
-        )
+        )?;
+        app.state::<MfaStore>().status_at(epoch)
     })
     .await
     .map_err(|_| AppError::new("mfa_task_error", "设置 MFA 恢复密码任务异常结束。"))?

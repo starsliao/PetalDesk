@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>PetalDesk AMO login fixture</title>
+    <style>
+      body { max-width: 28rem; margin: 3rem auto; padding: 0 1rem; font: 16px/1.5 system-ui, sans-serif; color: #17202a; }
+      form { display: grid; gap: 0.75rem; }
+      label { display: grid; gap: 0.25rem; }
+      input, button { box-sizing: border-box; min-height: 2.5rem; padding: 0.5rem; font: inherit; }
+      button { cursor: pointer; }
+      #status { padding: 1rem; border: 1px solid #7dcea0; background: #eafaf1; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>PetalDesk reviewer login fixture</h1>
+      <form id="login-form">
+        <label>Email <input name="username" type="email" autocomplete="username" required></label>
+        <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+        <button type="submit">Sign in</button>
+      </form>
+      <p>This page keeps all values in the browser and sends no network request.</p>
+    </main>
+    <script>
+      document.querySelector("#login-form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        const status = document.createElement("p");
+        status.id = "status";
+        status.setAttribute("role", "status");
+        status.textContent = "Fixture login succeeded.";
+        event.currentTarget.replaceWith(status);
+        history.pushState({}, "", "/signed-in");
+      });
+    </script>
+  </body>
+</html>

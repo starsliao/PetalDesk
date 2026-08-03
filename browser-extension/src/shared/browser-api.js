@@ -41,6 +41,53 @@
     );
   }
 
+  async function createTab(createProperties) {
+    if (usesPromiseApi) {
+      return extensionApi.tabs.create(createProperties);
+    }
+    return callbackCall((done) => extensionApi.tabs.create(createProperties, done));
+  }
+
+  async function getTab(tabId) {
+    if (usesPromiseApi) {
+      return extensionApi.tabs.get(tabId);
+    }
+    return callbackCall((done) => extensionApi.tabs.get(tabId, done));
+  }
+
+  async function queryAllTabs(queryInfo = {}) {
+    return queryTabs(queryInfo);
+  }
+
+  function onTabRemoved(listener) {
+    if (!extensionApi.tabs || !extensionApi.tabs.onRemoved
+      || typeof extensionApi.tabs.onRemoved.addListener !== "function") {
+      return false;
+    }
+    extensionApi.tabs.onRemoved.addListener(listener);
+    return true;
+  }
+
+  async function getAllPermissions() {
+    if (!extensionApi.permissions || typeof extensionApi.permissions.getAll !== "function") {
+      return {};
+    }
+    if (usesPromiseApi) {
+      return extensionApi.permissions.getAll();
+    }
+    return callbackCall((done) => extensionApi.permissions.getAll(done));
+  }
+
+  async function requestPermissions(permissions) {
+    if (!extensionApi.permissions || typeof extensionApi.permissions.request !== "function") {
+      return false;
+    }
+    if (usesPromiseApi) {
+      return extensionApi.permissions.request(permissions);
+    }
+    return callbackCall((done) => extensionApi.permissions.request(permissions, done));
+  }
+
   function connectNative(hostName) {
     return extensionApi.runtime.connectNative(hostName);
   }
@@ -65,10 +112,18 @@
     browserFamily: detectBrowserFamily(),
     connectNative,
     consumeRuntimeLastError,
+    createTab,
     extensionId: extensionApi.runtime.id,
     extensionVersion: extensionApi.runtime.getManifest().version,
+    getAllPermissions,
+    getTab,
+    onTabRemoved,
+    queryAllTabs,
+    requestPermissions,
     queryTabs,
+    permissions: extensionApi.permissions || null,
     runtime: extensionApi.runtime,
     sendTabMessage,
+    action: extensionApi.action || extensionApi.browserAction || null,
   });
 })(typeof globalThis !== "undefined" ? globalThis : this);

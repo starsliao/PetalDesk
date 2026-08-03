@@ -11,11 +11,11 @@ describe("updater desktop API", () => {
   it("normalizes backend state and camel-case phases", () => {
     expect(normalizeUpdateState({
       phase: "up_to_date",
-      current_version: "0.5.2",
+      current_version: "0.6.0",
       downloaded_bytes: 0,
     })).toMatchObject({
       phase: "upToDate",
-      currentVersion: "0.5.2",
+      currentVersion: "0.6.0",
       downloadedBytes: 0,
       totalBytes: null,
     });
@@ -25,7 +25,7 @@ describe("updater desktop API", () => {
     backend.invoke
       .mockResolvedValueOnce({ autoUpdate: true })
       .mockResolvedValueOnce({ autoUpdate: false })
-      .mockResolvedValueOnce({ phase: "upToDate", currentVersion: "0.5.2" });
+      .mockResolvedValueOnce({ phase: "upToDate", currentVersion: "0.6.0" });
 
     await expect(updaterApi.getSettings()).resolves.toEqual({ autoUpdate: true });
     await expect(updaterApi.setSettings({ autoUpdate: false })).resolves.toEqual({ autoUpdate: false });
