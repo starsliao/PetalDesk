@@ -89,6 +89,31 @@ describe("browser password preview", () => {
 });
 
 describe("desktop password command contract", () => {
+  it("normalizes the shared recovery flag from desktop status payloads", async () => {
+    (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
+    backendInvoke.mockResolvedValueOnce({
+      available: true,
+      locked: false,
+      entry_count: 0,
+      protection: "windows-dpapi",
+      recovery_state: "setup-required",
+      shared_recovery_configured: true,
+      capture_enabled: false,
+      capture_configured: false,
+      browser: {
+        browser: "firefox",
+        connection: "disconnected",
+        extension_installed: false,
+        native_host_installed: false,
+      },
+    });
+
+    await expect(passwordApi.getStatus()).resolves.toMatchObject({
+      recoveryState: "setup-required",
+      sharedRecoveryConfigured: true,
+    });
+  });
+
   it("uses direct Rust request payloads and exact command names", async () => {
     (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
     const entry: PasswordEntrySummary = {

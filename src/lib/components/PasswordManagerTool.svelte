@@ -46,7 +46,7 @@
   }
 
   type EditorMode = "add" | "edit";
-  type RecoveryMode = "setup" | "unlock" | "change";
+  type RecoveryMode = "setup" | "reuse" | "unlock" | "change";
 
   let { api = passwordApi }: Props = $props();
 
@@ -113,6 +113,7 @@
   let recoveryConfirm = $state("");
   let recoveryError = $state("");
   let recoveryBusy = $state(false);
+  let recoveryCurrentInput = $state<HTMLInputElement | null>(null);
   let recoveryInput = $state<HTMLInputElement | null>(null);
 
   let captureBusy = $state(false);
@@ -471,62 +472,75 @@
     if (mode && mode !== "change") void closeWindow();
   }
 
+  function focusRecoveryInput(): void {
+    void tick().then(() => {
+      const input = recoveryMode === "change" ? recoveryCurrentInput : recoveryInput;
+      input?.focus();
+    });
+  }
+
   function openRecovery(mode: RecoveryMode): void {
     recoveryMode = mode;
     clearRecoveryInputs();
-    void tick().then(() => recoveryInput?.focus());
+    focusRecoveryInput();
   }
 
   function syncRequiredRecovery(next: PasswordStatus): void {
     const recoveryAvailable = next.available && next.recoveryState !== "unavailable";
     const required = recoveryAvailable
       ? next.recoveryState === "setup-required"
-        ? "setup"
+        ? next.sharedRecoveryConfigured ? "reuse" : "setup"
         : next.recoveryState === "password-required"
           ? "unlock"
           : null
       : null;
-    if (required && recoveryMode !== "change") {
+    if (required) {
+      if (recoveryMode !== required) clearRecoveryInputs();
       recoveryMode = required;
-      void tick().then(() => recoveryInput?.focus());
+      focusRecoveryInput();
     }
-    if (!required && (recoveryMode === "setup" || recoveryMode === "unlock")) {
+    if (!required && (recoveryMode === "setup" || recoveryMode === "reuse" || recoveryMode === "unlock")) {
       recoveryMode = null;
       clearRecoveryInputs();
     }
   }
 
   async function submitRecovery(): Promise<void> {
-    if (!recoveryMode || recoveryBusy) return;
-    if (recoveryMode === "change" && recoveryCurrent.length < 12) {
+    const mode = recoveryMode;
+    if (!mode || recoveryBusy) return;
+    if (mode === "change" && recoveryCurrent.length < 12) {
       recoveryError = "请输入至少 12 个字符的原恢复密码。";
+      focusRecoveryInput();
       return;
     }
     if (recoveryPassword.length < 12) {
       recoveryError = "恢复密码至少需要 12 个字符。";
+      void tick().then(() => recoveryInput?.focus());
       return;
     }
     if (recoveryPassword.length > 256) {
       recoveryError = "恢复密码不能超过 256 个字符。";
+      void tick().then(() => recoveryInput?.focus());
       return;
     }
-    if (recoveryMode !== "unlock" && recoveryPassword !== recoveryConfirm) {
+    if ((mode === "setup" || mode === "change") && recoveryPassword !== recoveryConfirm) {
       recoveryError = "两次输入的恢复密码不一致。";
+      void tick().then(() => recoveryInput?.focus());
       return;
     }
     recoveryBusy = true;
     recoveryError = "";
     try {
-      if (recoveryMode === "unlock") await api.unlockWithRecoveryPassword(recoveryPassword);
-      else if (recoveryMode === "change") await api.configureRecoveryPassword(recoveryPassword, recoveryCurrent);
+      if (mode === "unlock") await api.unlockWithRecoveryPassword(recoveryPassword);
+      else if (mode === "change") await api.configureRecoveryPassword(recoveryPassword, recoveryCurrent);
       else await api.configureRecoveryPassword(recoveryPassword);
-      const completed = recoveryMode;
       clearRecoveryInputs();
       recoveryMode = null;
       await refresh();
-      showToast(completed === "unlock" ? "密码保险库已解锁" : completed === "change" ? "恢复密码已修改" : "恢复密码已设置");
+      showToast(mode === "unlock" ? "密码保险库已解锁" : mode === "change" ? "全局恢复密码已修改" : mode === "reuse" ? "密码管理器已启用" : "全局恢复密码已设置");
     } catch (reason) {
-      recoveryError = reasonMessage(reason, "恢复密码操作失败。");
+      recoveryError = reasonMessage(reason, mode === "reuse" ? "全局恢复密码不正确，无法启用密码管理器。" : "恢复密码操作失败。");
+      focusRecoveryInput();
     } finally {
       recoveryBusy = false;
     }
@@ -782,6 +796,11 @@
         <span class="status-dot" aria-hidden="true"></span>
         {browser ? browserLabel(browser.connection) : "Firefox 状态读取中"}
       </span>
+      {#if status?.recoveryState === "ready" && status.protection !== "browser-demo"}
+        <button class="icon-button" type="button" data-tooltip="修改全局恢复密码" aria-label="修改全局恢复密码" onclick={() => openRecovery("change")}>
+          <KeyRound size={16} aria-hidden="true" />
+        </button>
+      {/if}
       <button class="icon-button" type="button" data-tooltip="刷新" aria-label="刷新密码账户" disabled={refreshing} onclick={() => void refresh()}>
         <span class:spin={refreshing}><RefreshCw size={16} aria-hidden="true" /></span>
       </button>
@@ -887,9 +906,6 @@
         <label class="capture-toggle"><input type="checkbox" checked={status.captureEnabled} disabled={captureBusy} onchange={(event) => void setCapture((event.currentTarget as HTMLInputElement).checked)} /><span>{status.captureEnabled && browser?.capturePermission === "action-required" ? "登录信息检测（等待 Firefox 授权）" : status.captureEnabled && browser?.capturePermission === "granted" ? "登录信息检测已开启" : "允许登录信息检测"}</span></label>
       {/if}
       {#if status?.idleTimeoutSeconds}<span>闲置 {Math.ceil(status.idleTimeoutSeconds / 60)} 分钟后锁定</span>{/if}
-      {#if status?.recoveryState === "ready" && status.protection !== "browser-demo"}
-        <button type="button" class="text-button" onclick={() => openRecovery("change")}>修改恢复密码</button>
-      {/if}
       {#if status?.protection !== "browser-demo"}
         <button type="button" class="icon-button" data-tooltip="锁定保险库" aria-label="锁定保险库" disabled={lockBusy} onclick={() => void lockVault()}><Lock size={15} aria-hidden="true" /></button>
       {/if}
@@ -964,16 +980,21 @@
 {/if}
 
 {#if recoveryMode}
+  {@const isSettingRecovery = recoveryMode === "setup"}
+  {@const isReusingRecovery = recoveryMode === "reuse"}
+  {@const isUnlockingRecovery = recoveryMode === "unlock"}
+  {@const isChangingRecovery = recoveryMode === "change"}
   <div class="modal-backdrop" role="presentation">
-    <button type="button" class="modal-dismiss" aria-label="关闭恢复密码窗口" disabled={recoveryMode !== "change" || recoveryBusy} onclick={() => { if (recoveryMode === "change") recoveryMode = null; }}></button>
+    <button type="button" class="modal-dismiss" aria-label="关闭恢复密码窗口" disabled={!isChangingRecovery || recoveryBusy} onclick={closeRecovery}></button>
     <div class="recovery-dialog" role="dialog" aria-modal="true" aria-labelledby="password-recovery-title">
-      <div class="dialog-heading"><div><h2 id="password-recovery-title">{recoveryMode === "setup" ? "设置恢复密码" : recoveryMode === "unlock" ? "解锁密码保险库" : "修改恢复密码"}</h2><p>恢复密码用于跨设备恢复本地保险库，请使用至少 12 个字符的短语。</p></div><button type="button" class="icon-button" aria-label={recoveryMode === "change" ? "关闭" : "关闭密码管理器"} disabled={recoveryBusy} onclick={() => { if (recoveryMode === "change") recoveryMode = null; else void closeWindow(); }}><X size={17} aria-hidden="true" /></button></div>
+      <div class="dialog-heading"><div><h2 id="password-recovery-title">{isSettingRecovery ? "设置全局恢复密码" : isReusingRecovery ? "启用密码管理器" : isUnlockingRecovery ? "解锁密码保险库" : "修改全局恢复密码"}</h2><p>{isSettingRecovery ? "密码管理器和 MFA 验证器全局共用此恢复密码，请使用至少 12 个字符的短语。" : isReusingRecovery ? "MFA 验证器已设置全局恢复密码，请输入同一个密码来启用密码管理器。" : isUnlockingRecovery ? "密码管理器和 MFA 验证器共用同一个全局恢复密码。" : "恢复密码由密码管理器和 MFA 验证器全局共用；修改后，两处都需要使用新密码。"}</p></div><button type="button" class="icon-button" aria-label={isChangingRecovery ? "关闭" : "关闭密码管理器"} disabled={recoveryBusy} onclick={closeRecovery}><X size={17} aria-hidden="true" /></button></div>
       <form class="editor-form" onsubmit={(event) => { event.preventDefault(); void submitRecovery(); }}>
-        {#if recoveryMode === "change"}<label><span>当前恢复密码</span><input type="password" bind:value={recoveryCurrent} autocomplete="current-password" /></label>{/if}
-        <label><span>{recoveryMode === "unlock" ? "恢复密码" : "新的恢复密码"}{#if recoveryMode === "unlock"}<small>不会写入页面存储</small>{/if}</span><input bind:this={recoveryInput} type="password" bind:value={recoveryPassword} autocomplete={recoveryMode === "unlock" ? "current-password" : "new-password"} /></label>
-        {#if recoveryMode !== "unlock"}<label><span>再次输入</span><input type="password" bind:value={recoveryConfirm} autocomplete="new-password" /></label>{/if}
+        {#if isChangingRecovery}<label><span>原恢复密码</span><input bind:this={recoveryCurrentInput} type="password" bind:value={recoveryCurrent} autocomplete="current-password" aria-label="原恢复密码" /></label>{/if}
+        <label><span>{isChangingRecovery ? "新恢复密码" : isReusingRecovery ? "全局恢复密码" : "恢复密码"}{#if isUnlockingRecovery || isReusingRecovery}<small>不会写入页面存储</small>{/if}</span><input bind:this={recoveryInput} type="password" bind:value={recoveryPassword} autocomplete={isUnlockingRecovery || isReusingRecovery ? "current-password" : "new-password"} aria-label={isChangingRecovery ? "新恢复密码" : isReusingRecovery ? "全局恢复密码" : "恢复密码"} /></label>
+        {#if isSettingRecovery || isChangingRecovery}<label><span>{isChangingRecovery ? "确认新恢复密码" : "确认恢复密码"}</span><input type="password" bind:value={recoveryConfirm} autocomplete="new-password" aria-label={isChangingRecovery ? "确认新恢复密码" : "确认恢复密码"} /></label>{/if}
+        {#if !isUnlockingRecovery}<div class="recovery-sharing-note" role="note"><KeyRound size={15} aria-hidden="true" /><span>这是飞花的全局恢复密码，同时用于密码管理器和 MFA 验证器。飞花无法找回遗忘的恢复密码。</span></div>{/if}
         {#if recoveryError}<div class="form-error" role="alert">{recoveryError}</div>{/if}
-        <div class="dialog-actions">{#if recoveryMode === "change"}<button type="button" class="secondary-button" disabled={recoveryBusy} onclick={() => (recoveryMode = null)}>取消</button>{/if}<button type="submit" class="primary-button" disabled={recoveryBusy}>{recoveryBusy ? "处理中…" : recoveryMode === "unlock" ? "解锁" : recoveryMode === "change" ? "修改并同步" : "设置并继续"}</button></div>
+        <div class="dialog-actions">{#if isChangingRecovery}<button type="button" class="secondary-button" disabled={recoveryBusy} onclick={closeRecovery}>取消</button>{/if}<button type="submit" class="primary-button" disabled={recoveryBusy}>{recoveryBusy ? "处理中…" : isUnlockingRecovery ? "解锁" : isChangingRecovery ? "保存新密码" : isReusingRecovery ? "启用密码管理器" : "设置恢复密码"}</button></div>
       </form>
     </div>
   </div>
@@ -1026,19 +1047,18 @@
   .search-box:focus-within { border-color: var(--app-focus); box-shadow: 0 0 0 1px var(--app-focus); }
   .search-box input { min-width: 0; flex: 1; height: 100%; padding: 0; color: var(--app-fg); background: transparent; border: 0; outline: 0; font-size: 12px; }
   .clear-search { display: inline-grid; width: 22px; height: 22px; padding: 0; place-items: center; color: var(--app-muted); background: transparent; border: 0; cursor: pointer; }
-  .primary-button, .secondary-button, .quiet-button, .text-button { display: inline-flex; min-height: 30px; padding: 5px 10px; align-items: center; justify-content: center; gap: 6px; font-size: 12px; border-radius: 4px; cursor: pointer; }
+  .primary-button, .secondary-button, .quiet-button { display: inline-flex; min-height: 30px; padding: 5px 10px; align-items: center; justify-content: center; gap: 6px; font-size: 12px; border-radius: 4px; cursor: pointer; }
   .primary-button { color: #ffffff; background: var(--app-accent); border: 1px solid #00589f; }
   .primary-button:hover { background: #005ba9; }
   .secondary-button { color: var(--app-fg); background: var(--app-surface); border: 1px solid var(--app-border-strong); }
   .secondary-button:hover { background: var(--app-surface-hover); }
-  .quiet-button, .text-button { padding-right: 4px; padding-left: 4px; color: var(--app-muted); background: transparent; border: 1px solid transparent; }
-  .quiet-button:hover, .text-button:hover { color: var(--app-fg); background: rgb(0 0 0 / 5%); }
+  .quiet-button { padding-right: 4px; padding-left: 4px; color: var(--app-muted); background: transparent; border: 1px solid transparent; }
+  .quiet-button:hover { color: var(--app-fg); background: rgb(0 0 0 / 5%); }
   button:disabled { cursor: not-allowed; opacity: .58; }
   .add-button { flex: 0 0 auto; }
   .password-meta { min-height: 34px; padding: 0 16px 8px; gap: 12px; color: var(--app-muted); font-size: 11px; }
   .capture-toggle { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
   .capture-toggle input, .check-row input, .generator-checks input { accent-color: var(--app-accent); }
-  .password-meta .text-button { margin-left: auto; }
   .entry-list { display: flex; min-height: 0; flex: 1; padding: 0 16px 18px; flex-direction: column; gap: 7px; overflow: auto; }
   .entry-row { display: grid; min-width: 0; padding: 11px 10px; grid-template-columns: 34px minmax(150px, 1fr) minmax(120px, .9fr) auto; align-items: center; gap: 10px; background: var(--app-surface); border: 1px solid var(--app-border); border-radius: 6px; }
   .entry-row:hover { border-color: var(--app-border-strong); box-shadow: 0 1px 2px rgb(0 0 0 / 6%); }
@@ -1068,6 +1088,8 @@
   .modal-dismiss { position: absolute; inset: 0; width: 100%; height: 100%; padding: 0; background: transparent; border: 0; }
   .editor-dialog, .recovery-dialog { position: relative; width: min(100%, 490px); max-height: calc(100vh - 32px); padding: 18px; overflow: auto; color: var(--app-fg); background: var(--app-surface); border: 1px solid var(--app-border); border-radius: 7px; box-shadow: var(--shadow-flyout); }
   .recovery-dialog { width: min(100%, 430px); }
+  .recovery-sharing-note { display: flex; padding: 9px 10px; align-items: flex-start; gap: 7px; color: #76520b; font-size: 11px; line-height: 1.45; background: #fff8df; border: 1px solid #ead69a; border-radius: 6px; }
+  .recovery-sharing-note :global(svg) { flex: 0 0 auto; margin-top: 1px; }
   .dialog-heading { min-width: 0; justify-content: space-between; align-items: flex-start; gap: 12px; }
   .dialog-heading h2 { font-size: 16px; }
   .dialog-heading p { margin-top: 4px; color: var(--app-muted); font-size: 11px; line-height: 1.45; }

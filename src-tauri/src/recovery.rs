@@ -2,7 +2,7 @@
 
 use crate::error::{AppError, AppResult};
 use crate::mfa::MfaStore;
-use crate::passwords::PasswordStore;
+use crate::passwords::{PasswordStatus, PasswordStore};
 use crate::storage::{
     atomic_write, atomic_write_json, ensure_managed_subdirectory, INTERNAL_DATA_DIR,
 };
@@ -91,6 +91,26 @@ pub(crate) fn configure_shared_recovery_password(
     )
 }
 
+/// Enriches password-manager status with the global recovery-password state.
+///
+/// A vault that does not exist yet still reports its own state as
+/// `setup-required`; this additional bit lets the UI distinguish linking that
+/// vault to the recovery password already used by MFA from creating the first
+/// global recovery password.
+pub(crate) fn annotate_password_status(
+    mfa: &MfaStore,
+    mut status: PasswordStatus,
+) -> AppResult<PasswordStatus> {
+    if status.recovery_state != crate::passwords::PasswordRecoveryState::SetupRequired {
+        return Ok(status);
+    }
+    let _coordinator = lock_unpoisoned(&SHARED_RECOVERY_LOCK);
+    let mfa_transaction = mfa.shared_recovery_transaction_lock();
+    status.shared_recovery_configured = mfa.shared_recovery_is_configured_locked()?;
+    drop(mfa_transaction);
+    Ok(status)
+}
+
 pub(crate) fn configure_recovery_password_from_mfa(
     mfa: &MfaStore,
     passwords: &PasswordStore,
@@ -126,7 +146,15 @@ where
     let passwords_configured = passwords.shared_recovery_is_configured_locked()?;
 
     if mfa_configured && passwords_configured {
-        let current = current_password.ok_or_else(current_password_required_error)?;
+        if current_password.is_none() {
+            // A status read can race with the other tool finishing first-time
+            // setup. Submitting the already-current password is a safe no-op;
+            // a different password still cannot rotate either vault.
+            mfa.verify_shared_recovery_password_locked(password)?;
+            passwords.verify_shared_recovery_password_locked(password)?;
+            return Ok(());
+        }
+        let current = current_password.expect("current password presence was checked");
         mfa.verify_shared_recovery_password_locked(current)?;
         passwords.verify_shared_recovery_password_locked(current)?;
     } else if mfa_configured {
@@ -567,13 +595,6 @@ fn bytes_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn current_password_required_error() -> AppError {
-    AppError::new(
-        "shared_recovery_current_password_required",
-        "修改共享恢复密码时必须输入当前恢复密码。",
-    )
-}
-
 fn journal_invalid_error() -> AppError {
     AppError::new(
         "shared_recovery_journal_invalid",
@@ -615,8 +636,21 @@ mod tests {
         let passwords = PasswordStore::load(root.path()).unwrap();
         mfa.activate();
         passwords.activate();
+        let initial_epoch = passwords.require_active_epoch().unwrap();
+        let initial_status =
+            annotate_password_status(&mfa, passwords.status_at(initial_epoch).unwrap()).unwrap();
+        assert!(!initial_status.shared_recovery_configured);
+
         mfa.configure_shared_recovery_password(OLD_PASSWORD, None)
             .unwrap();
+
+        let epoch = passwords.require_active_epoch().unwrap();
+        let status = annotate_password_status(&mfa, passwords.status_at(epoch).unwrap()).unwrap();
+        assert_eq!(
+            status.recovery_state,
+            crate::passwords::PasswordRecoveryState::SetupRequired
+        );
+        assert!(status.shared_recovery_configured);
 
         let wrong = configure_shared_recovery_password(
             &mfa,
@@ -629,6 +663,17 @@ mod tests {
         assert!(!passwords.shared_recovery_is_configured_locked().unwrap());
 
         configure_shared_recovery_password(&mfa, &passwords, OLD_PASSWORD, None).unwrap();
+        mfa.verify_shared_recovery_password(OLD_PASSWORD).unwrap();
+        passwords
+            .verify_shared_recovery_password(OLD_PASSWORD)
+            .unwrap();
+
+        // A stale setup dialog can submit after the other tool initialized
+        // both vaults. The same password is idempotent; a different one fails.
+        configure_shared_recovery_password(&mfa, &passwords, OLD_PASSWORD, None).unwrap();
+        let different =
+            configure_shared_recovery_password(&mfa, &passwords, NEW_PASSWORD, None).unwrap_err();
+        assert_eq!(different.code, "mfa_recovery_password_invalid");
         mfa.verify_shared_recovery_password(OLD_PASSWORD).unwrap();
         passwords
             .verify_shared_recovery_password(OLD_PASSWORD)

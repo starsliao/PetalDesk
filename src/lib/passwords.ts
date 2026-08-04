@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-/** Recovery state shared by the password vault and the MFA vault. */
+/** Recovery state of the password vault; the global recovery flag is separate. */
 export type PasswordRecoveryState = "setup-required" | "ready" | "password-required" | "unavailable";
 export type PasswordProtection =
   | "windows-dpapi"
@@ -33,6 +33,7 @@ export interface PasswordStatus {
   entryCount: number;
   protection: PasswordProtection;
   recoveryState: PasswordRecoveryState;
+  sharedRecoveryConfigured: boolean;
   captureEnabled: boolean;
   captureConfigured: boolean;
   browser: PasswordBrowserStatus;
@@ -295,6 +296,10 @@ function normalizeStatus(value: Partial<PasswordStatus> & Record<string, unknown
     entryCount: Math.max(0, Number(value.entryCount ?? value.entry_count ?? 0)),
     protection: (value.protection as PasswordProtection) || "unavailable",
     recoveryState: allowed.includes(recovery) ? recovery : "unavailable",
+    sharedRecoveryConfigured: Boolean(
+      value.sharedRecoveryConfigured ?? value.shared_recovery_configured
+      ?? (recovery === "ready" || recovery === "password-required"),
+    ),
     captureEnabled: Boolean(value.captureEnabled ?? value.capture_enabled ?? false),
     captureConfigured: Boolean(value.captureConfigured ?? value.capture_configured ?? false),
     browser: normalizeBrowser((value.browser ?? {}) as Record<string, unknown>),
@@ -414,6 +419,7 @@ export function createBrowserPasswordApi(): PasswordApi {
         entryCount: entries.length,
         protection: "browser-demo",
         recoveryState: "ready",
+        sharedRecoveryConfigured: false,
         captureEnabled,
         captureConfigured,
         browser: demoBrowserStatus(),

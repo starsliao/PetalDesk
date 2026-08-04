@@ -194,6 +194,10 @@ pub struct PasswordStatus {
     pub entry_count: usize,
     pub protection: String,
     pub recovery_state: PasswordRecoveryState,
+    /// During password-vault setup, true means MFA already has the global
+    /// recovery password and this vault must reuse it. It remains true after
+    /// the password vault itself is configured.
+    pub shared_recovery_configured: bool,
     pub capture_configured: bool,
     pub capture_enabled: bool,
     pub idle_timeout_seconds: u64,
@@ -804,6 +808,7 @@ impl PasswordStore {
                 entry_count: 0,
                 protection: "unavailable".to_string(),
                 recovery_state: PasswordRecoveryState::Unavailable,
+                shared_recovery_configured: false,
                 capture_configured: settings.capture_configured,
                 capture_enabled: false,
                 idle_timeout_seconds: IDLE_LOCK_TIMEOUT.as_secs(),
@@ -831,6 +836,10 @@ impl PasswordStore {
             entry_count,
             protection: local_protection_label(runtime.recovery_state).to_string(),
             recovery_state: runtime.recovery_state,
+            shared_recovery_configured: matches!(
+                runtime.recovery_state,
+                PasswordRecoveryState::Ready | PasswordRecoveryState::PasswordRequired
+            ),
             capture_configured: settings.capture_configured,
             capture_enabled: settings.capture_enabled,
             idle_timeout_seconds: IDLE_LOCK_TIMEOUT.as_secs(),
@@ -3076,8 +3085,9 @@ pub async fn get_password_status(
     ensure_password_window(&window)?;
     let epoch = app.state::<PasswordStore>().require_active_epoch()?;
     let task_app = app.clone();
-    let status = tauri::async_runtime::spawn_blocking(move || {
-        task_app.state::<PasswordStore>().status_at(epoch)
+    let status = tauri::async_runtime::spawn_blocking(move || -> AppResult<PasswordStatus> {
+        let status = task_app.state::<PasswordStore>().status_at(epoch)?;
+        crate::recovery::annotate_password_status(&task_app.state::<crate::mfa::MfaStore>(), status)
     })
     .await
     .map_err(|_| AppError::new("password_task_error", "读取密码状态任务异常结束。"))??;
@@ -3218,10 +3228,18 @@ pub async fn set_password_capture_enabled(
     ensure_password_window(&window)?;
     let epoch = app.state::<PasswordStore>().require_active_epoch()?;
     let task_app = app.clone();
-    let status = tauri::async_runtime::spawn_blocking(move || {
-        task_app
+    let status = tauri::async_runtime::spawn_blocking(move || -> AppResult<PasswordStatus> {
+        let baseline = task_app.state::<PasswordStore>().status_at(epoch)?;
+        let shared_recovery_configured = crate::recovery::annotate_password_status(
+            &task_app.state::<crate::mfa::MfaStore>(),
+            baseline,
+        )?
+        .shared_recovery_configured;
+        let mut status = task_app
             .state::<PasswordStore>()
-            .set_capture_enabled_at(enabled, epoch)
+            .set_capture_enabled_at(enabled, epoch)?;
+        status.shared_recovery_configured |= shared_recovery_configured;
+        Ok(status)
     })
     .await
     .map_err(|_| AppError::new("password_task_error", "更新登录检测设置任务异常结束。"))??;
@@ -3245,7 +3263,8 @@ pub async fn configure_password_recovery_password(
             password.as_str(),
             current_password.as_ref().map(SensitiveText::as_str),
         )?;
-        app.state::<PasswordStore>().status_at(epoch)
+        let status = app.state::<PasswordStore>().status_at(epoch)?;
+        crate::recovery::annotate_password_status(&app.state::<crate::mfa::MfaStore>(), status)
     })
     .await
     .map_err(|_| AppError::new("password_task_error", "设置恢复密码任务异常结束。"))?
@@ -3260,8 +3279,10 @@ pub async fn unlock_passwords_with_recovery_password(
     ensure_password_window(&window)?;
     let epoch = app.state::<PasswordStore>().require_active_epoch()?;
     tauri::async_runtime::spawn_blocking(move || {
-        app.state::<PasswordStore>()
-            .unlock_with_recovery_password_at(password.as_str(), epoch)
+        let status = app
+            .state::<PasswordStore>()
+            .unlock_with_recovery_password_at(password.as_str(), epoch)?;
+        crate::recovery::annotate_password_status(&app.state::<crate::mfa::MfaStore>(), status)
     })
     .await
     .map_err(|_| AppError::new("password_task_error", "恢复密码保险库任务异常结束。"))?

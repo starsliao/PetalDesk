@@ -175,7 +175,7 @@ describe("PasswordManagerTool", () => {
     expect(view.queryByText("正在录制站点模板")).not.toBeInTheDocument();
   });
 
-  it("requires recovery setup before showing vault entries", async () => {
+  it("requires global recovery setup only when no shared recovery password exists", async () => {
     const base = createBrowserPasswordApi();
     const status: PasswordStatus = {
       available: true,
@@ -183,8 +183,95 @@ describe("PasswordManagerTool", () => {
       entryCount: 0,
       protection: "windows-dpapi",
       recoveryState: "setup-required",
+      sharedRecoveryConfigured: false,
       captureEnabled: false,
       captureConfigured: false,
+      browser: await base.getBrowserStatus(),
+    };
+    const readyStatus: PasswordStatus = {
+      ...status,
+      entryCount: 3,
+      protection: "windows-dpapi-recovery-password",
+      recoveryState: "ready",
+      sharedRecoveryConfigured: true,
+    };
+    const configureRecoveryPassword = vi.fn().mockResolvedValue(undefined);
+    const api: PasswordApi = {
+      ...base,
+      getStatus: vi.fn().mockResolvedValueOnce(status).mockResolvedValue(readyStatus),
+      configureRecoveryPassword,
+    };
+    const view = render(PasswordManagerTool, { api });
+
+    const dialog = await view.findByRole("dialog", { name: "设置全局恢复密码" });
+    expect(within(dialog).getByText(/密码管理器和 MFA 验证器全局共用/)).toBeInTheDocument();
+    expect(within(dialog).getByRole("note")).toHaveTextContent("同时用于密码管理器和 MFA 验证器");
+    const inputs = [within(dialog).getByLabelText("恢复密码"), within(dialog).getByLabelText("确认恢复密码")];
+    await fireEvent.input(inputs[0], { target: { value: "correct horse battery" } });
+    await fireEvent.input(inputs[1], { target: { value: "correct horse battery" } });
+    await fireEvent.click(within(dialog).getByRole("button", { name: "设置恢复密码" }));
+    await waitFor(() => expect(configureRecoveryPassword).toHaveBeenCalledWith("correct horse battery"));
+    await waitFor(() => expect(view.queryByRole("dialog", { name: "设置全局恢复密码" })).not.toBeInTheDocument());
+    expect(await view.findByText("全局恢复密码已设置")).toBeInTheDocument();
+  });
+
+  it("reuses the existing MFA recovery password without asking for confirmation", async () => {
+    const base = createBrowserPasswordApi();
+    const setupStatus: PasswordStatus = {
+      available: true,
+      locked: false,
+      entryCount: 0,
+      protection: "windows-dpapi",
+      recoveryState: "setup-required",
+      sharedRecoveryConfigured: true,
+      captureEnabled: false,
+      captureConfigured: false,
+      browser: await base.getBrowserStatus(),
+    };
+    const readyStatus: PasswordStatus = {
+      ...setupStatus,
+      entryCount: 3,
+      protection: "windows-dpapi-recovery-password",
+      recoveryState: "ready",
+      captureConfigured: true,
+    };
+    const configureRecoveryPassword = vi.fn().mockResolvedValue(undefined);
+    const unlockWithRecoveryPassword = vi.fn();
+    const getStatus = vi.fn()
+      .mockResolvedValueOnce(setupStatus)
+      .mockResolvedValue(readyStatus);
+    const api: PasswordApi = {
+      ...base,
+      getStatus,
+      configureRecoveryPassword,
+      unlockWithRecoveryPassword,
+    };
+    const view = render(PasswordManagerTool, { api });
+
+    const dialog = await view.findByRole("dialog", { name: "启用密码管理器" });
+    expect(within(dialog).getByText(/MFA 验证器已设置全局恢复密码，请输入同一个密码/)).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("全局恢复密码")).toBeInTheDocument();
+    expect(within(dialog).queryByLabelText("确认恢复密码")).not.toBeInTheDocument();
+    await fireEvent.input(within(dialog).getByLabelText("全局恢复密码"), { target: { value: "existing recovery password" } });
+    await fireEvent.click(within(dialog).getByRole("button", { name: "启用密码管理器" }));
+
+    await waitFor(() => expect(configureRecoveryPassword).toHaveBeenCalledWith("existing recovery password"));
+    expect(unlockWithRecoveryPassword).not.toHaveBeenCalled();
+    await waitFor(() => expect(view.queryByRole("dialog", { name: "启用密码管理器" })).not.toBeInTheDocument());
+    expect(await view.findByText("密码管理器已启用")).toBeInTheDocument();
+  });
+
+  it("changes the existing global recovery password from the titlebar key action", async () => {
+    const base = createBrowserPasswordApi();
+    const status: PasswordStatus = {
+      available: true,
+      locked: false,
+      entryCount: 3,
+      protection: "windows-dpapi-recovery-password",
+      recoveryState: "ready",
+      sharedRecoveryConfigured: true,
+      captureEnabled: false,
+      captureConfigured: true,
       browser: await base.getBrowserStatus(),
     };
     const configureRecoveryPassword = vi.fn().mockResolvedValue(undefined);
@@ -194,13 +281,56 @@ describe("PasswordManagerTool", () => {
       configureRecoveryPassword,
     };
     const view = render(PasswordManagerTool, { api });
+    await view.findByText("demo@example.com");
 
-    expect(await view.findByRole("dialog", { name: "设置恢复密码" })).toBeInTheDocument();
-    const inputs = view.getAllByLabelText(/新的恢复密码|再次输入/);
-    await fireEvent.input(inputs[0], { target: { value: "correct horse battery" } });
-    await fireEvent.input(inputs[1], { target: { value: "correct horse battery" } });
-    await fireEvent.click(view.getByRole("button", { name: "设置并继续" }));
-    await waitFor(() => expect(configureRecoveryPassword).toHaveBeenCalledWith("correct horse battery"));
+    expect(view.queryByRole("dialog", { name: "设置全局恢复密码" })).not.toBeInTheDocument();
+    await fireEvent.click(view.getByRole("button", { name: "修改全局恢复密码" }));
+    const dialog = view.getByRole("dialog", { name: "修改全局恢复密码" });
+    expect(within(dialog).getByText(/密码管理器和 MFA 验证器全局共用/)).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("原恢复密码")).toHaveFocus();
+
+    await fireEvent.input(within(dialog).getByLabelText("原恢复密码"), { target: { value: "current recovery password" } });
+    await fireEvent.input(within(dialog).getByLabelText("新恢复密码"), { target: { value: "new recovery password" } });
+    await fireEvent.input(within(dialog).getByLabelText("确认新恢复密码"), { target: { value: "new recovery password" } });
+    await fireEvent.click(within(dialog).getByRole("button", { name: "保存新密码" }));
+
+    await waitFor(() => expect(configureRecoveryPassword).toHaveBeenCalledWith(
+      "new recovery password",
+      "current recovery password",
+    ));
+  });
+
+  it("replaces the password-change dialog with unlock after an idle lock", async () => {
+    const base = createBrowserPasswordApi();
+    let status: PasswordStatus = {
+      available: true,
+      locked: false,
+      entryCount: 3,
+      protection: "windows-dpapi-recovery-password",
+      recoveryState: "ready",
+      sharedRecoveryConfigured: true,
+      captureEnabled: false,
+      captureConfigured: true,
+      browser: await base.getBrowserStatus(),
+    };
+    const api: PasswordApi = {
+      ...base,
+      isDesktop: () => true,
+      getStatus: vi.fn().mockImplementation(async () => structuredClone(status)),
+    };
+    const view = render(PasswordManagerTool, { api });
+    await view.findByText("demo@example.com");
+
+    await fireEvent.click(view.getByRole("button", { name: "修改全局恢复密码" }));
+    const changeDialog = view.getByRole("dialog", { name: "修改全局恢复密码" });
+    await fireEvent.input(within(changeDialog).getByLabelText("原恢复密码"), { target: { value: "sensitive current password" } });
+
+    status = { ...status, locked: true, recoveryState: "password-required", captureEnabled: false };
+    eventHarness.emit("password-vault-locked");
+
+    const unlockDialog = await view.findByRole("dialog", { name: "解锁密码保险库" });
+    expect(within(unlockDialog).queryByLabelText("原恢复密码")).not.toBeInTheDocument();
+    expect(within(unlockDialog).getByLabelText("恢复密码")).toHaveValue("");
   });
 
   it("shows the unsupported platform state without opening recovery setup", async () => {
@@ -211,6 +341,7 @@ describe("PasswordManagerTool", () => {
       entryCount: 0,
       protection: "unavailable",
       recoveryState: "setup-required",
+      sharedRecoveryConfigured: false,
       captureEnabled: false,
       captureConfigured: false,
       browser: {
@@ -229,7 +360,7 @@ describe("PasswordManagerTool", () => {
 
     expect(await view.findByText("密码保险库不可用")).toBeInTheDocument();
     expect(view.getByText(/首版仅支持 Windows/)).toBeInTheDocument();
-    expect(view.queryByRole("dialog", { name: "设置恢复密码" })).not.toBeInTheDocument();
+    expect(view.queryByRole("dialog", { name: "设置全局恢复密码" })).not.toBeInTheDocument();
   });
 
   it("shows a locked state after explicit lock and unlocks in the same window", async () => {
@@ -240,6 +371,7 @@ describe("PasswordManagerTool", () => {
       entryCount: 3,
       protection: "windows-dpapi-recovery-password",
       recoveryState: "ready",
+      sharedRecoveryConfigured: true,
       captureEnabled: false,
       captureConfigured: true,
       browser: await base.getBrowserStatus(),
@@ -279,6 +411,7 @@ describe("PasswordManagerTool", () => {
       entryCount: 3,
       protection: "windows-dpapi-recovery-password",
       recoveryState: "ready",
+      sharedRecoveryConfigured: true,
       captureEnabled: false,
       captureConfigured: true,
       browser: await base.getBrowserStatus(),
@@ -306,6 +439,7 @@ describe("PasswordManagerTool", () => {
       entryCount: 3,
       protection: "windows-dpapi-recovery-password",
       recoveryState: "ready",
+      sharedRecoveryConfigured: true,
       captureEnabled: true,
       captureConfigured: true,
       browser: await base.getBrowserStatus(),

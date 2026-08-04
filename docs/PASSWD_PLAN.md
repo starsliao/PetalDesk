@@ -23,7 +23,7 @@
 - 最终的扩展名称、短摘要、完整介绍、中文/英文展示语言、分类、标签、版本更新说明、版权/许可证和隐私政策正文/URL。公开 listing 可以把隐私政策放在 AMO；我会同时准备一个稳定的外部网站副本，内容按“本地保存、只通过本机 Native Messaging 传递、不上传远程服务器”的实际行为起草，用户确认法律表述后再提交。
 - 品牌素材确认：扩展图标、商店截图、可选宣传图。没有新素材时可以使用飞花现有图标并由我生成 Firefox 界面截图；用户只需确认名称和视觉资产可用于公开发布。
 - 审核测试路径：审核员是否可以安装公开的飞花 Windows 安装包，以及密码管理器的无真实账号测试页面/测试数据。不能要求审核员使用真实密码；若必须安装桌面端才能验证 Native Messaging，应提供公开下载链接、可复现步骤和脱敏测试账号或本地 fixture。
-- 首版公开版本号为 `0.6.0`。`package.json`、Cargo、Tauri 和两个浏览器 manifest 必须在提交标签前保持一致；Firefox AMO 首次公开提交也使用此版本号。
+- 首版 AMO 公开版本号为 `0.6.1`（桌面端 `0.6.0` 已先行发布）。`package.json`、Cargo、Tauri 和两个浏览器 manifest 必须在提交标签前保持一致；Firefox AMO 首次公开提交也使用此版本号。
 
 我可以直接完成：
 
@@ -44,7 +44,7 @@ AMO 发布步骤：
 
 自动化发布凭据（可选，不是首次手工提交的前置条件）：
 
-- `0.6.0` 首次公开上架只用 AMO Developer Hub 手工上传。标签 CI 只生成 AMO 上传 ZIP 和审核源码 ZIP，不读取 AMO API secret，也不在桌面 Release 成功前占用不可重复的扩展版本号。
+- `0.6.1` 首次公开上架只用 AMO Developer Hub 手工上传。标签 CI 只生成 AMO 上传 ZIP 和审核源码 ZIP，不读取 AMO API secret，也不在桌面 Release 成功前占用不可重复的扩展版本号。
 - `browser-extension/scripts/package-firefox.ps1 -Sign` 支持显式的 `Listed` 与 `Unlisted` 通道，供独立测试或未来自动化使用。若后续增加 GitHub Actions 自动上传，用户需把 `AMO_JWT_ISSUER` 和 `AMO_JWT_SECRET` 配置为仓库 Secrets；自动上传必须放在桌面 Release 成功后的独立流程中，并验证始终更新同一个 AMO listing。
 
 **Password Vault**

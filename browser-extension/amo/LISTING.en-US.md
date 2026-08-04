@@ -51,5 +51,5 @@ The password vault remains encrypted on the user's Windows device. The extension
 - Support page: https://github.com/starsliao/PetalDesk/issues
 - Homepage: https://starsliao.github.io/PetalDesk/
 - Public privacy-policy URL: https://starsliao.github.io/PetalDesk/privacy.html
-- Public Windows installer URL: https://github.com/starsliao/PetalDesk/releases/download/v0.6.0/PetalDesk_0.6.0_x64-setup.exe
+- Public Windows installer URL: https://github.com/starsliao/PetalDesk/releases/download/v0.6.1/PetalDesk_0.6.1_x64-setup.exe
 - License: MIT

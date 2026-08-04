@@ -2,7 +2,7 @@
 
 ## Dependency
 
-The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.6.0/PetalDesk_0.6.0_x64-setup.exe.
+The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.6.1/PetalDesk_0.6.1_x64-setup.exe.
 
 The extension ID is fixed as `petaldesk-capture@petaldesk.app`, and the Native Messaging host name is `com.petaldesk.capture`.
 
