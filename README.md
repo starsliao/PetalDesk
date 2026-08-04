@@ -2,7 +2,7 @@
 
 > 把想法留在桌面，把文件留在自己手里。
 
-[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows x64](https://github.com/starsliao/PetalDesk/releases/download/v0.6.1/PetalDesk_0.6.1_x64-setup.exe) · [下载 macOS Universal](https://github.com/starsliao/PetalDesk/releases/download/v0.6.1/PetalDesk_0.6.1_universal.dmg)
+[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows x64](https://github.com/starsliao/PetalDesk/releases/download/v0.6.2/PetalDesk_0.6.2_x64-setup.exe) · [下载 macOS Universal](https://github.com/starsliao/PetalDesk/releases/download/v0.6.2/PetalDesk_0.6.2_universal.dmg)
 
 飞花 - PetalDesk 是一款面向 Windows 10/11 与 macOS 12+ 的本地便签与效率工具。它启动快、界面安静，支持 Markdown 即时排版、纯文本、图片、搜索、回收站，以及截图、任务规划和本地 MFA 验证器等随时可以唤起的小工具。没有账号、没有云端依赖，内容保留在你的本地数据目录中。
 
@@ -28,7 +28,9 @@
 | --- | --- |
 | <img src="website/assets/screenshots/gantt-tool.png" alt="飞花 - PetalDesk 任务甘特图" width="500" /> | <img src="website/assets/screenshots/screenshot-tool-final.png" alt="飞花 - PetalDesk 截图工具" width="500" /> |
 
-### 0.6.1 平台支持
+### 0.6.2 平台支持
+
+`0.6.2` 修复密码管理器图标提示、窗口关闭和手动锁定交互，取消闲置 15 分钟自动锁定；远程桌面会话中不再打开会被系统隐藏的 MFA 与密码管理器窗口，而是直接说明原因并提示回到本机使用。
 
 | 能力 | Windows 10/11 x64 | macOS 12+（Intel / Apple Silicon） |
 | --- | --- | --- |
@@ -89,15 +91,15 @@ MFA 与密码管理器同样可以随整个数据目录迁移。首次启用任�
 
 ### 升级与兼容
 
-Windows 上的 `0.5.2` 是自动更新桥接版本；已安装该版本或更高版本的用户可直接在飞花内更新到 `0.6.1`，无需重新运行本地安装流程。macOS 的 `0.5.0` 是首个公开版本，`0.6.1` 可以直接覆盖升级，但当前仍使用手动下载安装。首次启动时会自动识别旧的 `飞花/.feihua` 存储布局、旧便签元数据和旧甘特图数组格式，转换到当前 `.petaldesk/` 结构；便签正文 `note.md` 不会被改写，甘特图转换前会保留迁移备份。同机升级不需要输入全局恢复密码；恢复密码由 MFA 与密码管理器全局共用，用于跨设备恢复两个保险库，以及主动导出单个 MFA 账户。旧数据损坏或格式版本过新时，飞花会保留原文件并阻止静默覆盖。
+Windows 上的 `0.5.2` 是自动更新桥接版本；已安装该版本或更高版本的用户可直接在飞花内更新到 `0.6.2`，无需重新运行本地安装流程。macOS 的 `0.5.0` 是首个公开版本，`0.6.2` 可以直接覆盖升级，但当前仍使用手动下载安装。首次启动时会自动识别旧的 `飞花/.feihua` 存储布局、旧便签元数据和旧甘特图数组格式，转换到当前 `.petaldesk/` 结构；便签正文 `note.md` 不会被改写，甘特图转换前会保留迁移备份。同机升级不需要输入全局恢复密码；恢复密码由 MFA 与密码管理器全局共用，用于跨设备恢复两个保险库，以及主动导出单个 MFA 账户。旧数据损坏或格式版本过新时，飞花会保留原文件并阻止静默覆盖。
 
 ## 安装与运行
 
-Windows 新用户可下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.6.1/PetalDesk_0.6.1_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。`0.5.2` 起默认开启自动检查与后台下载；“关于飞花 - PetalDesk”中可以手动检查或关闭自动更新，下载完成后仍由用户选择何时重启安装。
+Windows 新用户可下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.6.2/PetalDesk_0.6.2_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。`0.5.2` 起默认开启自动检查与后台下载；“关于飞花 - PetalDesk”中可以手动检查或关闭自动更新，下载完成后仍由用户选择何时重启安装。
 
 没有 WebView2 或下载权限时，安装器会明确提示失败原因，不会静默留下无法启动的程序。未签名构建可能显示“未知发布者”，这是 Windows 对代码签名的正常提示。
 
-macOS 用户下载 [Universal DMG](https://github.com/starsliao/PetalDesk/releases/download/v0.6.1/PetalDesk_0.6.1_universal.dmg)，将应用拖入“应用程序”即可。同一个 DMG 同时包含 Intel（x86_64）和 Apple Silicon（arm64）代码，不需要按芯片下载不同安装包。普通截图首次使用时，请在“系统设置 > 隐私与安全性 > 屏幕录制”中允许 PetalDesk；未签名、未公证的测试构建可能被 Gatekeeper 阻止，正式发布方式见 [`docs/publishing.md`](docs/publishing.md)。
+macOS 用户下载 [Universal DMG](https://github.com/starsliao/PetalDesk/releases/download/v0.6.2/PetalDesk_0.6.2_universal.dmg)，将应用拖入“应用程序”即可。同一个 DMG 同时包含 Intel（x86_64）和 Apple Silicon（arm64）代码，不需要按芯片下载不同安装包。普通截图首次使用时，请在“系统设置 > 隐私与安全性 > 屏幕录制”中允许 PetalDesk；未签名、未公证的测试构建可能被 Gatekeeper 阻止，正式发布方式见 [`docs/publishing.md`](docs/publishing.md)。
 
 Windows 安装包已经包含长截图和密码管理器所需的 Native Messaging Host。首版密码自动填充与登录检测只由 Firefox 扩展提供；安装器不会静默安装扩展，用户需从 [Firefox 扩展安装页](https://starsliao.github.io/PetalDesk/firefox.html) 进入 AMO 并确认安装。不安装扩展仍可在密码管理器中打开站点、复制凭据并使用 Windows 通用长截图。macOS 版本不安装 Native Messaging Host，也不提供密码管理器、长截图或浏览器增强模式。
 

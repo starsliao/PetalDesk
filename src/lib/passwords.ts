@@ -37,7 +37,6 @@ export interface PasswordStatus {
   captureEnabled: boolean;
   captureConfigured: boolean;
   browser: PasswordBrowserStatus;
-  idleTimeoutSeconds?: number;
   sessionEpoch?: number;
   recoveredFromBackup?: boolean;
   message?: string | null;
@@ -304,7 +303,6 @@ function normalizeStatus(value: Partial<PasswordStatus> & Record<string, unknown
     captureConfigured: Boolean(value.captureConfigured ?? value.capture_configured ?? false),
     browser: normalizeBrowser((value.browser ?? {}) as Record<string, unknown>),
     recoveredFromBackup: Boolean(value.recoveredFromBackup ?? value.recovered_from_backup ?? false),
-    idleTimeoutSeconds: Number(value.idleTimeoutSeconds ?? value.idle_timeout_seconds ?? 0) || undefined,
     sessionEpoch: Number(value.sessionEpoch ?? value.session_epoch ?? 0) || undefined,
     message: value.message == null ? null : String(value.message),
   };

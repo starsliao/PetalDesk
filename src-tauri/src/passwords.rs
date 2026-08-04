@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
+use tauri::{AppHandle, Manager, WebviewWindow};
 use url::Url;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
@@ -73,8 +73,6 @@ const MAX_TEMPLATE_SELECTOR_BYTES: usize = 512;
 const MAX_TEMPLATE_SELECTORS: usize = 16;
 const BACKUP_LIMIT: usize = 5;
 const CONFLICT_LIMIT: usize = 10;
-const IDLE_LOCK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const REVEAL_TTL: Duration = Duration::from_secs(15);
 const CLIPBOARD_TTL: Duration = Duration::from_secs(30);
 #[cfg(windows)]
@@ -200,7 +198,6 @@ pub struct PasswordStatus {
     pub shared_recovery_configured: bool,
     pub capture_configured: bool,
     pub capture_enabled: bool,
-    pub idle_timeout_seconds: u64,
     pub session_epoch: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recovered_from_backup: bool,
@@ -508,7 +505,6 @@ struct RuntimeState {
 struct SessionState {
     epoch: AtomicU64,
     active: AtomicBool,
-    last_activity: Mutex<Option<Instant>>,
 }
 
 struct ClipboardLease {
@@ -580,7 +576,6 @@ pub struct PasswordStore {
     session: Arc<SessionState>,
     lifecycle_lock: Arc<Mutex<()>>,
     clipboard: Arc<Mutex<Option<ClipboardLease>>>,
-    idle_sweeper_started: Arc<AtomicBool>,
 }
 
 impl PasswordStore {
@@ -630,71 +625,21 @@ impl PasswordStore {
             session: Arc::new(SessionState {
                 epoch: AtomicU64::new(0),
                 active: AtomicBool::new(false),
-                last_activity: Mutex::new(None),
             }),
             lifecycle_lock: Arc::new(Mutex::new(())),
             clipboard: Arc::new(Mutex::new(None)),
-            idle_sweeper_started: Arc::new(AtomicBool::new(false)),
         };
         Ok(store)
-    }
-
-    pub(crate) fn start_idle_sweeper(&self, app: AppHandle) {
-        if self
-            .idle_sweeper_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        let session = Arc::downgrade(&self.session);
-        let runtime = Arc::downgrade(&self.runtime);
-        let lifecycle = Arc::downgrade(&self.lifecycle_lock);
-        let clipboard = Arc::downgrade(&self.clipboard);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(IDLE_SWEEP_INTERVAL);
-            let (Some(session), Some(runtime), Some(lifecycle), Some(clipboard)) = (
-                session.upgrade(),
-                runtime.upgrade(),
-                lifecycle.upgrade(),
-                clipboard.upgrade(),
-            ) else {
-                break;
-            };
-            let expired = {
-                let _guard = lock_unpoisoned(&lifecycle);
-                expire_session_if_idle(&session, &runtime)
-            };
-            if expired {
-                force_expire_clipboard(&clipboard);
-                if !clear_clipboard_now(&clipboard) {
-                    schedule_clipboard_cleanup(Arc::downgrade(&clipboard), Instant::now());
-                }
-                app.state::<crate::password_browser::PasswordBrowserService>()
-                    .suspend_capture();
-                let _ = app.emit_to(
-                    "passwords",
-                    "password-vault-locked",
-                    serde_json::json!({
-                        "reason": "idle",
-                        "sessionEpoch": session.epoch.load(Ordering::Acquire),
-                    }),
-                );
-            }
-        });
     }
 
     /// Opens or refocuses one logical password-manager session.
     pub fn activate(&self) -> u64 {
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        let _ = expire_session_if_idle(&self.session, &self.runtime);
         if self.session.active.load(Ordering::Acquire) {
-            *lock_unpoisoned(&self.session.last_activity) = Some(Instant::now());
             return self.session.epoch.load(Ordering::Acquire);
         }
         let epoch = self.session.epoch.fetch_add(1, Ordering::AcqRel) + 1;
         self.session.active.store(true, Ordering::Release);
-        *lock_unpoisoned(&self.session.last_activity) = Some(Instant::now());
         epoch
     }
 
@@ -702,7 +647,6 @@ impl PasswordStore {
     pub fn deactivate(&self) -> u64 {
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
         self.session.active.store(false, Ordering::Release);
-        *lock_unpoisoned(&self.session.last_activity) = None;
         self.session.epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 
@@ -735,13 +679,10 @@ impl PasswordStore {
     /// work from before the lock cannot publish a result afterwards.
     pub(crate) fn lock_current_session(&self) -> AppResult<()> {
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        if expire_session_if_idle(&self.session, &self.runtime)
-            || !self.session.active.load(Ordering::Acquire)
-        {
+        if !self.session.active.load(Ordering::Acquire) {
             return Err(session_closed_error());
         }
         self.session.epoch.fetch_add(1, Ordering::AcqRel);
-        *lock_unpoisoned(&self.session.last_activity) = Some(Instant::now());
         let mut runtime = lock_unpoisoned(&self.runtime);
         runtime.locked_entry_count = runtime
             .vault
@@ -760,12 +701,6 @@ impl PasswordStore {
 
     pub(crate) fn require_active_epoch(&self) -> AppResult<u64> {
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        if expire_session_if_idle(&self.session, &self.runtime) {
-            force_expire_clipboard(&self.clipboard);
-            if !clear_clipboard_now(&self.clipboard) {
-                schedule_clipboard_cleanup(Arc::downgrade(&self.clipboard), Instant::now());
-            }
-        }
         if !self.session.active.load(Ordering::Acquire) {
             return Err(session_closed_error());
         }
@@ -775,18 +710,15 @@ impl PasswordStore {
         {
             return Err(session_closed_error());
         }
-        *lock_unpoisoned(&self.session.last_activity) = Some(Instant::now());
         Ok(epoch)
     }
 
-    fn validate_epoch_and_touch(&self, epoch: u64) -> AppResult<()> {
-        if expire_session_if_idle(&self.session, &self.runtime)
-            || !self.session.active.load(Ordering::Acquire)
+    fn validate_epoch(&self, epoch: u64) -> AppResult<()> {
+        if !self.session.active.load(Ordering::Acquire)
             || self.session.epoch.load(Ordering::Acquire) != epoch
         {
             return Err(session_closed_error());
         }
-        *lock_unpoisoned(&self.session.last_activity) = Some(Instant::now());
         Ok(())
     }
 
@@ -798,7 +730,7 @@ impl PasswordStore {
 
     pub(crate) fn status_at(&self, epoch: u64) -> AppResult<PasswordStatus> {
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        self.validate_epoch_and_touch(epoch)?;
+        self.validate_epoch(epoch)?;
         #[cfg(all(not(windows), not(test)))]
         {
             let settings = lock_unpoisoned(&self.settings).clone();
@@ -811,7 +743,6 @@ impl PasswordStore {
                 shared_recovery_configured: false,
                 capture_configured: settings.capture_configured,
                 capture_enabled: false,
-                idle_timeout_seconds: IDLE_LOCK_TIMEOUT.as_secs(),
                 session_epoch: epoch,
                 recovered_from_backup: false,
                 message: Some("密码管理器首版仅支持 Windows。".to_string()),
@@ -842,7 +773,6 @@ impl PasswordStore {
             ),
             capture_configured: settings.capture_configured,
             capture_enabled: settings.capture_enabled,
-            idle_timeout_seconds: IDLE_LOCK_TIMEOUT.as_secs(),
             session_epoch: epoch,
             recovered_from_backup: runtime.recovered_from_backup,
             message: if manually_locked {
@@ -875,7 +805,7 @@ impl PasswordStore {
 
     pub(crate) fn list_entries_at(&self, epoch: u64) -> AppResult<Vec<PasswordEntrySummary>> {
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        self.validate_epoch_and_touch(epoch)?;
+        self.validate_epoch(epoch)?;
         let mut runtime = lock_unpoisoned(&self.runtime);
         self.ensure_unlocked(&mut runtime)?;
         let vault = runtime.vault.as_ref().ok_or_else(generic_vault_error)?;
@@ -886,7 +816,7 @@ impl PasswordStore {
         let epoch = self.require_active_epoch()?;
         validate_entry_id(entry_id)?;
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        self.validate_epoch_and_touch(epoch)?;
+        self.validate_epoch(epoch)?;
         let mut runtime = lock_unpoisoned(&self.runtime);
         self.ensure_unlocked(&mut runtime)?;
         let entry = runtime
@@ -945,7 +875,7 @@ impl PasswordStore {
         };
 
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        self.validate_epoch_and_touch(epoch)?;
+        self.validate_epoch(epoch)?;
         let mut runtime = lock_unpoisoned(&self.runtime);
         self.ensure_unlocked(&mut runtime)?;
         let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
@@ -987,7 +917,7 @@ impl PasswordStore {
         let login = validate_login_url(&input.login_url, input.allow_insecure_http)?;
 
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        self.validate_epoch_and_touch(epoch)?;
+        self.validate_epoch(epoch)?;
         let mut runtime = lock_unpoisoned(&self.runtime);
         self.ensure_unlocked(&mut runtime)?;
         let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
@@ -1045,7 +975,7 @@ impl PasswordStore {
     ) -> AppResult<PasswordEntrySummary> {
         validate_entry_id(entry_id)?;
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        self.validate_epoch_and_touch(epoch)?;
+        self.validate_epoch(epoch)?;
         let mut runtime = lock_unpoisoned(&self.runtime);
         self.ensure_unlocked(&mut runtime)?;
         let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
@@ -1089,7 +1019,7 @@ impl PasswordStore {
     pub(crate) fn delete_entry_at(&self, entry_id: &str, epoch: u64) -> AppResult<()> {
         validate_entry_id(entry_id)?;
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        self.validate_epoch_and_touch(epoch)?;
+        self.validate_epoch(epoch)?;
         let mut runtime = lock_unpoisoned(&self.runtime);
         self.ensure_unlocked(&mut runtime)?;
         let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
@@ -1120,7 +1050,7 @@ impl PasswordStore {
     ) -> AppResult<PasswordRevealResult> {
         validate_entry_id(entry_id)?;
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        self.validate_epoch_and_touch(epoch)?;
+        self.validate_epoch(epoch)?;
         let mut runtime = lock_unpoisoned(&self.runtime);
         self.ensure_unlocked(&mut runtime)?;
         let entry = runtime
@@ -1149,7 +1079,7 @@ impl PasswordStore {
     ) -> AppResult<()> {
         validate_entry_id(entry_id)?;
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        self.validate_epoch_and_touch(epoch)?;
+        self.validate_epoch(epoch)?;
         let mut runtime = lock_unpoisoned(&self.runtime);
         self.ensure_unlocked(&mut runtime)?;
         let entry = runtime
@@ -1201,7 +1131,7 @@ impl PasswordStore {
             validate_exact_origin(&candidate.origin, candidate.allow_insecure_http)?;
 
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        self.validate_epoch_and_touch(epoch)?;
+        self.validate_epoch(epoch)?;
         let mut runtime = lock_unpoisoned(&self.runtime);
         self.ensure_unlocked(&mut runtime)?;
         let vault = runtime.vault.as_ref().ok_or_else(generic_vault_error)?;
@@ -1283,7 +1213,7 @@ impl PasswordStore {
         epoch: u64,
     ) -> AppResult<PasswordStatus> {
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        self.validate_epoch_and_touch(epoch)?;
+        self.validate_epoch(epoch)?;
         let mut settings = lock_unpoisoned(&self.settings);
         let previous = settings.clone();
         settings.capture_configured = true;
@@ -1487,7 +1417,7 @@ impl PasswordStore {
     ) -> AppResult<PasswordStatus> {
         validate_recovery_password(password)?;
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        self.validate_epoch_and_touch(epoch)?;
+        self.validate_epoch(epoch)?;
         let mut runtime = lock_unpoisoned(&self.runtime);
         self.ensure_unlocked(&mut runtime)?;
         let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
@@ -1535,7 +1465,7 @@ impl PasswordStore {
     ) -> AppResult<PasswordStatus> {
         validate_recovery_password(password)?;
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
-        self.validate_epoch_and_touch(epoch)?;
+        self.validate_epoch(epoch)?;
         let mut runtime = lock_unpoisoned(&self.runtime);
         if let Some(vault) = runtime.vault.as_ref() {
             verify_current_recovery_password(vault, password)?;
@@ -1806,12 +1736,6 @@ impl PasswordStore {
         trim_json_files(&self.conflict_path, CONFLICT_LIMIT, "读取密码冲突目录")?;
         Ok(target)
     }
-
-    #[cfg(test)]
-    fn force_idle_for_test(&self) {
-        *lock_unpoisoned(&self.session.last_activity) =
-            Some(Instant::now() - IDLE_LOCK_TIMEOUT - Duration::from_secs(1));
-    }
 }
 
 fn load_settings(path: &Path) -> AppResult<PasswordSettings> {
@@ -1845,37 +1769,6 @@ fn preserve_invalid_settings(path: &Path) {
         Uuid::new_v4()
     ));
     let _ = atomic_write(&target, &bytes);
-}
-
-fn expire_session_if_idle(session: &SessionState, runtime: &Mutex<RuntimeState>) -> bool {
-    if !session.active.load(Ordering::Acquire) {
-        return false;
-    }
-    let mut last_activity = lock_unpoisoned(&session.last_activity);
-    let expired = last_activity
-        .as_ref()
-        .is_some_and(|last| last.elapsed() >= IDLE_LOCK_TIMEOUT);
-    if !expired {
-        return false;
-    }
-    session.epoch.fetch_add(1, Ordering::AcqRel);
-    *last_activity = Some(Instant::now());
-    let mut runtime = lock_unpoisoned(runtime);
-    let was_configured = runtime
-        .vault
-        .as_ref()
-        .is_some_and(|vault| vault.recovery_wrapped_key.is_some())
-        || matches!(
-            runtime.recovery_state,
-            PasswordRecoveryState::Ready | PasswordRecoveryState::PasswordRequired
-        );
-    if let Some(vault) = runtime.vault.as_ref() {
-        runtime.locked_entry_count = vault.payload.entries.len();
-    }
-    runtime.vault = None;
-    runtime.manually_locked = was_configured;
-    runtime.recovered_from_backup = false;
-    true
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -3720,14 +3613,14 @@ mod tests {
     }
 
     #[test]
-    fn window_close_expires_the_session_but_idle_lock_can_be_recovered_in_place() {
+    fn window_close_expires_the_session_and_reopen_starts_a_new_epoch() {
         let (_root, store) = test_store();
         let entry = store
             .create_entry(input(
                 "Example",
                 "https://example.com/login",
                 "alice",
-                "idle secret",
+                "stored secret",
             ))
             .unwrap();
         let first = store.activate();
@@ -3738,18 +3631,13 @@ mod tests {
         );
         let second = store.activate();
         assert!(second > first);
-        store.force_idle_for_test();
         let status = store.status().unwrap();
-        assert!(status.locked);
+        assert!(!status.locked);
         assert_eq!(status.entry_count, 1);
         assert!(store.session.active.load(Ordering::Acquire));
-        assert!(store.session.epoch.load(Ordering::Acquire) > second);
-        store
-            .unlock_with_recovery_password(RECOVERY_PASSWORD)
-            .unwrap();
         assert_eq!(
             store.reveal_password(&entry.id).unwrap().password.as_str(),
-            "idle secret"
+            "stored secret"
         );
     }
 

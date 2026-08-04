@@ -11,6 +11,10 @@ pub(crate) const REMINDER_WINDOW_LABEL: &str = "reminder";
 pub(crate) const GANTT_WINDOW_LABEL: &str = "gantt";
 pub(crate) const MFA_WINDOW_LABEL: &str = "mfa";
 pub(crate) const PASSWORD_WINDOW_LABEL: &str = "passwords";
+pub(crate) const SENSITIVE_TOOL_REMOTE_SESSION_CODE: &str =
+    "remote_desktop_sensitive_window_unavailable";
+const SENSITIVE_TOOL_REMOTE_SESSION_MESSAGE: &str =
+    "远程桌面会隐藏 MFA 验证器和密码管理器的敏感内容，因此当前不会打开窗口。请在本机登录后使用。";
 const TIMER_DEFAULT_WIDTH: f64 = 320.0;
 const TIMER_DEFAULT_HEIGHT: f64 = 140.0;
 const TIMER_MIN_VISIBLE_WIDTH: f64 = 48.0;
@@ -625,6 +629,7 @@ pub fn open_gantt_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppRe
 
 pub fn open_mfa_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResult<String> {
     let _creation_guard = lock_window_creation(&MFA_WINDOW_CREATION_LOCK);
+    ensure_sensitive_tool_local(app, MFA_WINDOW_LABEL)?;
     if let Some(window) = app.get_webview_window(MFA_WINDOW_LABEL) {
         window.show().map_err(|error| {
             AppError::new("window_error", format!("显示 MFA 验证器失败: {error}"))
@@ -678,6 +683,7 @@ pub fn open_mfa_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResu
 
 pub fn open_password_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResult<String> {
     let _creation_guard = lock_window_creation(&PASSWORD_WINDOW_CREATION_LOCK);
+    ensure_sensitive_tool_local(app, PASSWORD_WINDOW_LABEL)?;
     if let Some(window) = app.get_webview_window(PASSWORD_WINDOW_LABEL) {
         window.show().map_err(|error| {
             AppError::new("window_error", format!("显示密码管理器失败: {error}"))
@@ -722,6 +728,140 @@ pub fn open_password_window_inner(app: &AppHandle, store: &WorkspaceStore) -> Ap
     let _ = protect_sensitive_window(&window);
     let _ = window.set_focus();
     Ok(PASSWORD_WINDOW_LABEL.to_string())
+}
+
+fn ensure_sensitive_tool_local(app: &AppHandle, label: &str) -> AppResult<()> {
+    let access = sensitive_tool_access(is_remote_desktop_session());
+    if access.is_err() {
+        close_sensitive_window_for_remote_session(app, label);
+    }
+    access
+}
+
+fn close_sensitive_window_for_remote_session(app: &AppHandle, label: &str) {
+    if let Some(window) = app.get_webview_window(label) {
+        let _ = window.hide();
+        let _ = window.destroy();
+    }
+
+    match label {
+        MFA_WINDOW_LABEL => {
+            app.state::<crate::mfa::MfaStore>().lock();
+        }
+        PASSWORD_WINDOW_LABEL => {
+            app.state::<crate::password_browser::PasswordBrowserService>()
+                .suspend_capture();
+            app.state::<crate::passwords::PasswordStore>().lock();
+        }
+        _ => {}
+    }
+}
+
+fn remote_session_signals_indicate_remote(
+    remote_session_metric: bool,
+    remote_control_metric: bool,
+    wts_protocol_type: Option<u16>,
+) -> bool {
+    remote_session_metric || remote_control_metric || wts_protocol_type == Some(2)
+}
+
+fn sensitive_tool_access(remote_session: bool) -> AppResult<()> {
+    if remote_session {
+        Err(AppError::new(
+            SENSITIVE_TOOL_REMOTE_SESSION_CODE,
+            SENSITIVE_TOOL_REMOTE_SESSION_MESSAGE,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn is_remote_desktop_session() -> bool {
+    use std::mem::size_of;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::System::RemoteDesktop::{
+        WTSClientProtocolType, WTSFreeMemory, WTSQuerySessionInformationW,
+        WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_REMOTECONTROL, SM_REMOTESESSION,
+    };
+
+    let remote_session_metric = unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 };
+    let remote_control_metric = unsafe { GetSystemMetrics(SM_REMOTECONTROL) != 0 };
+    let mut buffer = null_mut();
+    let mut bytes_returned = 0u32;
+    let query_succeeded = unsafe {
+        WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            WTS_CURRENT_SESSION,
+            WTSClientProtocolType,
+            &mut buffer,
+            &mut bytes_returned,
+        ) != 0
+    };
+    let wts_protocol_type =
+        if query_succeeded && !buffer.is_null() && bytes_returned >= size_of::<u16>() as u32 {
+            Some(unsafe { *(buffer as *const u16) })
+        } else {
+            None
+        };
+    if !buffer.is_null() {
+        unsafe { WTSFreeMemory(buffer as *mut core::ffi::c_void) };
+    }
+
+    remote_session_signals_indicate_remote(
+        remote_session_metric,
+        remote_control_metric,
+        wts_protocol_type,
+    )
+}
+
+#[cfg(not(windows))]
+fn is_remote_desktop_session() -> bool {
+    false
+}
+
+#[cfg(test)]
+mod remote_session_tests {
+    use super::{
+        remote_session_signals_indicate_remote, sensitive_tool_access,
+        SENSITIVE_TOOL_REMOTE_SESSION_CODE, SENSITIVE_TOOL_REMOTE_SESSION_MESSAGE,
+    };
+
+    #[test]
+    fn either_windows_remote_metric_blocks_sensitive_tools() {
+        assert!(remote_session_signals_indicate_remote(true, false, Some(0)));
+        assert!(remote_session_signals_indicate_remote(false, true, Some(0)));
+    }
+
+    #[test]
+    fn rdp_wts_protocol_blocks_when_metrics_are_unavailable() {
+        assert!(remote_session_signals_indicate_remote(
+            false,
+            false,
+            Some(2)
+        ));
+    }
+
+    #[test]
+    fn console_and_unknown_sessions_are_allowed() {
+        assert!(!remote_session_signals_indicate_remote(
+            false,
+            false,
+            Some(0)
+        ));
+        assert!(!remote_session_signals_indicate_remote(false, false, None));
+    }
+
+    #[test]
+    fn sensitive_tool_policy_returns_the_user_facing_remote_error() {
+        let error = sensitive_tool_access(true).unwrap_err();
+        assert_eq!(error.code, SENSITIVE_TOOL_REMOTE_SESSION_CODE);
+        assert_eq!(error.message, SENSITIVE_TOOL_REMOTE_SESSION_MESSAGE);
+        sensitive_tool_access(false).unwrap();
+    }
 }
 
 #[cfg(windows)]

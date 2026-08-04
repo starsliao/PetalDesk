@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/svelte";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { notesApi } from "../bridge";
 import { createBrowserPasswordApi, type PasswordApi, type PasswordStatus } from "../passwords";
 import PasswordManagerTool from "./PasswordManagerTool.svelte";
@@ -20,7 +20,18 @@ const eventHarness = vi.hoisted(() => {
   };
 });
 
+const nativeWindowHarness = vi.hoisted(() => ({
+  close: vi.fn<() => Promise<void>>(),
+  destroy: vi.fn<() => Promise<void>>(),
+}));
+
 vi.mock("@tauri-apps/api/event", () => ({ listen: eventHarness.listen }));
+vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => nativeWindowHarness }));
+
+beforeEach(() => {
+  nativeWindowHarness.close.mockReset().mockResolvedValue(undefined);
+  nativeWindowHarness.destroy.mockReset().mockResolvedValue(undefined);
+});
 
 afterEach(() => {
   cleanup();
@@ -204,8 +215,11 @@ describe("PasswordManagerTool", () => {
     const view = render(PasswordManagerTool, { api });
 
     const dialog = await view.findByRole("dialog", { name: "设置全局恢复密码" });
-    expect(within(dialog).getByText(/密码管理器和 MFA 验证器全局共用/)).toBeInTheDocument();
-    expect(within(dialog).getByRole("note")).toHaveTextContent("同时用于密码管理器和 MFA 验证器");
+    expect(within(dialog).getByText(/设置后，密码管理器和 MFA 验证器将共同使用/)).toBeInTheDocument();
+    const guidance = within(dialog).getByRole("note");
+    expect(guidance).toHaveTextContent("更换电脑、重装系统、切换系统用户");
+    expect(guidance).toHaveTextContent("请务必牢记并妥善保管");
+    expect(guidance).toHaveTextContent("恢复密码本身无法找回");
     const inputs = [within(dialog).getByLabelText("恢复密码"), within(dialog).getByLabelText("确认恢复密码")];
     await fireEvent.input(inputs[0], { target: { value: "correct horse battery" } });
     await fireEvent.input(inputs[1], { target: { value: "correct horse battery" } });
@@ -249,7 +263,9 @@ describe("PasswordManagerTool", () => {
     const view = render(PasswordManagerTool, { api });
 
     const dialog = await view.findByRole("dialog", { name: "启用密码管理器" });
-    expect(within(dialog).getByText(/MFA 验证器已设置全局恢复密码，请输入同一个密码/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/不会创建第二套密码，也不会修改现有密码/)).toBeInTheDocument();
+    expect(within(dialog).getByRole("note")).toHaveTextContent("日常使用通常无需输入");
+    expect(within(dialog).getByRole("note")).toHaveTextContent("恢复密码本身无法找回");
     expect(within(dialog).getByLabelText("全局恢复密码")).toBeInTheDocument();
     expect(within(dialog).queryByLabelText("确认恢复密码")).not.toBeInTheDocument();
     await fireEvent.input(within(dialog).getByLabelText("全局恢复密码"), { target: { value: "existing recovery password" } });
@@ -286,7 +302,9 @@ describe("PasswordManagerTool", () => {
     expect(view.queryByRole("dialog", { name: "设置全局恢复密码" })).not.toBeInTheDocument();
     await fireEvent.click(view.getByRole("button", { name: "修改全局恢复密码" }));
     const dialog = view.getByRole("dialog", { name: "修改全局恢复密码" });
-    expect(within(dialog).getByText(/密码管理器和 MFA 验证器全局共用/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/同时改用新密码，旧密码失效/)).toBeInTheDocument();
+    expect(within(dialog).getByRole("note")).toHaveTextContent("本机安全保护不可用");
+    expect(within(dialog).getByRole("note")).toHaveTextContent("无法帮你找回");
     expect(within(dialog).getByLabelText("原恢复密码")).toHaveFocus();
 
     await fireEvent.input(within(dialog).getByLabelText("原恢复密码"), { target: { value: "current recovery password" } });
@@ -300,9 +318,9 @@ describe("PasswordManagerTool", () => {
     ));
   });
 
-  it("replaces the password-change dialog with unlock after an idle lock", async () => {
+  it("keeps one titlebar lock action and places all titlebar tooltips below the buttons", async () => {
     const base = createBrowserPasswordApi();
-    let status: PasswordStatus = {
+    const status: PasswordStatus = {
       available: true,
       locked: false,
       entryCount: 3,
@@ -315,22 +333,49 @@ describe("PasswordManagerTool", () => {
     };
     const api: PasswordApi = {
       ...base,
-      isDesktop: () => true,
-      getStatus: vi.fn().mockImplementation(async () => structuredClone(status)),
+      getStatus: vi.fn().mockResolvedValue(status),
     };
     const view = render(PasswordManagerTool, { api });
     await view.findByText("demo@example.com");
 
-    await fireEvent.click(view.getByRole("button", { name: "修改全局恢复密码" }));
-    const changeDialog = view.getByRole("dialog", { name: "修改全局恢复密码" });
-    await fireEvent.input(within(changeDialog).getByLabelText("原恢复密码"), { target: { value: "sensitive current password" } });
+    const recoveryButton = view.getByRole("button", { name: "修改全局恢复密码" });
+    const lockButtons = view.getAllByRole("button", { name: "锁定保险库" });
+    const closeButton = view.getByRole("button", { name: "关闭密码管理器" });
+    expect(lockButtons).toHaveLength(1);
+    expect(recoveryButton).toHaveAttribute("data-tooltip-placement", "bottom");
+    expect(lockButtons[0]).toHaveAttribute("data-tooltip-placement", "bottom");
+    expect(closeButton).toHaveAttribute("data-tooltip-placement", "bottom");
+    expect(view.queryByText(/闲置.*分钟后锁定/)).not.toBeInTheDocument();
+  });
 
-    status = { ...status, locked: true, recoveryState: "password-required", captureEnabled: false };
-    eventHarness.emit("password-vault-locked");
+  it("renders account action tooltips in a fixed layer outside the scrolling list", async () => {
+    const api = createBrowserPasswordApi();
+    const view = render(PasswordManagerTool, { api });
+    await view.findByText("demo@example.com");
 
-    const unlockDialog = await view.findByRole("dialog", { name: "解锁密码保险库" });
-    expect(within(unlockDialog).queryByLabelText("原恢复密码")).not.toBeInTheDocument();
-    expect(within(unlockDialog).getByLabelText("恢复密码")).toHaveValue("");
+    const button = view.getAllByRole("button", { name: "复制 Google Workspace 用户名" })[0];
+    vi.spyOn(button, "getBoundingClientRect").mockReturnValue({
+      x: 700,
+      y: 700,
+      top: 700,
+      right: 730,
+      bottom: 730,
+      left: 700,
+      width: 30,
+      height: 30,
+      toJSON: () => ({}),
+    });
+    await fireEvent.mouseOver(button);
+
+    const tooltip = await view.findByRole("tooltip");
+    await waitFor(() => expect(tooltip).toHaveAttribute("data-placement", "top"));
+    expect(tooltip).toHaveTextContent("复制用户名");
+    expect(tooltip.closest(".entry-list")).toBeNull();
+    expect(button).toHaveAttribute("aria-describedby", "password-manager-tooltip");
+    expect(Number.parseInt(tooltip.style.top, 10)).toBeLessThan(700);
+
+    await fireEvent.mouseOut(button);
+    await waitFor(() => expect(view.queryByRole("tooltip")).not.toBeInTheDocument());
   });
 
   it("shows the unsupported platform state without opening recovery setup", async () => {
@@ -431,44 +476,38 @@ describe("PasswordManagerTool", () => {
     expect(lock).toHaveBeenCalledOnce();
   });
 
-  it("immediately removes revealed and edited secrets after an idle-lock event", async () => {
+  it("closes the native password window after locking the vault", async () => {
     const base = createBrowserPasswordApi();
-    let status: PasswordStatus = {
-      available: true,
-      locked: false,
-      entryCount: 3,
-      protection: "windows-dpapi-recovery-password",
-      recoveryState: "ready",
-      sharedRecoveryConfigured: true,
-      captureEnabled: true,
-      captureConfigured: true,
-      browser: await base.getBrowserStatus(),
-    };
+    const lock = vi.fn().mockResolvedValue(undefined);
     const api: PasswordApi = {
       ...base,
       isDesktop: () => true,
-      getStatus: vi.fn().mockImplementation(async () => structuredClone(status)),
+      lock,
     };
     const view = render(PasswordManagerTool, { api });
     await view.findByText("demo@example.com");
-    await waitFor(() => expect(eventHarness.listen).toHaveBeenCalledWith(
-      "password-vault-locked",
-      expect.any(Function),
-    ));
 
-    await fireEvent.click(view.getAllByRole("button", { name: "显示密码" })[0]);
-    expect(await view.findByText("Demo-Google-2026!")).toBeInTheDocument();
-    await fireEvent.click(view.getAllByRole("button", { name: "编辑 Google Workspace" })[0]);
-    expect(view.getByRole("dialog", { name: "编辑密码账户" })).toBeInTheDocument();
+    await fireEvent.click(view.getByRole("button", { name: "关闭密码管理器" }));
 
-    status = { ...status, locked: true, recoveryState: "password-required", captureEnabled: false };
-    eventHarness.emit("password-vault-locked");
+    await waitFor(() => expect(nativeWindowHarness.close).toHaveBeenCalledOnce());
+    expect(lock).toHaveBeenCalledOnce();
+    expect(nativeWindowHarness.destroy).not.toHaveBeenCalled();
+  });
 
-    await waitFor(() => {
-      expect(view.queryByText("Demo-Google-2026!")).not.toBeInTheDocument();
-      expect(view.queryByRole("dialog", { name: "编辑密码账户" })).not.toBeInTheDocument();
-      expect(view.queryByText("demo@example.com")).not.toBeInTheDocument();
-      expect(view.getByTestId("password-locked-state")).toBeInTheDocument();
-    });
+  it("destroys the native password window when graceful close fails", async () => {
+    nativeWindowHarness.close.mockRejectedValueOnce(new Error("close denied"));
+    const base = createBrowserPasswordApi();
+    const api: PasswordApi = {
+      ...base,
+      isDesktop: () => true,
+      lock: vi.fn().mockResolvedValue(undefined),
+    };
+    const view = render(PasswordManagerTool, { api });
+    await view.findByText("demo@example.com");
+
+    await fireEvent.click(view.getByRole("button", { name: "关闭密码管理器" }));
+
+    await waitFor(() => expect(nativeWindowHarness.destroy).toHaveBeenCalledOnce());
+    expect(nativeWindowHarness.close).toHaveBeenCalledOnce();
   });
 });

@@ -38,6 +38,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tauri::menu::{Menu, MenuItem, Submenu};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 const TRAY_ID: &str = "petaldesk-tray";
 const OPEN_NOTE_MENU_PREFIX: &str = "open-note:";
@@ -315,24 +316,35 @@ fn spawn_show_note(app: &tauri::AppHandle, note_id: String) {
 
 fn spawn_open_tool(app: &tauri::AppHandle, tool: models::ToolName) {
     let app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || match tool {
-        models::ToolName::Timer => {
-            let _ = commands::open_timer_window_inner(&app, &app.state());
-        }
-        models::ToolName::Reminder => {
-            let _ = commands::open_reminder_window_inner(&app, &app.state());
-        }
-        models::ToolName::Gantt => {
-            let _ = commands::open_gantt_window_inner(&app, &app.state());
-        }
-        models::ToolName::Mfa => {
-            let _ = commands::open_mfa_window_inner(&app, &app.state());
-        }
-        models::ToolName::Passwords => {
-            let _ = commands::open_password_window_inner(&app, &app.state());
-        }
-        models::ToolName::Screenshot => {
-            let _ = screenshot::start_capture_inner(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = match tool {
+            models::ToolName::Timer => {
+                commands::open_timer_window_inner(&app, &app.state()).map(|_| ())
+            }
+            models::ToolName::Reminder => {
+                commands::open_reminder_window_inner(&app, &app.state()).map(|_| ())
+            }
+            models::ToolName::Gantt => {
+                commands::open_gantt_window_inner(&app, &app.state()).map(|_| ())
+            }
+            models::ToolName::Mfa => {
+                commands::open_mfa_window_inner(&app, &app.state()).map(|_| ())
+            }
+            models::ToolName::Passwords => {
+                commands::open_password_window_inner(&app, &app.state()).map(|_| ())
+            }
+            models::ToolName::Screenshot => screenshot::start_capture_inner(&app).map(|_| ()),
+        };
+        if let Err(error) = result {
+            if error.code == commands::SENSITIVE_TOOL_REMOTE_SESSION_CODE {
+                app.dialog()
+                    .message(error.message)
+                    .title("飞花安全提示")
+                    .kind(MessageDialogKind::Warning)
+                    .blocking_show();
+            } else {
+                eprintln!("托盘打开小工具失败: {error}");
+            }
         }
     });
 }
@@ -544,8 +556,6 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     app.manage(PasswordBrowserService::start());
     screenshot::setup(app)?;
     password_browser::start_event_dispatcher(app.handle().clone());
-    app.state::<PasswordStore>()
-        .start_idle_sweeper(app.handle().clone());
     let notes = app.state::<WorkspaceStore>().list_notes()?;
     let shortcut = app.state::<ScreenshotStore>().settings().shortcut;
     // Seed the signature with what the initial menu renders so the first

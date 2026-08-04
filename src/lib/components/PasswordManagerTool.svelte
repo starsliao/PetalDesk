@@ -54,7 +54,6 @@
   let status = $state<PasswordStatus | null>(null);
   let browser = $state<PasswordBrowserStatus | null>(null);
   let loading = $state(true);
-  let refreshing = $state(false);
   let error = $state("");
   let toast = $state("");
   let searchText = $state("");
@@ -79,9 +78,18 @@
   let templateExpiryTimer: number | null = null;
   let unlistenEntriesChanged: (() => void) | undefined;
   let unlistenTemplateRecording: (() => void) | undefined;
-  let unlistenVaultLocked: (() => void) | undefined;
   let destroyed = false;
   let now = $state(Date.now());
+
+  type TooltipPlacement = "top" | "bottom";
+  const tooltipId = "password-manager-tooltip";
+  let tooltipText = $state("");
+  let tooltipOwner = $state<HTMLButtonElement | null>(null);
+  let tooltipVisible = $state(false);
+  let tooltipLeft = $state(0);
+  let tooltipTop = $state(0);
+  let tooltipPlacement = $state<TooltipPlacement>("bottom");
+  let tooltipElement = $state<HTMLDivElement | null>(null);
 
   let siteName = $state("");
   let loginUrl = $state("");
@@ -225,12 +233,13 @@
     revealed = {};
   }
 
-  function handleVaultLocked(): void {
+  function clearLockedUiState(): void {
     clearAllReveals();
     clearEditorInputs();
     clearRecoveryInputs();
     clearTemplateRecording();
     editorMode = null;
+    recoveryMode = null;
     pendingDelete = null;
     entries = [];
     searchText = "";
@@ -248,7 +257,87 @@
       };
     }
     error = "";
-    void refresh();
+  }
+
+  function tooltipButtonFromTarget(target: EventTarget | null): HTMLButtonElement | null {
+    if (!(target instanceof Element)) return null;
+    const button = target.closest("button.icon-button[data-tooltip]");
+    return button instanceof HTMLButtonElement && button.closest(".password-tool") ? button : null;
+  }
+
+  function hideTooltip(): void {
+    tooltipOwner?.removeAttribute("aria-describedby");
+    tooltipOwner = null;
+    tooltipText = "";
+    tooltipVisible = false;
+    tooltipElement = null;
+  }
+
+  async function positionTooltip(): Promise<void> {
+    await tick();
+    if (!tooltipVisible || !tooltipOwner || !tooltipElement) return;
+    const rect = tooltipOwner.getBoundingClientRect();
+    const viewportWidth = Math.max(window.innerWidth, document.documentElement.clientWidth, 1);
+    const viewportHeight = Math.max(window.innerHeight, document.documentElement.clientHeight, 1);
+    const margin = 8;
+    const gap = 8;
+    const width = Math.min(tooltipElement.offsetWidth || Math.min(220, tooltipText.length * 7 + 16), viewportWidth - margin * 2);
+    const height = tooltipElement.offsetHeight || 26;
+    const preferredPlacement: TooltipPlacement = tooltipOwner.closest(".header-actions")
+      ? "bottom"
+      : tooltipOwner.dataset.tooltipPlacement === "bottom" ? "bottom" : "top";
+    let placement = preferredPlacement;
+    const canFitBottom = rect.bottom + gap + height <= viewportHeight - margin;
+    const canFitTop = rect.top - gap - height >= margin;
+    if (placement === "bottom" && !canFitBottom && canFitTop) placement = "top";
+    if (placement === "top" && !canFitTop && canFitBottom) placement = "bottom";
+    const maxLeft = Math.max(margin, viewportWidth - width - margin);
+    const desiredLeft = rect.left + (rect.width - width) / 2;
+    const desiredTop = placement === "bottom" ? rect.bottom + gap : rect.top - height - gap;
+    const maxTop = Math.max(margin, viewportHeight - height - margin);
+    tooltipPlacement = placement;
+    tooltipLeft = Math.round(Math.max(margin, Math.min(desiredLeft, maxLeft)));
+    tooltipTop = Math.round(Math.max(margin, Math.min(desiredTop, maxTop)));
+  }
+
+  function showTooltip(button: HTMLButtonElement): void {
+    const text = button.dataset.tooltip?.trim();
+    if (!text) return;
+    if (tooltipOwner !== button) {
+      tooltipOwner?.removeAttribute("aria-describedby");
+      tooltipOwner = button;
+      button.setAttribute("aria-describedby", tooltipId);
+    }
+    tooltipText = text;
+    tooltipVisible = true;
+    void positionTooltip();
+  }
+
+  function handleTooltipMouseOver(event: MouseEvent): void {
+    const button = tooltipButtonFromTarget(event.target);
+    if (!button) return;
+    const related = event.relatedTarget;
+    if (related instanceof Node && button.contains(related)) return;
+    showTooltip(button);
+  }
+
+  function handleTooltipMouseOut(event: MouseEvent): void {
+    const button = tooltipButtonFromTarget(event.target);
+    if (!button || button !== tooltipOwner) return;
+    const related = event.relatedTarget;
+    if (related instanceof Node && button.contains(related)) return;
+    if (button.matches(":focus")) return;
+    hideTooltip();
+  }
+
+  function handleTooltipFocusIn(event: FocusEvent): void {
+    const button = tooltipButtonFromTarget(event.target);
+    if (button) showTooltip(button);
+  }
+
+  function handleTooltipFocusOut(event: FocusEvent): void {
+    const button = tooltipButtonFromTarget(event.target);
+    if (button === tooltipOwner) hideTooltip();
   }
 
   function clearTemplateRecording(): void {
@@ -590,10 +679,9 @@
   async function lockVault(): Promise<void> {
     if (lockBusy) return;
     lockBusy = true;
-    clearAllReveals();
     try {
       await api.lock();
-      error = "";
+      clearLockedUiState();
       await refresh();
     } catch (reason) {
       error = reasonMessage(reason, "锁定密码保险库失败。");
@@ -603,7 +691,6 @@
   }
 
   async function refresh(): Promise<void> {
-    refreshing = true;
     try {
       const nextStatus = await api.getStatus();
       status = nextStatus;
@@ -623,7 +710,6 @@
       clearAllReveals();
       error = reasonMessage(reason, "无法读取密码保险库。");
     } finally {
-      refreshing = false;
       loading = false;
     }
   }
@@ -715,6 +801,14 @@
 
   onMount(() => {
     destroyed = false;
+    document.addEventListener("mouseover", handleTooltipMouseOver);
+    document.addEventListener("mouseout", handleTooltipMouseOut);
+    document.addEventListener("focusin", handleTooltipFocusIn);
+    document.addEventListener("focusout", handleTooltipFocusOut);
+    document.addEventListener("click", hideTooltip);
+    document.addEventListener("scroll", hideTooltip, true);
+    window.addEventListener("resize", hideTooltip);
+    window.addEventListener("blur", hideTooltip);
     void refresh();
     countdownTimer = window.setInterval(() => (now = Date.now()), 1_000);
     if (api.isDesktop()) {
@@ -743,15 +837,12 @@
               if (payload.state === "completed") void refresh();
             }
           });
-          const vaultLockedCleanup = await listen("password-vault-locked", handleVaultLocked);
           if (destroyed) {
             cleanup();
             templateCleanup();
-            vaultLockedCleanup();
           } else {
             unlistenEntriesChanged = cleanup;
             unlistenTemplateRecording = templateCleanup;
-            unlistenVaultLocked = vaultLockedCleanup;
           }
         })
         .catch(() => undefined);
@@ -760,12 +851,19 @@
 
   onDestroy(() => {
     destroyed = true;
+    document.removeEventListener("mouseover", handleTooltipMouseOver);
+    document.removeEventListener("mouseout", handleTooltipMouseOut);
+    document.removeEventListener("focusin", handleTooltipFocusIn);
+    document.removeEventListener("focusout", handleTooltipFocusOut);
+    document.removeEventListener("click", hideTooltip);
+    document.removeEventListener("scroll", hideTooltip, true);
+    window.removeEventListener("resize", hideTooltip);
+    window.removeEventListener("blur", hideTooltip);
+    hideTooltip();
     unlistenEntriesChanged?.();
     unlistenEntriesChanged = undefined;
     unlistenTemplateRecording?.();
     unlistenTemplateRecording = undefined;
-    unlistenVaultLocked?.();
-    unlistenVaultLocked = undefined;
     if (countdownTimer !== null) window.clearInterval(countdownTimer);
     if (browserStatusTimer !== null) window.clearInterval(browserStatusTimer);
     if (templateExpiryTimer !== null) window.clearTimeout(templateExpiryTimer);
@@ -797,14 +895,14 @@
         {browser ? browserLabel(browser.connection) : "Firefox 状态读取中"}
       </span>
       {#if status?.recoveryState === "ready" && status.protection !== "browser-demo"}
-        <button class="icon-button" type="button" data-tooltip="修改全局恢复密码" aria-label="修改全局恢复密码" onclick={() => openRecovery("change")}>
+        <button class="icon-button" type="button" data-tooltip="修改全局恢复密码" data-tooltip-placement="bottom" aria-label="修改全局恢复密码" onclick={() => openRecovery("change")}>
           <KeyRound size={16} aria-hidden="true" />
         </button>
+        <button class="icon-button" type="button" data-tooltip="锁定保险库" data-tooltip-placement="bottom" aria-label="锁定保险库" disabled={lockBusy} onclick={() => void lockVault()}>
+          <Lock size={16} aria-hidden="true" />
+        </button>
       {/if}
-      <button class="icon-button" type="button" data-tooltip="刷新" aria-label="刷新密码账户" disabled={refreshing} onclick={() => void refresh()}>
-        <span class:spin={refreshing}><RefreshCw size={16} aria-hidden="true" /></span>
-      </button>
-      <button class="icon-button close-button" type="button" data-tooltip="关闭" aria-label="关闭密码管理器" onclick={() => void closeWindow()}>
+      <button class="icon-button close-button" type="button" data-tooltip="关闭" data-tooltip-placement="bottom" aria-label="关闭密码管理器" onclick={() => void closeWindow()}>
         <X size={17} aria-hidden="true" />
       </button>
     </div>
@@ -905,10 +1003,6 @@
       {#if status?.captureConfigured}
         <label class="capture-toggle"><input type="checkbox" checked={status.captureEnabled} disabled={captureBusy} onchange={(event) => void setCapture((event.currentTarget as HTMLInputElement).checked)} /><span>{status.captureEnabled && browser?.capturePermission === "action-required" ? "登录信息检测（等待 Firefox 授权）" : status.captureEnabled && browser?.capturePermission === "granted" ? "登录信息检测已开启" : "允许登录信息检测"}</span></label>
       {/if}
-      {#if status?.idleTimeoutSeconds}<span>闲置 {Math.ceil(status.idleTimeoutSeconds / 60)} 分钟后锁定</span>{/if}
-      {#if status?.protection !== "browser-demo"}
-        <button type="button" class="icon-button" data-tooltip="锁定保险库" aria-label="锁定保险库" disabled={lockBusy} onclick={() => void lockVault()}><Lock size={15} aria-hidden="true" /></button>
-      {/if}
     </div>
 
     {#if filteredEntries.length === 0}
@@ -947,6 +1041,17 @@
     {/if}
   {/if}
 </main>
+
+{#if tooltipVisible}
+  <div
+    bind:this={tooltipElement}
+    id={tooltipId}
+    class="floating-tooltip"
+    data-placement={tooltipPlacement}
+    role="tooltip"
+    style={`left: ${tooltipLeft}px; top: ${tooltipTop}px;`}
+  >{tooltipText}</div>
+{/if}
 
 {#if editorMode}
   <div class="modal-backdrop" role="presentation">
@@ -987,12 +1092,20 @@
   <div class="modal-backdrop" role="presentation">
     <button type="button" class="modal-dismiss" aria-label="关闭恢复密码窗口" disabled={!isChangingRecovery || recoveryBusy} onclick={closeRecovery}></button>
     <div class="recovery-dialog" role="dialog" aria-modal="true" aria-labelledby="password-recovery-title">
-      <div class="dialog-heading"><div><h2 id="password-recovery-title">{isSettingRecovery ? "设置全局恢复密码" : isReusingRecovery ? "启用密码管理器" : isUnlockingRecovery ? "解锁密码保险库" : "修改全局恢复密码"}</h2><p>{isSettingRecovery ? "密码管理器和 MFA 验证器全局共用此恢复密码，请使用至少 12 个字符的短语。" : isReusingRecovery ? "MFA 验证器已设置全局恢复密码，请输入同一个密码来启用密码管理器。" : isUnlockingRecovery ? "密码管理器和 MFA 验证器共用同一个全局恢复密码。" : "恢复密码由密码管理器和 MFA 验证器全局共用；修改后，两处都需要使用新密码。"}</p></div><button type="button" class="icon-button" aria-label={isChangingRecovery ? "关闭" : "关闭密码管理器"} disabled={recoveryBusy} onclick={closeRecovery}><X size={17} aria-hidden="true" /></button></div>
+      <div class="dialog-heading"><div><h2 id="password-recovery-title">{isSettingRecovery ? "设置全局恢复密码" : isReusingRecovery ? "启用密码管理器" : isUnlockingRecovery ? "解锁密码保险库" : "修改全局恢复密码"}</h2><p>{isSettingRecovery ? "设置后，密码管理器和 MFA 验证器将共同使用此密码。" : isReusingRecovery ? "请输入 MFA 验证器已有的全局恢复密码；这不会创建第二套密码，也不会修改现有密码。" : isUnlockingRecovery ? "密码管理器和 MFA 验证器共用同一个全局恢复密码。" : "修改成功后，密码管理器和 MFA 验证器将同时改用新密码，旧密码失效。"}</p></div><button type="button" class="icon-button" aria-label={isChangingRecovery ? "关闭" : "关闭密码管理器"} disabled={recoveryBusy} onclick={closeRecovery}><X size={17} aria-hidden="true" /></button></div>
       <form class="editor-form" onsubmit={(event) => { event.preventDefault(); void submitRecovery(); }}>
         {#if isChangingRecovery}<label><span>原恢复密码</span><input bind:this={recoveryCurrentInput} type="password" bind:value={recoveryCurrent} autocomplete="current-password" aria-label="原恢复密码" /></label>{/if}
         <label><span>{isChangingRecovery ? "新恢复密码" : isReusingRecovery ? "全局恢复密码" : "恢复密码"}{#if isUnlockingRecovery || isReusingRecovery}<small>不会写入页面存储</small>{/if}</span><input bind:this={recoveryInput} type="password" bind:value={recoveryPassword} autocomplete={isUnlockingRecovery || isReusingRecovery ? "current-password" : "new-password"} aria-label={isChangingRecovery ? "新恢复密码" : isReusingRecovery ? "全局恢复密码" : "恢复密码"} /></label>
         {#if isSettingRecovery || isChangingRecovery}<label><span>{isChangingRecovery ? "确认新恢复密码" : "确认恢复密码"}</span><input type="password" bind:value={recoveryConfirm} autocomplete="new-password" aria-label={isChangingRecovery ? "确认新恢复密码" : "确认恢复密码"} /></label>{/if}
-        {#if !isUnlockingRecovery}<div class="recovery-sharing-note" role="note"><KeyRound size={15} aria-hidden="true" /><span>这是飞花的全局恢复密码，同时用于密码管理器和 MFA 验证器。飞花无法找回遗忘的恢复密码。</span></div>{/if}
+        {#if !isUnlockingRecovery}
+          <div class="recovery-sharing-note" role="note">
+            <KeyRound size={15} aria-hidden="true" />
+            <span>
+              <strong>用途：</strong>这是飞花的全局恢复密码，由密码管理器和 MFA 验证器共同使用。更换电脑、重装系统、切换系统用户或本机安全保护不可用时，需要用它迁移或恢复加密保险库；导出 MFA 账户时也会用于身份验证。当前设备日常使用通常无需输入。
+              <strong>{isChangingRecovery ? "请务必牢记并妥善保管新密码：" : "请务必牢记并妥善保管："}</strong>飞花不保存可供找回的恢复密码副本，也无法帮你找回。一旦遗忘，恢复密码本身无法找回；在需要它时，你将无法迁移或恢复保险库，也无法导出 MFA 账户。
+            </span>
+          </div>
+        {/if}
         {#if recoveryError}<div class="form-error" role="alert">{recoveryError}</div>{/if}
         <div class="dialog-actions">{#if isChangingRecovery}<button type="button" class="secondary-button" disabled={recoveryBusy} onclick={closeRecovery}>取消</button>{/if}<button type="submit" class="primary-button" disabled={recoveryBusy}>{recoveryBusy ? "处理中…" : isUnlockingRecovery ? "解锁" : isChangingRecovery ? "保存新密码" : isReusingRecovery ? "启用密码管理器" : "设置恢复密码"}</button></div>
       </form>
@@ -1015,6 +1128,8 @@
 <style>
   :global(body) { overflow: hidden; }
   .password-tool { display: flex; width: 100%; height: 100%; min-width: 0; min-height: 0; flex-direction: column; color: var(--app-fg); background: var(--app-bg); }
+  :global(.password-tool .icon-button[data-tooltip]::after) { display: none !important; content: none !important; }
+  .floating-tooltip { position: fixed; z-index: 3000; width: max-content; max-width: min(220px, calc(100vw - 16px)); padding: 5px 8px; color: #ffffff; font-size: 12px; line-height: 1.3; white-space: nowrap; pointer-events: none; background: #252525; border-radius: 4px; box-shadow: 0 2px 8px rgb(0 0 0 / 20%); }
   .password-header { display: flex; min-height: 58px; padding: 10px 16px; align-items: center; justify-content: space-between; gap: 14px; border-bottom: 1px solid var(--app-border); background: var(--app-surface); }
   .title-block, .header-actions, .banner-copy, .banner-actions, .password-toolbar, .password-meta, .entry-heading, .entry-actions, .generator-row, .dialog-actions { display: flex; align-items: center; }
   .title-block { min-width: 0; gap: 10px; }

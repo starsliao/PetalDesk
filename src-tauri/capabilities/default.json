@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "飞花 - PetalDesk main, note, and desktop tool window permissions",
-  "windows": ["main", "note-*", "timer", "reminder", "gantt", "mfa", "screenshot-capture", "screenshot-long-control", "screenshot-long-outline", "screenshot-pin-*"],
+  "windows": ["main", "note-*", "timer", "reminder", "gantt", "mfa", "passwords", "screenshot-capture", "screenshot-long-control", "screenshot-long-outline", "screenshot-pin-*"],
   "permissions": [
     "core:default",
     "core:window:allow-destroy",

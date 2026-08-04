@@ -314,15 +314,19 @@ describe("MfaTool", () => {
       captureExcluded: true,
     });
     const rendered = render(MfaTool, { api });
-    const dialog = await rendered.findByRole("dialog", { name: "设置 MFA 恢复密码" });
+    const dialog = await rendered.findByRole("dialog", { name: "设置全局恢复密码" });
 
-    expect(within(dialog).getByText("本机使用仍然不需要输入密码")).toBeInTheDocument();
+    expect(within(dialog).getByText("这是密码管理器和 MFA 验证器全局共用的恢复密码。")).toBeInTheDocument();
+    expect(within(dialog).getByText("用于迁移或恢复飞花的加密保险库")).toBeInTheDocument();
+    const guidance = within(dialog).getByRole("note");
+    expect(guidance).toHaveTextContent("请务必牢记并妥善保管");
+    expect(guidance).toHaveTextContent("恢复密码本身无法找回");
     await fireEvent.input(within(dialog).getByLabelText("恢复密码"), { target: { value: "correct horse battery" } });
     await fireEvent.input(within(dialog).getByLabelText("确认恢复密码"), { target: { value: "correct horse battery" } });
     await fireEvent.click(within(dialog).getByRole("button", { name: "设置恢复密码" }));
 
     await waitFor(() => expect(api.configureRecoveryPassword).toHaveBeenCalledWith("correct horse battery"));
-    await waitFor(() => expect(rendered.queryByRole("dialog", { name: "设置 MFA 恢复密码" })).not.toBeInTheDocument());
+    await waitFor(() => expect(rendered.queryByRole("dialog", { name: "设置全局恢复密码" })).not.toBeInTheDocument());
   });
 
   it("validates recovery password length and confirmation before calling the API", async () => {
@@ -336,7 +340,7 @@ describe("MfaTool", () => {
       captureExcluded: true,
     });
     const rendered = render(MfaTool, { api });
-    const dialog = await rendered.findByRole("dialog", { name: "设置 MFA 恢复密码" });
+    const dialog = await rendered.findByRole("dialog", { name: "设置全局恢复密码" });
     const form = dialog.querySelector("form") as HTMLFormElement;
     const password = within(dialog).getByLabelText("恢复密码");
     const confirmation = within(dialog).getByLabelText("确认恢复密码");
@@ -381,8 +385,10 @@ describe("MfaTool", () => {
     const rendered = render(MfaTool, { api });
     await rendered.findByText("GitHub", { selector: ".account-heading strong" });
 
-    await fireEvent.click(rendered.getByRole("button", { name: "修改 MFA 恢复密码" }));
-    const dialog = rendered.getByRole("dialog", { name: "修改 MFA 恢复密码" });
+    await fireEvent.click(rendered.getByRole("button", { name: "修改全局恢复密码" }));
+    const dialog = rendered.getByRole("dialog", { name: "修改全局恢复密码" });
+    expect(within(dialog).getByText("修改后，两项工具同时使用新密码")).toBeInTheDocument();
+    expect(within(dialog).getByRole("note")).toHaveTextContent("无法帮你找回");
     await fireEvent.input(within(dialog).getByLabelText("原恢复密码"), { target: { value: "current recovery password" } });
     await fireEvent.input(within(dialog).getByLabelText("新恢复密码"), { target: { value: "new recovery password" } });
     await fireEvent.input(within(dialog).getByLabelText("确认新恢复密码"), { target: { value: "new recovery password" } });
@@ -392,7 +398,7 @@ describe("MfaTool", () => {
       "new recovery password",
       "current recovery password",
     ));
-    expect(rendered.queryByRole("dialog", { name: "修改 MFA 恢复密码" })).not.toBeInTheDocument();
+    expect(rendered.queryByRole("dialog", { name: "修改全局恢复密码" })).not.toBeInTheDocument();
   });
 
   it("requires the original recovery password before changing it", async () => {
@@ -400,8 +406,8 @@ describe("MfaTool", () => {
     const rendered = render(MfaTool, { api });
     await rendered.findByText("GitHub", { selector: ".account-heading strong" });
 
-    await fireEvent.click(rendered.getByRole("button", { name: "修改 MFA 恢复密码" }));
-    const dialog = rendered.getByRole("dialog", { name: "修改 MFA 恢复密码" });
+    await fireEvent.click(rendered.getByRole("button", { name: "修改全局恢复密码" }));
+    const dialog = rendered.getByRole("dialog", { name: "修改全局恢复密码" });
     const originalPassword = within(dialog).getByLabelText("原恢复密码");
     await fireEvent.input(within(dialog).getByLabelText("新恢复密码"), { target: { value: "new recovery password" } });
     await fireEvent.input(within(dialog).getByLabelText("确认新恢复密码"), { target: { value: "new recovery password" } });

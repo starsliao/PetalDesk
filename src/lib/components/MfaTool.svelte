@@ -408,8 +408,8 @@
       recoveryDialogMode = null;
       await refreshList();
       if (mode === "unlock") showToast("MFA 数据已在本机安全解锁");
-      else if (mode === "change") showToast("MFA 恢复密码已修改");
-      else showToast("MFA 恢复密码已设置");
+      else if (mode === "change") showToast("全局恢复密码已修改");
+      else showToast("全局恢复密码已设置");
     } catch (reason) {
       recoveryError = reasonMessage(
         reason,
@@ -417,7 +417,7 @@
           ? "恢复密码不正确，无法解锁 MFA 数据。"
           : mode === "change"
             ? "原恢复密码不正确，无法修改恢复密码。"
-            : "无法保存 MFA 恢复密码。",
+            : "无法保存全局恢复密码。",
       );
       focusRecoveryPassword();
     } finally {
@@ -692,7 +692,7 @@
     const target = exportTarget;
     if (!target || exportBusy || exportResult) return;
     if (!exportPassword) {
-      exportError = "请输入 MFA 恢复密码。";
+      exportError = "请输入全局恢复密码。";
       exportPasswordInput?.focus();
       return;
     }
@@ -1371,7 +1371,7 @@
         {#if trashCount > 0}<span aria-hidden="true">{trashCount > 99 ? "99+" : trashCount}</span>{/if}
       </button>
       {#if status?.recoveryState === "ready" && status.protection !== "browser-demo"}
-        <button type="button" aria-label="修改 MFA 恢复密码" title="修改恢复密码" onclick={openRecoveryPasswordChange}>
+        <button type="button" aria-label="修改全局恢复密码" title="修改全局恢复密码" onclick={openRecoveryPasswordChange}>
           <KeyRound size={18} aria-hidden="true" />
         </button>
       {/if}
@@ -1647,8 +1647,8 @@
         <form novalidate onsubmit={(event) => { event.preventDefault(); void submitRecoveryPassword(); }}>
           <header class="modal-header">
             <div>
-              <h2 id="mfa-recovery-title">{isUnlocking ? "使用恢复密码迁移" : isChanging ? "修改 MFA 恢复密码" : "设置 MFA 恢复密码"}</h2>
-              <p>{isUnlocking ? "验证成功后，这台电脑将恢复本机免密解锁。" : "恢复密码仅用于换电脑或更换系统用户。"}</p>
+              <h2 id="mfa-recovery-title">{isUnlocking ? "使用恢复密码迁移" : isChanging ? "修改全局恢复密码" : "设置全局恢复密码"}</h2>
+              <p>{isUnlocking ? "验证成功后，这台电脑将恢复本机免密解锁。" : "这是密码管理器和 MFA 验证器全局共用的恢复密码。"}</p>
             </div>
             <button
               type="button"
@@ -1661,14 +1661,14 @@
             <div class="recovery-intro">
               <div class="recovery-icon"><KeyRound size={24} aria-hidden="true" /></div>
               <div class="recovery-copy">
-                <strong>{isUnlocking ? "解锁从其他电脑迁移来的 MFA 数据" : isChanging ? "验证原密码后再设置新密码" : "本机使用仍然不需要输入密码"}</strong>
+                <strong>{isUnlocking ? "解锁从其他电脑迁移来的 MFA 数据" : isChanging ? "修改后，两项工具同时使用新密码" : "用于迁移或恢复飞花的加密保险库"}</strong>
                 <p>
                   {#if isUnlocking}
                     输入原电脑设置的恢复密码。解锁后，飞花会为当前系统用户建立新的本机保护。
                   {:else if isChanging}
-                    原恢复密码只用于验证身份；修改后，跨电脑迁移和账户导出都需要使用新密码。
+                    原密码用于验证身份，修改成功后旧密码失效。更换电脑、重装系统、切换系统用户或本机安全保护不可用时，需要用新密码迁移或恢复加密保险库；导出 MFA 账户时也会用它验证身份。
                   {:else}
-                    飞花日常由 Windows DPAPI 或 macOS Keychain 自动解锁。只有把飞花数据迁移到其他电脑或系统用户时，才需要这个恢复密码。
+                    更换电脑、重装系统、切换系统用户或本机安全保护不可用时，需要用它迁移或恢复加密保险库；导出 MFA 账户时也会用于身份验证。当前设备日常使用通常无需输入。
                   {/if}
                 </p>
               </div>
@@ -1718,7 +1718,10 @@
                   required
                 />
               </label>
-              <div class="recovery-warning"><AlertTriangle size={15} aria-hidden="true" /><span>飞花不会保存或找回恢复密码。遗忘后只能在仍可打开 MFA 的原电脑上重新设置。</span></div>
+              <div class="recovery-warning" role="note">
+                <AlertTriangle size={15} aria-hidden="true" />
+                <span><strong>{isChanging ? "请务必牢记并妥善保管新密码。" : "请务必牢记并妥善保管。"}</strong>飞花不保存可供找回的恢复密码副本，也无法帮你找回。一旦遗忘，恢复密码本身无法找回；在需要它时，你将无法迁移或恢复保险库，也无法导出 MFA 账户。</span>
+              </div>
             {/if}
 
             {#if recoveryError}
@@ -1752,7 +1755,7 @@
         <header class="modal-header">
           <div>
             <h2 id="mfa-export-title">导出“{exportTarget.name}”</h2>
-            <p>{exportResult ? "可导入其他支持 TOTP 的验证器" : "需要先验证当前 MFA 恢复密码"}</p>
+            <p>{exportResult ? "可导入其他支持 TOTP 的验证器" : "需要先验证当前全局恢复密码"}</p>
           </div>
           <button type="button" aria-label="关闭导出账户" disabled={exportBusy} onclick={closeExport}>
             <X size={18} aria-hidden="true" />
