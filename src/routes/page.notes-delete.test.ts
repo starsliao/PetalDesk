@@ -42,6 +42,7 @@ async function renderNotesList() {
     version: "0.6.0",
     defaultEditorMode: "typora",
     trayShortcutSettings,
+    protectSensitiveWindows: false,
   });
   vi.spyOn(notesApi, "listNotes").mockResolvedValue([note]);
   vi.spyOn(notesApi, "listTrash").mockResolvedValue([]);
@@ -65,6 +66,7 @@ async function renderActiveNote() {
     version: "0.6.0",
     defaultEditorMode: "typora",
     trayShortcutSettings,
+    protectSensitiveWindows: false,
   });
   vi.spyOn(notesApi, "getNote").mockResolvedValue({
     id: "note-1",

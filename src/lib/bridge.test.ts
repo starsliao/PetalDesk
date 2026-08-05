@@ -4,6 +4,7 @@ import {
   defaultEditorModeStorageKey,
   noteColorForSeed,
   notesApi,
+  protectSensitiveWindowsStorageKey,
 } from "./bridge";
 import { previousStorageKey } from "./storage";
 
@@ -101,13 +102,25 @@ describe("browser note styles", () => {
   });
 
   it("defaults to Typora mode and persists a new global selection", async () => {
-    expect((await notesApi.appInfo()).version).toBe("0.6.3");
+    expect((await notesApi.appInfo()).version).toBe("0.7.0");
     expect((await notesApi.appInfo()).defaultEditorMode).toBe("typora");
 
     await expect(notesApi.setDefaultEditorMode("plain")).resolves.toBe("plain");
 
     expect(localStorage.getItem(defaultEditorModeStorageKey)).toBe("plain");
     expect((await notesApi.appInfo()).defaultEditorMode).toBe("plain");
+  });
+
+  it("leaves sensitive window protection off by default and persists opt-in", async () => {
+    expect((await notesApi.appInfo()).protectSensitiveWindows).toBe(false);
+
+    await expect(notesApi.setProtectSensitiveWindows(true)).resolves.toBe(true);
+
+    expect(localStorage.getItem(protectSensitiveWindowsStorageKey)).toBe("true");
+    expect((await notesApi.appInfo()).protectSensitiveWindows).toBe(true);
+
+    await expect(notesApi.setProtectSensitiveWindows(false)).resolves.toBe(false);
+    expect((await notesApi.appInfo()).protectSensitiveWindows).toBe(false);
   });
 
   it("persists configurable tray double-click actions in the browser fallback", async () => {

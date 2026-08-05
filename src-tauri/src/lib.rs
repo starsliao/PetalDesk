@@ -805,6 +805,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_app_info,
             commands::set_default_editor_mode,
+            commands::set_protect_sensitive_windows,
             commands::set_tray_shortcut_settings,
             commands::set_data_storage_path,
             commands::restart_app,

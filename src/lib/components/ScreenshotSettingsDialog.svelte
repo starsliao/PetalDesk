@@ -13,6 +13,7 @@
     shortcut?: string;
     trayShortcutSettings?: TrayShortcutSettings;
     editorMode?: EditorMode;
+    protectSensitiveWindows?: boolean;
     dataStoragePath?: string;
     dataStorageLabel?: string;
     busy?: boolean;
@@ -23,6 +24,7 @@
     ) => void | Promise<void>;
     oncancel?: () => void;
     oneditormodechange?: (mode: EditorMode) => void | Promise<void>;
+    onprotectsensitivechange?: (enabled: boolean) => void | Promise<void>;
     ondatastoragechange?: () => void | Promise<void>;
     onaboutopen?: () => void;
   }
@@ -32,6 +34,7 @@
     shortcut = "F1",
     trayShortcutSettings = { ...DEFAULT_TRAY_SHORTCUT_SETTINGS },
     editorMode = "typora",
+    protectSensitiveWindows = false,
     dataStoragePath = "",
     dataStorageLabel = "尚未获取到存储路径",
     busy = false,
@@ -39,6 +42,7 @@
     onsave,
     oncancel,
     oneditormodechange,
+    onprotectsensitivechange,
     ondatastoragechange,
     onaboutopen,
   }: Props = $props();
@@ -179,6 +183,36 @@
                 onclick={() => oneditormodechange?.("plain")}
               >
                 纯文本
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section class="settings-section" aria-labelledby="privacy-settings-title">
+          <h3 id="privacy-settings-title">隐私与安全</h3>
+          <div class="setting-row protect-row">
+            <div class="setting-copy">
+              <strong>保护敏感窗口</strong>
+              <span>开启后，远程桌面会话中不会打开 MFA 验证器和密码管理器，窗口内容也会对截图、录屏和屏幕共享隐藏</span>
+            </div>
+            <div class="mode-selector" role="group" aria-label="保护敏感窗口">
+              <button
+                type="button"
+                class:active={!protectSensitiveWindows}
+                aria-pressed={!protectSensitiveWindows}
+                disabled={submitting}
+                onclick={() => onprotectsensitivechange?.(false)}
+              >
+                关闭
+              </button>
+              <button
+                type="button"
+                class:active={protectSensitiveWindows}
+                aria-pressed={protectSensitiveWindows}
+                disabled={submitting}
+                onclick={() => onprotectsensitivechange?.(true)}
+              >
+                开启
               </button>
             </div>
           </div>

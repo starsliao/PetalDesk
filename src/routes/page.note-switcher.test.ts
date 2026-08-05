@@ -29,6 +29,7 @@ describe("independent note window switcher", () => {
         ctrlDoubleClick: "mfa",
         shiftDoubleClick: "mainWindow",
       },
+      protectSensitiveWindows: false,
     });
     vi.spyOn(notesApi, "getNote").mockResolvedValue({
       id: "note-current",

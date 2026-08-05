@@ -149,6 +149,7 @@ pub fn get_app_info(store: State<'_, WorkspaceStore>) -> AppInfo {
         workspace_path: store.workspace_path().to_string_lossy().into_owned(),
         default_editor_mode: store.default_editor_mode(),
         tray_shortcut_settings: store.tray_shortcut_settings(),
+        protect_sensitive_windows: store.protect_sensitive_windows(),
         colors: ALLOWED_COLORS
             .iter()
             .map(|color| (*color).to_string())
@@ -183,6 +184,37 @@ pub async fn set_default_editor_mode(
             json!({ "mode": default_editor_mode.clone() }),
         );
         Ok(default_editor_mode)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn set_protect_sensitive_windows(app: AppHandle, enabled: bool) -> AppResult<bool> {
+    run_background("设置敏感窗口保护", move || {
+        let enabled = app
+            .state::<WorkspaceStore>()
+            .set_protect_sensitive_windows(enabled)?;
+        // Apply or clear the display-affinity protection on already-open
+        // sensitive windows so the toggle takes effect without a restart.
+        for label in [MFA_WINDOW_LABEL, PASSWORD_WINDOW_LABEL] {
+            if let Some(window) = app.get_webview_window(label) {
+                let protected = if enabled {
+                    protect_sensitive_window(&window)
+                } else {
+                    unprotect_sensitive_window(&window);
+                    false
+                };
+                if label == MFA_WINDOW_LABEL {
+                    app.state::<crate::mfa::MfaStore>()
+                        .set_capture_excluded(protected);
+                }
+            }
+        }
+        let _ = app.emit(
+            "protect_sensitive_windows_changed",
+            json!({ "enabled": enabled }),
+        );
+        Ok(enabled)
     })
     .await
 }
@@ -638,7 +670,11 @@ pub fn open_mfa_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResu
         })?;
         let _ = window.unminimize();
         app.state::<crate::mfa::MfaStore>().activate();
-        let protected = protect_mfa_window(&window);
+        let protected = if store.protect_sensitive_windows() {
+            protect_mfa_window(&window)
+        } else {
+            false
+        };
         app.state::<crate::mfa::MfaStore>()
             .set_capture_excluded(protected);
         let _ = window.set_focus();
@@ -676,7 +712,11 @@ pub fn open_mfa_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResu
             ));
         }
     };
-    let protected = protect_mfa_window(&window);
+    let protected = if store.protect_sensitive_windows() {
+        protect_mfa_window(&window)
+    } else {
+        false
+    };
     app.state::<crate::mfa::MfaStore>()
         .set_capture_excluded(protected);
     let _ = window.set_focus();
@@ -698,7 +738,9 @@ pub fn open_password_window_inner(app: &AppHandle, store: &WorkspaceStore) -> Ap
         })?;
         let _ = window.unminimize();
         app.state::<crate::passwords::PasswordStore>().activate();
-        let _ = protect_sensitive_window(&window);
+        if store.protect_sensitive_windows() {
+            let _ = protect_sensitive_window(&window);
+        }
         let _ = window.set_focus();
         return Ok(PASSWORD_WINDOW_LABEL.to_string());
     }
@@ -733,13 +775,18 @@ pub fn open_password_window_inner(app: &AppHandle, store: &WorkspaceStore) -> Ap
             ));
         }
     };
-    let _ = protect_sensitive_window(&window);
+    if store.protect_sensitive_windows() {
+        let _ = protect_sensitive_window(&window);
+    }
     let _ = window.set_focus();
     Ok(PASSWORD_WINDOW_LABEL.to_string())
 }
 
 fn ensure_sensitive_tool_local(app: &AppHandle, label: &str) -> AppResult<()> {
-    let access = sensitive_tool_access(is_remote_desktop_session());
+    let protect_enabled = app
+        .state::<WorkspaceStore>()
+        .protect_sensitive_windows();
+    let access = sensitive_tool_access(is_remote_desktop_session(), protect_enabled);
     if access.is_err() {
         close_sensitive_window_for_remote_session(app, label);
     }
@@ -777,8 +824,8 @@ fn remote_session_signals_indicate_remote(
     remote_session_metric || remote_control_metric || wts_protocol_type == Some(2)
 }
 
-fn sensitive_tool_access(remote_session: bool) -> AppResult<()> {
-    if remote_session {
+fn sensitive_tool_access(remote_session: bool, protect_enabled: bool) -> AppResult<()> {
+    if remote_session && protect_enabled {
         Err(AppError::new(
             SENSITIVE_TOOL_REMOTE_SESSION_CODE,
             SENSITIVE_TOOL_REMOTE_SESSION_MESSAGE,
@@ -869,10 +916,18 @@ mod remote_session_tests {
 
     #[test]
     fn sensitive_tool_policy_returns_the_user_facing_remote_error() {
-        let error = sensitive_tool_access(true).unwrap_err();
+        let error = sensitive_tool_access(true, true).unwrap_err();
         assert_eq!(error.code, SENSITIVE_TOOL_REMOTE_SESSION_CODE);
         assert_eq!(error.message, SENSITIVE_TOOL_REMOTE_SESSION_MESSAGE);
-        sensitive_tool_access(false).unwrap();
+        sensitive_tool_access(false, true).unwrap();
+    }
+
+    #[test]
+    fn sensitive_tool_policy_allows_remote_sessions_when_protection_is_off() {
+        // The setting defaults to off: remote desktop sessions may open the
+        // MFA and password windows unless the user opts back into protection.
+        sensitive_tool_access(true, false).unwrap();
+        sensitive_tool_access(false, false).unwrap();
     }
 }
 
@@ -893,6 +948,22 @@ fn protect_sensitive_window(window: &tauri::WebviewWindow) -> bool {
 
 #[cfg(not(windows))]
 fn protect_sensitive_window(_window: &tauri::WebviewWindow) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn unprotect_sensitive_window(window: &tauri::WebviewWindow) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowDisplayAffinity;
+
+    const WDA_NONE: u32 = 0x0000_0000;
+    let Ok(handle) = window.hwnd() else {
+        return false;
+    };
+    unsafe { SetWindowDisplayAffinity(handle.0, WDA_NONE) != 0 }
+}
+
+#[cfg(not(windows))]
+fn unprotect_sensitive_window(_window: &tauri::WebviewWindow) -> bool {
     false
 }
 

@@ -208,6 +208,7 @@ pub struct AppInfo {
     pub workspace_path: String,
     pub default_editor_mode: String,
     pub tray_shortcut_settings: TrayShortcutSettings,
+    pub protect_sensitive_windows: bool,
     pub colors: Vec<String>,
     pub recovered_drafts: usize,
 }

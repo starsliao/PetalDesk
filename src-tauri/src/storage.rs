@@ -46,6 +46,12 @@ struct DataStorageConfig {
     tray_shortcuts: TrayShortcutSettings,
     #[serde(default = "default_auto_update")]
     auto_update: bool,
+    /// When false (the default), MFA and password windows open normally in
+    /// remote-desktop sessions and stay visible to screen capture. Enabling
+    /// restores the protected behavior (blocked over RDP, hidden from
+    /// capture and screen sharing).
+    #[serde(default)]
+    protect_sensitive_windows: bool,
 }
 
 impl Default for DataStorageConfig {
@@ -55,6 +61,7 @@ impl Default for DataStorageConfig {
             default_editor_mode: DEFAULT_EDITOR_MODE.to_string(),
             tray_shortcuts: TrayShortcutSettings::default(),
             auto_update: default_auto_update(),
+            protect_sensitive_windows: false,
         }
     }
 }
@@ -125,6 +132,7 @@ pub struct WorkspaceStore {
     default_editor_mode: RwLock<String>,
     tray_shortcuts: RwLock<TrayShortcutSettings>,
     auto_update: RwLock<bool>,
+    protect_sensitive_windows: RwLock<bool>,
     app_data: PathBuf,
     startup_recovery: RwLock<Vec<RecoveredDraft>>,
     mutation_lock: Mutex<()>,
@@ -176,6 +184,7 @@ impl WorkspaceStore {
             default_editor_mode: RwLock::new(data_config.default_editor_mode),
             tray_shortcuts: RwLock::new(data_config.tray_shortcuts),
             auto_update: RwLock::new(data_config.auto_update),
+            protect_sensitive_windows: RwLock::new(data_config.protect_sensitive_windows),
             app_data,
             startup_recovery: RwLock::new(Vec::new()),
             mutation_lock: Mutex::new(()),
@@ -204,6 +213,7 @@ impl WorkspaceStore {
             default_editor_mode: RwLock::new(DEFAULT_EDITOR_MODE.to_string()),
             tray_shortcuts: RwLock::new(TrayShortcutSettings::default()),
             auto_update: RwLock::new(default_auto_update()),
+            protect_sensitive_windows: RwLock::new(false),
             app_data: app_data.to_path_buf(),
             startup_recovery: RwLock::new(Vec::new()),
             mutation_lock: Mutex::new(()),
@@ -248,6 +258,26 @@ impl WorkspaceStore {
             .expect("editor mode lock poisoned") = editor_mode.to_string();
         self.save_data_storage_config()?;
         Ok(editor_mode.to_string())
+    }
+
+    pub fn protect_sensitive_windows(&self) -> bool {
+        *self
+            .protect_sensitive_windows
+            .read()
+            .expect("sensitive window protection lock poisoned")
+    }
+
+    pub fn set_protect_sensitive_windows(&self, enabled: bool) -> AppResult<bool> {
+        let _mutation = self
+            .mutation_lock
+            .lock()
+            .expect("workspace mutation lock poisoned");
+        *self
+            .protect_sensitive_windows
+            .write()
+            .expect("sensitive window protection lock poisoned") = enabled;
+        self.save_data_storage_config()?;
+        Ok(enabled)
     }
 
     pub fn tray_shortcut_settings(&self) -> TrayShortcutSettings {
@@ -336,6 +366,7 @@ impl WorkspaceStore {
                     default_editor_mode: self.default_editor_mode(),
                     tray_shortcuts: self.tray_shortcut_settings(),
                     auto_update: self.auto_update_enabled(),
+                    protect_sensitive_windows: self.protect_sensitive_windows(),
                 },
             )?;
         }
@@ -1513,6 +1544,7 @@ impl WorkspaceStore {
                 default_editor_mode: self.default_editor_mode(),
                 tray_shortcuts: self.tray_shortcut_settings(),
                 auto_update: self.auto_update_enabled(),
+                protect_sensitive_windows: self.protect_sensitive_windows(),
             },
         )
     }
@@ -2197,6 +2229,7 @@ fn migrate_legacy_storage(
                 default_editor_mode,
                 tray_shortcuts: TrayShortcutSettings::default(),
                 auto_update: default_auto_update(),
+                protect_sensitive_windows: false,
             },
         )?;
     }

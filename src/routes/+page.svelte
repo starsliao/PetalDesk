@@ -135,6 +135,7 @@
   let trayShortcutSettings = $state<TrayShortcutSettings>({
     ...DEFAULT_TRAY_SHORTCUT_SETTINGS,
   });
+  let protectSensitiveWindows = $state(false);
 
   let activeNote = $state<NoteSnapshot | null>(null);
   let NoteEditor = $state<NoteEditorComponent | null>(null);
@@ -188,6 +189,7 @@
       trayShortcutSettings = {
         ...(appInfo.trayShortcutSettings ?? DEFAULT_TRAY_SHORTCUT_SETTINGS),
       };
+      protectSensitiveWindows = appInfo.protectSensitiveWindows ?? false;
       if (notesApi.isDesktop()) {
         try {
           screenshotShortcut = (await screenshotApi.getSettings()).shortcut;
@@ -291,6 +293,12 @@
         await listen<{ mode: EditorMode }>("default_editor_mode_changed", ({ payload }) => {
           defaultEditorMode = payload.mode;
           if (appInfo) appInfo = { ...appInfo, defaultEditorMode: payload.mode };
+        }),
+      );
+      desktopCleanups.push(
+        await listen<{ enabled: boolean }>("protect_sensitive_windows_changed", ({ payload }) => {
+          protectSensitiveWindows = payload.enabled === true;
+          if (appInfo) appInfo = { ...appInfo, protectSensitiveWindows: payload.enabled === true };
         }),
       );
       desktopCleanups.push(
@@ -449,6 +457,23 @@
     } catch (error) {
       defaultEditorMode = previous;
       if (appInfo) appInfo = { ...appInfo, defaultEditorMode: previous };
+      showToast(errorMessage(error));
+    }
+  }
+
+  async function changeProtectSensitiveWindows(enabled: boolean): Promise<void> {
+    if (enabled === protectSensitiveWindows) return;
+    const previous = protectSensitiveWindows;
+    protectSensitiveWindows = enabled;
+    if (appInfo) appInfo = { ...appInfo, protectSensitiveWindows: enabled };
+    try {
+      const saved = await notesApi.setProtectSensitiveWindows(enabled);
+      protectSensitiveWindows = saved;
+      if (appInfo) appInfo = { ...appInfo, protectSensitiveWindows: saved };
+      showToast(saved ? "敏感窗口保护已开启" : "敏感窗口保护已关闭");
+    } catch (error) {
+      protectSensitiveWindows = previous;
+      if (appInfo) appInfo = { ...appInfo, protectSensitiveWindows: previous };
       showToast(errorMessage(error));
     }
   }
@@ -627,6 +652,7 @@
       trayShortcutSettings = {
         ...(latestAppInfo.trayShortcutSettings ?? DEFAULT_TRAY_SHORTCUT_SETTINGS),
       };
+      protectSensitiveWindows = latestAppInfo.protectSensitiveWindows ?? false;
       screenshotShortcut = (await screenshotApi.getSettings()).shortcut;
     } catch (error) {
       settingsError = errorMessage(error);
@@ -1132,6 +1158,8 @@
     error={settingsError}
     onsave={saveSettings}
     oneditormodechange={(mode) => void changeDefaultEditorMode(mode)}
+    protectSensitiveWindows={protectSensitiveWindows}
+    onprotectsensitivechange={(enabled) => void changeProtectSensitiveWindows(enabled)}
     ondatastoragechange={() => void chooseDataStoragePath()}
     onaboutopen={() => {
       if (settingsBusy) return;

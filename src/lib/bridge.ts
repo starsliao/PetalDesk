@@ -96,6 +96,7 @@ export interface AppInfo {
   version: string;
   defaultEditorMode: EditorMode;
   trayShortcutSettings: TrayShortcutSettings;
+  protectSensitiveWindows: boolean;
   recoveredDrafts?: number;
   name?: string;
   colors?: string[];
@@ -118,6 +119,7 @@ export const defaultEditorModeStorageKey = "petaldesk.default-editor-mode.v2";
 const previousDefaultEditorModeStorageKey = previousStorageKey("default-editor-mode.v2");
 const previousEditorModeStorageKey = previousStorageKey("editor-mode.v1");
 const trayShortcutSettingsStorageKey = "petaldesk.tray-shortcut-settings.v1";
+export const protectSensitiveWindowsStorageKey = "petaldesk.protect-sensitive-windows.v1";
 const editorModes: readonly EditorMode[] = ["typora", "plain"];
 const trayShortcutActions: readonly TrayShortcutAction[] = [
   "firstNote",
@@ -197,6 +199,15 @@ function readBrowserDefaultEditorMode(): EditorMode {
   const migrated = normalizeStoredEditorMode(stored);
   localStorage.setItem(defaultEditorModeStorageKey, migrated);
   return migrated;
+}
+
+function readBrowserProtectSensitiveWindows(): boolean {
+  if (typeof localStorage === "undefined") return false;
+  try {
+    return localStorage.getItem(protectSensitiveWindowsStorageKey) === "true";
+  } catch {
+    return false;
+  }
 }
 
 function now(): string {
@@ -463,9 +474,10 @@ export const notesApi = {
     if (isTauriRuntime()) return command<AppInfo>("get_app_info");
     return {
       workspacePath: "浏览器演示数据",
-      version: "0.6.3",
+      version: "0.7.0",
       defaultEditorMode: readBrowserDefaultEditorMode(),
       trayShortcutSettings: readBrowserTrayShortcutSettings(),
+      protectSensitiveWindows: readBrowserProtectSensitiveWindows(),
       recoveredDrafts: 0,
     };
   },
@@ -482,6 +494,18 @@ export const notesApi = {
       new CustomEvent("petaldesk:default-editor-mode-changed", { detail: defaultEditorMode }),
     );
     return defaultEditorMode;
+  },
+
+  async setProtectSensitiveWindows(enabled: boolean): Promise<boolean> {
+    const normalized = enabled === true;
+    if (isTauriRuntime()) {
+      return command<boolean>("set_protect_sensitive_windows", { enabled: normalized });
+    }
+    localStorage.setItem(protectSensitiveWindowsStorageKey, String(normalized));
+    window.dispatchEvent(
+      new CustomEvent("petaldesk:protect-sensitive-windows-changed", { detail: normalized }),
+    );
+    return normalized;
   },
 
   async setTrayShortcutSettings(

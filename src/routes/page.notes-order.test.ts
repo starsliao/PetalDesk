@@ -47,6 +47,7 @@ describe("main note order", () => {
       version: "0.6.0",
       defaultEditorMode: "typora",
       trayShortcutSettings,
+      protectSensitiveWindows: false,
     });
     vi.spyOn(notesApi, "listNotes").mockResolvedValue(initial);
     vi.spyOn(notesApi, "listTrash").mockResolvedValue([]);

@@ -62,6 +62,33 @@ describe("ScreenshotSettingsDialog", () => {
     expect(onsave).not.toHaveBeenCalled();
   });
 
+  it("toggles sensitive window protection through the privacy section", async () => {
+    const onprotectsensitivechange = vi.fn();
+    const rendered = render(ScreenshotSettingsDialog, {
+      open: true,
+      protectSensitiveWindows: false,
+      onprotectsensitivechange,
+    });
+
+    expect(rendered.getByRole("heading", { name: "隐私与安全" })).toBeInTheDocument();
+    const group = rendered.getByRole("group", { name: "保护敏感窗口" });
+    const off = Array.from(group.querySelectorAll("button")).find(
+      (button) => button.textContent === "关闭",
+    );
+    const on = Array.from(group.querySelectorAll("button")).find(
+      (button) => button.textContent === "开启",
+    );
+    expect(off?.classList.contains("active")).toBe(true);
+    expect(on?.classList.contains("active")).toBe(false);
+
+    await fireEvent.click(on!);
+    expect(onprotectsensitivechange).toHaveBeenCalledWith(true);
+
+    rendered.rerender({ open: true, protectSensitiveWindows: true, onprotectsensitivechange });
+    await fireEvent.click(rendered.getByRole("group", { name: "保护敏感窗口" }).children[0]);
+    expect(onprotectsensitivechange).toHaveBeenCalledWith(false);
+  });
+
   it("configures every tray double-click modifier and saves it with the screenshot shortcut", async () => {
     const onsave = vi.fn();
     const rendered = render(ScreenshotSettingsDialog, {
