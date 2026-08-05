@@ -288,11 +288,11 @@
       }
 
       .hero h1 {
-        max-width: 900px;
+        max-width: 1000px;
         margin: 20px auto 0;
-        font-size: clamp(38px, 6vw, 62px);
+        font-size: clamp(30px, 4.4vw, 46px);
         font-weight: 900;
-        line-height: 1.16;
+        line-height: 1.2;
         letter-spacing: -0.01em;
       }
 
@@ -1225,7 +1225,7 @@
               />
             </svg>
           </a>
-          <a class="btn btn-primary nav-download" href="#download">下载 0.7.0</a>
+          <a class="btn btn-primary nav-download" href="#download">下载</a>
         </div>
       </nav>
     </header>
@@ -1233,9 +1233,9 @@
     <main id="main">
       <section class="hero" id="top" aria-labelledby="hero-title">
         <div class="hero-inner container">
-          <p class="hero-eyebrow">v0.7.0 现已发布 · Windows 10/11 与 macOS 12+</p>
+          <p class="hero-eyebrow">Windows 10/11 与 macOS 12+ · 本地优先</p>
           <h1 id="hero-title">
-            把想法留在桌面，<br />把文件留在<span class="hl">自己手里</span>。
+            把想法留在桌面，把文件留在<span class="hl">自己手里</span>。
           </h1>
           <p class="hero-lead">
             飞花 - PetalDesk 是本地便签与效率工具：Markdown 便签、密码管理器、MFA 验证器、截图与甘特图。无账号、无云端依赖，装好即用。
@@ -1243,13 +1243,13 @@
           <div class="hero-actions">
             <a
               class="btn btn-primary"
-              href="https://github.com/starsliao/PetalDesk/releases/download/v0.7.0/PetalDesk_0.7.0_x64-setup.exe"
-              download
+              href="https://github.com/starsliao/PetalDesk/releases/latest"
+              target="_blank" rel="noopener noreferrer"
             >下载 Windows 版</a>
             <a
               class="btn btn-secondary"
-              href="https://github.com/starsliao/PetalDesk/releases/download/v0.7.0/PetalDesk_0.7.0_universal.dmg"
-              download
+              href="https://github.com/starsliao/PetalDesk/releases/latest"
+              target="_blank" rel="noopener noreferrer"
             >下载 macOS 版</a>
           </div>
           <p class="hero-meta">
@@ -1607,7 +1607,7 @@
             </table>
           </div>
           <p class="table-note">
-            升级：Windows 0.5.2 及以上可在应用内自动更新到 0.7.0；macOS 下载新版 DMG 覆盖安装即可。
+            升级：Windows 0.5.2 及以上可在应用内自动更新到最新版本；macOS 下载新版 DMG 覆盖安装即可。
           </p>
         </div>
       </section>
@@ -1618,7 +1618,7 @@
             <span class="kicker">下载</span>
             <h2 id="download-title">现在，把飞花放到你的桌面。</h2>
             <p class="section-intro">
-              当前版本 0.7.0。装好即用，不需要账号。
+              装好即用，不需要账号；下方链接始终指向最新版本。
             </p>
           </div>
 
@@ -1628,9 +1628,9 @@
               <span class="dl-desc">x64 · 联网安装包 · 自动检查 WebView2</span>
               <a
                 class="btn btn-primary"
-                href="https://github.com/starsliao/PetalDesk/releases/download/v0.7.0/PetalDesk_0.7.0_x64-setup.exe"
-                download
-              >下载 Windows 版 0.7.0</a>
+                href="https://github.com/starsliao/PetalDesk/releases/latest"
+                target="_blank" rel="noopener noreferrer"
+              >下载 Windows 版</a>
               <div class="dl-meta">0.5.2 及以上可应用内自动更新</div>
             </div>
             <div class="dl-card">
@@ -1638,9 +1638,9 @@
               <span class="dl-desc">Universal DMG · Intel + Apple Silicon</span>
               <a
                 class="btn btn-dark"
-                href="https://github.com/starsliao/PetalDesk/releases/download/v0.7.0/PetalDesk_0.7.0_universal.dmg"
-                download
-              >下载 macOS 版 0.7.0</a>
+                href="https://github.com/starsliao/PetalDesk/releases/latest"
+                target="_blank" rel="noopener noreferrer"
+              >下载 macOS 版</a>
               <div class="dl-meta">手动覆盖安装即完成升级</div>
             </div>
           </div>
@@ -1676,7 +1676,7 @@
         </div>
         <div class="footer-bottom">
           <span>Rust + Tauri 2 · Svelte 5 · 系统 WebView（无 Electron）· Firefox 扩展（MV3）</span>
-          <span>v0.7.0 · 本地优先，数据可见</span>
+          <span>本地优先，数据可见</span>
         </div>
       </div>
     </footer>
