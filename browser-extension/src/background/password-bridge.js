@@ -12,6 +12,7 @@
   const CANDIDATE_TTL_MS = 30_000;
   const USERNAME_STAGE_TTL_MS = 2 * 60 * 1_000;
   const CONSENT_ARM_TTL_MS = 2 * 60 * 1_000;
+  const TOOLBAR_FEEDBACK_TTL_MS = 3_000;
   const CAPABILITY_GROUPS = Object.freeze(["password-fill", "password-capture"]);
   const COMMANDS = new Set([
     "password.open",
@@ -91,6 +92,33 @@
     let captureInsecureOrigins = new Set();
     let consentArmedUntil = 0;
     let authenticationConsentGranted = null;
+    let toolbarFeedbackTimer = null;
+
+    function callToolbarAction(method, details) {
+      if (!api.action || typeof api.action[method] !== "function") return;
+      try {
+        const result = api.action[method](details);
+        if (result && typeof result.catch === "function") void result.catch(() => {});
+      } catch {
+        // Toolbar feedback is best-effort and must not interrupt permission handling.
+      }
+    }
+
+    function showToolbarFeedback(text, title, color) {
+      if (!api.action) return;
+      if (toolbarFeedbackTimer != null) clearTimeout(toolbarFeedbackTimer);
+      callToolbarAction("setBadgeBackgroundColor", { color });
+      callToolbarAction("setBadgeText", { text });
+      callToolbarAction("setTitle", { title });
+      toolbarFeedbackTimer = setTimeout(() => {
+        toolbarFeedbackTimer = null;
+        callToolbarAction("setBadgeText", { text: "" });
+        callToolbarAction("setTitle", { title: "飞花：授权密码管理" });
+      }, TOOLBAR_FEEDBACK_TTL_MS);
+      if (toolbarFeedbackTimer && typeof toolbarFeedbackTimer.unref === "function") {
+        toolbarFeedbackTimer.unref();
+      }
+    }
 
     function postEvent(event, payload) {
       const result = postToNative({
@@ -1318,13 +1346,28 @@
 
     if (api.action && api.action.onClicked) {
       api.action.onClicked.addListener(() => {
-        if (Date.now() >= consentArmedUntil) return;
+        if (Date.now() >= consentArmedUntil) {
+          void hasAuthenticationConsent().then(
+            (granted) => showToolbarFeedback(
+              granted ? "OK" : "!",
+              granted ? "飞花：密码权限已授权" : "飞花：请先在桌面端发起密码授权",
+              granted ? "#2e7d32" : "#b26a00",
+            ),
+            () => showToolbarFeedback("!", "飞花：无法读取密码权限状态", "#b3261e"),
+          );
+          return;
+        }
         consentArmedUntil = 0;
         // This call stays directly inside the toolbar click handler so Firefox
         // recognizes it as a user-activated optional data request.
         void api.requestPermissions({ data_collection: ["authenticationInfo"] }).then(
           (granted) => {
             authenticationConsentGranted = granted === true;
+            showToolbarFeedback(
+              granted === true ? "OK" : "!",
+              granted === true ? "飞花：密码权限已授权" : "飞花：密码权限未授权",
+              granted === true ? "#2e7d32" : "#b26a00",
+            );
             postEvent("consentChanged", {
               actionRequired: granted === true ? null : "toolbar-click",
               dataCollection: "authenticationInfo",
@@ -1332,12 +1375,15 @@
               userGestureRequired: granted !== true,
             });
           },
-          () => postEvent("consentChanged", {
-            actionRequired: "toolbar-click",
-            dataCollection: "authenticationInfo",
-            granted: false,
-            userGestureRequired: true,
-          }),
+          () => {
+            showToolbarFeedback("!", "飞花：密码权限授权失败", "#b3261e");
+            postEvent("consentChanged", {
+              actionRequired: "toolbar-click",
+              dataCollection: "authenticationInfo",
+              granted: false,
+              userGestureRequired: true,
+            });
+          },
         );
       });
     }

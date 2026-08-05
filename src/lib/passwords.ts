@@ -12,7 +12,7 @@ export type PasswordProtection =
 
 export type PasswordBrowser = "firefox";
 export type PasswordBrowserConnection = "connected" | "extension-missing" | "native-host-missing" | "unsupported" | "disconnected";
-export type PasswordBrowserCapturePermission = "granted" | "action-required" | "unavailable";
+export type PasswordBrowserCapturePermission = "granted" | "action-required" | "unavailable" | "unknown";
 
 export const FIREFOX_EXTENSION_INSTALL_URL = "https://starsliao.github.io/PetalDesk/firefox.html";
 
@@ -242,8 +242,10 @@ function normalizeBrowser(value: Partial<PasswordBrowserStatus> & Record<string,
   const allowed: PasswordBrowserConnection[] = ["connected", "extension-missing", "native-host-missing", "unsupported", "disconnected"];
   const normalizedConnection = allowed.includes(connection) ? connection : "disconnected";
   const capturePermissionValue = String(value.capturePermission ?? value.capture_permission ?? "");
-  const capturePermission = (["granted", "action-required", "unavailable"] as const)
+  const capturePermission = (["granted", "action-required", "unavailable", "unknown"] as const)
     .find((candidate) => candidate === capturePermissionValue);
+  const normalizedCapturePermission = capturePermission
+    ?? (normalizedConnection === "connected" ? "unknown" : undefined);
   return {
     browser: "firefox",
     connection: normalizedConnection,
@@ -255,7 +257,7 @@ function normalizeBrowser(value: Partial<PasswordBrowserStatus> & Record<string,
         ? null
         : FIREFOX_EXTENSION_INSTALL_URL
       : String(value.installUrl),
-    ...(capturePermission ? { capturePermission } : {}),
+    ...(normalizedCapturePermission ? { capturePermission: normalizedCapturePermission } : {}),
     message: value.message == null ? null : String(value.message),
   };
 }
@@ -532,8 +534,8 @@ export const passwordApi: PasswordApi = {
         connection: "disconnected",
         extensionInstalled: false,
         nativeHostInstalled: false,
-        capturePermission: "unavailable",
-        message: "无法读取 Firefox 扩展状态。",
+        capturePermission: "unknown",
+        message: "Firefox 扩展通信异常，无法读取密码权限状态。",
       };
     }
   },

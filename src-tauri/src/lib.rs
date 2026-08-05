@@ -791,10 +791,12 @@ pub fn run() {
                             .clear_deactivated_state(closing_epoch);
                     });
                 } else if label == commands::PASSWORD_WINDOW_LABEL {
-                    app.state::<PasswordBrowserService>().suspend_capture();
                     let closing_epoch = app.state::<PasswordStore>().deactivate();
                     let password_app = app.clone();
                     tauri::async_runtime::spawn_blocking(move || {
+                        password_app
+                            .state::<PasswordBrowserService>()
+                            .suspend_capture();
                         password_app
                             .state::<PasswordStore>()
                             .clear_deactivated_state(closing_epoch);

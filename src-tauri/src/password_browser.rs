@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -164,21 +164,31 @@ impl PasswordBrowserService {
             };
         }
         #[cfg(windows)]
-        let connected = self.bridge.is_connected(BrowserFamily::Firefox);
+        let connection_id = self.bridge.latest_connection_id(BrowserFamily::Firefox);
         #[cfg(windows)]
-        let extension_status = self
-            .bridge
-            .latest_connection_id(BrowserFamily::Firefox)
-            .and_then(|connection_id| {
-                self.bridge
-                    .request_connection(
-                        &connection_id,
-                        "password.getStatus",
-                        Value::Object(Default::default()),
-                        Duration::from_secs(2),
-                    )
-                    .ok()
-            });
+        let had_connection = connection_id.is_some();
+        #[cfg(windows)]
+        let extension_status_result = connection_id.map(|connection_id| {
+            self.bridge.request_connection(
+                &connection_id,
+                "password.getStatus",
+                Value::Object(Default::default()),
+                Duration::from_secs(2),
+            )
+        });
+        #[cfg(windows)]
+        let (extension_status, status_error) = match extension_status_result {
+            Some(Ok(status)) => (Some(status), None),
+            Some(Err(error)) => {
+                eprintln!("读取 Firefox 密码扩展状态失败: {error}");
+                (None, Some(error))
+            }
+            None => (None, None),
+        };
+        // A failed send may retire a half-open connection, so check this after
+        // the request instead of preserving a stale pre-request snapshot.
+        #[cfg(windows)]
+        let connected = self.bridge.is_connected(BrowserFamily::Firefox);
         #[cfg(windows)]
         let authentication_consent = extension_status
             .as_ref()
@@ -198,6 +208,12 @@ impl PasswordBrowserService {
             .filter(|value| *value == "toolbar-click")
             .map(str::to_string);
         #[cfg(windows)]
+        let unsupported = status_error
+            .as_deref()
+            .is_some_and(password_status_error_is_unsupported);
+        #[cfg(windows)]
+        let known_extension = had_connection || connected;
+        #[cfg(windows)]
         PasswordBrowserStatus {
             browser: "firefox",
             connection: if connected {
@@ -205,19 +221,24 @@ impl PasswordBrowserService {
             } else {
                 "disconnected"
             },
-            extension_installed: connected,
-            native_host_installed: connected,
+            extension_installed: known_extension,
+            native_host_installed: known_extension,
             extension_version: None,
-            install_url: (!connected).then(|| FIREFOX_AMO_URL.to_string()),
-            capture_permission: match authentication_consent {
-                Some(true) => "granted",
-                Some(false) => "action-required",
-                None => "unavailable",
+            install_url: (!known_extension).then(|| FIREFOX_AMO_URL.to_string()),
+            capture_permission: match (authentication_consent, known_extension, unsupported) {
+                (Some(true), _, _) => "granted",
+                (Some(false), _, _) => "action-required",
+                (None, true, false) => "unknown",
+                _ => "unavailable",
             },
             authentication_consent: authentication_consent.unwrap_or(false),
             consent_armed,
             consent_action_required,
-            message: if !connected {
+            message: if unsupported {
+                Some("当前 Firefox 扩展不支持密码功能，请更新扩展。".to_string())
+            } else if status_error.is_some() {
+                Some("Firefox 密码通道通信异常；请稍后重试，必要时重启飞花或 Firefox。".to_string())
+            } else if !connected {
                 Some("Firefox 扩展或本机通信组件尚未连接；仍可复制账号和密码。".to_string())
             } else if authentication_consent == Some(false) {
                 Some("登录信息检测等待 Firefox 工具栏中的扩展授权。".to_string())
@@ -1302,6 +1323,11 @@ impl PasswordBrowserService {
     }
 }
 
+fn password_status_error_is_unsupported(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("unsupported") || normalized.contains("does not support")
+}
+
 pub fn start_event_dispatcher(app: AppHandle) {
     if EVENT_DISPATCHER_STARTED.swap(true, Ordering::AcqRel) {
         return;
@@ -1485,12 +1511,15 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 #[tauri::command]
-pub fn get_password_browser_status(
+pub async fn get_password_browser_status(
+    app: AppHandle,
     window: WebviewWindow,
-    service: State<'_, PasswordBrowserService>,
 ) -> AppResult<PasswordBrowserStatus> {
     ensure_password_window(&window)?;
-    Ok(service.status())
+    crate::commands::run_background("读取 Firefox 扩展状态", move || {
+        Ok(app.state::<PasswordBrowserService>().status())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1597,6 +1626,22 @@ mod tests {
             document_id: None,
             expires_at: Instant::now() + FILL_TTL,
         }
+    }
+
+    #[test]
+    fn status_errors_only_mark_explicitly_unsupported_extensions() {
+        assert!(password_status_error_is_unsupported(
+            "Unsupported password command: password.getStatus"
+        ));
+        assert!(password_status_error_is_unsupported(
+            "firefox browser extension does not support command password.getStatus"
+        ));
+        assert!(!password_status_error_is_unsupported(
+            "password browser request timed out after 2000 ms"
+        ));
+        assert!(!password_status_error_is_unsupported(
+            "password browser connection is busy"
+        ));
     }
 
     #[test]

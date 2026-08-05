@@ -2984,7 +2984,10 @@ pub async fn get_password_status(
     })
     .await
     .map_err(|_| AppError::new("password_task_error", "读取密码状态任务异常结束。"))??;
-    crate::password_browser::sync_capture_from_store(&app);
+    let sync_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::password_browser::sync_capture_from_store(&sync_app);
+    });
     Ok(status)
 }
 
@@ -3136,7 +3139,12 @@ pub async fn set_password_capture_enabled(
     })
     .await
     .map_err(|_| AppError::new("password_task_error", "更新登录检测设置任务异常结束。"))??;
-    crate::password_browser::sync_capture_from_store(&app);
+    let sync_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::password_browser::sync_capture_from_store(&sync_app);
+    })
+    .await
+    .map_err(|_| AppError::new("password_task_error", "同步 Firefox 登录检测任务异常结束。"))?;
     Ok(status)
 }
 
@@ -3149,18 +3157,24 @@ pub async fn configure_password_recovery_password(
 ) -> AppResult<PasswordStatus> {
     ensure_password_window(&window)?;
     let epoch = app.state::<PasswordStore>().require_active_epoch()?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let task_app = app.clone();
+    let status = tauri::async_runtime::spawn_blocking(move || {
         crate::recovery::configure_shared_recovery_password(
-            &app.state::<crate::mfa::MfaStore>(),
-            &app.state::<PasswordStore>(),
+            &task_app.state::<crate::mfa::MfaStore>(),
+            &task_app.state::<PasswordStore>(),
             password.as_str(),
             current_password.as_ref().map(SensitiveText::as_str),
         )?;
-        let status = app.state::<PasswordStore>().status_at(epoch)?;
-        crate::recovery::annotate_password_status(&app.state::<crate::mfa::MfaStore>(), status)
+        let status = task_app.state::<PasswordStore>().status_at(epoch)?;
+        crate::recovery::annotate_password_status(&task_app.state::<crate::mfa::MfaStore>(), status)
     })
     .await
-    .map_err(|_| AppError::new("password_task_error", "设置恢复密码任务异常结束。"))?
+    .map_err(|_| AppError::new("password_task_error", "设置恢复密码任务异常结束。"))??;
+    let sync_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::password_browser::sync_capture_from_store(&sync_app);
+    });
+    Ok(status)
 }
 
 #[tauri::command]
@@ -3171,14 +3185,20 @@ pub async fn unlock_passwords_with_recovery_password(
 ) -> AppResult<PasswordStatus> {
     ensure_password_window(&window)?;
     let epoch = app.state::<PasswordStore>().require_active_epoch()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let status = app
+    let task_app = app.clone();
+    let status = tauri::async_runtime::spawn_blocking(move || {
+        let status = task_app
             .state::<PasswordStore>()
             .unlock_with_recovery_password_at(password.as_str(), epoch)?;
-        crate::recovery::annotate_password_status(&app.state::<crate::mfa::MfaStore>(), status)
+        crate::recovery::annotate_password_status(&task_app.state::<crate::mfa::MfaStore>(), status)
     })
     .await
-    .map_err(|_| AppError::new("password_task_error", "恢复密码保险库任务异常结束。"))?
+    .map_err(|_| AppError::new("password_task_error", "恢复密码保险库任务异常结束。"))??;
+    let sync_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::password_browser::sync_capture_from_store(&sync_app);
+    });
+    Ok(status)
 }
 
 #[tauri::command]
@@ -3193,9 +3213,16 @@ pub fn generate_password(
 #[tauri::command]
 pub async fn lock_password_vault(app: AppHandle, window: WebviewWindow) -> AppResult<()> {
     ensure_password_window(&window)?;
-    app.state::<crate::password_browser::PasswordBrowserService>()
-        .suspend_capture();
-    app.state::<PasswordStore>().lock_current_session()?;
+    let task_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        task_app.state::<PasswordStore>().lock_current_session()
+    })
+    .await
+    .map_err(|_| AppError::new("password_task_error", "锁定密码保险库任务异常结束。"))??;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<crate::password_browser::PasswordBrowserService>()
+            .suspend_capture();
+    });
     Ok(())
 }
 

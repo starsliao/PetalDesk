@@ -5,6 +5,15 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+#[cfg(windows)]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+#[cfg(windows)]
+use std::thread::JoinHandle;
+#[cfg(windows)]
+use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -14,6 +23,14 @@ const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(30);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 #[cfg(windows)]
 const SECRET_ENDPOINT_MAX_FUTURE: Duration = Duration::from_secs(10 * 60);
+#[cfg(windows)]
+const SECRET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const SECRET_IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(windows)]
+const SECRET_IO_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+#[cfg(windows)]
+const SECRET_THREAD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -460,6 +477,246 @@ fn write_native_message<W: Write, T: Serialize>(writer: &mut W, value: &T) -> Re
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecretReaderExit {
+    PipeClosed,
+    CommandChannelClosed,
+    Stopped,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecretWriterExit {
+    PipeClosed,
+    OutboundChannelClosed,
+    Stopped,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecretIoExit {
+    Reader(SecretReaderExit),
+    Writer(SecretWriterExit),
+}
+
+#[cfg(windows)]
+impl SecretIoExit {
+    fn stops_connector(self) -> bool {
+        matches!(
+            self,
+            Self::Reader(SecretReaderExit::CommandChannelClosed)
+                | Self::Writer(SecretWriterExit::OutboundChannelClosed)
+        )
+    }
+
+    fn disconnect_reason(self) -> &'static str {
+        match self {
+            Self::Reader(SecretReaderExit::CommandChannelClosed)
+            | Self::Writer(SecretWriterExit::OutboundChannelClosed) => "secret-channel-closed",
+            Self::Reader(SecretReaderExit::Stopped) | Self::Writer(SecretWriterExit::Stopped) => {
+                "secret-pipe-stopped"
+            }
+            Self::Reader(SecretReaderExit::PipeClosed)
+            | Self::Writer(SecretWriterExit::PipeClosed) => "secret-pipe-closed",
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_secret_reader<R: Read>(
+    reader: &mut R,
+    command_sender: &mpsc::Sender<Value>,
+    stop: &AtomicBool,
+) -> SecretReaderExit {
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return SecretReaderExit::Stopped;
+        }
+        match read_secret_frame(reader) {
+            Ok(Some(command))
+                if command.get("type").and_then(Value::as_str) == Some("secret.command") =>
+            {
+                if stop.load(Ordering::Acquire) {
+                    return SecretReaderExit::Stopped;
+                }
+                if command_sender.send(command).is_err() {
+                    return SecretReaderExit::CommandChannelClosed;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return SecretReaderExit::PipeClosed,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_secret_writer<W: Write>(
+    writer: &mut W,
+    outbound_receiver: &Mutex<mpsc::Receiver<Value>>,
+    stop: &AtomicBool,
+) -> SecretWriterExit {
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return SecretWriterExit::Stopped;
+        }
+        let received = outbound_receiver
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recv_timeout(SECRET_IO_POLL_INTERVAL);
+        let message = match received {
+            Ok(message) => message,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return SecretWriterExit::OutboundChannelClosed;
+            }
+        };
+        if stop.load(Ordering::Acquire) {
+            return SecretWriterExit::Stopped;
+        }
+        let queued_at = message
+            .get("queuedAtUnixMs")
+            .and_then(Value::as_u64)
+            .map(u128::from)
+            .unwrap_or_else(unix_time_ms);
+        if unix_time_ms().saturating_sub(queued_at) > 30_000 {
+            continue;
+        }
+        if write_secret_frame(writer, &message).is_err() {
+            return SecretWriterExit::PipeClosed;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn cancel_secret_thread_io<T>(thread: &JoinHandle<T>) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
+    use windows_sys::Win32::System::IO::CancelSynchronousIo;
+
+    if unsafe { CancelSynchronousIo(thread.as_raw_handle() as _) } != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_NOT_FOUND as i32) {
+        Ok(())
+    } else {
+        Err(format!("failed to cancel browser secret pipe I/O: {error}"))
+    }
+}
+
+#[cfg(windows)]
+fn cancel_and_join_secret_thread<T>(
+    thread: JoinHandle<T>,
+    deadline: Instant,
+) -> Option<std::thread::Result<T>> {
+    loop {
+        if thread.is_finished() {
+            return Some(thread.join());
+        }
+        let _ = cancel_secret_thread_io(&thread);
+        if Instant::now() >= deadline {
+            return thread.is_finished().then(|| thread.join());
+        }
+        std::thread::sleep(SECRET_THREAD_POLL_INTERVAL);
+    }
+}
+
+#[cfg(windows)]
+fn join_finished_secret_worker(thread: &mut Option<JoinHandle<()>>) {
+    if !thread.as_ref().is_some_and(JoinHandle::is_finished) {
+        return;
+    }
+    if thread.take().is_some_and(|thread| thread.join().is_err()) {
+        eprintln!("browser secret pipe worker panicked");
+    }
+}
+
+#[cfg(windows)]
+fn cancel_and_join_secret_workers(
+    reader: JoinHandle<()>,
+    writer: JoinHandle<()>,
+    deadline: Instant,
+) -> bool {
+    let mut reader = Some(reader);
+    let mut writer = Some(writer);
+    loop {
+        join_finished_secret_worker(&mut reader);
+        join_finished_secret_worker(&mut writer);
+        if reader.is_none() && writer.is_none() {
+            return true;
+        }
+        if let Some(thread) = reader.as_ref() {
+            let _ = cancel_secret_thread_io(thread);
+        }
+        if let Some(thread) = writer.as_ref() {
+            let _ = cancel_secret_thread_io(thread);
+        }
+        if Instant::now() >= deadline {
+            join_finished_secret_worker(&mut reader);
+            join_finished_secret_worker(&mut writer);
+            return reader.is_none() && writer.is_none();
+        }
+        std::thread::sleep(SECRET_THREAD_POLL_INTERVAL);
+    }
+}
+
+#[cfg(windows)]
+enum SecretHandshakeWait<T> {
+    Finished(std::thread::Result<T>),
+    TimedOutStopped,
+    TimedOutRunning,
+}
+
+#[cfg(windows)]
+fn wait_secret_handshake_thread<T>(
+    thread: JoinHandle<T>,
+    timeout: Duration,
+    stop_timeout: Duration,
+) -> SecretHandshakeWait<T> {
+    let deadline = Instant::now() + timeout;
+    while !thread.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(SECRET_THREAD_POLL_INTERVAL);
+    }
+    if thread.is_finished() {
+        return SecretHandshakeWait::Finished(thread.join());
+    }
+    match cancel_and_join_secret_thread(thread, Instant::now() + stop_timeout) {
+        Some(_) => SecretHandshakeWait::TimedOutStopped,
+        None => SecretHandshakeWait::TimedOutRunning,
+    }
+}
+
+#[cfg(windows)]
+fn connect_secret_pipe(
+    endpoint: SecretEndpoint,
+    connection_id: String,
+    browser: String,
+) -> Result<std::fs::File, String> {
+    let mut pipe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&endpoint.pipe_name)
+        .map_err(|error| format!("failed to open browser secret pipe: {error}"))?;
+    write_secret_frame(
+        &mut pipe,
+        &serde_json::json!({
+            "version": PROTOCOL_VERSION,
+            "type": "secret.hello",
+            "token": endpoint.token,
+            "connectionId": connection_id,
+            "browser": browser,
+            "processId": std::process::id(),
+        }),
+    )?;
+    let ready = read_secret_frame(&mut pipe)?
+        .ok_or_else(|| "browser secret pipe closed during handshake".to_string())?;
+    if ready.get("type").and_then(Value::as_str) != Some("secret.ready") {
+        return Err("browser secret handshake was rejected".to_string());
+    }
+    Ok(pipe)
+}
+
+#[cfg(windows)]
 fn start_secret_connector(
     connection_id: String,
     browser: String,
@@ -469,11 +726,17 @@ fn start_secret_connector(
     let _ = std::thread::Builder::new()
         .name("petaldesk-password-native-pipe".to_string())
         .spawn(move || {
-            let _ = command_sender.send(serde_json::json!({
+            if command_sender
+                .send(serde_json::json!({
                 "type": "secret.lifecycle",
                 "event": "secretDisconnected",
                 "payload": { "reason": "secret-pipe-unavailable" },
-            }));
+                }))
+                .is_err()
+            {
+                return;
+            }
+            let outbound_receiver = Arc::new(Mutex::new(outbound_receiver));
             loop {
                 let endpoint = match read_secret_endpoint() {
                     Ok(endpoint) => endpoint,
@@ -482,103 +745,180 @@ fn start_secret_connector(
                         continue;
                     }
                 };
-                let mut pipe = match OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&endpoint.pipe_name)
-                {
-                    Ok(pipe) => pipe,
+                let handshake_connection_id = connection_id.clone();
+                let handshake_browser = browser.clone();
+                let handshake_thread = std::thread::Builder::new()
+                    .name("petaldesk-password-native-handshake".to_string())
+                    .spawn(move || {
+                        connect_secret_pipe(endpoint, handshake_connection_id, handshake_browser)
+                    });
+                let handshake_thread = match handshake_thread {
+                    Ok(thread) => thread,
                     Err(_) => {
-                        std::thread::sleep(Duration::from_secs(1));
-                        continue;
-                    }
-                };
-                if write_secret_frame(
-                    &mut pipe,
-                    &serde_json::json!({
-                        "version": PROTOCOL_VERSION,
-                        "type": "secret.hello",
-                        "token": endpoint.token,
-                        "connectionId": connection_id.clone(),
-                        "browser": browser.clone(),
-                        "processId": std::process::id(),
-                    }),
-                )
-                .is_err()
-                {
-                    std::thread::sleep(Duration::from_millis(500));
-                    continue;
-                }
-                let ready = match read_secret_frame(&mut pipe) {
-                    Ok(Some(value)) => value,
-                    _ => {
+                        let _ = command_sender.send(serde_json::json!({
+                            "type": "secret.lifecycle",
+                            "event": "secretDisconnected",
+                            "payload": { "reason": "secret-pipe-thread-unavailable" },
+                        }));
                         std::thread::sleep(Duration::from_millis(500));
                         continue;
                     }
                 };
-                if ready.get("type").and_then(Value::as_str) != Some("secret.ready") {
-                    std::thread::sleep(Duration::from_millis(500));
-                    continue;
-                }
-                let _ = command_sender.send(serde_json::json!({
-                    "type": "secret.lifecycle",
-                    "event": "secretConnected",
-                    "payload": {},
-                }));
-
+                let mut pipe = match wait_secret_handshake_thread(
+                    handshake_thread,
+                    SECRET_HANDSHAKE_TIMEOUT,
+                    SECRET_IO_STOP_TIMEOUT,
+                ) {
+                    SecretHandshakeWait::Finished(Ok(Ok(pipe))) => pipe,
+                    SecretHandshakeWait::Finished(Ok(Err(_))) => {
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                    SecretHandshakeWait::Finished(Err(_)) => {
+                        let _ = command_sender.send(serde_json::json!({
+                            "type": "secret.lifecycle",
+                            "event": "secretDisconnected",
+                            "payload": { "reason": "secret-pipe-thread-unavailable" },
+                        }));
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                    SecretHandshakeWait::TimedOutStopped => {
+                        let _ = command_sender.send(serde_json::json!({
+                            "type": "secret.lifecycle",
+                            "event": "secretDisconnected",
+                            "payload": { "reason": "secret-pipe-handshake-timeout" },
+                        }));
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                    SecretHandshakeWait::TimedOutRunning => {
+                        let _ = command_sender.send(serde_json::json!({
+                            "type": "secret.lifecycle",
+                            "event": "secretDisconnected",
+                            "payload": { "reason": "secret-pipe-handshake-stuck" },
+                        }));
+                        eprintln!("browser secret pipe handshake did not stop after timeout");
+                        return;
+                    }
+                };
                 let mut reader = match pipe.try_clone() {
                     Ok(reader) => reader,
                     Err(_) => continue,
                 };
-                let (closed_tx, closed_rx) = mpsc::sync_channel(1);
-                let reader_commands = command_sender.clone();
-                let reader_thread = std::thread::spawn(move || {
-                    loop {
-                        match read_secret_frame(&mut reader) {
-                            Ok(Some(command))
-                                if command.get("type").and_then(Value::as_str)
-                                    == Some("secret.command") =>
-                            {
-                                if reader_commands.send(command).is_err() {
-                                    break;
-                                }
-                            }
-                            Ok(Some(_)) => {}
-                            Ok(None) | Err(_) => break,
-                        }
-                    }
-                    let _ = closed_tx.send(());
-                });
+                if command_sender
+                    .send(serde_json::json!({
+                        "type": "secret.lifecycle",
+                        "event": "secretConnected",
+                        "payload": {},
+                    }))
+                    .is_err()
+                {
+                    return;
+                }
 
-                loop {
-                    if closed_rx.try_recv().is_ok() {
-                        break;
+                let stop = Arc::new(AtomicBool::new(false));
+                let (io_ended_tx, io_ended_rx) = mpsc::channel();
+                let reader_commands = command_sender.clone();
+                let reader_stop = stop.clone();
+                let reader_ended = io_ended_tx.clone();
+                let reader_thread = std::thread::Builder::new()
+                    .name("petaldesk-password-native-reader".to_string())
+                    .spawn(move || {
+                        let exit = run_secret_reader(&mut reader, &reader_commands, &reader_stop);
+                        let _ = reader_ended.send(SecretIoExit::Reader(exit));
+                    });
+                let reader_thread = match reader_thread {
+                    Ok(thread) => thread,
+                    Err(_) => {
+                        let _ = command_sender.send(serde_json::json!({
+                            "type": "secret.lifecycle",
+                            "event": "secretDisconnected",
+                            "payload": { "reason": "secret-pipe-thread-unavailable" },
+                        }));
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
                     }
-                    match outbound_receiver.recv_timeout(Duration::from_millis(250)) {
-                        Ok(message) => {
-                            let queued_at = message
-                                .get("queuedAtUnixMs")
-                                .and_then(Value::as_u64)
-                                .map(u128::from)
-                                .unwrap_or_else(unix_time_ms);
-                            if unix_time_ms().saturating_sub(queued_at) > 30_000 {
-                                continue;
-                            }
-                            if write_secret_frame(&mut pipe, &message).is_err() {
-                                break;
-                            }
+                };
+
+                let writer_receiver = outbound_receiver.clone();
+                let writer_stop = stop.clone();
+                let writer_ended = io_ended_tx.clone();
+                let writer_thread = std::thread::Builder::new()
+                    .name("petaldesk-password-native-writer".to_string())
+                    .spawn(move || {
+                        let exit = run_secret_writer(&mut pipe, &writer_receiver, &writer_stop);
+                        let _ = writer_ended.send(SecretIoExit::Writer(exit));
+                    });
+                let writer_thread = match writer_thread {
+                    Ok(thread) => thread,
+                    Err(_) => {
+                        stop.store(true, Ordering::Release);
+                        let deadline = Instant::now() + SECRET_IO_STOP_TIMEOUT;
+                        let reader_stopped =
+                            cancel_and_join_secret_thread(reader_thread, deadline).is_some();
+                        let _ = command_sender.send(serde_json::json!({
+                            "type": "secret.lifecycle",
+                            "event": "secretDisconnected",
+                            "payload": {
+                                "reason": if reader_stopped {
+                                    "secret-pipe-thread-unavailable"
+                                } else {
+                                    "secret-pipe-worker-stuck"
+                                }
+                            },
+                        }));
+                        if !reader_stopped {
+                            eprintln!("browser secret pipe reader did not stop after writer spawn failure");
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                        continue;
+                    }
+                };
+                drop(io_ended_tx);
+
+                let first_exit = loop {
+                    match io_ended_rx.recv_timeout(SECRET_IO_POLL_INTERVAL) {
+                        Ok(exit) => break exit,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            break SecretIoExit::Reader(SecretReaderExit::PipeClosed);
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) if reader_thread.is_finished() => {
+                            break SecretIoExit::Reader(SecretReaderExit::PipeClosed);
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) if writer_thread.is_finished() => {
+                            break SecretIoExit::Writer(SecretWriterExit::PipeClosed);
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
+                };
+                stop.store(true, Ordering::Release);
+                let deadline = Instant::now() + SECRET_IO_STOP_TIMEOUT;
+                let workers_stopped =
+                    cancel_and_join_secret_workers(reader_thread, writer_thread, deadline);
+
+                let mut stop_connector = first_exit.stops_connector();
+                while let Ok(exit) = io_ended_rx.try_recv() {
+                    stop_connector |= exit.stops_connector();
                 }
-                drop(pipe);
-                let _ = reader_thread.join();
+                if !workers_stopped {
+                    let _ = command_sender.send(serde_json::json!({
+                        "type": "secret.lifecycle",
+                        "event": "secretDisconnected",
+                        "payload": { "reason": "secret-pipe-worker-stuck" },
+                    }));
+                    eprintln!("browser secret pipe worker did not stop; reconnect was abandoned");
+                    return;
+                }
                 let _ = command_sender.send(serde_json::json!({
                     "type": "secret.lifecycle",
                     "event": "secretDisconnected",
-                    "payload": { "reason": "secret-pipe-closed" },
+                    "payload": { "reason": first_exit.disconnect_reason() },
                 }));
+                if stop_connector {
+                    return;
+                }
                 std::thread::sleep(Duration::from_millis(500));
             }
         });
@@ -754,6 +1094,164 @@ mod tests {
             "id": "capture-request",
             "command": "capture.start"
         })));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn secret_reader_reports_a_closed_pipe() {
+        let (command_tx, _command_rx) = mpsc::channel();
+        let stop = AtomicBool::new(false);
+        assert_eq!(
+            run_secret_reader(&mut Cursor::new(Vec::<u8>::new()), &command_tx, &stop),
+            SecretReaderExit::PipeClosed
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn secret_writer_reports_a_pipe_write_failure() {
+        struct BrokenWriter;
+
+        impl Write for BrokenWriter {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "test pipe closed",
+                ))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (outbound_tx, outbound_rx) = mpsc::channel();
+        outbound_tx
+            .send(serde_json::json!({
+                "type": "secret.response",
+                "queuedAtUnixMs": unix_time_ms(),
+            }))
+            .unwrap();
+        let stop = AtomicBool::new(false);
+        assert_eq!(
+            run_secret_writer(&mut BrokenWriter, &Mutex::new(outbound_rx), &stop),
+            SecretWriterExit::PipeClosed
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelling_synchronous_io_releases_a_blocked_pipe_reader() {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::Pipes::CreatePipe;
+
+        let mut read_handle: HANDLE = std::ptr::null_mut();
+        let mut write_handle: HANDLE = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { CreatePipe(&mut read_handle, &mut write_handle, std::ptr::null(), 0,) },
+            0
+        );
+        let mut reader = unsafe { std::fs::File::from_raw_handle(read_handle as _) };
+        let writer = unsafe { std::fs::File::from_raw_handle(write_handle as _) };
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let reader_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let mut byte = [0_u8; 1];
+            let result = reader.read_exact(&mut byte);
+            let _ = finished_tx.send(result.is_err());
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let joined =
+            cancel_and_join_secret_thread(reader_thread, Instant::now() + SECRET_IO_STOP_TIMEOUT);
+        let cancelled = finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(writer);
+        assert!(cancelled, "blocked pipe read was not cancelled");
+        assert!(joined.is_some(), "cancelled pipe reader did not stop");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn worker_stop_retries_after_a_missed_cancel_window() {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::Pipes::CreatePipe;
+
+        let mut read_handle: HANDLE = std::ptr::null_mut();
+        let mut write_handle: HANDLE = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { CreatePipe(&mut read_handle, &mut write_handle, std::ptr::null(), 0,) },
+            0
+        );
+        let mut reader = unsafe { std::fs::File::from_raw_handle(read_handle as _) };
+        let writer = unsafe { std::fs::File::from_raw_handle(write_handle as _) };
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (proceed_tx, proceed_rx) = mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let reader_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            proceed_rx.recv().unwrap();
+            let mut byte = [0_u8; 1];
+            let result = reader.read_exact(&mut byte);
+            finished_tx.send(result.is_err()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let release_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            proceed_tx.send(()).unwrap();
+        });
+        let other_worker = std::thread::spawn(|| {});
+        let stopped = cancel_and_join_secret_workers(
+            reader_thread,
+            other_worker,
+            Instant::now() + SECRET_IO_STOP_TIMEOUT,
+        );
+        drop(writer);
+        release_thread.join().unwrap();
+        assert!(
+            stopped,
+            "workers did not stop after the missed-cancel window"
+        );
+        assert!(
+            finished_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "the worker did not observe cancellation after entering pipe I/O"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn handshake_timeout_cancels_a_blocked_pipe_operation() {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::Pipes::CreatePipe;
+
+        let mut read_handle: HANDLE = std::ptr::null_mut();
+        let mut write_handle: HANDLE = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { CreatePipe(&mut read_handle, &mut write_handle, std::ptr::null(), 0,) },
+            0
+        );
+        let mut reader = unsafe { std::fs::File::from_raw_handle(read_handle as _) };
+        let writer = unsafe { std::fs::File::from_raw_handle(write_handle as _) };
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let handshake_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let mut byte = [0_u8; 1];
+            let _ = reader.read_exact(&mut byte);
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let outcome = wait_secret_handshake_thread(
+            handshake_thread,
+            Duration::from_millis(25),
+            SECRET_IO_STOP_TIMEOUT,
+        );
+        drop(writer);
+        assert!(
+            matches!(outcome, SecretHandshakeWait::TimedOutStopped),
+            "handshake timeout did not cancel the blocked operation"
+        );
     }
 
     #[cfg(windows)]

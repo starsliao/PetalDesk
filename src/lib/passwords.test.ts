@@ -210,4 +210,29 @@ describe("desktop password command contract", () => {
       installUrl: "https://starsliao.github.io/PetalDesk/firefox.html",
     });
   });
+
+  it("normalizes a connected browser with no permission result as unknown", async () => {
+    (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
+    backendInvoke.mockResolvedValue({
+      browser: "firefox",
+      connection: "connected",
+      extensionInstalled: true,
+      nativeHostInstalled: true,
+    });
+
+    await expect(passwordApi.getBrowserStatus()).resolves.toMatchObject({
+      connection: "connected",
+      capturePermission: "unknown",
+    });
+  });
+
+  it("reports desktop browser-status command failures as communication errors", async () => {
+    (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
+    backendInvoke.mockRejectedValue(new Error("native bridge timed out"));
+
+    await expect(passwordApi.getBrowserStatus()).resolves.toMatchObject({
+      capturePermission: "unknown",
+      message: expect.stringContaining("通信异常"),
+    });
+  });
 });

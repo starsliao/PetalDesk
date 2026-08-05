@@ -6,20 +6,20 @@
 
 <https://starsliao.github.io/PetalDesk/>
 
-## 0.6.2 平台范围
+## 0.6.3 平台范围
 
-Windows 10/11 x64 与 macOS 12+ 共享便签、甘特图、计时器、提醒、系统通知、MFA 和普通截图能力。`0.6.0` 在 Windows 新增本地密码保险库，并把经确认的自动填充和登录信息检测整合进 Firefox 长截图扩展；`0.6.1` 修复密码管理器首次启用时对 MFA 全局恢复密码的复用与修改体验；`0.6.2` 修复密码管理器提示层、窗口关闭和锁定交互，取消闲置自动锁定，并在远程桌面会话中阻止打开会被系统隐藏的 MFA 与密码管理器窗口。Chrome/Edge 的密码能力延期。Windows 继续提供长截图、自动滚动和 Native Messaging Host。macOS 使用 Keychain 提供 MFA 本机免密解锁，并支持普通区域截图，但当前不提供密码管理器、长截图、浏览器联动、Native Messaging 注册或自动更新。
+Windows 10/11 x64 与 macOS 12+ 共享便签、甘特图、计时器、提醒、系统通知、MFA 和普通截图能力。`0.6.0` 在 Windows 新增本地密码保险库，并把经确认的自动填充和登录信息检测整合进 Firefox 长截图扩展；`0.6.1` 修复密码管理器首次启用时对 MFA 全局恢复密码的复用与修改体验；`0.6.2` 修复密码管理器提示层、窗口关闭和锁定交互，取消闲置自动锁定，并在远程桌面会话中阻止打开会被系统隐藏的 MFA 与密码管理器窗口；`0.6.3` 修复 Firefox 原生消息通道断开后造成的飞花卡顿、密码权限误报和扩展按钮无反馈，并为通道握手与重连增加超时保护。Chrome/Edge 的密码能力延期。Windows 继续提供长截图、自动滚动和 Native Messaging Host。macOS 使用 Keychain 提供 MFA 本机免密解锁，并支持普通区域截图，但当前不提供密码管理器、长截图、浏览器联动、Native Messaging 注册或自动更新。
 
 macOS Release 是一个 Universal DMG，内部同时包含 `x86_64-apple-darwin` 与 `aarch64-apple-darwin`，所以 Intel 和 Apple Silicon 不需要两个安装包。当前发布资产为：
 
-- `PetalDesk_0.6.2_x64-setup.exe`
-- `PetalDesk_0.6.2_x64-setup.exe.sig`
+- `PetalDesk_0.6.3_x64-setup.exe`
+- `PetalDesk_0.6.3_x64-setup.exe.sig`
 - `latest.json`
-- `PetalDesk_0.6.2_universal.dmg`
-- `PetalDesk_Firefox_AMO-upload_0.6.2.zip`
-- `PetalDesk_Firefox_AMO-source_0.6.2.zip`
+- `PetalDesk_0.6.3_universal.dmg`
+- `PetalDesk_Firefox_AMO-upload_0.6.3.zip`
+- `PetalDesk_Firefox_AMO-source_0.6.3.zip`
 
-Windows `0.5.2` 及后续版本可以通过客户端自动更新到 `0.6.2`，无需先在本机手工打包或安装。macOS 的 `0.5.0` 是首个公开版本，`0.6.2` 可以直接覆盖升级。MFA 保险库继续兼容已有 DPAPI/Keychain 包装；Windows 密码保险库使用独立数据密钥，并与 MFA 协调同一个全局恢复密码。
+Windows `0.5.2` 及后续版本可以通过客户端自动更新到 `0.6.3`，无需先在本机手工打包或安装。macOS 的 `0.5.0` 是首个公开版本，`0.6.3` 可以直接覆盖升级。MFA 保险库继续兼容已有 DPAPI/Keychain 包装；Windows 密码保险库使用独立数据密钥，并与 MFA 协调同一个全局恢复密码。
 
 ## 本地构建
 
@@ -83,7 +83,7 @@ Windows 包始终包含并注册 Firefox Native Messaging Host。构建 Chromium
 - Firefox 扩展安装页：<https://starsliao.github.io/PetalDesk/firefox.html>
 - 浏览器增强隐私政策：<https://starsliao.github.io/PetalDesk/privacy.html>
 
-AMO 公开提交前应先把包含这两个页面的 `main` 分支推送并等待 Pages 部署成功，再创建 `v0.6.2` 标签和提交 AMO，避免审核材料引用尚未上线的页面。
+AMO 公开提交前应先把包含这两个页面的 `main` 分支推送并等待 Pages 部署成功，再创建 `v0.6.3` 标签和提交 AMO，避免审核材料引用尚未上线的页面。
 
 本地生成带版本号的 AMO 上传包：
 
@@ -95,4 +95,4 @@ npm --prefix browser-extension run package:firefox
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.6.2>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.6.3>

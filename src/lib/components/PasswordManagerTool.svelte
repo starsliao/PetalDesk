@@ -47,6 +47,7 @@
 
   type EditorMode = "add" | "edit";
   type RecoveryMode = "setup" | "reuse" | "unlock" | "change";
+  const BROWSER_STATUS_POLL_MS = 10_000;
 
   let { api = passwordApi }: Props = $props();
 
@@ -75,6 +76,7 @@
   let revealTimers = new Map<string, number>();
   let countdownTimer: number | null = null;
   let browserStatusTimer: number | null = null;
+  let browserStatusRefreshInFlight: Promise<void> | null = null;
   let templateExpiryTimer: number | null = null;
   let unlistenEntriesChanged: (() => void) | undefined;
   let unlistenTemplateRecording: (() => void) | undefined;
@@ -415,12 +417,18 @@
     }
     if (fillBusy[entry.id]) return;
     fillBusy = setBusy(fillBusy, entry.id, true);
-    if (browser?.connection === "connected" && browser.capturePermission === "unavailable") {
+    if (browser?.connection === "connected"
+      && (browser.capturePermission === "unavailable" || browser.capturePermission === "unknown" || !browser.capturePermission)) {
+      const communicationFailed = browser.capturePermission === "unknown" || !browser.capturePermission;
       try {
         await notesApi.openExternalLink(entry.loginUrl);
-        error = "当前 Firefox 扩展不支持密码填充，请更新扩展；站点已直接打开。";
+        error = communicationFailed
+          ? "Firefox 扩展通信异常，暂时无法确认密码权限；站点已直接打开。"
+          : "当前 Firefox 扩展不支持密码填充，请更新扩展；站点已直接打开。";
       } catch (reason) {
-        error = reasonMessage(reason, "当前扩展不支持密码填充，且无法打开站点。");
+        error = reasonMessage(reason, communicationFailed
+          ? "Firefox 扩展通信异常，且无法打开站点。"
+          : "当前扩展不支持密码填充，且无法打开站点。");
       } finally {
         fillBusy = setBusy(fillBusy, entry.id, false);
       }
@@ -449,8 +457,7 @@
       error = "";
       showToast(`已在 Firefox 中打开“${entry.siteName}”，请在页面确认填充`);
     } catch (reason) {
-      const refreshedBrowser = await api.getBrowserStatus().catch(() => browser);
-      if (refreshedBrowser) browser = refreshedBrowser;
+      await refreshBrowserStatus().catch(() => undefined);
       if (browser?.capturePermission === "action-required") {
         authorizationRequested = true;
         error = "请点击 Firefox 工具栏中的飞花图标完成密码权限授权；授权后回到已打开的页面确认填充，无需再次点击。";
@@ -642,15 +649,17 @@
       status = await api.setCaptureEnabled(enabled);
       syncRequiredRecovery(status);
       authorizationRequested = enabled;
-      browser = await api.getBrowserStatus();
+      await refreshBrowserStatus();
       if (!enabled) {
         showToast("登录信息检测已关闭");
-      } else if (browser.capturePermission === "granted") {
+      } else if (browser?.capturePermission === "granted") {
         authorizationRequested = false;
         showToast("登录信息检测已开启");
-      } else if (browser.capturePermission === "action-required") {
+      } else if (browser?.capturePermission === "action-required") {
         showToast("检测设置已保存，请在 Firefox 中完成授权");
-      } else if (browser.capturePermission === "unavailable") {
+      } else if (browser?.capturePermission === "unknown" || !browser?.capturePermission) {
+        showToast("检测设置已保存，但 Firefox 扩展通信异常");
+      } else if (browser?.capturePermission === "unavailable") {
         showToast("检测设置已保存，但当前扩展不支持密码权限");
       } else {
         showToast("登录信息检测设置已保存");
@@ -662,18 +671,46 @@
     }
   }
 
-  async function refreshBrowserStatus(announceGrant = false): Promise<void> {
-    const previousPermission = browser?.capturePermission;
-    const next = await api.getBrowserStatus();
-    browser = next;
-    if (next.capturePermission === "granted") {
-      const newlyGranted = previousPermission === "action-required" || authorizationRequested;
-      authorizationRequested = false;
-      if (announceGrant && newlyGranted) {
-        error = "";
-        showToast(status?.captureEnabled ? "Firefox 已授权，登录信息检测已开启" : "Firefox 密码填充已授权");
+  function refreshBrowserStatus(announceGrant = false): Promise<void> {
+    if (browserStatusRefreshInFlight) return browserStatusRefreshInFlight;
+    const request = (async () => {
+      const previousPermission = browser?.capturePermission;
+      const next = await api.getBrowserStatus();
+      browser = next;
+      if (next.capturePermission === "granted") {
+        const newlyGranted = previousPermission === "action-required" || authorizationRequested;
+        authorizationRequested = false;
+        if (announceGrant && newlyGranted) {
+          error = "";
+          showToast(status?.captureEnabled ? "Firefox 已授权，登录信息检测已开启" : "Firefox 密码填充已授权");
+        }
       }
-    }
+    })();
+    browserStatusRefreshInFlight = request;
+    void request.then(
+      () => {
+        if (browserStatusRefreshInFlight === request) browserStatusRefreshInFlight = null;
+      },
+      () => {
+        if (browserStatusRefreshInFlight === request) browserStatusRefreshInFlight = null;
+      },
+    );
+    return request;
+  }
+
+  function scheduleBrowserStatusRefresh(): void {
+    if (destroyed || !api.isDesktop()) return;
+    if (browserStatusTimer !== null) window.clearTimeout(browserStatusTimer);
+    browserStatusTimer = window.setTimeout(async () => {
+      browserStatusTimer = null;
+      try {
+        await refreshBrowserStatus(true);
+      } catch {
+        // The normalized desktop API normally reports communication errors as status.
+      } finally {
+        scheduleBrowserStatusRefresh();
+      }
+    }, BROWSER_STATUS_POLL_MS);
   }
 
   async function lockVault(): Promise<void> {
@@ -758,17 +795,7 @@
     clearEditorInputs();
     clearRecoveryInputs();
     if (templateRecording) {
-      try {
-        await api.cancelTemplateRecording(templateRecording.sessionId);
-      } catch {
-        // The backend also expires recording sessions when the tool closes.
-      }
       clearTemplateRecording();
-    }
-    try {
-      await api.lock();
-    } catch {
-      // Closing must remain available while the backend is shutting down.
     }
     if (!api.isDesktop()) {
       window.close();
@@ -812,9 +839,7 @@
     void refresh();
     countdownTimer = window.setInterval(() => (now = Date.now()), 1_000);
     if (api.isDesktop()) {
-      browserStatusTimer = window.setInterval(() => {
-        void refreshBrowserStatus(true).catch(() => undefined);
-      }, 3_000);
+      scheduleBrowserStatusRefresh();
       void import("@tauri-apps/api/event")
         .then(async ({ listen }) => {
           const cleanup = await listen<{ entryId?: string; action?: string }>("password_entries_changed", ({ payload }) => {
@@ -865,7 +890,7 @@
     unlistenTemplateRecording?.();
     unlistenTemplateRecording = undefined;
     if (countdownTimer !== null) window.clearInterval(countdownTimer);
-    if (browserStatusTimer !== null) window.clearInterval(browserStatusTimer);
+    if (browserStatusTimer !== null) window.clearTimeout(browserStatusTimer);
     if (templateExpiryTimer !== null) window.clearTimeout(templateExpiryTimer);
     for (const timer of revealTimers.values()) window.clearTimeout(timer);
     revealed = {};
@@ -962,6 +987,14 @@
         <span>点击 Firefox 工具栏中的飞花图标完成授权，然后回到已打开的页面确认填充，无需再次点击；登录信息检测也会按设置运行。</span>
       </div>
     </div>
+  {:else if browser?.connection === "connected" && (browser.capturePermission === "unknown" || !browser.capturePermission) && status?.captureEnabled}
+    <div class="consent-banner permission-banner" role="alert">
+      <div class="banner-icon" aria-hidden="true"><AlertTriangle size={17} /></div>
+      <div class="banner-copy">
+        <strong>Firefox 扩展通信异常</strong>
+        <span>暂时无法读取密码权限状态；登录信息检测暂未运行，飞花会自动重试。</span>
+      </div>
+    </div>
   {:else if browser?.connection === "connected" && browser.capturePermission === "unavailable" && status?.captureEnabled}
     <div class="consent-banner permission-banner" role="alert">
       <div class="banner-icon" aria-hidden="true"><AlertTriangle size={17} /></div>
@@ -1013,7 +1046,8 @@
           {@const revealedEntry = revealFor(entry)}
           {@const canFill = browser?.connection === "connected"}
           {@const fillPermission = browser?.capturePermission}
-          {@const fillActionLabel = !canFill || fillPermission === "unavailable" ? "打开站点" : fillPermission === "action-required" ? "授权后填充" : "打开并填充"}
+          {@const fillStatusUnavailable = fillPermission === "unavailable" || fillPermission === "unknown" || !fillPermission}
+          {@const fillActionLabel = !canFill || fillStatusUnavailable ? "打开站点" : fillPermission === "action-required" ? "授权后填充" : "打开并填充"}
           <article class="entry-row" data-testid={`password-entry-${entry.id}`}>
             <div class="entry-site-mark" aria-hidden="true">{shortSiteName(entry).slice(0, 1).toUpperCase()}</div>
             <div class="entry-main">
@@ -1027,7 +1061,7 @@
               {#if revealedEntry}<small>{revealCountdown(entry)} 秒后隐藏</small>{/if}
             </div>
             <div class="entry-actions">
-              <button type="button" class="icon-button" data-tooltip={fillPermission === "action-required" ? "先授权 Firefox 密码权限" : canFill && fillPermission !== "unavailable" ? (isHttpUrl(entry.loginUrl) ? "通过 HTTP 打开并填充" : "打开并填充") : "打开站点"} aria-label={`${fillActionLabel} ${entry.siteName}`} disabled={Boolean(fillBusy[entry.id])} onclick={() => void openAndFill(entry)}><ExternalLink size={15} aria-hidden="true" /></button>
+              <button type="button" class="icon-button" data-tooltip={fillPermission === "action-required" ? "先授权 Firefox 密码权限" : canFill && !fillStatusUnavailable ? (isHttpUrl(entry.loginUrl) ? "通过 HTTP 打开并填充" : "打开并填充") : fillPermission === "unknown" ? "扩展通信异常，暂时仅打开站点" : "打开站点"} aria-label={`${fillActionLabel} ${entry.siteName}`} disabled={Boolean(fillBusy[entry.id])} onclick={() => void openAndFill(entry)}><ExternalLink size={15} aria-hidden="true" /></button>
               <button type="button" class="icon-button" data-tooltip="复制用户名" aria-label={`复制 ${entry.siteName} 用户名`} disabled={copyBusy?.[entry.id] === "username"} onclick={() => void copyUsername(entry)}><Clipboard size={15} aria-hidden="true" /></button>
               <button type="button" class="icon-button" data-tooltip={revealedEntry ? "隐藏密码" : "显示密码"} aria-label={revealedEntry ? "隐藏密码" : "显示密码"} disabled={Boolean(revealBusy[entry.id])} onclick={() => void revealPassword(entry)}>{#if revealedEntry}<EyeOff size={15} aria-hidden="true" />{:else}<Eye size={15} aria-hidden="true" />{/if}</button>
               <button type="button" class="icon-button" data-tooltip="复制密码" aria-label={`复制 ${entry.siteName} 密码`} disabled={copyBusy?.[entry.id] === "password"} onclick={() => void copyPassword(entry)}><Copy size={15} aria-hidden="true" /></button>

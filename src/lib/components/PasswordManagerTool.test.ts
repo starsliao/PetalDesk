@@ -149,6 +149,77 @@ describe("PasswordManagerTool", () => {
     expect(view.queryByText(/已在 Firefox 中打开/)).not.toBeInTheDocument();
   });
 
+  it("reports an unknown connected permission as a communication error", async () => {
+    const base = createBrowserPasswordApi();
+    const browser = {
+      browser: "firefox" as const,
+      connection: "connected" as const,
+      extensionInstalled: true,
+      nativeHostInstalled: true,
+      capturePermission: "unknown" as const,
+    };
+    const status: PasswordStatus = {
+      available: true,
+      locked: false,
+      entryCount: 3,
+      protection: "windows-dpapi-recovery-password",
+      recoveryState: "ready",
+      sharedRecoveryConfigured: true,
+      captureEnabled: true,
+      captureConfigured: true,
+      browser,
+    };
+    const api: PasswordApi = {
+      ...base,
+      getStatus: vi.fn().mockResolvedValue(status),
+      getBrowserStatus: vi.fn().mockResolvedValue(browser),
+    };
+    const view = render(PasswordManagerTool, { api });
+
+    expect(await view.findByText("Firefox 扩展通信异常")).toBeInTheDocument();
+    expect(view.getByRole("alert")).toHaveTextContent("自动重试");
+    expect(view.queryByText(/请更新 Firefox 扩展/)).not.toBeInTheDocument();
+  });
+
+  it("polls browser status ten seconds after completion without overlapping requests", async () => {
+    vi.useFakeTimers();
+    const base = createBrowserPasswordApi();
+    const connected = {
+      browser: "firefox" as const,
+      connection: "connected" as const,
+      extensionInstalled: true,
+      nativeHostInstalled: true,
+      capturePermission: "granted" as const,
+    };
+    let resolvePending: ((value: typeof connected) => void) | undefined;
+    const getBrowserStatus = vi.fn()
+      .mockResolvedValueOnce(connected)
+      .mockImplementationOnce(() => new Promise<typeof connected>((resolve) => {
+        resolvePending = resolve;
+      }))
+      .mockResolvedValue(connected);
+    const api: PasswordApi = {
+      ...base,
+      isDesktop: () => true,
+      getBrowserStatus,
+    };
+    render(PasswordManagerTool, { api });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getBrowserStatus).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(getBrowserStatus).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(getBrowserStatus).toHaveBeenCalledTimes(2);
+
+    resolvePending?.(connected);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(getBrowserStatus).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(getBrowserStatus).toHaveBeenCalledTimes(3);
+  });
+
   it("starts and cancels template recording when Firefox is connected", async () => {
     const base = createBrowserPasswordApi();
     const connected = {
@@ -476,7 +547,7 @@ describe("PasswordManagerTool", () => {
     expect(lock).toHaveBeenCalledOnce();
   });
 
-  it("closes the native password window after locking the vault", async () => {
+  it("closes the native password window without waiting for a vault lock command", async () => {
     const base = createBrowserPasswordApi();
     const lock = vi.fn().mockResolvedValue(undefined);
     const api: PasswordApi = {
@@ -490,8 +561,44 @@ describe("PasswordManagerTool", () => {
     await fireEvent.click(view.getByRole("button", { name: "关闭密码管理器" }));
 
     await waitFor(() => expect(nativeWindowHarness.close).toHaveBeenCalledOnce());
-    expect(lock).toHaveBeenCalledOnce();
+    expect(lock).not.toHaveBeenCalled();
     expect(nativeWindowHarness.destroy).not.toHaveBeenCalled();
+  });
+
+  it("closes immediately during template recording without waiting for Firefox", async () => {
+    const base = createBrowserPasswordApi();
+    const connected = {
+      browser: "firefox" as const,
+      connection: "connected" as const,
+      extensionInstalled: true,
+      nativeHostInstalled: true,
+      extensionVersion: "0.6.3",
+      installUrl: null,
+      capturePermission: "granted" as const,
+    };
+    const cancelTemplateRecording = vi.fn(() => new Promise<void>(() => {}));
+    const api: PasswordApi = {
+      ...base,
+      isDesktop: () => true,
+      getBrowserStatus: vi.fn().mockResolvedValue(connected),
+      startTemplateRecording: vi.fn().mockResolvedValue({
+        sessionId: "recording-close",
+        entryId: "browser-demo-google-work",
+        origin: "https://accounts.google.com",
+        state: "recording",
+        expiresAt: Date.now() + 60_000,
+      }),
+      cancelTemplateRecording,
+    };
+    const view = render(PasswordManagerTool, { api });
+    await view.findByText("demo@example.com");
+    await fireEvent.click(view.getAllByRole("button", { name: "录制 Google Workspace 模板" })[0]);
+    expect(await view.findByText("正在录制站点模板")).toBeInTheDocument();
+
+    await fireEvent.click(view.getByRole("button", { name: "关闭密码管理器" }));
+
+    await waitFor(() => expect(nativeWindowHarness.close).toHaveBeenCalledOnce());
+    expect(cancelTemplateRecording).not.toHaveBeenCalled();
   });
 
   it("destroys the native password window when graceful close fails", async () => {

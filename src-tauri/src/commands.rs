@@ -749,9 +749,13 @@ fn close_sensitive_window_for_remote_session(app: &AppHandle, label: &str) {
             app.state::<crate::mfa::MfaStore>().lock();
         }
         PASSWORD_WINDOW_LABEL => {
-            app.state::<crate::password_browser::PasswordBrowserService>()
-                .suspend_capture();
             app.state::<crate::passwords::PasswordStore>().lock();
+            let cleanup_app = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                cleanup_app
+                    .state::<crate::password_browser::PasswordBrowserService>()
+                    .suspend_capture();
+            });
         }
         _ => {}
     }

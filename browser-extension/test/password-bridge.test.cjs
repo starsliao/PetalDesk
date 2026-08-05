@@ -24,9 +24,25 @@ function loadBridge({ authenticationInfo = true } = {}) {
   const tabMessages = [];
   let nextTabId = 40;
   let permissionRequests = 0;
+  const actionUpdates = {
+    badgeColors: [],
+    badgeTexts: [],
+    titles: [],
+  };
   const api = {
     browserFamily: "firefox",
-    action: { onClicked: actionClicks },
+    action: {
+      onClicked: actionClicks,
+      async setBadgeBackgroundColor(value) {
+        actionUpdates.badgeColors.push(JSON.parse(JSON.stringify(value)));
+      },
+      async setBadgeText(value) {
+        actionUpdates.badgeTexts.push(JSON.parse(JSON.stringify(value)));
+      },
+      async setTitle(value) {
+        actionUpdates.titles.push(JSON.parse(JSON.stringify(value)));
+      },
+    },
     permissions: { onRemoved: permissionRemovals },
     async createTab({ url }) {
       const tab = { id: ++nextTabId, url };
@@ -105,6 +121,7 @@ function loadBridge({ authenticationInfo = true } = {}) {
     return result;
   }
   return {
+    actionUpdates,
     actionClicks,
     api,
     bridge,
@@ -137,6 +154,26 @@ test("consent request is armed by native command and requested only by toolbar g
   assert.equal(harness.events.at(-1).event, "consentChanged");
   assert.equal(harness.events.at(-1).payload.granted, true);
   assert.equal(harness.events.at(-1).payload.actionRequired, null);
+  assert.deepEqual(harness.actionUpdates.badgeTexts.at(-1), { text: "OK" });
+  assert.match(harness.actionUpdates.titles.at(-1).title, /已授权/);
+});
+
+test("toolbar click reports an already granted permission", async () => {
+  const harness = loadBridge({ authenticationInfo: true });
+  harness.actionClicks.listeners[0]();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.permissionRequests(), 0);
+  assert.deepEqual(harness.actionUpdates.badgeTexts.at(-1), { text: "OK" });
+  assert.match(harness.actionUpdates.titles.at(-1).title, /已授权/);
+});
+
+test("toolbar click explains when desktop consent has not been armed", async () => {
+  const harness = loadBridge({ authenticationInfo: false });
+  harness.actionClicks.listeners[0]();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.permissionRequests(), 0);
+  assert.deepEqual(harness.actionUpdates.badgeTexts.at(-1), { text: "!" });
+  assert.match(harness.actionUpdates.titles.at(-1).title, /桌面端/);
 });
 
 test("a direct fill attempt arms Firefox consent and succeeds only after the toolbar gesture", async () => {
