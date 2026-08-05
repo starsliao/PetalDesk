@@ -2,7 +2,7 @@
 
 ## Dependency
 
-The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.6.3/PetalDesk_0.6.3_x64-setup.exe.
+The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.7.0/PetalDesk_0.7.0_x64-setup.exe.
 
 The extension ID is fixed as `petaldesk-capture@petaldesk.app`, and the Native Messaging host name is `com.petaldesk.capture`.
 
@@ -40,13 +40,18 @@ The project has no runtime npm dependencies, bundler, minifier, generated JavaSc
 4. Choose **Fill**. Only then is the one-time credential sent. The username/password fields change and the form is not submitted.
 5. Choose **Cancel** in a new attempt and confirm no field changes.
 
-## Login-detection consent test
+## Toolbar popup and badge test
 
-1. Enable login detection in PetalDesk. The Native Messaging request only arms the consent flow.
-2. Click the PetalDesk Firefox toolbar icon. Firefox displays the optional authentication-information consent prompt from this direct user action.
-3. Decline: password capture remains disabled and long screenshots still work.
-4. Repeat and allow: submit a test form. A likely success prompts to save/update; an unchanged account creates no prompt after PetalDesk's match decision.
-5. Disable login detection in PetalDesk and confirm subsequent submissions create no candidate.
+1. With accounts saved for a site, open that site: the toolbar badge shows the saved-account count for the exact origin and refreshes on tab switch, navigation, and vault changes. Lock the vault manually in PetalDesk: the badge clears.
+2. Click the toolbar button: the popup shows layered diagnostics (install-time data permission, Native Host stdio, desktop password channel, recent request outcome, extension version), the current site's account list, and an **Open PetalDesk password manager** button.
+3. Choose an account in the popup: a fill starts on the current page and still requires the in-page overlay confirmation; the form is not submitted.
+
+## Login-detection test
+
+1. The `authenticationInfo` data permission is granted once at installation together with `websiteActivity`; there is no runtime or toolbar consent prompt. Confirm password features work immediately after installation.
+2. Enable login detection in PetalDesk and submit a test form. A likely success prompts to save as a new account or update an existing one (with a choice of which account); an unchanged account creates no prompt after PetalDesk's match decision.
+3. Lock the vault manually in PetalDesk and submit again: the prompt reports the locked state instead of offering a save.
+4. Disable login detection in PetalDesk and confirm subsequent submissions create no candidate.
 
 ## Local no-real-account fixture
 

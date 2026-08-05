@@ -1,0 +1,124 @@
+:root {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  min-width: 300px;
+  max-width: 340px;
+  font: 13px/1.5 system-ui, sans-serif;
+  color: #17202a;
+  background: #f7f9fb;
+}
+
+.popup {
+  padding: 12px 14px 14px;
+}
+
+h1 {
+  font-size: 15px;
+  margin: 0 0 10px;
+}
+
+h2 {
+  font-size: 12px;
+  color: #566573;
+  margin: 12px 0 6px;
+}
+
+.diagnostics,
+.accounts {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.diagnostics li {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.diagnostics .label {
+  color: #566573;
+  flex: none;
+}
+
+.diagnostics .value {
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.diagnostics .value.ok {
+  color: #2e7d32;
+}
+
+.diagnostics .value.warn {
+  color: #b26a00;
+}
+
+.origin {
+  font-weight: 600;
+  margin: 0 0 4px;
+  overflow-wrap: anywhere;
+}
+
+.status {
+  color: #566573;
+  margin: 0 0 8px;
+}
+
+.accounts li {
+  margin-bottom: 6px;
+}
+
+button {
+  border: 1px solid #9aa8b5;
+  border-radius: 5px;
+  background: #fff;
+  color: #17202a;
+  cursor: pointer;
+  font: 600 12px system-ui, sans-serif;
+  padding: 7px 10px;
+}
+
+button.primary {
+  background: #1769aa;
+  border-color: #1769aa;
+  color: #fff;
+  width: 100%;
+  margin-top: 12px;
+}
+
+button.account {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+}
+
+button.account:hover,
+button.primary:hover {
+  filter: brightness(0.96);
+}
+
+button.account .site {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+button.account .username {
+  color: #566573;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+
+.version {
+  color: #93a1af;
+  font-size: 11px;
+  margin: 8px 0 0;
+  text-align: right;
+}

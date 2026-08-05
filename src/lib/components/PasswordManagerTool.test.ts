@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { notesApi } from "../bridge";
-import { createBrowserPasswordApi, type PasswordApi, type PasswordStatus } from "../passwords";
+import { createBrowserPasswordApi, type PasswordApi, type PasswordBrowserStatus, type PasswordStatus } from "../passwords";
 import PasswordManagerTool from "./PasswordManagerTool.svelte";
 
 const eventHarness = vi.hoisted(() => {
@@ -115,14 +115,16 @@ describe("PasswordManagerTool", () => {
     expect(await view.findByText(/可从飞花复制账号和密码/)).toBeInTheDocument();
   });
 
-  it("does not report fill as started while Firefox toolbar authorization is required", async () => {
+  it("fills directly without any Firefox authorization step when connected", async () => {
     const base = createBrowserPasswordApi();
     const browser = {
       browser: "firefox" as const,
       connection: "connected" as const,
       extensionInstalled: true,
       nativeHostInstalled: true,
-      capturePermission: "action-required" as const,
+      capturePermission: "granted" as const,
+      stdioConnected: true,
+      pipeConnected: true,
     };
     const startFill = vi.fn().mockResolvedValue({
       sessionId: "fill-1",
@@ -130,7 +132,6 @@ describe("PasswordManagerTool", () => {
       browser: "firefox",
       origin: "https://accounts.google.com",
       expiresAt: Date.now() + 60_000,
-      actionRequired: "toolbar-click",
     });
     const api: PasswordApi = {
       ...base,
@@ -140,24 +141,16 @@ describe("PasswordManagerTool", () => {
     const view = render(PasswordManagerTool, { api });
     await view.findByText("demo@example.com");
 
-    await fireEvent.click(view.getAllByRole("button", { name: "授权后填充 Google Workspace" })[0]);
+    await fireEvent.click(view.getAllByRole("button", { name: "打开并填充 Google Workspace" })[0]);
 
     await waitFor(() => expect(startFill).toHaveBeenCalledWith("browser-demo-google-work"));
     expect(startFill).toHaveBeenCalledTimes(1);
-    expect(await view.findByText("Firefox 密码权限等待授权")).toBeInTheDocument();
-    expect(view.getByRole("alert")).toHaveTextContent("授权后回到已打开的页面确认填充，无需再次点击");
-    expect(view.queryByText(/已在 Firefox 中打开/)).not.toBeInTheDocument();
+    expect(await view.findByText(/已在 Firefox 中打开/)).toBeInTheDocument();
+    expect(view.queryByText(/等待授权|授权后填充/)).not.toBeInTheDocument();
   });
 
-  it("reports an unknown connected permission as a communication error", async () => {
+  function captureEnabledHarness(browser: PasswordBrowserStatus): PasswordApi {
     const base = createBrowserPasswordApi();
-    const browser = {
-      browser: "firefox" as const,
-      connection: "connected" as const,
-      extensionInstalled: true,
-      nativeHostInstalled: true,
-      capturePermission: "unknown" as const,
-    };
     const status: PasswordStatus = {
       available: true,
       locked: false,
@@ -169,16 +162,112 @@ describe("PasswordManagerTool", () => {
       captureConfigured: true,
       browser,
     };
-    const api: PasswordApi = {
+    return {
       ...base,
       getStatus: vi.fn().mockResolvedValue(status),
       getBrowserStatus: vi.fn().mockResolvedValue(browser),
     };
+  }
+
+  it("reports an unknown connected permission as a communication error", async () => {
+    const api = captureEnabledHarness({
+      browser: "firefox",
+      connection: "connected",
+      extensionInstalled: true,
+      nativeHostInstalled: true,
+      capturePermission: "unknown",
+      stdioConnected: true,
+      pipeConnected: true,
+    });
     const view = render(PasswordManagerTool, { api });
 
     expect(await view.findByText("Firefox 扩展通信异常")).toBeInTheDocument();
     expect(view.getByRole("alert")).toHaveTextContent("自动重试");
+    expect(view.getByRole("alert")).toHaveTextContent("暂时无法读取密码权限状态");
     expect(view.queryByText(/请更新 Firefox 扩展/)).not.toBeInTheDocument();
+  });
+
+  it("points at the extension install when the stdio layer is down", async () => {
+    const api = captureEnabledHarness({
+      browser: "firefox",
+      connection: "connected",
+      extensionInstalled: true,
+      nativeHostInstalled: true,
+      capturePermission: "unknown",
+      stdioConnected: false,
+      pipeConnected: false,
+    });
+    const view = render(PasswordManagerTool, { api });
+
+    expect(await view.findByText("Firefox 扩展通信异常")).toBeInTheDocument();
+    expect(view.getByRole("alert")).toHaveTextContent("未检测到 Firefox 扩展连接，请确认扩展已安装并启用");
+  });
+
+  it("reports a missing secret pipe while the extension is connected", async () => {
+    const api = captureEnabledHarness({
+      browser: "firefox",
+      connection: "connected",
+      extensionInstalled: true,
+      nativeHostInstalled: true,
+      capturePermission: "unknown",
+      stdioConnected: true,
+      pipeConnected: false,
+    });
+    const view = render(PasswordManagerTool, { api });
+
+    expect(await view.findByText("Firefox 扩展通信异常")).toBeInTheDocument();
+    expect(view.getByRole("alert")).toHaveTextContent("Firefox 扩展已连接，桌面密码通道未建立，正在自动重试");
+  });
+
+  it("renders layered connection diagnostics and copies them as plain text", async () => {
+    const clipboardWrite = vi.fn().mockResolvedValue(undefined);
+    const previousClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: clipboardWrite } });
+    try {
+      const api = captureEnabledHarness({
+        browser: "firefox",
+        connection: "connected",
+        extensionInstalled: true,
+        nativeHostInstalled: true,
+        extensionVersion: "1.2.0",
+        capturePermission: "granted",
+        stdioConnected: true,
+        pipeConnected: true,
+        connectionId: "connection-abcdef",
+        lastRequestOutcome: {
+          atUnixMs: 1_800_000_001_000,
+          layer: "request",
+          event: "failed",
+          detail: "command=password.getStatus requestId=abc12345 outcome=timeout",
+        },
+        diagnostics: [
+          { atUnixMs: 1_800_000_000_000, layer: "stdio", event: "connected", detail: "connection-abcdef" },
+          { atUnixMs: 1_800_000_001_000, layer: "request", event: "failed", detail: "command=password.getStatus requestId=abc12345 outcome=timeout" },
+        ],
+      });
+      const view = render(PasswordManagerTool, { api });
+      const panel = (await view.findByTestId("connection-diagnostics")) as HTMLDetailsElement;
+      expect(panel.open).toBe(false);
+      expect(panel).toHaveTextContent("已随安装授予");
+      expect(panel).toHaveTextContent("已连接");
+      expect(panel).toHaveTextContent("已建立");
+      expect(panel).toHaveTextContent("1.2.0");
+      expect(panel).toHaveTextContent("connecti…");
+      expect(panel).toHaveTextContent(/failed · 失败/);
+
+      await fireEvent.click(view.getByRole("button", { name: "复制诊断信息" }));
+
+      await waitFor(() => expect(clipboardWrite).toHaveBeenCalledOnce());
+      const text = clipboardWrite.mock.calls[0][0] as string;
+      const lines = text.split("\n");
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toContain("stdio connected connection-abcdef");
+      expect(lines[1]).toContain("request failed command=password.getStatus requestId=abc12345 outcome=timeout");
+      expect(await view.findByText("诊断信息已复制")).toBeInTheDocument();
+    } finally {
+      if (previousClipboard) Object.defineProperty(navigator, "clipboard", previousClipboard);
+      else Reflect.deleteProperty(navigator, "clipboard");
+    }
   });
 
   it("polls browser status ten seconds after completion without overlapping requests", async () => {

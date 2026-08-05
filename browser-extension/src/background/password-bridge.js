@@ -7,16 +7,18 @@
   }
 
   const CONTENT_MESSAGE_TYPE = "petaldesk.password.command";
+  const CONTENT_MESSAGE_PREFIX = "petaldesk.password.";
+  const POPUP_MESSAGE_PREFIX = "petaldesk.popup.";
   const SESSION_TTL_MS = 5 * 60 * 1_000;
   const RECORDING_TTL_MS = 5 * 60 * 1_000;
   const CANDIDATE_TTL_MS = 30_000;
   const USERNAME_STAGE_TTL_MS = 2 * 60 * 1_000;
-  const CONSENT_ARM_TTL_MS = 2 * 60 * 1_000;
-  const TOOLBAR_FEEDBACK_TTL_MS = 3_000;
+  const BADGE_ACCOUNT_LIMIT = 16;
   const CAPABILITY_GROUPS = Object.freeze(["password-fill", "password-capture"]);
   const COMMANDS = new Set([
     "password.open",
     "password.offerFill",
+    "password.offerFillDirect",
     "password.provideCredentials",
     "password.cancelFill",
     "password.requestConsent",
@@ -27,6 +29,7 @@
     "password.startTemplateRecording",
     "password.cancelTemplateRecording",
     "password.getStatus",
+    "password.updateBadge",
   ]);
   const SAVE_ACTIONS = new Set(["new", "update", "replace", "ignore"]);
 
@@ -88,36 +91,31 @@
     const candidates = new Map();
     const captureUsernames = new Map();
     const recordings = new Map();
+    const tabContexts = new Map();
+    const tabAccounts = new Map();
+    const diagnostics = {
+      lastCommandAt: null,
+      lastCommandErrorCode: null,
+      lastCommandOk: null,
+      nativeConnected: false,
+      secretConnected: false,
+    };
     let captureEnabled = false;
     let captureInsecureOrigins = new Set();
-    let consentArmedUntil = 0;
-    let authenticationConsentGranted = null;
-    let toolbarFeedbackTimer = null;
 
-    function callToolbarAction(method, details) {
-      if (!api.action || typeof api.action[method] !== "function") return;
+    function setBadgeText(tabId, text) {
+      if (!api.action || typeof api.action.setBadgeText !== "function") return;
       try {
-        const result = api.action[method](details);
+        const result = api.action.setBadgeText({ tabId, text });
         if (result && typeof result.catch === "function") void result.catch(() => {});
       } catch {
-        // Toolbar feedback is best-effort and must not interrupt permission handling.
+        // Badge updates are best-effort and must not interrupt command handling.
       }
     }
 
-    function showToolbarFeedback(text, title, color) {
-      if (!api.action) return;
-      if (toolbarFeedbackTimer != null) clearTimeout(toolbarFeedbackTimer);
-      callToolbarAction("setBadgeBackgroundColor", { color });
-      callToolbarAction("setBadgeText", { text });
-      callToolbarAction("setTitle", { title });
-      toolbarFeedbackTimer = setTimeout(() => {
-        toolbarFeedbackTimer = null;
-        callToolbarAction("setBadgeText", { text: "" });
-        callToolbarAction("setTitle", { title: "飞花：授权密码管理" });
-      }, TOOLBAR_FEEDBACK_TTL_MS);
-      if (toolbarFeedbackTimer && typeof toolbarFeedbackTimer.unref === "function") {
-        toolbarFeedbackTimer.unref();
-      }
+    function clearTabAccounts(tabId) {
+      tabAccounts.delete(tabId);
+      setBadgeText(tabId, "");
     }
 
     function postEvent(event, payload) {
@@ -261,58 +259,6 @@
       if (recording.timer && typeof recording.timer.unref === "function") recording.timer.unref();
     }
 
-    function consentGranted(permissions) {
-      return Boolean(
-        permissions
-        && Array.isArray(permissions.data_collection)
-        && permissions.data_collection.includes("authenticationInfo"),
-      );
-    }
-
-    async function hasAuthenticationConsent() {
-      const granted = consentGranted(await api.getAllPermissions());
-      if (authenticationConsentGranted === true && !granted) {
-        await handleAuthenticationConsentLoss();
-      }
-      authenticationConsentGranted = granted;
-      return granted;
-    }
-
-    async function handleAuthenticationConsentLoss() {
-      authenticationConsentGranted = false;
-      captureEnabled = false;
-      consentArmedUntil = 0;
-      await broadcastCaptureState().catch(() => {});
-      for (const sessionId of Array.from(sessions.keys())) clearSession(sessionId);
-      clearCaptureState();
-      postEvent("consentChanged", {
-        actionRequired: "toolbar-click",
-        dataCollection: "authenticationInfo",
-        granted: false,
-        userGestureRequired: true,
-      });
-    }
-
-    function armAuthenticationConsent() {
-      consentArmedUntil = Date.now() + CONSENT_ARM_TTL_MS;
-      postEvent("consentRequired", {
-        actionRequired: "toolbar-click",
-        dataCollection: "authenticationInfo",
-        granted: false,
-        userGestureRequired: true,
-      });
-    }
-
-    async function requireAuthenticationConsent() {
-      if (!await hasAuthenticationConsent()) {
-        armAuthenticationConsent();
-        throw bridgeError(
-          "AUTHENTICATION_CONSENT_REQUIRED",
-          "Click the PetalDesk Firefox toolbar button to allow authentication information access",
-        );
-      }
-    }
-
     function normalizeInsecureOrigins(value) {
       if (!Array.isArray(value)) return new Set();
       const origins = value.map((item) => templates.exactOrigin(item));
@@ -409,11 +355,9 @@
       };
       sessions.set(sessionId, session);
       renewSession(session);
-      const authenticationConsent = await hasAuthenticationConsent();
-      if (!authenticationConsent) armAuthenticationConsent();
       return {
-        actionRequired: authenticationConsent ? null : "toolbar-click",
-        authenticationConsent,
+        actionRequired: null,
+        authenticationConsent: true,
         sessionId,
         tabId: tab.id,
         frameId: 0,
@@ -422,8 +366,7 @@
       };
     }
 
-    async function offerFill(payload) {
-      await requireAuthenticationConsent();
+    function rejectFillSecrets(payload) {
       if (
         Object.prototype.hasOwnProperty.call(payload, "password")
         || Object.prototype.hasOwnProperty.call(payload, "secret")
@@ -431,7 +374,9 @@
       ) {
         throw bridgeError("PASSWORD_PROTOCOL_INVALID", "A fill offer cannot contain a password");
       }
-      const session = sessionForPayload(payload);
+    }
+
+    async function dispatchFillOffer(session, payload) {
       if (session.state !== "ready") {
         throw bridgeError("PASSWORD_SESSION_STATE", `The fill session is ${session.state}`);
       }
@@ -465,8 +410,61 @@
       return { ...result, tabId: session.tabId, frameId: session.frameId };
     }
 
+    async function offerFill(payload) {
+      rejectFillSecrets(payload);
+      const session = sessionForPayload(payload);
+      return dispatchFillOffer(session, payload);
+    }
+
+    async function offerFillDirect(payload) {
+      rejectFillSecrets(payload);
+      const sessionId = requiredString(payload.sessionId, "sessionId", 160);
+      if (sessions.has(sessionId)) {
+        throw bridgeError("PASSWORD_SESSION_EXISTS", "The password fill session already exists");
+      }
+      const tabId = optionalRoutingId(payload.tabId, "tabId");
+      if (tabId == null) {
+        throw bridgeError("PASSWORD_TARGET_INVALID", "A fill target tab is required");
+      }
+      const frameId = optionalRoutingId(payload.frameId, "frameId") ?? 0;
+      const origin = templates.exactOrigin(payload.origin);
+      const allowInsecureHttp = payload.allowInsecureHttp === true;
+      if (origin.startsWith("http://") && !allowInsecureHttp) {
+        throw bridgeError(
+          "PASSWORD_INSECURE_ORIGIN",
+          "HTTP password filling requires an explicit per-origin opt-in",
+        );
+      }
+      const tab = await api.getTab(tabId).catch(() => null);
+      let tabOrigin = "";
+      try {
+        tabOrigin = templates.exactOrigin(tab && tab.url);
+      } catch (_error) {
+        tabOrigin = "";
+      }
+      if (tabOrigin !== origin) {
+        throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The fill target tab is not on the requested origin");
+      }
+      const session = {
+        allowInsecureHttp,
+        allowedOrigins: new Set([origin]),
+        documentId: payload.documentId ? String(payload.documentId) : null,
+        entryId: requiredString(payload.entryId, "entryId", 160),
+        expiresAt: 0,
+        frameId,
+        offerId: null,
+        origin,
+        sessionId,
+        state: "ready",
+        tabId,
+        timer: null,
+      };
+      sessions.set(sessionId, session);
+      renewSession(session);
+      return dispatchFillOffer(session, payload);
+    }
+
     async function provideCredentials(payload) {
-      await requireAuthenticationConsent();
       const session = sessionForPayload(payload);
       if (session.state !== "confirmed") {
         throw bridgeError("PASSWORD_SESSION_STATE", "The user has not confirmed this fill request");
@@ -544,7 +542,6 @@
     }
 
     async function startTemplateRecording(payload) {
-      await requireAuthenticationConsent();
       const sessionId = requiredString(payload.sessionId || payload.recordingId, "sessionId", 160);
       if (recordings.has(sessionId)) {
         throw bridgeError(
@@ -652,7 +649,6 @@
 
     async function setCaptureEnabled(payload) {
       const enabled = payload.enabled === true;
-      if (enabled) await requireAuthenticationConsent();
       captureInsecureOrigins = normalizeInsecureOrigins(payload.insecureOrigins);
       captureEnabled = enabled;
       if (!enabled) clearCaptureState();
@@ -664,12 +660,25 @@
     }
 
     async function requestConsent() {
-      if (await hasAuthenticationConsent()) {
-        consentArmedUntil = 0;
-        return { actionRequired: null, granted: true, userGestureRequired: false };
+      // Authentication access is now a required install-time permission, so the
+      // desktop's legacy consent probe always reports an already granted state.
+      return { actionRequired: null, granted: true, userGestureRequired: false };
+    }
+
+    async function updateBadge(payload) {
+      const tabId = optionalRoutingId(payload.tabId, "tabId");
+      if (tabId == null) {
+        throw bridgeError("PASSWORD_TARGET_INVALID", "A badge target tab is required");
       }
-      armAuthenticationConsent();
-      return { actionRequired: "toolbar-click", granted: false, userGestureRequired: true };
+      let origin = "";
+      if (payload.origin != null && String(payload.origin).trim() !== "") {
+        origin = templates.exactOrigin(payload.origin);
+      }
+      const locked = payload.locked === true;
+      const accounts = normalizeAccountChoices(payload.accounts, BADGE_ACCOUNT_LIMIT);
+      tabAccounts.set(tabId, { accounts, locked, origin });
+      setBadgeText(tabId, locked || accounts.length === 0 ? "" : String(accounts.length));
+      return { applied: true, tabId };
     }
 
     async function captureMatch(payload) {
@@ -680,7 +689,7 @@
         throw bridgeError("PASSWORD_CANDIDATE_EXPIRED", "The login candidate has expired");
       }
       const action = String(payload.action || "");
-      if (!new Set(["new", "update", "same", "select", "username-required"]).has(action)) {
+      if (!new Set(["new", "update", "same", "select", "username-required", "locked"]).has(action)) {
         throw bridgeError("PASSWORD_PROTOCOL_INVALID", "The capture match action is invalid");
       }
       if (!record.promoted) {
@@ -705,13 +714,15 @@
         },
         { frameId: record.frameId },
       ).catch(() => {});
-      if (action === "same" || action === "username-required") clearCandidate(candidateId);
+      if (action === "same" || action === "username-required" || action === "locked") {
+        clearCandidate(candidateId);
+      }
       return { action, candidateId };
     }
 
-    function normalizeAccountChoices(value) {
+    function normalizeAccountChoices(value, limit = 32) {
       if (!Array.isArray(value)) return [];
-      return value.slice(0, 32).flatMap((item) => {
+      return value.slice(0, limit).flatMap((item) => {
         if (!item || typeof item !== "object") return [];
         const entryId = String(item.entryId == null ? "" : item.entryId).trim();
         const username = String(item.username == null ? "" : item.username);
@@ -731,11 +742,10 @@
     }
 
     async function getStatus() {
-      const authenticationConsent = await hasAuthenticationConsent();
       return {
-        authenticationConsent,
-        consentActionRequired: authenticationConsent ? null : "toolbar-click",
-        consentArmed: !authenticationConsent && Date.now() < consentArmedUntil,
+        authenticationConsent: true,
+        consentActionRequired: null,
+        consentArmed: false,
         captureEnabled,
         pendingCandidates: candidates.size,
         pendingUsernameStages: captureUsernames.size,
@@ -744,12 +754,13 @@
       };
     }
 
-    async function route(request) {
+    function routeCommand(request) {
       const command = String(request.command || "");
       const payload = request.payload && typeof request.payload === "object" ? request.payload : {};
       switch (command) {
         case "password.open": return openPasswordTab(payload);
         case "password.offerFill": return offerFill(payload);
+        case "password.offerFillDirect": return offerFillDirect(payload);
         case "password.provideCredentials": return provideCredentials(payload);
         case "password.cancelFill": return cancelFill(payload);
         case "password.requestConsent": return requestConsent();
@@ -760,8 +771,25 @@
         case "password.startTemplateRecording": return startTemplateRecording(payload);
         case "password.cancelTemplateRecording": return cancelTemplateRecording(payload);
         case "password.getStatus": return getStatus();
+        case "password.updateBadge": return updateBadge(payload);
         default:
           throw bridgeError("PASSWORD_COMMAND_UNSUPPORTED", `Unsupported password command: ${command || "<empty>"}`);
+      }
+    }
+
+    async function route(request) {
+      diagnostics.lastCommandAt = Date.now();
+      try {
+        const result = await routeCommand(request);
+        diagnostics.lastCommandOk = true;
+        diagnostics.lastCommandErrorCode = null;
+        return result;
+      } catch (error) {
+        diagnostics.lastCommandOk = false;
+        diagnostics.lastCommandErrorCode = error && error.code
+          ? String(error.code)
+          : "PASSWORD_COMMAND_FAILED";
+        throw error;
       }
     }
 
@@ -896,7 +924,7 @@
         sessionId: recording.sessionId,
         tabId: recording.tabId,
       });
-      clearRecording(recording.sessionId);
+      clearRecording(sessionId);
       return { cancelled: true, sessionId: recording.sessionId };
     }
 
@@ -922,9 +950,30 @@
 
     async function onTabReady(message, sender) {
       const binding = senderBinding(sender);
-      const announcedOrigin = templates.exactOrigin(message.origin);
+      let announcedOrigin = "";
+      try {
+        announcedOrigin = templates.exactOrigin(message.origin);
+      } catch (_error) {
+        announcedOrigin = "";
+      }
+      if (binding.frameId === 0 && !announcedOrigin) {
+        // A top-level page without a valid HTTP(S) origin has no accounts; drop
+        // stale badge state and report the tab as having no active origin.
+        tabContexts.set(binding.tabId, { documentId: binding.documentId, origin: "" });
+        clearTabAccounts(binding.tabId);
+        postEvent("originActive", { origin: "", tabId: binding.tabId });
+        throw bridgeError("PASSWORD_TARGET_MISMATCH", "The ready page did not match its browser frame");
+      }
       if (announcedOrigin !== binding.origin || binding.frameId !== 0) {
         throw bridgeError("PASSWORD_TARGET_MISMATCH", "The ready page did not match its browser frame");
+      }
+      tabContexts.set(binding.tabId, { documentId: binding.documentId, origin: binding.origin });
+      postEvent("originActive", { origin: binding.origin, tabId: binding.tabId });
+      const cachedAccounts = tabAccounts.get(binding.tabId);
+      if (cachedAccounts && cachedAccounts.origin !== binding.origin) {
+        // The desktop pushes badge accounts per origin; a navigation makes any
+        // previously cached list stale until the next password.updateBadge.
+        clearTabAccounts(binding.tabId);
       }
       for (const recording of Array.from(recordings.values())) {
         if (recording.tabId !== binding.tabId) continue;
@@ -1030,11 +1079,10 @@
         // definitive success signal. The page prompt remains low confidence.
         promoteCandidate(record, "low", binding);
       }
-      const consent = await hasAuthenticationConsent();
       const originCaptureAllowed = binding.origin.startsWith("https://")
         || captureInsecureOrigins.has(binding.origin);
       return {
-        captureEnabled: Boolean(captureEnabled && consent && originCaptureAllowed),
+        captureEnabled: Boolean(captureEnabled && originCaptureAllowed),
         insecureOrigins: Array.from(captureInsecureOrigins),
       };
     }
@@ -1091,7 +1139,7 @@
     }
 
     async function onCaptureUsernameStage(message, sender) {
-      if (!captureEnabled || !await hasAuthenticationConsent()) {
+      if (!captureEnabled) {
         throw bridgeError("PASSWORD_CAPTURE_DISABLED", "Login detection is disabled");
       }
       const binding = senderBinding(sender);
@@ -1126,7 +1174,7 @@
     }
 
     async function onCaptureSubmitted(message, sender) {
-      if (!captureEnabled || !await hasAuthenticationConsent()) {
+      if (!captureEnabled) {
         throw bridgeError("PASSWORD_CAPTURE_DISABLED", "Login detection is disabled");
       }
       const binding = senderBinding(sender);
@@ -1213,7 +1261,8 @@
       }
       const entryId = message.entryId == null ? "" : String(message.entryId).trim();
       if (action === "replace") {
-        if (record.matchedAction !== "select" || !record.accountChoices.some((choice) => choice.entryId === entryId)) {
+        const replaceAllowed = record.matchedAction === "select" || record.matchedAction === "new";
+        if (!replaceAllowed || !record.accountChoices.some((choice) => choice.entryId === entryId)) {
           throw bridgeError("PASSWORD_PROTOCOL_INVALID", "The selected account is not available for this candidate");
         }
       } else if (action !== "ignore" && action !== record.matchedAction) {
@@ -1304,6 +1353,96 @@
       return { candidateId, success, cleared: success };
     }
 
+    async function activeTabContext() {
+      if (typeof api.queryActiveTab !== "function") {
+        return { documentId: null, origin: "", tabId: null };
+      }
+      const tab = await api.queryActiveTab().catch(() => null);
+      const tabId = tab && Number.isInteger(tab.id) ? tab.id : null;
+      if (tabId == null) {
+        return { documentId: null, origin: "", tabId: null };
+      }
+      const context = tabContexts.get(tabId);
+      let origin = context ? context.origin : "";
+      if (!origin) {
+        try {
+          origin = templates.exactOrigin(tab.url);
+        } catch (_error) {
+          origin = "";
+        }
+      }
+      return {
+        documentId: context ? context.documentId : null,
+        origin,
+        tabId,
+      };
+    }
+
+    async function popupGetState() {
+      const active = await activeTabContext();
+      const cached = active.tabId == null ? null : tabAccounts.get(active.tabId);
+      return {
+        diagnostics: {
+          captureEnabled,
+          extensionVersion: String(api.extensionVersion || ""),
+          lastCommandAt: diagnostics.lastCommandAt,
+          lastCommandErrorCode: diagnostics.lastCommandErrorCode,
+          lastCommandOk: diagnostics.lastCommandOk,
+          nativeConnected: diagnostics.nativeConnected,
+          secretConnected: diagnostics.secretConnected,
+        },
+        tab: {
+          accounts: cached ? cached.accounts.map((account) => ({ ...account })) : [],
+          locked: cached ? cached.locked : false,
+          origin: active.origin || (cached ? cached.origin : ""),
+        },
+      };
+    }
+
+    async function popupFill(message) {
+      const entryId = requiredString(message.entryId, "entryId", 160);
+      const active = await activeTabContext();
+      if (active.tabId == null) {
+        throw bridgeError("PASSWORD_TARGET_INVALID", "No active browser tab is available");
+      }
+      const cached = tabAccounts.get(active.tabId);
+      if (!cached || cached.locked || !cached.accounts.some((account) => account.entryId === entryId)) {
+        throw bridgeError("PASSWORD_TARGET_MISMATCH", "The requested account is not available on this tab");
+      }
+      const posted = postEvent("fillRequest", {
+        documentId: active.documentId,
+        entryId,
+        origin: active.origin,
+        tabId: active.tabId,
+      });
+      if (!posted) {
+        throw bridgeError("PASSWORD_NATIVE_DISCONNECTED", "PetalDesk native host is disconnected");
+      }
+      return { accepted: true };
+    }
+
+    function popupOpenManager() {
+      const posted = postEvent("openPasswordManager", {});
+      if (!posted) {
+        throw bridgeError("PASSWORD_NATIVE_DISCONNECTED", "PetalDesk native host is disconnected");
+      }
+      return { accepted: true };
+    }
+
+    function onPopupMessage(message, sender) {
+      // The action popup is an extension page without a tab; content scripts
+      // and other extensions must never reach these handlers.
+      if (!sender || sender.id !== api.runtime.id || sender.tab) {
+        throw bridgeError("PASSWORD_TARGET_INVALID", "The popup message sender is not trusted");
+      }
+      switch (message.type) {
+        case "petaldesk.popup.getState": return popupGetState();
+        case "petaldesk.popup.fill": return popupFill(message);
+        case "petaldesk.popup.openManager": return popupOpenManager();
+        default: return null;
+      }
+    }
+
     async function onContentMessage(message, sender) {
       switch (message.type) {
         case "petaldesk.password.page-closed": return onPageClosed(sender);
@@ -1321,10 +1460,14 @@
     }
 
     api.runtime.onMessage.addListener((message, sender, sendResponse) => {
-      if (!message || typeof message.type !== "string" || !message.type.startsWith("petaldesk.password.")) {
-        return false;
-      }
-      Promise.resolve().then(() => onContentMessage(message, sender)).then(
+      if (!message || typeof message.type !== "string") return false;
+      const isContentMessage = message.type.startsWith(CONTENT_MESSAGE_PREFIX);
+      const isPopupMessage = message.type.startsWith(POPUP_MESSAGE_PREFIX);
+      if (!isContentMessage && !isPopupMessage) return false;
+      const handler = isPopupMessage
+        ? () => onPopupMessage(message, sender)
+        : () => onContentMessage(message, sender);
+      Promise.resolve().then(handler).then(
         (result) => sendResponse(result || { ok: true }),
         (error) => sendResponse({
           ok: false,
@@ -1339,65 +1482,42 @@
 
     if (typeof api.onTabRemoved === "function") {
       api.onTabRemoved((tabId) => {
+        tabContexts.delete(tabId);
+        tabAccounts.delete(tabId);
         clearTabState(tabId);
         postEvent("pageClosed", { documentId: null, tabId });
       });
     }
 
-    if (api.action && api.action.onClicked) {
-      api.action.onClicked.addListener(() => {
-        if (Date.now() >= consentArmedUntil) {
-          void hasAuthenticationConsent().then(
-            (granted) => showToolbarFeedback(
-              granted ? "OK" : "!",
-              granted ? "飞花：密码权限已授权" : "飞花：请先在桌面端发起密码授权",
-              granted ? "#2e7d32" : "#b26a00",
-            ),
-            () => showToolbarFeedback("!", "飞花：无法读取密码权限状态", "#b3261e"),
-          );
+    if (typeof api.onActivated === "function") {
+      api.onActivated((activeInfo) => {
+        const tabId = activeInfo && Number.isInteger(activeInfo.tabId) ? activeInfo.tabId : null;
+        if (tabId == null) return;
+        const context = tabContexts.get(tabId);
+        if (context && context.origin) {
+          postEvent("originActive", { origin: context.origin, tabId });
           return;
         }
-        consentArmedUntil = 0;
-        // This call stays directly inside the toolbar click handler so Firefox
-        // recognizes it as a user-activated optional data request.
-        void api.requestPermissions({ data_collection: ["authenticationInfo"] }).then(
-          (granted) => {
-            authenticationConsentGranted = granted === true;
-            showToolbarFeedback(
-              granted === true ? "OK" : "!",
-              granted === true ? "飞花：密码权限已授权" : "飞花：密码权限未授权",
-              granted === true ? "#2e7d32" : "#b26a00",
-            );
-            postEvent("consentChanged", {
-              actionRequired: granted === true ? null : "toolbar-click",
-              dataCollection: "authenticationInfo",
-              granted: granted === true,
-              userGestureRequired: granted !== true,
-            });
-          },
-          () => {
-            showToolbarFeedback("!", "飞花：密码权限授权失败", "#b3261e");
-            postEvent("consentChanged", {
-              actionRequired: "toolbar-click",
-              dataCollection: "authenticationInfo",
-              granted: false,
-              userGestureRequired: true,
-            });
-          },
-        );
+        // No content script has announced this tab, so a badge left over from
+        // a previous page must not survive the switch.
+        clearTabAccounts(tabId);
       });
     }
 
-    if (api.permissions && api.permissions.onRemoved) {
-      api.permissions.onRemoved.addListener((removed) => {
-        if (!consentGranted(removed)) return;
-        void handleAuthenticationConsentLoss();
-      });
+    async function onSecretConnected() {
+      diagnostics.secretConnected = true;
+      const active = await activeTabContext();
+      if (active.tabId == null) return;
+      if (!tabContexts.has(active.tabId)) {
+        tabContexts.set(active.tabId, { documentId: null, origin: active.origin });
+      }
+      if (!active.origin) clearTabAccounts(active.tabId);
+      postEvent("originActive", { origin: active.origin, tabId: active.tabId });
     }
 
     function disconnect() {
+      diagnostics.secretConnected = false;
       captureEnabled = false;
-      consentArmedUntil = 0;
       void broadcastCaptureState().catch(() => {});
       for (const sessionId of Array.from(sessions.keys())) clearSession(sessionId);
       clearCaptureState();
@@ -1407,7 +1527,11 @@
       capabilities: Object.freeze([...CAPABILITY_GROUPS, ...COMMANDS]),
       commands: COMMANDS,
       disconnect,
+      onSecretConnected,
       route,
+      setNativeConnected(connected) {
+        diagnostics.nativeConnected = connected === true;
+      },
       supportsCommand(command) {
         return COMMANDS.has(String(command || ""));
       },

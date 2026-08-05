@@ -1,5 +1,5 @@
 use crate::browser_bridge::BrowserFamily;
-use crate::browser_secret_bridge::{BrowserSecretBridge, BrowserSecretEvent};
+use crate::browser_secret_bridge::{BrowserSecretBridge, BrowserSecretEvent, DiagEntry};
 use crate::error::{AppError, AppResult};
 use crate::passwords::{
     PasswordCaptureAccount, PasswordCaptureAction, PasswordCaptureCandidate, PasswordEntryInput,
@@ -22,6 +22,12 @@ const FILL_TTL: Duration = Duration::from_secs(5 * 60);
 const CAPTURE_TTL: Duration = Duration::from_secs(30);
 const TEMPLATE_RECORDING_TTL: Duration = Duration::from_secs(5 * 60);
 const TEMPLATE_RECORDING_TIMEOUT: Duration = Duration::from_secs(15);
+const BADGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_BADGE_ACCOUNTS: usize = 16;
+const STATUS_DIAGNOSTIC_LIMIT: usize = 20;
+/// The native host rewrites its session heartbeat every 2s; anything older is
+/// treated as a dead stdio layer.
+const STDIO_SESSION_MAX_AGE: Duration = Duration::from_secs(6);
 #[cfg(windows)]
 const FIREFOX_AMO_URL: &str = "https://starsliao.github.io/PetalDesk/firefox.html";
 static EVENT_DISPATCHER_STARTED: AtomicBool = AtomicBool::new(false);
@@ -89,6 +95,12 @@ pub struct PasswordBrowserService {
     fills: Mutex<HashMap<String, FillSession>>,
     captures: Mutex<HashMap<String, PendingCapture>>,
     recordings: Mutex<HashMap<String, TemplateRecordingSession>>,
+    // Last setCaptureEnabled payload sent per connection; suppresses duplicate
+    // broadcasts triggered by password-status polling.
+    synced_capture: Mutex<HashMap<String, (bool, Vec<String>)>>,
+    // Active tab origins per connection, reported by the extension for badge
+    // account counts.
+    badge_tabs: Mutex<HashMap<String, HashMap<i64, String>>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,9 +114,13 @@ pub struct PasswordBrowserStatus {
     install_url: Option<String>,
     capture_permission: &'static str,
     authentication_consent: bool,
-    consent_armed: bool,
+    stdio_connected: bool,
+    pipe_connected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    consent_action_required: Option<String>,
+    connection_id: Option<String>,
+    diagnostics: Vec<DiagEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_request_outcome: Option<DiagEntry>,
     message: Option<String>,
 }
 
@@ -116,8 +132,6 @@ pub struct PasswordFillTicket {
     browser: &'static str,
     origin: String,
     expires_at: u128,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    action_required: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,6 +157,8 @@ impl PasswordBrowserService {
             fills: Mutex::new(HashMap::new()),
             captures: Mutex::new(HashMap::new()),
             recordings: Mutex::new(HashMap::new()),
+            synced_capture: Mutex::new(HashMap::new()),
+            badge_tabs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -158,19 +174,31 @@ impl PasswordBrowserService {
                 install_url: None,
                 capture_permission: "unavailable",
                 authentication_consent: false,
-                consent_armed: false,
-                consent_action_required: None,
+                stdio_connected: false,
+                pipe_connected: false,
+                connection_id: None,
+                diagnostics: Vec::new(),
+                last_request_outcome: None,
                 message: Some("密码浏览器集成首版仅支持 Windows。".to_string()),
             };
         }
+        // The stdio layer health comes from the native host's session
+        // heartbeat file; the pipe layer from this process's secret bridge.
+        #[cfg(windows)]
+        let bridge_session = latest_firefox_bridge_session();
+        #[cfg(windows)]
+        let stdio_connected = bridge_session.as_ref().is_some_and(|session| {
+            unix_time_ms().saturating_sub(session.last_seen_unix_ms)
+                <= STDIO_SESSION_MAX_AGE.as_millis()
+        });
         #[cfg(windows)]
         let connection_id = self.bridge.latest_connection_id(BrowserFamily::Firefox);
         #[cfg(windows)]
         let had_connection = connection_id.is_some();
         #[cfg(windows)]
-        let extension_status_result = connection_id.map(|connection_id| {
+        let extension_status_result = connection_id.as_deref().map(|connection_id| {
             self.bridge.request_connection(
-                &connection_id,
+                connection_id,
                 "password.getStatus",
                 Value::Object(Default::default()),
                 Duration::from_secs(2),
@@ -195,19 +223,6 @@ impl PasswordBrowserService {
             .and_then(|status| status.get("authenticationConsent"))
             .and_then(Value::as_bool);
         #[cfg(windows)]
-        let consent_armed = extension_status
-            .as_ref()
-            .and_then(|status| status.get("consentArmed"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        #[cfg(windows)]
-        let consent_action_required = extension_status
-            .as_ref()
-            .and_then(|status| status.get("consentActionRequired"))
-            .and_then(Value::as_str)
-            .filter(|value| *value == "toolbar-click")
-            .map(str::to_string);
-        #[cfg(windows)]
         let unsupported = status_error
             .as_deref()
             .is_some_and(password_status_error_is_unsupported);
@@ -223,17 +238,21 @@ impl PasswordBrowserService {
             },
             extension_installed: known_extension,
             native_host_installed: known_extension,
-            extension_version: None,
+            extension_version: bridge_session.and_then(|session| session.extension_version),
             install_url: (!known_extension).then(|| FIREFOX_AMO_URL.to_string()),
             capture_permission: match (authentication_consent, known_extension, unsupported) {
+                (_, _, true) => "unavailable",
                 (Some(true), _, _) => "granted",
-                (Some(false), _, _) => "action-required",
-                (None, true, false) => "unknown",
+                (Some(false), _, _) => "unknown",
+                (None, true, _) => "unknown",
                 _ => "unavailable",
             },
             authentication_consent: authentication_consent.unwrap_or(false),
-            consent_armed,
-            consent_action_required,
+            stdio_connected,
+            pipe_connected: connected,
+            connection_id,
+            diagnostics: self.bridge.diag_snapshot(STATUS_DIAGNOSTIC_LIMIT),
+            last_request_outcome: self.bridge.last_request_outcome(),
             message: if unsupported {
                 Some("当前 Firefox 扩展不支持密码功能，请更新扩展。".to_string())
             } else if status_error.is_some() {
@@ -241,7 +260,7 @@ impl PasswordBrowserService {
             } else if !connected {
                 Some("Firefox 扩展或本机通信组件尚未连接；仍可复制账号和密码。".to_string())
             } else if authentication_consent == Some(false) {
-                Some("登录信息检测等待 Firefox 工具栏中的扩展授权。".to_string())
+                Some("Firefox 扩展的密码权限状态异常；请更新或重新安装扩展。".to_string())
             } else {
                 None
             },
@@ -279,22 +298,17 @@ impl PasswordBrowserService {
             }),
             REQUEST_TIMEOUT,
         );
-        let response = result.map_err(|error| {
-            lock_unpoisoned(&self.fills).remove(&session_id);
-            browser_error("password_fill_start_failed", error)
-        })?;
-        let action_required = response
-            .get("actionRequired")
-            .and_then(Value::as_str)
-            .filter(|value| *value == "toolbar-click")
-            .map(str::to_string);
+        result
+            .map_err(|error| {
+                lock_unpoisoned(&self.fills).remove(&session_id);
+                browser_error("password_fill_start_failed", error)
+            })?;
         Ok(PasswordFillTicket {
             session_id,
             entry_id: entry_id.to_string(),
             browser: "firefox",
             origin: data.origin.clone(),
             expires_at: unix_time_ms().saturating_add(FILL_TTL.as_millis()),
-            action_required,
         })
     }
 
@@ -423,6 +437,9 @@ impl PasswordBrowserService {
                 Duration::from_secs(2),
             );
         }
+        // The extension-side state no longer matches the cache, so the next
+        // successful sync must broadcast again.
+        lock_unpoisoned(&self.synced_capture).clear();
         lock_unpoisoned(&self.captures).clear();
         let fills = lock_unpoisoned(&self.fills).drain().collect::<Vec<_>>();
         for (session_id, session) in fills {
@@ -461,9 +478,8 @@ impl PasswordBrowserService {
         }
     }
 
-    pub(crate) fn sync_capture_from_store(&self, app: &AppHandle) {
-        let store = app.state::<PasswordStore>();
-        let Ok(epoch) = store.require_active_epoch() else {
+    pub(crate) fn sync_capture_from_store(&self, store: &PasswordStore) {
+        let Ok(epoch) = store.require_any_epoch() else {
             self.suspend_capture();
             return;
         };
@@ -490,29 +506,28 @@ impl PasswordBrowserService {
             return;
         }
         for connection_id in connection_ids {
-            let granted = if status.capture_enabled {
-                self.bridge
-                    .request_connection(
-                        &connection_id,
-                        "password.requestConsent",
-                        Value::Object(Default::default()),
-                        Duration::from_secs(2),
-                    )
-                    .ok()
-                    .and_then(|value| value.get("granted").and_then(Value::as_bool))
-                    .unwrap_or(false)
-            } else {
-                false
-            };
-            let _ = self.bridge.request_connection(
+            // The extension permission is mandatory at install time, so the
+            // desktop setting maps directly onto the capture switch. Skip the
+            // broadcast when nothing changed since the last successful sync.
+            let desired = (status.capture_enabled, insecure_origins.clone());
+            if lock_unpoisoned(&self.synced_capture).get(&connection_id) == Some(&desired) {
+                continue;
+            }
+            let result = self.bridge.request_connection(
                 &connection_id,
                 "password.setCaptureEnabled",
                 serde_json::json!({
-                    "enabled": status.capture_enabled && granted,
-                    "insecureOrigins": insecure_origins.clone(),
+                    "enabled": desired.0,
+                    "insecureOrigins": desired.1,
                 }),
                 Duration::from_secs(2),
             );
+            let mut synced = lock_unpoisoned(&self.synced_capture);
+            if result.is_ok() {
+                synced.insert(connection_id, desired);
+            } else {
+                synced.remove(&connection_id);
+            }
         }
     }
 
@@ -522,15 +537,28 @@ impl PasswordBrowserService {
         }
         self.prune(app);
         match event.event.as_str() {
-            "connectionReady" => self.sync_capture_from_store(app),
+            "connectionReady" => {
+                // A live extension keeps the decrypted vault usable for the
+                // background session even while the password window is closed.
+                let store = app.state::<PasswordStore>();
+                store.activate_browser_session();
+                self.sync_capture_from_store(&store);
+            }
             "connectionClosed" => {
                 self.clear_connection_state(app, &event.connection_id);
-                self.sync_capture_from_store(app);
+                self.sync_capture_from_store(&app.state());
+            }
+            "originActive" => self.handle_origin_active(&app.state(), &event),
+            "fillRequest" => self.handle_fill_request(&app.state(), &event),
+            "openPasswordManager" => {
+                if let Err(error) = crate::commands::open_password_window(app) {
+                    eprintln!("打开密码管理器窗口失败: {error}");
+                }
             }
             "tabReady" => self.handle_tab_ready(app, &event),
-            "fillConfirm" => self.handle_fill_confirm(app, &event),
+            "fillConfirm" => self.handle_fill_confirm(&app.state(), &event),
             "fillResult" => self.handle_fill_result(&event),
-            "captureCandidate" => self.handle_capture_candidate(app, &event),
+            "captureCandidate" => self.handle_capture_candidate(&app.state(), &event),
             "pageClosed" => self.handle_page_closed(&event),
             "saveDecision" => self.handle_save_decision(app, &event),
             "templateRecordingReady" => self.handle_template_recording_ready(app, &event),
@@ -538,7 +566,7 @@ impl PasswordBrowserService {
             "templateRecordingCancelled" => self.handle_template_recording_cancelled(app, &event),
             "consentChanged" => {
                 if event.payload.get("granted").and_then(Value::as_bool) == Some(true) {
-                    self.sync_capture_from_store(app);
+                    self.sync_capture_from_store(&app.state());
                     self.resume_pending_fills(app, &event.connection_id);
                 }
             }
@@ -570,6 +598,8 @@ impl PasswordBrowserService {
         // page cannot submit a candidate after its native connection closed.
         lock_unpoisoned(&self.fills).retain(|_, session| session.connection_id != connection_id);
         lock_unpoisoned(&self.captures).retain(|_, capture| capture.connection_id != connection_id);
+        lock_unpoisoned(&self.badge_tabs).remove(connection_id);
+        lock_unpoisoned(&self.synced_capture).remove(connection_id);
 
         let recording_ids = {
             let recordings = lock_unpoisoned(&self.recordings);
@@ -646,9 +676,6 @@ impl PasswordBrowserService {
     fn offer_fill(&self, app: &AppHandle, session_id: &str) {
         let session = lock_unpoisoned(&self.fills).get(session_id).cloned();
         let Some(mut session) = session else { return };
-        if self.authentication_consent(&session.connection_id) != Some(true) {
-            return;
-        }
         let offer_id = Uuid::new_v4().to_string();
         session.offer_id = Some(offer_id.clone());
         if let Some(current) = lock_unpoisoned(&self.fills).get_mut(session_id) {
@@ -663,9 +690,10 @@ impl PasswordBrowserService {
         } else {
             return;
         }
-        let Ok(data) = app
-            .state::<PasswordStore>()
-            .browser_fill_data(&session.entry_id)
+        let store = app.state::<PasswordStore>();
+        let Ok(data) = store
+            .require_any_epoch()
+            .and_then(|epoch| store.browser_fill_data_at(&session.entry_id, epoch))
         else {
             lock_unpoisoned(&self.fills).remove(session_id);
             return;
@@ -692,18 +720,6 @@ impl PasswordBrowserService {
         }
     }
 
-    fn authentication_consent(&self, connection_id: &str) -> Option<bool> {
-        self.bridge
-            .request_connection(
-                connection_id,
-                "password.getStatus",
-                Value::Object(Default::default()),
-                Duration::from_secs(2),
-            )
-            .ok()
-            .and_then(|status| status.get("authenticationConsent").and_then(Value::as_bool))
-    }
-
     fn resume_pending_fills(&self, app: &AppHandle, connection_id: &str) {
         let sessions = lock_unpoisoned(&self.fills)
             .iter()
@@ -721,7 +737,7 @@ impl PasswordBrowserService {
         }
     }
 
-    fn handle_fill_confirm(&self, app: &AppHandle, event: &BrowserSecretEvent) {
+    fn handle_fill_confirm(&self, store: &PasswordStore, event: &BrowserSecretEvent) {
         let Some(session_id) = event.payload.get("sessionId").and_then(Value::as_str) else {
             return;
         };
@@ -736,9 +752,9 @@ impl PasswordBrowserService {
             lock_unpoisoned(&self.fills).remove(session_id);
             return;
         }
-        let Ok(data) = app
-            .state::<PasswordStore>()
-            .browser_fill_data(&session.entry_id)
+        let Ok(data) = store
+            .require_any_epoch()
+            .and_then(|epoch| store.browser_fill_data_at(&session.entry_id, epoch))
         else {
             lock_unpoisoned(&self.fills).remove(session_id);
             return;
@@ -794,7 +810,181 @@ impl PasswordBrowserService {
         }
     }
 
-    fn handle_capture_candidate(&self, app: &AppHandle, event: &BrowserSecretEvent) {
+    /// The popup asks to fill one entry into the current tab. Unlike
+    /// `password.open` the page is already known, so the session is bound to
+    /// the reported tab/document before the offer is sent.
+    fn handle_fill_request(&self, store: &PasswordStore, event: &BrowserSecretEvent) {
+        let Some(entry_id) = event
+            .payload
+            .get("entryId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+        else {
+            return;
+        };
+        let Some(tab_id) = event
+            .payload
+            .get("tabId")
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0)
+        else {
+            return;
+        };
+        // Popup fills always target the top-level document.
+        if event
+            .payload
+            .get("frameId")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| value != 0)
+        {
+            return;
+        }
+        let Some(document_id) = event
+            .payload
+            .get("documentId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 256)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let Some(origin) = event
+            .payload
+            .get("origin")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 2048)
+        else {
+            return;
+        };
+        let data = store
+            .require_any_epoch()
+            .and_then(|epoch| store.browser_fill_data_at(entry_id, epoch));
+        let data = match data {
+            Ok(data) => data,
+            Err(_) => {
+                // Locked vault or a stale entry id: push a locked badge so the
+                // popup re-reads the state instead of waiting for the fill.
+                self.push_badge(&event.connection_id, tab_id, origin, true, Vec::new());
+                return;
+            }
+        };
+        if data.origin != origin {
+            return;
+        }
+        let session_id = Uuid::new_v4().to_string();
+        let offer_id = Uuid::new_v4().to_string();
+        lock_unpoisoned(&self.fills).insert(
+            session_id.clone(),
+            FillSession {
+                connection_id: event.connection_id.clone(),
+                entry_id: data.entry_id.clone(),
+                origin: data.origin.clone(),
+                offer_id: Some(offer_id.clone()),
+                tab_id: Some(tab_id),
+                frame_id: Some(0),
+                document_id: Some(document_id.clone()),
+                expires_at: Instant::now() + FILL_TTL,
+            },
+        );
+        let result = self.bridge.request_connection(
+            &event.connection_id,
+            "password.offerFillDirect",
+            serde_json::json!({
+                "sessionId": session_id,
+                "entryId": data.entry_id,
+                "offerId": offer_id,
+                "tabId": tab_id,
+                "frameId": 0,
+                "documentId": document_id,
+                "origin": data.origin,
+                "username": data.username,
+                "userTemplate": data.user_template,
+                "allowInsecureHttp": data.allow_insecure_http,
+            }),
+            REQUEST_TIMEOUT,
+        );
+        if result.is_err() {
+            lock_unpoisoned(&self.fills).remove(&session_id);
+        }
+    }
+
+    fn handle_origin_active(&self, store: &PasswordStore, event: &BrowserSecretEvent) {
+        let Some(tab_id) = event
+            .payload
+            .get("tabId")
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0)
+        else {
+            return;
+        };
+        let origin = event
+            .payload
+            .get("origin")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if origin.is_empty() {
+            // The tab has no fillable origin (about: pages, the new-tab page,
+            // ...), so only the tracking entry is dropped.
+            if let Some(tabs) = lock_unpoisoned(&self.badge_tabs).get_mut(&event.connection_id) {
+                tabs.remove(&tab_id);
+            }
+            return;
+        }
+        if origin.len() > 2048
+            || !(origin.starts_with("https://") || origin.starts_with("http://"))
+        {
+            return;
+        }
+        lock_unpoisoned(&self.badge_tabs)
+            .entry(event.connection_id.clone())
+            .or_default()
+            .insert(tab_id, origin.to_string());
+        let (locked, accounts) = badge_accounts(store, origin);
+        self.push_badge(&event.connection_id, tab_id, origin, locked, accounts);
+    }
+
+    fn push_badge(
+        &self,
+        connection_id: &str,
+        tab_id: i64,
+        origin: &str,
+        locked: bool,
+        accounts: Vec<PasswordCaptureAccount>,
+    ) {
+        let _ = self.bridge.request_connection(
+            connection_id,
+            "password.updateBadge",
+            serde_json::json!({
+                "tabId": tab_id,
+                "origin": origin,
+                "locked": locked,
+                "accounts": accounts,
+            }),
+            BADGE_REQUEST_TIMEOUT,
+        );
+    }
+
+    /// Recomputes and pushes the badge for every tracked tab. Called after
+    /// vault mutations (entry create/update/delete, lock, unlock).
+    pub fn refresh_badges(&self, store: &PasswordStore) {
+        let tracked = lock_unpoisoned(&self.badge_tabs)
+            .iter()
+            .flat_map(|(connection_id, tabs)| {
+                tabs.iter()
+                    .map(|(tab_id, origin)| (connection_id.clone(), *tab_id, origin.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        if tracked.is_empty() {
+            return;
+        }
+        for (connection_id, tab_id, origin) in tracked {
+            let (locked, accounts) = badge_accounts(store, &origin);
+            self.push_badge(&connection_id, tab_id, &origin, locked, accounts);
+        }
+    }
+
+    fn handle_capture_candidate(&self, store: &PasswordStore, event: &BrowserSecretEvent) {
         let Some(candidate_id) = event.payload.get("candidateId").and_then(Value::as_str) else {
             return;
         };
@@ -849,8 +1039,7 @@ impl PasswordBrowserService {
             return;
         }
         let allow_insecure_http = origin.starts_with("http://");
-        let store = app.state::<PasswordStore>();
-        let decision = store.require_active_epoch().and_then(|epoch| {
+        let decision = store.require_any_epoch().and_then(|epoch| {
             store.capture_decision_at(
                 PasswordCaptureCandidate {
                     origin: origin.clone(),
@@ -900,6 +1089,16 @@ impl PasswordBrowserService {
                     decision.insecure_http,
                 ),
             },
+            Err(error) if error.code == "password_vault_locked" => (
+                // A manually locked vault is a definite answer, not a sync
+                // failure: tell the popup so it can offer unlock instead of
+                // pretending the login is already saved.
+                "locked",
+                None,
+                Vec::new(),
+                origin.clone(),
+                allow_insecure_http,
+            ),
             Err(_) => (
                 "same",
                 None,
@@ -908,7 +1107,7 @@ impl PasswordBrowserService {
                 allow_insecure_http,
             ),
         };
-        if action != "same" && action != "username-required" {
+        if !matches!(action, "same" | "username-required" | "locked") {
             lock_unpoisoned(&self.captures).insert(
                 candidate_id.to_string(),
                 PendingCapture {
@@ -944,8 +1143,27 @@ impl PasswordBrowserService {
     }
 
     fn handle_save_decision(&self, app: &AppHandle, event: &BrowserSecretEvent) {
+        let store = app.state::<PasswordStore>();
+        if let Some((entry_id, action)) = self.save_decision_from_event(&store, event) {
+            let _ = app.emit_to(
+                "passwords",
+                "password_entries_changed",
+                serde_json::json!({ "entryId": entry_id, "action": action }),
+            );
+            self.refresh_badges(&store);
+        }
+    }
+
+    /// Applies the popup's save decision. On a successful write the entry id
+    /// and action come back so the dispatcher can notify the password window
+    /// and refresh badges.
+    fn save_decision_from_event(
+        &self,
+        store: &PasswordStore,
+        event: &BrowserSecretEvent,
+    ) -> Option<(String, String)> {
         let Some(candidate_id) = event.payload.get("candidateId").and_then(Value::as_str) else {
-            return;
+            return None;
         };
         let action = event
             .payload
@@ -955,18 +1173,18 @@ impl PasswordBrowserService {
 
         let mut captures = lock_unpoisoned(&self.captures);
         let Some(candidate) = captures.get_mut(candidate_id) else {
-            return;
+            return None;
         };
         if candidate.connection_id != event.connection_id {
-            return;
+            return None;
         }
         if !capture_decision_matches(candidate, &event.payload) {
             captures.remove(candidate_id);
-            return;
+            return None;
         }
         if action == "ignore" {
             captures.remove(candidate_id);
-            return;
+            return None;
         }
 
         let selected_entry_id = event
@@ -977,12 +1195,14 @@ impl PasswordBrowserService {
         let valid_action = match (candidate.matched_action.as_str(), action) {
             ("new", "new") => candidate.entry_id.is_none() && !candidate.username.is_empty(),
             ("update", "update") => candidate.entry_id.is_some(),
-            ("select", "replace") => selected_entry_id.as_ref().is_some_and(|entry_id| {
-                candidate
-                    .account_choices
-                    .iter()
-                    .any(|choice| &choice.entry_id == entry_id)
-            }),
+            ("new", "replace") | ("select", "replace") => {
+                selected_entry_id.as_ref().is_some_and(|entry_id| {
+                    candidate
+                        .account_choices
+                        .iter()
+                        .any(|choice| &choice.entry_id == entry_id)
+                })
+            }
             _ => false,
         };
         if !valid_action {
@@ -1003,7 +1223,7 @@ impl PasswordBrowserService {
                 payload,
                 REQUEST_TIMEOUT,
             );
-            return;
+            return None;
         }
         if candidate.save_pending {
             let payload = save_result_payload(
@@ -1020,14 +1240,13 @@ impl PasswordBrowserService {
                 payload,
                 REQUEST_TIMEOUT,
             );
-            return;
+            return None;
         }
         candidate.save_pending = true;
         let pending = captures.remove(candidate_id);
         drop(captures);
-        let Some(pending) = pending else { return };
-        let store = app.state::<PasswordStore>();
-        let epoch = store.require_active_epoch();
+        let Some(pending) = pending else { return None };
+        let epoch = store.require_any_epoch();
         let result: AppResult<PasswordEntrySummary> = match epoch {
             Err(error) => Err(error),
             Ok(epoch) if action == "update" || action == "replace" => {
@@ -1041,12 +1260,15 @@ impl PasswordBrowserService {
                         Ok(entries) => {
                             match entries.into_iter().find(|entry| entry.id == target_id) {
                                 Some(entry) if entry.origin == pending.origin => {
-                                    let username =
-                                        if action == "replace" || pending.username.is_empty() {
-                                            entry.username.clone()
-                                        } else {
-                                            pending.username.clone()
-                                        };
+                                    // A replace adopts the candidate username
+                                    // together with the password; a candidate
+                                    // without a username (password-change
+                                    // pages) keeps the stored one.
+                                    let username = if pending.username.is_empty() {
+                                        entry.username.clone()
+                                    } else {
+                                        pending.username.clone()
+                                    };
                                     store.update_entry_at(
                                         PasswordEntryUpdateInput {
                                             id: entry.id,
@@ -1103,11 +1325,6 @@ impl PasswordBrowserService {
 
         match result {
             Ok(entry) => {
-                let _ = app.emit_to(
-                    "passwords",
-                    "password_entries_changed",
-                    serde_json::json!({ "entryId": entry.id, "action": action }),
-                );
                 let receipt = self.bridge.request_connection(
                     &event.connection_id,
                     "password.saveResult",
@@ -1118,6 +1335,7 @@ impl PasswordBrowserService {
                 // write has already completed, so discard the in-memory secret
                 // even when that old extension rejects the receipt command.
                 let _ = receipt;
+                Some((entry.id, action.to_string()))
             }
             Err(error) => {
                 let receipt = self.bridge.request_connection(
@@ -1143,6 +1361,7 @@ impl PasswordBrowserService {
                 }
                 // If the connection disappeared or the old extension rejected
                 // the command, dropping `pending` clears the secret promptly.
+                None
             }
         }
     }
@@ -1344,8 +1563,88 @@ pub fn start_event_dispatcher(app: AppHandle) {
 }
 
 pub(crate) fn sync_capture_from_store(app: &AppHandle) {
+    let store = app.state::<PasswordStore>();
     app.state::<PasswordBrowserService>()
-        .sync_capture_from_store(app);
+        .sync_capture_from_store(&store);
+}
+
+pub(crate) fn refresh_password_badges(app: &AppHandle) {
+    let store = app.state::<PasswordStore>();
+    app.state::<PasswordBrowserService>().refresh_badges(&store);
+}
+
+/// Counts the vault accounts bound to one origin for the extension badge. Any
+/// store error (locked vault, closed session, ...) maps to the locked badge so
+/// the popup offers unlock instead of an empty account list.
+fn badge_accounts(store: &PasswordStore, origin: &str) -> (bool, Vec<PasswordCaptureAccount>) {
+    let entries = store
+        .require_any_epoch()
+        .and_then(|epoch| store.list_entries_at(epoch));
+    match entries {
+        Ok(entries) => (
+            false,
+            entries
+                .into_iter()
+                .filter(|entry| entry.origin == origin)
+                .take(MAX_BADGE_ACCOUNTS)
+                .map(|entry| PasswordCaptureAccount {
+                    entry_id: entry.id,
+                    site_name: entry.site_name,
+                    username: entry.username,
+                })
+                .collect(),
+        ),
+        Err(_) => (true, Vec::new()),
+    }
+}
+
+/// Newest native-host session file for Firefox. The host rewrites the
+/// heartbeat every couple of seconds and deletes the file on exit, so its
+/// freshness describes the stdio layer's health.
+#[cfg(windows)]
+struct FirefoxBridgeSession {
+    extension_version: Option<String>,
+    last_seen_unix_ms: u128,
+}
+
+#[cfg(windows)]
+fn latest_firefox_bridge_session() -> Option<FirefoxBridgeSession> {
+    let sessions = crate::browser_secret_bridge::bridge_root()
+        .ok()?
+        .join("sessions");
+    let mut latest: Option<FirefoxBridgeSession> = None;
+    for entry in std::fs::read_dir(sessions).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if value.get("browser").and_then(Value::as_str) != Some(BrowserFamily::Firefox.as_str()) {
+            continue;
+        }
+        let Some(last_seen_unix_ms) = value.get("lastSeenUnixMs").and_then(Value::as_u64) else {
+            continue;
+        };
+        let session = FirefoxBridgeSession {
+            extension_version: value
+                .get("extensionVersion")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            last_seen_unix_ms: u128::from(last_seen_unix_ms),
+        };
+        if latest
+            .as_ref()
+            .is_none_or(|current| session.last_seen_unix_ms >= current.last_seen_unix_ms)
+        {
+            latest = Some(session);
+        }
+    }
+    latest
 }
 
 fn ensure_password_window(window: &WebviewWindow) -> AppResult<()> {
@@ -1612,6 +1911,8 @@ mod tests {
             fills: Mutex::new(HashMap::new()),
             captures: Mutex::new(HashMap::new()),
             recordings: Mutex::new(HashMap::new()),
+            synced_capture: Mutex::new(HashMap::new()),
+            badge_tabs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1897,5 +2198,558 @@ mod tests {
         let captures = lock_unpoisoned(&service.captures);
         assert!(!captures.contains_key("other-document"));
         assert!(captures.contains_key("other-connection"));
+    }
+
+    const TEST_RECOVERY_PASSWORD: &str = "petaldesk-browser-test-recovery";
+
+    /// Answers bridge requests from a background thread while recording them,
+    /// so service methods that block on `request_connection` can be tested
+    /// without a real extension.
+    struct RecordedBridge {
+        requests: std::sync::Arc<Mutex<Vec<Value>>>,
+        responses: std::sync::Arc<Mutex<HashMap<String, Value>>>,
+        stop: std::sync::Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl RecordedBridge {
+        fn spawn(bridge: BrowserSecretBridge, receiver: std::sync::mpsc::Receiver<Value>) -> Self {
+            let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let responses = std::sync::Arc::new(Mutex::new(HashMap::new()));
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let thread = {
+                let requests = requests.clone();
+                let responses = responses.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        match receiver.recv_timeout(Duration::from_millis(20)) {
+                            Ok(request) => {
+                                let command = request
+                                    .get("command")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                lock_unpoisoned(&requests).push(request.clone());
+                                let response = lock_unpoisoned(&responses)
+                                    .get(&command)
+                                    .cloned()
+                                    .unwrap_or_else(|| Value::Object(Default::default()));
+                                bridge.test_answer_request(&request, response);
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                })
+            };
+            Self {
+                requests,
+                responses,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn set_response(&self, command: &str, response: Value) {
+            lock_unpoisoned(&self.responses).insert(command.to_string(), response);
+        }
+
+        fn requests_for(&self, command: &str) -> Vec<Value> {
+            lock_unpoisoned(&self.requests)
+                .iter()
+                .filter(|request| request.get("command").and_then(Value::as_str) == Some(command))
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl Drop for RecordedBridge {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn connected_service(connection_id: &str) -> (PasswordBrowserService, RecordedBridge) {
+        let (bridge, receiver) = crate::browser_secret_bridge::test_bridge(connection_id);
+        let recorded = RecordedBridge::spawn(bridge.clone(), receiver);
+        (
+            PasswordBrowserService {
+                bridge,
+                fills: Mutex::new(HashMap::new()),
+                captures: Mutex::new(HashMap::new()),
+                recordings: Mutex::new(HashMap::new()),
+                synced_capture: Mutex::new(HashMap::new()),
+                badge_tabs: Mutex::new(HashMap::new()),
+            },
+            recorded,
+        )
+    }
+
+    fn test_store() -> (tempfile::TempDir, PasswordStore) {
+        let root = tempfile::tempdir().unwrap();
+        let store = PasswordStore::load(root.path()).unwrap();
+        store.activate();
+        let epoch = store.require_active_epoch().unwrap();
+        store
+            .configure_recovery_password_at(TEST_RECOVERY_PASSWORD, None, epoch)
+            .unwrap();
+        (root, store)
+    }
+
+    fn create_entry(
+        store: &PasswordStore,
+        login_url: &str,
+        username: &str,
+        password: &str,
+    ) -> PasswordEntrySummary {
+        let epoch = store.require_active_epoch().unwrap();
+        store
+            .create_entry_at(
+                PasswordEntryInput {
+                    site_name: "Example".to_string(),
+                    login_url: login_url.to_string(),
+                    username: SensitiveText::new(username.to_string()),
+                    password: SensitiveText::new(password.to_string()),
+                    notes: String::new(),
+                    template_id: None,
+                    allow_insecure_http: false,
+                },
+                epoch,
+            )
+            .unwrap()
+    }
+
+    fn capture_account(entry: &PasswordEntrySummary) -> PasswordCaptureAccount {
+        PasswordCaptureAccount {
+            entry_id: entry.id.clone(),
+            site_name: entry.site_name.clone(),
+            username: entry.username.clone(),
+        }
+    }
+
+    fn secret_event(connection_id: &str, event: &str, payload: Value) -> BrowserSecretEvent {
+        BrowserSecretEvent {
+            connection_id: connection_id.to_string(),
+            browser: BrowserFamily::Firefox,
+            event: event.to_string(),
+            payload,
+        }
+    }
+
+    fn pending_capture(account_choices: Vec<PasswordCaptureAccount>) -> PendingCapture {
+        PendingCapture {
+            connection_id: "connection-a".to_string(),
+            entry_id: None,
+            account_choices,
+            matched_action: "new".to_string(),
+            origin: "https://example.com".to_string(),
+            username: "carol".to_string(),
+            password: "three".to_string(),
+            allow_insecure_http: false,
+            tab_id: 7,
+            frame_id: 0,
+            document_id: "document-1".to_string(),
+            prompt_origin: "https://example.com".to_string(),
+            created_at: Instant::now(),
+            save_pending: false,
+        }
+    }
+
+    fn save_decision_event(candidate_id: &str, entry_id: Option<&str>) -> BrowserSecretEvent {
+        secret_event(
+            "connection-a",
+            "saveDecision",
+            serde_json::json!({
+                "candidateId": candidate_id,
+                "action": "replace",
+                "entryId": entry_id,
+                "origin": "https://example.com",
+                "promptOrigin": "https://example.com",
+                "tabId": 7,
+                "frameId": 0,
+                "documentId": "document-1",
+            }),
+        )
+    }
+
+    #[test]
+    fn origin_active_pushes_badge_with_matching_accounts() {
+        let (_root, store) = test_store();
+        let first = create_entry(&store, "https://example.com/login", "alice", "one");
+        let second = create_entry(&store, "https://example.com/signin", "bob", "two");
+        create_entry(&store,  "https://other.example.com/login", "carol", "three");
+        let (service, recorded) = connected_service("connection-a");
+
+        service.handle_origin_active(
+            &store,
+            &secret_event(
+                "connection-a",
+                "originActive",
+                serde_json::json!({ "tabId": 7, "origin": "https://example.com" }),
+            ),
+        );
+
+        let badges = recorded.requests_for("password.updateBadge");
+        assert_eq!(badges.len(), 1);
+        let payload = &badges[0]["payload"];
+        assert_eq!(payload["tabId"], 7);
+        assert_eq!(payload["origin"], "https://example.com");
+        assert_eq!(payload["locked"], false);
+        let accounts = payload["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 2);
+        let entry_ids = accounts
+            .iter()
+            .map(|account| account["entryId"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(entry_ids.contains(&first.id.as_str()));
+        assert!(entry_ids.contains(&second.id.as_str()));
+    }
+
+    #[test]
+    fn origin_active_pushes_empty_and_locked_badges() {
+        let (_root, store) = test_store();
+        create_entry(&store,  "https://example.com/login", "alice", "one");
+        let (service, recorded) = connected_service("connection-a");
+
+        service.handle_origin_active(
+            &store,
+            &secret_event(
+                "connection-a",
+                "originActive",
+                serde_json::json!({ "tabId": 8, "origin": "https://other.example.com" }),
+            ),
+        );
+        let badges = recorded.requests_for("password.updateBadge");
+        assert_eq!(badges.len(), 1);
+        assert_eq!(badges[0]["payload"]["locked"], false);
+        assert_eq!(
+            badges[0]["payload"]["accounts"].as_array().unwrap().len(),
+            0
+        );
+
+        store.lock_current_session().unwrap();
+        service.handle_origin_active(
+            &store,
+            &secret_event(
+                "connection-a",
+                "originActive",
+                serde_json::json!({ "tabId": 7, "origin": "https://example.com" }),
+            ),
+        );
+        let badges = recorded.requests_for("password.updateBadge");
+        assert_eq!(badges.len(), 2);
+        assert_eq!(badges[1]["payload"]["locked"], true);
+        assert_eq!(
+            badges[1]["payload"]["accounts"].as_array().unwrap().len(),
+            0
+        );
+
+        // An empty origin only drops the tracked tab without a broadcast.
+        service.handle_origin_active(
+            &store,
+            &secret_event(
+                "connection-a",
+                "originActive",
+                serde_json::json!({ "tabId": 7, "origin": "" }),
+            ),
+        );
+        assert_eq!(recorded.requests_for("password.updateBadge").len(), 2);
+        assert!(!lock_unpoisoned(&service.badge_tabs)["connection-a"].contains_key(&7));
+    }
+
+    #[test]
+    fn refresh_badges_pushes_updated_counts_after_entry_changes() {
+        let (_root, store) = test_store();
+        let entry = create_entry(&store, "https://example.com/login", "alice", "one");
+        let (service, recorded) = connected_service("connection-a");
+        service.handle_origin_active(
+            &store,
+            &secret_event(
+                "connection-a",
+                "originActive",
+                serde_json::json!({ "tabId": 7, "origin": "https://example.com" }),
+            ),
+        );
+        assert_eq!(recorded.requests_for("password.updateBadge").len(), 1);
+
+        create_entry(&store,  "https://example.com/signin", "bob", "two");
+        service.refresh_badges(&store);
+        let badges = recorded.requests_for("password.updateBadge");
+        assert_eq!(badges.len(), 2);
+        assert_eq!(
+            badges[1]["payload"]["accounts"].as_array().unwrap().len(),
+            2
+        );
+
+        let epoch = store.require_active_epoch().unwrap();
+        store.delete_entry_at(&entry.id, epoch).unwrap();
+        service.refresh_badges(&store);
+        let badges = recorded.requests_for("password.updateBadge");
+        assert_eq!(badges.len(), 3);
+        assert_eq!(
+            badges[2]["payload"]["accounts"].as_array().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn fill_request_binds_direct_offer_and_fill_confirm_provides_credentials() {
+        let (_root, store) = test_store();
+        let entry = create_entry(&store, "https://example.com/login", "alice", "one");
+        let (service, recorded) = connected_service("connection-a");
+
+        service.handle_fill_request(
+            &store,
+            &secret_event(
+                "connection-a",
+                "fillRequest",
+                serde_json::json!({
+                    "entryId": entry.id,
+                    "tabId": 7,
+                    "origin": "https://example.com",
+                    "documentId": "document-9",
+                }),
+            ),
+        );
+
+        let offers = recorded.requests_for("password.offerFillDirect");
+        assert_eq!(offers.len(), 1);
+        let payload = &offers[0]["payload"];
+        assert_eq!(payload["entryId"], entry.id);
+        assert_eq!(payload["tabId"], 7);
+        assert_eq!(payload["frameId"], 0);
+        assert_eq!(payload["documentId"], "document-9");
+        assert_eq!(payload["origin"], "https://example.com");
+        assert_eq!(payload["username"], "alice");
+        // The offer never carries the password; that waits for fillConfirm.
+        assert!(payload.get("password").is_none());
+        let session_id = payload["sessionId"].as_str().unwrap().to_string();
+        let offer_id = payload["offerId"].as_str().unwrap().to_string();
+        {
+            let fills = lock_unpoisoned(&service.fills);
+            let session = fills.get(&session_id).unwrap();
+            assert_eq!(session.entry_id, entry.id);
+            assert_eq!(session.tab_id, Some(7));
+            assert_eq!(session.frame_id, Some(0));
+            assert_eq!(session.document_id.as_deref(), Some("document-9"));
+            assert_eq!(session.offer_id.as_deref(), Some(offer_id.as_str()));
+        }
+
+        service.handle_fill_confirm(
+            &store,
+            &secret_event(
+                "connection-a",
+                "fillConfirm",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "offerId": offer_id,
+                    "origin": "https://example.com",
+                    "tabId": 7,
+                    "frameId": 0,
+                    "documentId": "document-9",
+                }),
+            ),
+        );
+        let credentials = recorded.requests_for("password.provideCredentials");
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0]["payload"]["username"], "alice");
+        assert_eq!(credentials[0]["payload"]["password"], "one");
+        assert_eq!(credentials[0]["payload"]["offerId"], offer_id);
+        assert!(!lock_unpoisoned(&service.fills).contains_key(&session_id));
+    }
+
+    #[test]
+    fn fill_request_rejects_origin_mismatch_and_reports_locked_vault() {
+        let (_root, store) = test_store();
+        let entry = create_entry(&store, "https://example.com/login", "alice", "one");
+        let (service, recorded) = connected_service("connection-a");
+
+        service.handle_fill_request(
+            &store,
+            &secret_event(
+                "connection-a",
+                "fillRequest",
+                serde_json::json!({
+                    "entryId": entry.id,
+                    "tabId": 7,
+                    "origin": "https://evil.example",
+                    "documentId": "document-9",
+                }),
+            ),
+        );
+        assert!(recorded.requests_for("password.offerFillDirect").is_empty());
+        assert!(lock_unpoisoned(&service.fills).is_empty());
+
+        store.lock_current_session().unwrap();
+        service.handle_fill_request(
+            &store,
+            &secret_event(
+                "connection-a",
+                "fillRequest",
+                serde_json::json!({
+                    "entryId": entry.id,
+                    "tabId": 7,
+                    "origin": "https://example.com",
+                    "documentId": "document-9",
+                }),
+            ),
+        );
+        assert!(recorded.requests_for("password.offerFillDirect").is_empty());
+        assert!(lock_unpoisoned(&service.fills).is_empty());
+        let badges = recorded.requests_for("password.updateBadge");
+        assert_eq!(badges.len(), 1);
+        assert_eq!(badges[0]["payload"]["locked"], true);
+        assert_eq!(badges[0]["payload"]["tabId"], 7);
+    }
+
+    #[test]
+    fn save_decision_new_replace_adopts_candidate_credentials() {
+        let (_root, store) = test_store();
+        let alice = create_entry(&store, "https://example.com/login", "alice", "one");
+        let bob = create_entry(&store, "https://example.com/signin", "bob", "two");
+        let (service, recorded) = connected_service("connection-a");
+        lock_unpoisoned(&service.captures).insert(
+            "candidate-1".to_string(),
+            pending_capture(vec![capture_account(&alice), capture_account(&bob)]),
+        );
+
+        let saved = service.save_decision_from_event(
+            &store,
+            &save_decision_event("candidate-1", Some(&bob.id)),
+        );
+        assert_eq!(saved, Some((bob.id.clone(), "replace".to_string())));
+
+        let results = recorded.requests_for("password.saveResult");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["payload"]["success"], true);
+        assert_eq!(results[0]["payload"]["entryId"], bob.id);
+        let epoch = store.require_active_epoch().unwrap();
+        let updated = store.browser_fill_data_at(&bob.id, epoch).unwrap();
+        assert_eq!(updated.username, "carol");
+        assert_eq!(updated.password, "three");
+        let entries = store.list_entries_at(epoch).unwrap();
+        let untouched = entries
+            .iter()
+            .find(|entry| entry.id == alice.id)
+            .unwrap();
+        assert_eq!(untouched.username, "alice");
+    }
+
+    #[test]
+    fn save_decision_new_replace_requires_a_listed_account() {
+        let (_root, store) = test_store();
+        let alice = create_entry(&store, "https://example.com/login", "alice", "one");
+        let bob = create_entry(&store, "https://example.com/signin", "bob", "two");
+        let (service, recorded) = connected_service("connection-a");
+        lock_unpoisoned(&service.captures).insert(
+            "candidate-2".to_string(),
+            pending_capture(vec![capture_account(&alice)]),
+        );
+
+        let saved = service.save_decision_from_event(
+            &store,
+            &save_decision_event("candidate-2", Some(&bob.id)),
+        );
+        assert_eq!(saved, None);
+
+        let results = recorded.requests_for("password.saveResult");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["payload"]["success"], false);
+        assert_eq!(
+            results[0]["payload"]["error"]["code"],
+            "PASSWORD_PROTOCOL_INVALID"
+        );
+        let epoch = store.require_active_epoch().unwrap();
+        let unchanged = store.browser_fill_data_at(&bob.id, epoch).unwrap();
+        assert_eq!(unchanged.username, "bob");
+        assert_eq!(unchanged.password, "two");
+    }
+
+    #[test]
+    fn capture_candidate_reports_locked_vault() {
+        let (_root, store) = test_store();
+        {
+            let epoch = store.require_active_epoch().unwrap();
+            store.set_capture_enabled_at(true, epoch).unwrap();
+            store.lock_current_session().unwrap();
+        }
+        let (service, recorded) = connected_service("connection-a");
+
+        service.handle_capture_candidate(
+            &store,
+            &secret_event(
+                "connection-a",
+                "captureCandidate",
+                serde_json::json!({
+                    "candidateId": "candidate-locked",
+                    "origin": "https://example.com",
+                    "username": "alice",
+                    "password": "one",
+                    "tabId": 7,
+                    "frameId": 0,
+                    "documentId": "document-1",
+                }),
+            ),
+        );
+
+        let matches = recorded.requests_for("password.captureMatch");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["payload"]["action"], "locked");
+        assert!(!lock_unpoisoned(&service.captures).contains_key("candidate-locked"));
+    }
+
+    #[test]
+    fn sync_capture_is_idempotent_until_connection_state_is_cleared() {
+        let (_root, store) = test_store();
+        {
+            let epoch = store.require_active_epoch().unwrap();
+            store.set_capture_enabled_at(true, epoch).unwrap();
+        }
+        let (service, recorded) = connected_service("connection-a");
+
+        service.sync_capture_from_store(&store);
+        service.sync_capture_from_store(&store);
+        let syncs = recorded.requests_for("password.setCaptureEnabled");
+        assert_eq!(syncs.len(), 1);
+        assert_eq!(syncs[0]["payload"]["enabled"], true);
+
+        service.clear_connection_state_data("connection-a");
+        service.sync_capture_from_store(&store);
+        let syncs = recorded.requests_for("password.setCaptureEnabled");
+        assert_eq!(syncs.len(), 2);
+        assert_eq!(syncs[1]["payload"]["enabled"], true);
+    }
+
+    #[test]
+    fn status_reports_layered_state_without_consent_actions() {
+        let disconnected = service();
+        let (service, recorded) = connected_service("connection-a");
+        recorded.set_response(
+            "password.getStatus",
+            serde_json::json!({ "authenticationConsent": false }),
+        );
+        let status = service.status();
+        assert_eq!(status.capture_permission, "unknown");
+        assert!(status.message.as_deref().unwrap().contains("权限状态异常"));
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["capturePermission"], "unknown");
+        assert_eq!(value["pipeConnected"], true);
+        assert_eq!(value["connectionId"], "connection-a");
+        assert!(value.get("consentArmed").is_none());
+        assert!(value.get("consentActionRequired").is_none());
+
+        recorded.set_response(
+            "password.getStatus",
+            serde_json::json!({ "authenticationConsent": true }),
+        );
+        assert_eq!(service.status().capture_permission, "granted");
+
+        let status = disconnected.status();
+        assert_eq!(status.capture_permission, "unavailable");
+        assert!(!status.pipe_connected);
     }
 }

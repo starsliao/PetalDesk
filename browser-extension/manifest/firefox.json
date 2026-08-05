@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "飞花 - PetalDesk 浏览器增强",
-  "version": "0.6.3",
+  "version": "0.7.0",
   "description": "飞花 Firefox 浏览器增强，支持长截图和经确认的密码填充。",
   "homepage_url": "https://starsliao.github.io/PetalDesk/",
   "icons": {
@@ -27,7 +27,8 @@
     ]
   },
   "action": {
-    "default_title": "飞花：授权密码管理",
+    "default_title": "飞花密码管理",
+    "default_popup": "popup/popup.html",
     "default_icon": {
       "16": "assets/icons/petaldesk-16.png",
       "32": "assets/icons/petaldesk-32.png"
@@ -53,8 +54,7 @@
       "id": "petaldesk-capture@petaldesk.app",
       "strict_min_version": "140.0",
       "data_collection_permissions": {
-        "required": ["websiteActivity"],
-        "optional": ["authenticationInfo"]
+        "required": ["websiteActivity", "authenticationInfo"]
       }
     }
   }

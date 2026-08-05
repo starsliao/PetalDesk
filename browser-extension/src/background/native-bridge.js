@@ -166,6 +166,10 @@
       if (request.event === "secretDisconnected") {
         cancelActiveSessions();
         if (passwordBridge) passwordBridge.disconnect();
+      } else if (request.event === "secretConnected") {
+        if (passwordBridge && typeof passwordBridge.onSecretConnected === "function") {
+          void passwordBridge.onSecretConnected();
+        }
       }
       return;
     }
@@ -209,6 +213,12 @@
     reconnectDelayMs = Math.min(reconnectDelayMs * 2, MAX_RECONNECT_DELAY_MS);
   }
 
+  function setNativeConnected(connected) {
+    if (passwordBridge && typeof passwordBridge.setNativeConnected === "function") {
+      passwordBridge.setNativeConnected(connected);
+    }
+  }
+
   function connect() {
     if (nativePort) {
       return;
@@ -217,11 +227,13 @@
     try {
       const port = api.connectNative(HOST_NAME);
       nativePort = port;
+      setNativeConnected(true);
       port.onMessage.addListener(onNativeMessage);
       port.onDisconnect.addListener(() => {
         api.consumeRuntimeLastError();
         nativePort = null;
         cancelActiveSessions();
+        setNativeConnected(false);
         if (passwordBridge) {
           passwordBridge.disconnect();
         }
@@ -240,6 +252,7 @@
       });
     } catch (error) {
       nativePort = null;
+      setNativeConnected(false);
       console.warn("PetalDesk native host connection failed", error);
       scheduleReconnect();
     }

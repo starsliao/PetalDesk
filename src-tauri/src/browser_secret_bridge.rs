@@ -26,6 +26,31 @@ const MAX_QUEUED_EVENTS: usize = 128;
 const ENDPOINT_TTL: Duration = Duration::from_secs(5 * 60);
 const ENDPOINT_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const CONNECTION_STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const DIAG_CAPACITY: usize = 100;
+/// 超时请求的存活探测时限。扩展端 native-bridge.js 会直接应答 ping（不经过
+/// password-bridge），健康连接即使真实命令卡住也应在 1.5s 内回复。
+const PING_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// 结构化诊断条目：只含事件名和短标识符，绝不包含 token 或凭据 payload。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DiagEntry {
+    pub(crate) at_unix_ms: u128,
+    pub(crate) layer: &'static str,
+    pub(crate) event: &'static str,
+    pub(crate) detail: String,
+}
+
+/// `send_and_wait` 的失败分类。只有 `TimedOut` 值得先做 ping 探测，其余两种
+/// 已经说明连接本身完了。
+enum SecretSendError {
+    /// 扩展返回了错误应答；连接本身是健康的。
+    Answered(String),
+    /// 请求发不出去或应答通道断开；按 reason 退休该 generation。
+    Retire { reason: &'static str, message: String },
+    /// 超时未收到应答；退休前先用 ping 探测连接死活。
+    TimedOut(String),
+}
 
 #[derive(Debug, Clone)]
 pub struct BrowserSecretEvent {
@@ -63,6 +88,8 @@ struct SecretInner {
     pending: Mutex<HashMap<String, SyncSender<Result<Value, String>>>>,
     events: Mutex<VecDeque<BrowserSecretEvent>>,
     event_ready: Condvar,
+    diag: Mutex<VecDeque<DiagEntry>>,
+    last_request_outcome: Mutex<Option<DiagEntry>>,
 }
 
 impl SecretConnectionControl {
@@ -217,6 +244,8 @@ impl BrowserSecretBridge {
                 pending: Mutex::new(HashMap::new()),
                 events: Mutex::new(VecDeque::new()),
                 event_ready: Condvar::new(),
+                diag: Mutex::new(VecDeque::new()),
+                last_request_outcome: Mutex::new(None),
             }),
         }
     }
@@ -250,6 +279,8 @@ impl BrowserSecretBridge {
                 pending: Mutex::new(HashMap::new()),
                 events: Mutex::new(VecDeque::new()),
                 event_ready: Condvar::new(),
+                diag: Mutex::new(VecDeque::new()),
+                last_request_outcome: Mutex::new(None),
             });
             let server_inner = inner.clone();
             std::thread::Builder::new()
@@ -314,69 +345,188 @@ impl BrowserSecretBridge {
         timeout: Duration,
     ) -> Result<Value, String> {
         validate_command(command)?;
-        if connection.control.is_retired() {
-            return Err("password browser connection closed".to_string());
+        let request_id = Uuid::new_v4().to_string();
+        match self.send_and_wait(&connection, &request_id, command, payload, timeout) {
+            Ok(value) => {
+                self.note_request_outcome("completed", command, &request_id, "ok");
+                Ok(value)
+            }
+            Err(SecretSendError::Answered(message)) => {
+                self.note_request_outcome("failed", command, &request_id, &message);
+                Err(message)
+            }
+            Err(SecretSendError::Retire { reason, message }) => {
+                close_connection_generation(
+                    &self.inner,
+                    connection_id,
+                    connection.browser,
+                    connection.generation,
+                    &connection.control,
+                    reason,
+                );
+                self.note_request_outcome("connection-retired", command, &request_id, reason);
+                Err(message)
+            }
+            Err(SecretSendError::TimedOut(message)) => {
+                record_diag(
+                    &self.inner,
+                    "request",
+                    "timeout",
+                    request_detail(command, &request_id),
+                );
+                if self.probe_connection(&connection) {
+                    // 连接仍然健康：只让本次调用方看到超时，不退休 generation，
+                    // 避免单次慢请求触发"杀连接→重连→再超时"的抖动循环。
+                    record_diag(
+                        &self.inner,
+                        "request",
+                        "probe-ok",
+                        request_detail(command, &request_id),
+                    );
+                    self.note_request_outcome(
+                        "timeout",
+                        command,
+                        &request_id,
+                        "ping ok, connection kept",
+                    );
+                    return Err(message);
+                }
+                record_diag(
+                    &self.inner,
+                    "request",
+                    "probe-failed",
+                    request_detail(command, &request_id),
+                );
+                close_connection_generation(
+                    &self.inner,
+                    connection_id,
+                    connection.browser,
+                    connection.generation,
+                    &connection.control,
+                    "request-timeout",
+                );
+                self.note_request_outcome(
+                    "timeout",
+                    command,
+                    &request_id,
+                    "ping failed, connection retired",
+                );
+                Err(message)
+            }
         }
+    }
 
-        let id = Uuid::new_v4().to_string();
+    /// 发送一条命令并等待应答，不做任何退休处理：失败含义由调用方决定。
+    /// ping 探测也走这里，因此探测自身绝不会触发新的探测。
+    fn send_and_wait(
+        &self,
+        connection: &SecretConnection,
+        request_id: &str,
+        command: &str,
+        payload: Value,
+        timeout: Duration,
+    ) -> Result<Value, SecretSendError> {
+        if connection.control.is_retired() {
+            return Err(SecretSendError::Retire {
+                reason: "already-retired",
+                message: "password browser connection closed".to_string(),
+            });
+        }
         let (response_tx, response_rx) = mpsc::sync_channel(1);
-        lock_unpoisoned(&self.inner.pending).insert(id.clone(), response_tx);
+        lock_unpoisoned(&self.inner.pending).insert(request_id.to_string(), response_tx);
         let request = serde_json::json!({
             "version": SECRET_PROTOCOL_VERSION,
             "type": "secret.command",
-            "id": id,
+            "id": request_id,
             "protocolVersion": 1,
             "command": command,
             "payload": payload,
         });
         if connection.control.is_retired() {
-            lock_unpoisoned(&self.inner.pending).remove(&id);
-            return Err("password browser connection closed".to_string());
+            lock_unpoisoned(&self.inner.pending).remove(request_id);
+            return Err(SecretSendError::Retire {
+                reason: "already-retired",
+                message: "password browser connection closed".to_string(),
+            });
         }
         if let Err(error) = connection.sender.try_send(request) {
-            lock_unpoisoned(&self.inner.pending).remove(&id);
-            close_connection_generation(
-                &self.inner,
-                connection_id,
-                connection.browser,
-                connection.generation,
-                &connection.control,
-            );
-            return Err(match error {
-                mpsc::TrySendError::Full(_) => "password browser connection is busy".to_string(),
-                mpsc::TrySendError::Disconnected(_) => {
-                    "password browser connection closed".to_string()
+            lock_unpoisoned(&self.inner.pending).remove(request_id);
+            let (reason, message) = match error {
+                mpsc::TrySendError::Full(_) => {
+                    ("request-queue-full", "password browser connection is busy")
                 }
+                mpsc::TrySendError::Disconnected(_) => (
+                    "request-queue-disconnected",
+                    "password browser connection closed",
+                ),
+            };
+            record_diag(
+                &self.inner,
+                "request",
+                reason,
+                request_detail(command, request_id),
+            );
+            return Err(SecretSendError::Retire {
+                reason,
+                message: message.to_string(),
             });
         }
         let result = match response_rx.recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                close_connection_generation(
-                    &self.inner,
-                    connection_id,
-                    connection.browser,
-                    connection.generation,
-                    &connection.control,
-                );
-                Err(format!(
-                    "password browser request timed out after {} ms",
-                    timeout.as_millis()
-                ))
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                close_connection_generation(
-                    &self.inner,
-                    connection_id,
-                    connection.browser,
-                    connection.generation,
-                    &connection.control,
-                );
-                Err("password browser connection closed".to_string())
-            }
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(message)) => Err(SecretSendError::Answered(message)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(SecretSendError::TimedOut(format!(
+                "password browser request timed out after {} ms",
+                timeout.as_millis()
+            ))),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(SecretSendError::Retire {
+                reason: "response-channel-closed",
+                message: "password browser connection closed".to_string(),
+            }),
         };
-        lock_unpoisoned(&self.inner.pending).remove(&id);
+        lock_unpoisoned(&self.inner.pending).remove(request_id);
         result
+    }
+
+    /// 用同一连接发内部 ping 探测死活。扩展端 native-bridge.js 直接应答
+    /// ping（不经过 password-bridge），所以真实命令卡住时健康连接仍会快速回复。
+    fn probe_connection(&self, connection: &SecretConnection) -> bool {
+        self.send_and_wait(
+            connection,
+            &Uuid::new_v4().to_string(),
+            "ping",
+            Value::Object(Default::default()),
+            PING_PROBE_TIMEOUT,
+        )
+        .is_ok()
+    }
+
+    fn note_request_outcome(
+        &self,
+        event: &'static str,
+        command: &str,
+        request_id: &str,
+        outcome: &str,
+    ) {
+        *lock_unpoisoned(&self.inner.last_request_outcome) = Some(DiagEntry {
+            at_unix_ms: unix_time_ms(),
+            layer: "request",
+            event,
+            detail: format!("{} outcome={outcome}", request_detail(command, request_id)),
+        });
+    }
+
+    /// 最近 N 条诊断（按时间升序）。供密码状态接口展示通道健康状况。
+    pub(crate) fn diag_snapshot(&self, limit: usize) -> Vec<DiagEntry> {
+        let diag = lock_unpoisoned(&self.inner.diag);
+        diag.iter()
+            .skip(diag.len().saturating_sub(limit))
+            .cloned()
+            .collect()
+    }
+
+    /// 最近一次请求的结局。供密码状态接口展示。
+    pub(crate) fn last_request_outcome(&self) -> Option<DiagEntry> {
+        lock_unpoisoned(&self.inner.last_request_outcome).clone()
     }
 
     pub fn receive_event(&self, timeout: Duration) -> Option<BrowserSecretEvent> {
@@ -423,7 +573,7 @@ impl Drop for SecretInner {
     }
 }
 
-fn bridge_root() -> Result<PathBuf, String> {
+pub(crate) fn bridge_root() -> Result<PathBuf, String> {
     dirs::data_local_dir()
         .ok_or_else(|| "unable to locate local application data".to_string())
         .map(|root| root.join("PetalDesk").join("browser-bridge"))
@@ -444,15 +594,37 @@ fn unix_time_ms() -> u128 {
 }
 
 fn validate_command(command: &str) -> Result<(), String> {
-    if !command.starts_with("password.")
-        || command.len() > 64
-        || !command
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    // 精确的 "ping" 是连接存活探测命令，由扩展直接应答；其余命令必须以
+    // "password." 开头。
+    if command != "ping"
+        && (!command.starts_with("password.")
+            || command.len() > 64
+            || !command
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')))
     {
         return Err("password browser command name is invalid".to_string());
     }
     Ok(())
+}
+
+/// 诊断 detail 只含命令名和 requestId 前 8 位，绝不包含 payload。
+fn request_detail(command: &str, request_id: &str) -> String {
+    let short_id = request_id.get(..8).unwrap_or(request_id);
+    format!("command={command} requestId={short_id}")
+}
+
+fn record_diag(inner: &SecretInner, layer: &'static str, event: &'static str, detail: impl Into<String>) {
+    let mut diag = lock_unpoisoned(&inner.diag);
+    while diag.len() >= DIAG_CAPACITY {
+        diag.pop_front();
+    }
+    diag.push_back(DiagEntry {
+        at_unix_ms: unix_time_ms(),
+        layer,
+        event,
+        detail: detail.into(),
+    });
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -528,8 +700,13 @@ fn write_frame<W: Write>(writer: &mut W, value: &Value) -> Result<(), String> {
         .map_err(|error| format!("failed to write browser secret frame: {error}"))
 }
 
-fn handle_pipe_connection(mut pipe: std::fs::File, inner: Arc<SecretInner>) -> Result<(), String> {
-    let hello = read_frame(&mut pipe)?.ok_or_else(|| "browser secret pipe closed".to_string())?;
+/// 握手与连接建立阶段。所有错误文案均为静态字符串或 I/O 错误，不含 token，
+/// 因此可以安全写入诊断缓冲。
+fn establish_secret_connection(
+    pipe: &mut std::fs::File,
+    inner: &SecretInner,
+) -> Result<(String, BrowserFamily, std::fs::File, Arc<SecretConnectionControl>), String> {
+    let hello = read_frame(pipe)?.ok_or_else(|| "browser secret pipe closed".to_string())?;
     let expected_token = lock_unpoisoned(&inner.token).clone();
     if hello.get("type").and_then(Value::as_str) != Some("secret.hello")
         || hello.get("version").and_then(Value::as_u64) != Some(SECRET_PROTOCOL_VERSION as u64)
@@ -555,20 +732,38 @@ fn handle_pipe_connection(mut pipe: std::fs::File, inner: Arc<SecretInner>) -> R
         .filter(|value| *value != 0)
         .ok_or_else(|| "browser secret handshake has no process ID".to_string())?;
     #[cfg(windows)]
-    validate_named_pipe_client(&pipe, declared_process_id)?;
+    validate_named_pipe_client(pipe, declared_process_id)?;
     write_frame(
-        &mut pipe,
+        pipe,
         &serde_json::json!({
             "version": SECRET_PROTOCOL_VERSION,
             "type": "secret.ready",
         }),
     )?;
 
-    let mut reader = pipe
+    let reader = pipe
         .try_clone()
         .map_err(|error| format!("failed to clone browser secret pipe: {error}"))?;
-    let control = Arc::new(SecretConnectionControl::new(&pipe)?);
+    let control = Arc::new(SecretConnectionControl::new(pipe)?);
     control.register_reader_thread()?;
+    Ok((connection_id, browser, reader, control))
+}
+
+fn handle_pipe_connection(mut pipe: std::fs::File, inner: Arc<SecretInner>) -> Result<(), String> {
+    let (connection_id, browser, mut reader, control) =
+        match establish_secret_connection(&mut pipe, &inner) {
+            Ok(established) => established,
+            Err(error) => {
+                record_diag(&inner, "handshake", "failed", error.clone());
+                return Err(error);
+            }
+        };
+    record_diag(
+        &inner,
+        "handshake",
+        "succeeded",
+        format!("connectionId={connection_id} browser={}", browser.as_str()),
+    );
     let (outbound_tx, outbound_rx) = mpsc::sync_channel::<Value>(32);
     let generation = Uuid::new_v4();
     insert_connection_generation(
@@ -581,6 +776,15 @@ fn handle_pipe_connection(mut pipe: std::fs::File, inner: Arc<SecretInner>) -> R
             generation,
             control: control.clone(),
         },
+    );
+    record_diag(
+        &inner,
+        "connection",
+        "established",
+        format!(
+            "connectionId={connection_id} browser={} generation={generation}",
+            browser.as_str()
+        ),
     );
     {
         let mut events = lock_unpoisoned(&inner.events);
@@ -606,6 +810,7 @@ fn handle_pipe_connection(mut pipe: std::fs::File, inner: Arc<SecretInner>) -> R
                 browser,
                 generation,
                 &writer_control,
+                "writer-register-failed",
             );
             return;
         }
@@ -666,7 +871,19 @@ fn handle_pipe_connection(mut pipe: std::fs::File, inner: Arc<SecretInner>) -> R
         Ok::<(), String>(())
     })();
 
-    close_connection_generation(&inner, &connection_id, browser, generation, &control);
+    let read_reason = if read_result.is_ok() {
+        "read-loop-ended"
+    } else {
+        "read-loop-failed"
+    };
+    close_connection_generation(
+        &inner,
+        &connection_id,
+        browser,
+        generation,
+        &control,
+        read_reason,
+    );
     let _ = writer.join();
     read_result
 }
@@ -690,7 +907,14 @@ fn run_connection_writer<W: Write>(
             break;
         }
         if write_frame(&mut writer, &message).is_err() {
-            close_connection_generation(&inner, &connection_id, browser, generation, &control);
+            close_connection_generation(
+                &inner,
+                &connection_id,
+                browser,
+                generation,
+                &control,
+                "writer-io-failed",
+            );
             break;
         }
     }
@@ -702,11 +926,21 @@ fn close_connection_generation(
     browser: BrowserFamily,
     generation: Uuid,
     control: &SecretConnectionControl,
+    reason: &'static str,
 ) -> bool {
     control.retire();
     if !remove_connection_generation(&inner.connections, connection_id, generation) {
         return false;
     }
+    record_diag(
+        inner,
+        "connection",
+        "retired",
+        format!(
+            "connectionId={connection_id} browser={} reason={reason}",
+            browser.as_str()
+        ),
+    );
     let mut events = lock_unpoisoned(&inner.events);
     while events.len() >= MAX_QUEUED_EVENTS {
         events.pop_front();
@@ -746,6 +980,49 @@ fn insert_connection_generation(
     let replaced = lock_unpoisoned(connections).insert(connection_id, connection);
     if let Some(replaced) = replaced {
         replaced.control.retire();
+    }
+}
+
+/// Builds a bridge with one fake Firefox connection whose outbound requests
+/// arrive on the returned channel. Password-service tests pair this with
+/// `test_answer_request` to drive request/response flows without a real pipe.
+#[cfg(test)]
+pub(crate) fn test_bridge(connection_id: &str) -> (BrowserSecretBridge, mpsc::Receiver<Value>) {
+    let inner = Arc::new(SecretInner {
+        token: Mutex::new("test-token".to_string()),
+        endpoint_path: PathBuf::new(),
+        connections: Mutex::new(HashMap::new()),
+        pending: Mutex::new(HashMap::new()),
+        events: Mutex::new(VecDeque::new()),
+        event_ready: Condvar::new(),
+        diag: Mutex::new(VecDeque::new()),
+        last_request_outcome: Mutex::new(None),
+    });
+    let (sender, receiver) = mpsc::sync_channel(MAX_QUEUED_EVENTS);
+    insert_connection_generation(
+        &inner.connections,
+        connection_id.to_string(),
+        SecretConnection {
+            browser: BrowserFamily::Firefox,
+            sender,
+            connected_at: Instant::now(),
+            generation: Uuid::new_v4(),
+            control: Arc::new(SecretConnectionControl::detached()),
+        },
+    );
+    (BrowserSecretBridge { inner }, receiver)
+}
+
+#[cfg(test)]
+impl BrowserSecretBridge {
+    /// Answers an in-flight request captured from the test channel.
+    pub(crate) fn test_answer_request(&self, request: &Value, response: Value) {
+        let Some(id) = request.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        if let Some(pending) = lock_unpoisoned(&self.inner.pending).remove(id) {
+            let _ = pending.send(Ok(response));
+        }
     }
 }
 
@@ -811,6 +1088,7 @@ fn is_expected_native_host_path(app_path: &Path, client_path: &Path) -> bool {
 
 #[cfg(windows)]
 fn run_pipe_server(pipe_name: &str, inner: Arc<SecretInner>) {
+    record_diag(&inner, "pipe-server", "started", pipe_name);
     loop {
         match create_and_connect_pipe(pipe_name) {
             Ok(pipe) => {
@@ -1001,6 +1279,8 @@ mod tests {
             pending: Mutex::new(HashMap::new()),
             events: Mutex::new(VecDeque::new()),
             event_ready: Condvar::new(),
+            diag: Mutex::new(VecDeque::new()),
+            last_request_outcome: Mutex::new(None),
         })
     }
 
@@ -1031,6 +1311,14 @@ mod tests {
         assert!(validate_command("password.provideCredentials").is_ok());
         assert!(validate_command("start").is_err());
         assert!(validate_command("password../escape").is_err());
+    }
+
+    #[test]
+    fn validate_command_allows_exact_ping_only() {
+        assert!(validate_command("ping").is_ok());
+        assert!(validate_command("pinger").is_err());
+        assert!(validate_command("ping.pong").is_err());
+        assert!(validate_command(" password.").is_err());
     }
 
     #[test]
@@ -1155,7 +1443,7 @@ mod tests {
         let bridge = BrowserSecretBridge {
             inner: inner.clone(),
         };
-        let (sender, receiver) = mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::sync_channel(4);
         let generation = Uuid::new_v4();
         let control = insert_test_connection(&inner, "timed-out", sender, generation);
 
@@ -1172,14 +1460,126 @@ mod tests {
         assert!(control.is_retired());
         assert!(lock_unpoisoned(&inner.pending).is_empty());
         assert!(!lock_unpoisoned(&inner.connections).contains_key("timed-out"));
-        assert!(receiver.recv_timeout(Duration::from_secs(1)).is_ok());
-        assert!(matches!(
-            receiver.recv_timeout(Duration::ZERO),
-            Err(mpsc::RecvTimeoutError::Disconnected)
-        ));
+        // 退休前会先做一次 ping 探测：队列里依次看到原请求和 ping，且 ping
+        // 同样无人应答后连接才被退休。
+        let mut commands = Vec::new();
+        while let Ok(request) = receiver.recv_timeout(Duration::from_secs(1)) {
+            commands.push(
+                request
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            );
+        }
+        assert_eq!(
+            commands,
+            vec![
+                Some("password.getStatus".to_string()),
+                Some("ping".to_string())
+            ]
+        );
         let event = bridge.receive_event(Duration::ZERO).unwrap();
         assert_eq!(event.connection_id, "timed-out");
         assert_eq!(event.event, "connectionClosed");
+        let outcome = bridge.last_request_outcome().unwrap();
+        assert_eq!(outcome.event, "timeout");
+        assert!(outcome.detail.contains("command=password.getStatus"));
+        assert!(outcome.detail.contains("ping failed"));
+        let diag = bridge.diag_snapshot(DIAG_CAPACITY);
+        assert!(diag.iter().any(|entry| entry.event == "timeout"));
+        assert!(diag.iter().any(|entry| entry.event == "probe-failed"));
+        assert!(diag
+            .iter()
+            .any(|entry| entry.event == "retired"
+                && entry.detail.contains("reason=request-timeout")));
+    }
+
+    #[test]
+    fn timed_out_request_keeps_connection_when_ping_answers() {
+        let inner = test_inner();
+        let bridge = BrowserSecretBridge {
+            inner: inner.clone(),
+        };
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let generation = Uuid::new_v4();
+        let control = insert_test_connection(&inner, "probe-alive", sender, generation);
+        // 模拟 Host 一侧：只应答 ping（与 native-bridge.js 的行为一致），
+        // 真实命令一直不应答。
+        let responder_inner = inner.clone();
+        let responder = std::thread::spawn(move || {
+            while let Ok(request) = receiver.recv() {
+                if request.get("command").and_then(Value::as_str) != Some("ping") {
+                    continue;
+                }
+                let Some(id) = request.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let pending = lock_unpoisoned(&responder_inner.pending).remove(id);
+                if let Some(pending) = pending {
+                    let _ = pending.send(Ok(serde_json::json!({ "pong": true })));
+                }
+            }
+        });
+
+        let error = bridge
+            .request_connection(
+                "probe-alive",
+                "password.getStatus",
+                Value::Object(Default::default()),
+                Duration::from_millis(50),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "password browser request timed out after 50 ms"
+        );
+        // ping 应答正常：连接保留，不退休 generation，也不产生关闭事件。
+        assert!(!control.is_retired());
+        assert!(lock_unpoisoned(&inner.connections).contains_key("probe-alive"));
+        assert!(lock_unpoisoned(&inner.pending).is_empty());
+        assert!(bridge.receive_event(Duration::ZERO).is_none());
+        let outcome = bridge.last_request_outcome().unwrap();
+        assert_eq!(outcome.event, "timeout");
+        assert!(outcome.detail.contains("ping ok"));
+        let diag = bridge.diag_snapshot(DIAG_CAPACITY);
+        assert!(diag.iter().any(|entry| entry.event == "probe-ok"));
+        assert!(!diag.iter().any(|entry| entry.event == "probe-failed"));
+
+        assert!(close_connection_generation(
+            &inner,
+            "probe-alive",
+            BrowserFamily::Firefox,
+            generation,
+            &control,
+            "test-close",
+        ));
+        responder.join().unwrap();
+    }
+
+    #[test]
+    fn diag_buffer_keeps_only_the_most_recent_entries() {
+        let inner = test_inner();
+        for index in 0..(DIAG_CAPACITY + 25) {
+            record_diag(&inner, "test", "fill", format!("entry-{index}"));
+        }
+        let bridge = BrowserSecretBridge {
+            inner: inner.clone(),
+        };
+        let snapshot = bridge.diag_snapshot(DIAG_CAPACITY * 2);
+        assert_eq!(snapshot.len(), DIAG_CAPACITY);
+        assert_eq!(snapshot[0].detail, "entry-25");
+        assert_eq!(
+            snapshot[DIAG_CAPACITY - 1].detail,
+            format!("entry-{}", DIAG_CAPACITY + 24)
+        );
+        let limited = bridge.diag_snapshot(5);
+        assert_eq!(limited.len(), 5);
+        assert_eq!(limited[0].detail, format!("entry-{}", DIAG_CAPACITY + 20));
+        assert_eq!(limited[4].detail, format!("entry-{}", DIAG_CAPACITY + 24));
+        assert!(limited.iter().all(|entry| entry.layer == "test"
+            && entry.event == "fill"
+            && entry.at_unix_ms > 0));
     }
 
     #[test]
@@ -1197,6 +1597,7 @@ mod tests {
             BrowserFamily::Firefox,
             old_generation,
             &old_control,
+            "test-close",
         ));
         assert!(old_control.is_retired());
         assert!(!replacement_control.is_retired());
@@ -1209,6 +1610,7 @@ mod tests {
             BrowserFamily::Firefox,
             new_generation,
             &replacement_control,
+            "test-close",
         ));
         assert!(!close_connection_generation(
             &inner,
@@ -1216,6 +1618,7 @@ mod tests {
             BrowserFamily::Firefox,
             new_generation,
             &replacement_control,
+            "test-close",
         ));
         assert_eq!(lock_unpoisoned(&inner.events).len(), 1);
     }
@@ -1304,6 +1707,7 @@ mod tests {
             BrowserFamily::Firefox,
             generation,
             &control,
+            "test-close",
         ));
         for _ in 0..20 {
             if writer.is_finished() {
@@ -1334,6 +1738,7 @@ mod tests {
             BrowserFamily::Firefox,
             generation,
             &control,
+            "test-close",
         ));
         let wrote = Arc::new(AtomicBool::new(false));
 
@@ -1476,6 +1881,7 @@ mod tests {
             BrowserFamily::Firefox,
             generation,
             &control,
+            "test-close",
         );
         for _ in 0..100 {
             if writer.is_finished() {

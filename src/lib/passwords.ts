@@ -12,9 +12,17 @@ export type PasswordProtection =
 
 export type PasswordBrowser = "firefox";
 export type PasswordBrowserConnection = "connected" | "extension-missing" | "native-host-missing" | "unsupported" | "disconnected";
-export type PasswordBrowserCapturePermission = "granted" | "action-required" | "unavailable" | "unknown";
+export type PasswordBrowserCapturePermission = "granted" | "unavailable" | "unknown";
 
 export const FIREFOX_EXTENSION_INSTALL_URL = "https://starsliao.github.io/PetalDesk/firefox.html";
+
+/** Non-secret diagnostic entry reported by the desktop bridge layers. */
+export interface PasswordBrowserDiagEntry {
+  atUnixMs: number;
+  layer: string;
+  event: string;
+  detail: string;
+}
 
 export interface PasswordBrowserStatus {
   browser: PasswordBrowser;
@@ -24,6 +32,14 @@ export interface PasswordBrowserStatus {
   extensionVersion?: string | null;
   installUrl?: string | null;
   capturePermission?: PasswordBrowserCapturePermission;
+  authenticationConsent?: boolean;
+  stdioConnected?: boolean;
+  pipeConnected?: boolean;
+  connectionId?: string | null;
+  diagnostics?: PasswordBrowserDiagEntry[];
+  lastRequestOutcome?: PasswordBrowserDiagEntry | null;
+  /** Backend error code preserved when the status itself had to be synthesized. */
+  errorCode?: string;
   message?: string | null;
 }
 
@@ -84,7 +100,6 @@ export interface PasswordFillTicket {
   browser: PasswordBrowser;
   origin: string;
   expiresAt: number | string;
-  actionRequired?: "toolbar-click";
 }
 
 export interface PasswordTemplateRecordingTicket {
@@ -155,10 +170,34 @@ export interface PasswordApi {
 interface BackendError {
   code?: string;
   message?: string;
+  layer?: string;
+  requestId?: string;
+  connectionId?: string;
+  details?: Record<string, unknown> | null;
+}
+
+/** Error thrown by desktop password commands; keeps the backend error code when present. */
+export interface PasswordCommandError extends Error {
+  code?: string;
+  layer?: string;
+  requestId?: string;
+  connectionId?: string;
 }
 
 function isDesktopRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function backendError(error: unknown): BackendError | null {
+  if (typeof error === "object" && error) return error as BackendError;
+  if (typeof error === "string") {
+    try {
+      return JSON.parse(error) as BackendError;
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 function errorMessage(error: unknown): string {
@@ -176,11 +215,29 @@ function errorMessage(error: unknown): string {
   return "密码管理器操作失败，请稍后重试。";
 }
 
+function backendErrorField(backend: BackendError, key: "layer" | "requestId" | "connectionId"): string | undefined {
+  const direct = backend[key];
+  if (typeof direct === "string" && direct) return direct;
+  const nested = backend.details?.[key];
+  return typeof nested === "string" && nested ? nested : undefined;
+}
+
 async function command<T>(name: string, args?: Record<string, unknown>): Promise<T> {
   try {
     return await invoke<T>(name, args);
   } catch (error) {
-    throw new Error(errorMessage(error));
+    const message = errorMessage(error);
+    const backend = backendError(error);
+    if (!backend) throw new Error(message);
+    const enriched = new Error(message) as PasswordCommandError;
+    if (typeof backend.code === "string" && backend.code) enriched.code = backend.code;
+    const layer = backendErrorField(backend, "layer");
+    const requestId = backendErrorField(backend, "requestId");
+    const connectionId = backendErrorField(backend, "connectionId");
+    if (layer) enriched.layer = layer;
+    if (requestId) enriched.requestId = requestId;
+    if (connectionId) enriched.connectionId = connectionId;
+    throw enriched;
   }
 }
 
@@ -237,15 +294,32 @@ function normalizedEntry(value: Partial<PasswordEntrySummary> & Record<string, u
   };
 }
 
+function normalizeDiagEntry(value: unknown): PasswordBrowserDiagEntry | null {
+  if (typeof value !== "object" || !value) return null;
+  const record = value as Record<string, unknown>;
+  const atUnixMs = Number(record.atUnixMs ?? record.at_unix_ms ?? 0);
+  return {
+    atUnixMs: Number.isFinite(atUnixMs) ? atUnixMs : 0,
+    layer: String(record.layer ?? ""),
+    event: String(record.event ?? ""),
+    detail: String(record.detail ?? ""),
+  };
+}
+
 function normalizeBrowser(value: Partial<PasswordBrowserStatus> & Record<string, unknown>): PasswordBrowserStatus {
   const connection = String(value.connection ?? value.status ?? "disconnected") as PasswordBrowserConnection;
   const allowed: PasswordBrowserConnection[] = ["connected", "extension-missing", "native-host-missing", "unsupported", "disconnected"];
   const normalizedConnection = allowed.includes(connection) ? connection : "disconnected";
   const capturePermissionValue = String(value.capturePermission ?? value.capture_permission ?? "");
-  const capturePermission = (["granted", "action-required", "unavailable", "unknown"] as const)
+  const capturePermission = (["granted", "unavailable", "unknown"] as const)
     .find((candidate) => candidate === capturePermissionValue);
   const normalizedCapturePermission = capturePermission
     ?? (normalizedConnection === "connected" ? "unknown" : undefined);
+  const diagnostics = Array.isArray(value.diagnostics)
+    ? value.diagnostics.map(normalizeDiagEntry).filter((entry): entry is PasswordBrowserDiagEntry => entry !== null)
+    : [];
+  const lastRequestOutcome = normalizeDiagEntry(value.lastRequestOutcome ?? value.last_request_outcome);
+  const connectionId = value.connectionId ?? value.connection_id;
   return {
     browser: "firefox",
     connection: normalizedConnection,
@@ -258,19 +332,23 @@ function normalizeBrowser(value: Partial<PasswordBrowserStatus> & Record<string,
         : FIREFOX_EXTENSION_INSTALL_URL
       : String(value.installUrl),
     ...(normalizedCapturePermission ? { capturePermission: normalizedCapturePermission } : {}),
+    authenticationConsent: Boolean(value.authenticationConsent ?? value.authentication_consent ?? false),
+    stdioConnected: Boolean(value.stdioConnected ?? value.stdio_connected ?? false),
+    pipeConnected: Boolean(value.pipeConnected ?? value.pipe_connected ?? false),
+    connectionId: connectionId == null ? null : String(connectionId),
+    diagnostics,
+    lastRequestOutcome,
     message: value.message == null ? null : String(value.message),
   };
 }
 
 function normalizeFillTicket(value: Partial<PasswordFillTicket> & Record<string, unknown>): PasswordFillTicket {
-  const actionRequired = value.actionRequired ?? value.action_required;
   return {
     sessionId: String(value.sessionId ?? value.session_id ?? ""),
     entryId: String(value.entryId ?? value.entry_id ?? ""),
     browser: "firefox",
     origin: String(value.origin ?? ""),
     expiresAt: (value.expiresAt ?? value.expires_at ?? 0) as number | string,
-    ...(actionRequired === "toolbar-click" ? { actionRequired } : {}),
   };
 }
 
@@ -528,14 +606,20 @@ export const passwordApi: PasswordApi = {
     if (!isDesktopRuntime()) return browserApi.getBrowserStatus();
     try {
       return normalizeBrowser(await command<PasswordBrowserStatus & Record<string, unknown>>("get_password_browser_status"));
-    } catch {
+    } catch (reason) {
+      const detail = reason instanceof Error && reason.message
+        && reason.message !== "密码管理器操作失败，请稍后重试。" ? reason.message : "";
+      const code = (reason as PasswordCommandError | null)?.code;
       return {
         browser: "firefox",
         connection: "disconnected",
         extensionInstalled: false,
         nativeHostInstalled: false,
         capturePermission: "unknown",
-        message: "Firefox 扩展通信异常，无法读取密码权限状态。",
+        ...(code ? { errorCode: code } : {}),
+        message: detail
+          ? `Firefox 扩展通信异常，无法读取密码权限状态（${detail}）。`
+          : "Firefox 扩展通信异常，无法读取密码权限状态。",
       };
     }
   },

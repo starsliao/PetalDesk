@@ -41,11 +41,12 @@ never requires AMO credentials or performs an external submission. Chrome/Edge
 password publication remains a later release step.
 
 The Firefox manifest declares required `websiteActivity` for scroll geometry
-and optional `authenticationInfo` for usernames/passwords. Authentication
-access is requested only from a directly clicked toolbar action after PetalDesk
-arms the consent flow. The Native Messaging host is on the same machine; the
-extension does not send data to a remote service. AMO listing, privacy,
-permission, and reviewer drafts are in `amo/`.
+and required `authenticationInfo` for usernames/passwords; both are granted at
+installation time. The toolbar action opens a popup with connection
+diagnostics and the accounts PetalDesk offers for the active tab. The Native
+Messaging host is on the same machine; the extension does not send data to a
+remote service. AMO listing, privacy, permission, and reviewer drafts are in
+`amo/`.
 
 ## Capture protocol
 
@@ -97,6 +98,7 @@ Firefox advertises `password-fill` and `password-capture` plus these commands:
 
 - `password.open`
 - `password.offerFill`
+- `password.offerFillDirect`
 - `password.provideCredentials`
 - `password.cancelFill`
 - `password.requestConsent`
@@ -107,21 +109,35 @@ Firefox advertises `password-fill` and `password-capture` plus these commands:
 - `password.startTemplateRecording`
 - `password.cancelTemplateRecording`
 - `password.getStatus`
+- `password.updateBadge`
+
+`password.requestConsent` is a no-op compatibility probe: authentication
+access is a required install-time permission, so it always reports a granted
+state. `password.updateBadge` caches up to 16 account summaries
+(`entryId`/`username`/`siteName`, never secrets) for one tab, mirrors the
+count into the toolbar badge, and backs the action popup. The popup talks to
+the background over `petaldesk.popup.*` runtime messages (`getState`, `fill`,
+`openManager`) that only accept the extension's own popup sender.
 
 Password events use
 `{ "type": "extension.event", "event": "...", "payload": { ... } }`.
 The event names are `tabReady`, `fillConfirm`, `fillResult`,
-`captureCandidate`, `saveDecision`, `consentRequired`, `consentChanged`,
-`templateRecordingReady`, `templateRecordingProgress`,
+`captureCandidate`, `saveDecision`, `originActive`, `fillRequest`,
+`openPasswordManager`, `templateRecordingReady`, `templateRecordingProgress`,
 `templateRecordingResult`, and `templateRecordingCancelled`.
-`password.captureMatch` can return `new`, `update`, `same`, `select`, or
-`username-required`; a `select` decision is completed by a bound `replace`
-save action. `password.saveResult` keeps a failed candidate available for a
-short retry window and clears it only after a confirmed success.
+`password.captureMatch` can return `new`, `update`, `same`, `select`,
+`username-required`, or `locked`; a `select` or `new` decision with accounts
+is completed by a bound `replace` save action, and `locked` dismisses the
+candidate with an unlock notice. `password.saveResult` keeps a failed
+candidate available for a short retry window and clears it only after a
+confirmed success.
 
 The two-phase fill protocol is mandatory: `password.offerFill` contains no
 password; after the page overlay produces `fillConfirm`, the host sends one
-`password.provideCredentials` command. The request is bound to one session,
+`password.provideCredentials` command. `password.offerFillDirect` skips
+`password.open` by binding an existing tab, frame, and exact origin into a
+ready session, then follows the same offer and confirmation steps. The
+request is bound to one session,
 tab, top-level frame, document, and exact origin. Content scripts fill fields
 and dispatch `input`/`change` events but never submit the form. Login candidates
 stay in extension memory for at most 30 seconds. A username captured on the

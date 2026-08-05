@@ -1,6 +1,6 @@
 # PetalDesk Browser Companion privacy notice (draft)
 
-Last updated: 2026-08-04
+Last updated: 2026-08-05
 
 This draft must be reviewed by the product owner and published at a stable HTTPS URL before the extension is submitted to AMO.
 
@@ -14,7 +14,7 @@ The extension may handle the following information only to provide a feature req
 
 - Website activity used for long screenshots, including scroll position, viewport measurements, and page-settling state.
 - The URL origin and tab/frame identifiers needed to bind a password request to the intended page.
-- Authentication information, including usernames and passwords, when the user separately enables password features and grants Firefox's optional authentication-information permission.
+- Authentication information, including usernames and passwords, under the `authenticationInfo` data-collection permission that Firefox presents and grants once at installation. There is no additional runtime consent prompt.
 
 The extension does not intentionally collect page text, browsing history, payment information, health information, personal communications, location, advertising identifiers, or analytics.
 
@@ -22,7 +22,8 @@ The extension does not intentionally collect page text, browsing history, paymen
 
 - Long-screenshot measurements are sent through Firefox Native Messaging to the local PetalDesk process to coordinate a screenshot requested by the user.
 - A fill offer is shown on the intended page without a password. Only after the user confirms the page overlay does PetalDesk provide one-time credentials for field filling.
-- When login detection is enabled, a submitted login candidate is held briefly in memory and sent to the local PetalDesk process so the encrypted vault can decide whether it is unchanged, new, or an update.
+- When login detection is enabled, a submitted login candidate is held briefly in memory and sent to the local PetalDesk process so the encrypted vault can decide whether it is unchanged, new, or an update. The prompt offers saving as a new account or updating an existing one, and reports when the vault is manually locked.
+- The toolbar badge shows the number of accounts saved for the exact current origin, and the toolbar popup lists those account labels on click. Both are read from the local vault through the local channel, refresh on tab or vault changes, and are cleared when the vault is manually locked. After the extension connects, capture, fill, and badge keep working while the PetalDesk password window is closed; a manual lock stops them immediately.
 
 The extension fills fields but never submits a login form. It does not bypass CAPTCHA, passkeys, SMS verification, security keys, or multi-factor authentication.
 
@@ -48,7 +49,7 @@ No security control can make an already compromised device or website safe. User
 
 ## User choices
 
-Users can decline or revoke the optional authentication-information permission in Firefox. They can disable login detection, delete saved accounts, or uninstall the extension. Long screenshots remain available when authentication-information access is not granted.
+The `authenticationInfo` permission is granted at installation; users who do not want it can decline the installation or remove the extension from Firefox at any time. They can disable login detection, lock the vault, or delete saved accounts in PetalDesk.
 
 ## Contact
 

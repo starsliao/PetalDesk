@@ -10,7 +10,7 @@ Required to communicate with the PetalDesk Native Messaging Host installed on th
 
 ### `tabs`
 
-Required to create the exact login tab requested by PetalDesk and bind a fill session to its tab ID, top-level frame, document, and exact origin. It is also used to cancel a request when that target changes.
+Required to create the exact login tab requested by PetalDesk and bind a fill session to its tab ID, top-level frame, document, and exact origin. It is also used to cancel a request when that target changes. Tab activation and navigation events additionally refresh the per-site account-count badge.
 
 ### `<all_urls>` host access
 
@@ -18,7 +18,7 @@ Long screenshots and password forms can occur on user-selected sites, so the con
 
 ### `action`
 
-The toolbar button is the explicit Firefox user gesture used to request optional authentication-information consent. A Native Messaging command can arm the request but cannot display the Firefox permission prompt itself.
+The toolbar button opens a popup showing layered connection diagnostics (install-time data permission, Native Host stdio, desktop password channel, recent request outcome, extension version), the accounts saved for the current exact origin, and a button that opens the PetalDesk password manager. Choosing an account in the popup starts a fill on the current page; the in-page overlay confirmation still applies. The badge on the button shows how many accounts PetalDesk has stored for the current site.
 
 ## Firefox data collection permissions
 
@@ -28,12 +28,13 @@ Firefox treats data transferred from the add-on to a native application as trans
 
 The long-screenshot feature sends user-initiated scroll position, viewport, and page-settling information to the local PetalDesk host. This is required for the extension's existing long-capture purpose.
 
-### Optional: `authenticationInfo`
+### Required: `authenticationInfo`
 
-Password filling and login detection handle usernames and passwords. This category is optional in the manifest and is not granted at installation. PetalDesk first records the user's feature choice. Firefox then asks for permission only from the extension toolbar click handler. Without the grant, fill and capture commands fail with `AUTHENTICATION_CONSENT_REQUIRED` and long screenshots remain available.
+Password filling and login detection handle usernames and passwords. This category is declared as required in the manifest, so Firefox presents and grants it once at installation together with `websiteActivity`. The extension never requests it again at runtime and there is no toolbar consent step; declining means not installing (or later removing) the extension.
 
 ## Data minimization
 
+- The toolbar badge shows only the number of saved accounts for the exact current origin; it is cleared when the vault is manually locked.
 - Fill offers contain the account label/username but no password.
 - The password is requested only after the page overlay sends `fillConfirm` for the bound session.
 - Filled credentials are removed from message objects immediately after use.

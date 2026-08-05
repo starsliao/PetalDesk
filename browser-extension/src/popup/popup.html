@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>飞花密码管理</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="popup">
+    <h1>飞花密码管理</h1>
+    <section aria-label="扩展状态">
+      <h2>扩展状态</h2>
+      <ul id="diagnostics-list" class="diagnostics"></ul>
+    </section>
+    <section aria-label="当前站点">
+      <h2>当前站点</h2>
+      <p id="site-origin" class="origin"></p>
+      <p id="site-status" class="status"></p>
+      <ul id="account-list" class="accounts"></ul>
+    </section>
+    <button id="open-manager" type="button" class="primary">打开飞花密码管理器</button>
+    <p id="extension-version" class="version"></p>
+  </main>
+  <script src="popup.js"></script>
+</body>
+</html>

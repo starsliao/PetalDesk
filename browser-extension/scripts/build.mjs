@@ -27,6 +27,9 @@ const variants = [
     files: [
       ["content/password-manager.js", "content/password-manager.js"],
       ["background/password-bridge.js", "background/password-bridge.js"],
+      ["popup/popup.html", "popup/popup.html"],
+      ["popup/popup.js", "popup/popup.js"],
+      ["popup/popup.css", "popup/popup.css"],
       ["../assets/icons/petaldesk-16.png", "assets/icons/petaldesk-16.png"],
       ["../assets/icons/petaldesk-32.png", "assets/icons/petaldesk-32.png"],
       ["../assets/icons/petaldesk-48.png", "assets/icons/petaldesk-48.png"],

@@ -392,7 +392,9 @@ pub async fn open_tool_window(app: AppHandle, tool: ToolName) -> AppResult<Strin
         ToolName::Reminder => open_reminder_window_inner(&app, &app.state()),
         ToolName::Gantt => open_gantt_window_inner(&app, &app.state()),
         ToolName::Mfa => open_mfa_window_inner(&app, &app.state()),
-        ToolName::Passwords => open_password_window_inner(&app, &app.state()),
+        ToolName::Passwords => {
+            open_password_window(&app).map(|_| PASSWORD_WINDOW_LABEL.to_string())
+        }
         ToolName::Screenshot => crate::screenshot::start_capture_inner(&app)
             .map(|_| crate::screenshot::CAPTURE_WINDOW_LABEL.to_string()),
     })
@@ -679,6 +681,12 @@ pub fn open_mfa_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResu
         .set_capture_excluded(protected);
     let _ = window.set_focus();
     Ok(MFA_WINDOW_LABEL.to_string())
+}
+
+/// Opens or focuses the password manager window. Shared by the tool command,
+/// the tray menu, and the Firefox extension's openPasswordManager event.
+pub(crate) fn open_password_window(app: &AppHandle) -> AppResult<()> {
+    open_password_window_inner(app, &app.state()).map(|_| ())
 }
 
 pub fn open_password_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResult<String> {

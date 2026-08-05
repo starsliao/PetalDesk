@@ -71,6 +71,7 @@ const MAX_TEMPLATE_ID_BYTES: usize = 256;
 const MAX_TEMPLATE_LABEL_BYTES: usize = 512;
 const MAX_TEMPLATE_SELECTOR_BYTES: usize = 512;
 const MAX_TEMPLATE_SELECTORS: usize = 16;
+const MAX_CAPTURE_ACCOUNT_CHOICES: usize = 16;
 const BACKUP_LIMIT: usize = 5;
 const CONFLICT_LIMIT: usize = 10;
 const REVEAL_TTL: Duration = Duration::from_secs(15);
@@ -505,6 +506,7 @@ struct RuntimeState {
 struct SessionState {
     epoch: AtomicU64,
     active: AtomicBool,
+    browser_active: AtomicBool,
 }
 
 struct ClipboardLease {
@@ -625,6 +627,7 @@ impl PasswordStore {
             session: Arc::new(SessionState {
                 epoch: AtomicU64::new(0),
                 active: AtomicBool::new(false),
+                browser_active: AtomicBool::new(false),
             }),
             lifecycle_lock: Arc::new(Mutex::new(())),
             clipboard: Arc::new(Mutex::new(None)),
@@ -643,6 +646,15 @@ impl PasswordStore {
         epoch
     }
 
+    /// Lets the browser service keep using the decrypted vault while the
+    /// password window is closed. Idempotent and never bumps the epoch, so
+    /// in-flight window work keeps its session handle. Any manual or
+    /// app-level lock ends the browser session immediately.
+    pub(crate) fn activate_browser_session(&self) {
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        self.session.browser_active.store(true, Ordering::Release);
+    }
+
     /// Invalidates queued work before clearing decrypted data.
     pub fn deactivate(&self) -> u64 {
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
@@ -657,12 +669,16 @@ impl PasswordStore {
         {
             return;
         }
-        let mut runtime = lock_unpoisoned(&self.runtime);
-        if let Some(vault) = runtime.vault.take() {
-            runtime.locked_entry_count = vault.payload.entries.len();
+        // A live browser session keeps the decrypted vault while the password
+        // window is closed; clipboard leases still expire as usual.
+        if !self.session.browser_active.load(Ordering::Acquire) {
+            let mut runtime = lock_unpoisoned(&self.runtime);
+            if let Some(vault) = runtime.vault.take() {
+                runtime.locked_entry_count = vault.payload.entries.len();
+            }
+            runtime.manually_locked = false;
+            drop(runtime);
         }
-        runtime.manually_locked = false;
-        drop(runtime);
         force_expire_clipboard(&self.clipboard);
         if !clear_clipboard_now(&self.clipboard) {
             schedule_clipboard_cleanup(Arc::downgrade(&self.clipboard), Instant::now());
@@ -670,6 +686,8 @@ impl PasswordStore {
     }
 
     pub fn lock(&self) {
+        // An app-level lock ends the browser background session immediately.
+        self.session.browser_active.store(false, Ordering::Release);
         let epoch = self.deactivate();
         self.clear_deactivated_state(epoch);
     }
@@ -683,6 +701,8 @@ impl PasswordStore {
             return Err(session_closed_error());
         }
         self.session.epoch.fetch_add(1, Ordering::AcqRel);
+        // A manual lock ends the browser background session immediately.
+        self.session.browser_active.store(false, Ordering::Release);
         let mut runtime = lock_unpoisoned(&self.runtime);
         runtime.locked_entry_count = runtime
             .vault
@@ -713,10 +733,33 @@ impl PasswordStore {
         Ok(epoch)
     }
 
+    /// Returns the current epoch while either the password window or the
+    /// browser background session is active. Browser service calls fetch a
+    /// fresh epoch through this method on every request, so the bump from a
+    /// window close is picked up instead of leaving a stale handle.
+    pub(crate) fn require_any_epoch(&self) -> AppResult<u64> {
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        let any_active = || {
+            self.session.active.load(Ordering::Acquire)
+                || self.session.browser_active.load(Ordering::Acquire)
+        };
+        if !any_active() {
+            return Err(session_closed_error());
+        }
+        let epoch = self.session.epoch.load(Ordering::Acquire);
+        if !any_active() || self.session.epoch.load(Ordering::Acquire) != epoch {
+            return Err(session_closed_error());
+        }
+        Ok(epoch)
+    }
+
     fn validate_epoch(&self, epoch: u64) -> AppResult<()> {
-        if !self.session.active.load(Ordering::Acquire)
-            || self.session.epoch.load(Ordering::Acquire) != epoch
-        {
+        // The browser background session keeps an epoch valid while the
+        // window is closed; deactivate() still bumps the epoch, so stale
+        // window work stays rejected either way.
+        let any_active = self.session.active.load(Ordering::Acquire)
+            || self.session.browser_active.load(Ordering::Acquire);
+        if !any_active || self.session.epoch.load(Ordering::Acquire) != epoch {
             return Err(session_closed_error());
         }
         Ok(())
@@ -814,6 +857,14 @@ impl PasswordStore {
 
     pub(crate) fn browser_fill_data(&self, entry_id: &str) -> AppResult<BrowserFillData> {
         let epoch = self.require_active_epoch()?;
+        self.browser_fill_data_at(entry_id, epoch)
+    }
+
+    pub(crate) fn browser_fill_data_at(
+        &self,
+        entry_id: &str,
+        epoch: u64,
+    ) -> AppResult<BrowserFillData> {
         validate_entry_id(entry_id)?;
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
         self.validate_epoch(epoch)?;
@@ -1192,12 +1243,27 @@ impl PasswordStore {
                 account_choices: Vec::new(),
             });
         }
+        // Offer the same-origin accounts alongside the create prompt so the
+        // browser can suggest updating an existing account instead. The list
+        // is bounded like the username-missing branch above.
+        let account_choices = vault
+            .payload
+            .entries
+            .iter()
+            .filter(|entry| entry.origin == origin)
+            .take(MAX_CAPTURE_ACCOUNT_CHOICES)
+            .map(|entry| PasswordCaptureAccount {
+                entry_id: entry.id.clone(),
+                site_name: entry.site_name.clone(),
+                username: entry.username.clone(),
+            })
+            .collect();
         Ok(PasswordCaptureDecision {
             action: PasswordCaptureAction::Create,
             entry_id: None,
             origin,
             insecure_http,
-            account_choices: Vec::new(),
+            account_choices,
         })
     }
 
@@ -3013,11 +3079,16 @@ pub async fn create_password_entry(
 ) -> AppResult<PasswordEntrySummary> {
     ensure_password_window(&window)?;
     let epoch = app.state::<PasswordStore>().require_active_epoch()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        app.state::<PasswordStore>().create_entry_at(input, epoch)
+    let task_app = app.clone();
+    let entry = tauri::async_runtime::spawn_blocking(move || {
+        task_app.state::<PasswordStore>().create_entry_at(input, epoch)
     })
     .await
-    .map_err(|_| AppError::new("password_task_error", "保存密码账户任务异常结束。"))?
+    .map_err(|_| AppError::new("password_task_error", "保存密码账户任务异常结束。"))??;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::password_browser::refresh_password_badges(&app);
+    });
+    Ok(entry)
 }
 
 #[tauri::command]
@@ -3028,11 +3099,16 @@ pub async fn update_password_entry(
 ) -> AppResult<PasswordEntrySummary> {
     ensure_password_window(&window)?;
     let epoch = app.state::<PasswordStore>().require_active_epoch()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        app.state::<PasswordStore>().update_entry_at(input, epoch)
+    let task_app = app.clone();
+    let entry = tauri::async_runtime::spawn_blocking(move || {
+        task_app.state::<PasswordStore>().update_entry_at(input, epoch)
     })
     .await
-    .map_err(|_| AppError::new("password_task_error", "更新密码账户任务异常结束。"))?
+    .map_err(|_| AppError::new("password_task_error", "更新密码账户任务异常结束。"))??;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::password_browser::refresh_password_badges(&app);
+    });
+    Ok(entry)
 }
 
 #[tauri::command]
@@ -3043,12 +3119,18 @@ pub async fn delete_password_entry(
 ) -> AppResult<()> {
     ensure_password_window(&window)?;
     let epoch = app.state::<PasswordStore>().require_active_epoch()?;
+    let task_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        app.state::<PasswordStore>()
+        task_app
+            .state::<PasswordStore>()
             .delete_entry_at(&entry_id, epoch)
     })
     .await
-    .map_err(|_| AppError::new("password_task_error", "删除密码账户任务异常结束。"))?
+    .map_err(|_| AppError::new("password_task_error", "删除密码账户任务异常结束。"))??;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::password_browser::refresh_password_badges(&app);
+    });
+    Ok(())
 }
 
 #[tauri::command]
@@ -3197,6 +3279,7 @@ pub async fn unlock_passwords_with_recovery_password(
     let sync_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         crate::password_browser::sync_capture_from_store(&sync_app);
+        crate::password_browser::refresh_password_badges(&sync_app);
     });
     Ok(status)
 }
@@ -3222,6 +3305,7 @@ pub async fn lock_password_vault(app: AppHandle, window: WebviewWindow) -> AppRe
     tauri::async_runtime::spawn_blocking(move || {
         app.state::<crate::password_browser::PasswordBrowserService>()
             .suspend_capture();
+        crate::password_browser::refresh_password_badges(&app);
     });
     Ok(())
 }
@@ -3699,5 +3783,182 @@ mod tests {
             exclude_ambiguous: true,
         })
         .is_err());
+    }
+
+    #[test]
+    fn browser_session_survives_window_close() {
+        let (_root, store) = test_store();
+        store.set_capture_enabled(true).unwrap();
+        let entry = store
+            .create_entry(input(
+                "Example",
+                "https://example.com/login",
+                "alice",
+                "stored secret",
+            ))
+            .unwrap();
+        store.activate_browser_session();
+        let window_epoch = store.require_active_epoch().unwrap();
+
+        let closed_epoch = store.deactivate();
+        store.clear_deactivated_state(closed_epoch);
+
+        // The window session is gone but the decrypted vault stays available
+        // for the browser background session.
+        assert!(!store.session.active.load(Ordering::Acquire));
+        assert!(lock_unpoisoned(&store.runtime).vault.is_some());
+        assert_eq!(
+            store.require_active_epoch().unwrap_err().code,
+            "password_session_closed"
+        );
+        let epoch = store.require_any_epoch().unwrap();
+        assert_ne!(epoch, window_epoch);
+        // Work queued by the closed window keeps its stale epoch rejected.
+        assert_eq!(
+            store
+                .capture_decision_at(
+                    candidate("https://example.com", "alice", "one"),
+                    window_epoch,
+                )
+                .err()
+                .unwrap()
+                .code,
+            "password_session_closed"
+        );
+        let decision = store
+            .capture_decision_at(candidate("https://example.com", "alice", "one"), epoch)
+            .unwrap();
+        assert_eq!(decision.action, PasswordCaptureAction::Update);
+        let fill = store.browser_fill_data_at(&entry.id, epoch).unwrap();
+        assert_eq!(fill.username, "alice");
+        assert_eq!(fill.password, "stored secret");
+    }
+
+    #[test]
+    fn manual_or_app_lock_ends_browser_session_immediately() {
+        let (_root, store) = test_store();
+        let entry = store
+            .create_entry(input(
+                "Example",
+                "https://example.com/login",
+                "alice",
+                "stored secret",
+            ))
+            .unwrap();
+        store.activate_browser_session();
+
+        store.lock_current_session().unwrap();
+
+        assert!(!store.session.browser_active.load(Ordering::Acquire));
+        // The window is still open, but the manual lock blocks silent unlock.
+        let epoch = store.require_any_epoch().unwrap();
+        assert_eq!(
+            store
+                .browser_fill_data_at(&entry.id, epoch)
+                .err()
+                .unwrap()
+                .code,
+            "password_vault_locked"
+        );
+        // Once the window closes, no session remains at all.
+        let closed_epoch = store.deactivate();
+        store.clear_deactivated_state(closed_epoch);
+        assert_eq!(
+            store.require_any_epoch().unwrap_err().code,
+            "password_session_closed"
+        );
+
+        // An app-level lock ends the browser session as well.
+        store.activate();
+        store.activate_browser_session();
+        store.lock();
+        assert!(!store.session.browser_active.load(Ordering::Acquire));
+        assert_eq!(
+            store.require_any_epoch().unwrap_err().code,
+            "password_session_closed"
+        );
+    }
+
+    #[test]
+    fn capture_create_offers_same_origin_account_choices() {
+        let (_root, store) = test_store();
+        store.set_capture_enabled(true).unwrap();
+        let first = store
+            .create_entry(input(
+                "Example",
+                "https://example.com/login",
+                "alice",
+                "one",
+            ))
+            .unwrap();
+        let second = store
+            .create_entry(input(
+                "Example Two",
+                "https://example.com/login",
+                "bob",
+                "two",
+            ))
+            .unwrap();
+        store
+            .create_entry(input(
+                "Other",
+                "https://other.example.com/login",
+                "carol",
+                "three",
+            ))
+            .unwrap();
+
+        let create = store
+            .capture_decision(candidate("https://example.com", "dana", "four"))
+            .unwrap();
+        assert_eq!(create.action, PasswordCaptureAction::Create);
+        assert!(create.entry_id.is_none());
+        let choice_ids = create
+            .account_choices
+            .iter()
+            .map(|choice| choice.entry_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(choice_ids.len(), 2);
+        assert!(choice_ids.contains(&first.id.as_str()));
+        assert!(choice_ids.contains(&second.id.as_str()));
+
+        let no_accounts = store
+            .capture_decision(candidate("https://new.example.com", "dana", "four"))
+            .unwrap();
+        assert_eq!(no_accounts.action, PasswordCaptureAction::Create);
+        assert!(no_accounts.account_choices.is_empty());
+
+        // Exact-username matches and identical credentials stay unchanged.
+        let update = store
+            .capture_decision(candidate("https://example.com", "alice", "five"))
+            .unwrap();
+        assert_eq!(update.action, PasswordCaptureAction::Update);
+        assert!(update.account_choices.is_empty());
+        let no_prompt = store
+            .capture_decision(candidate("https://example.com", "alice", "one"))
+            .unwrap();
+        assert_eq!(no_prompt.action, PasswordCaptureAction::NoPrompt);
+        assert!(no_prompt.account_choices.is_empty());
+    }
+
+    #[test]
+    fn capture_create_account_choices_are_capped() {
+        let (_root, store) = test_store();
+        store.set_capture_enabled(true).unwrap();
+        for index in 0..17 {
+            store
+                .create_entry(input(
+                    "Example",
+                    "https://example.com/login",
+                    &format!("user{index}"),
+                    "one",
+                ))
+                .unwrap();
+        }
+        let create = store
+            .capture_decision(candidate("https://example.com", "someone-new", "two"))
+            .unwrap();
+        assert_eq!(create.action, PasswordCaptureAction::Create);
+        assert_eq!(create.account_choices.len(), MAX_CAPTURE_ACCOUNT_CHOICES);
     }
 }

@@ -8,7 +8,7 @@ use std::sync::mpsc;
 #[cfg(windows)]
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
 };
 #[cfg(windows)]
 use std::thread::JoinHandle;
@@ -31,6 +31,8 @@ const SECRET_IO_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SECRET_IO_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(windows)]
 const SECRET_THREAD_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(windows)]
+const HOST_DIAG_MAX_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -126,6 +128,13 @@ where
         extension_id,
         &hello.capabilities,
     )?;
+    #[cfg(windows)]
+    {
+        if let Ok(path) = host_diag_path() {
+            let _ = trim_host_diag_log(&path);
+        }
+        log_host_diag("host-started", &format!("connectionId={connection_id}"));
+    }
 
     let (incoming_tx, incoming_rx) = mpsc::channel();
     std::thread::spawn(move || loop {
@@ -149,11 +158,17 @@ where
     let (secret_command_tx, secret_command_rx) = mpsc::channel::<Value>();
     let (secret_outbound_tx, secret_outbound_rx) = mpsc::sync_channel::<Value>(128);
     #[cfg(windows)]
+    let secret_fatal = Arc::new(OnceLock::new());
+    #[cfg(windows)]
+    let secret_reconnect_requested = Arc::new(AtomicBool::new(false));
+    #[cfg(windows)]
     start_secret_connector(
         connection_id.clone(),
         browser.to_string(),
         secret_command_tx,
         secret_outbound_rx,
+        secret_fatal.clone(),
+        secret_reconnect_requested.clone(),
     );
     #[cfg(not(windows))]
     {
@@ -166,19 +181,29 @@ where
     let mut secret_request_ids = HashSet::new();
     let mut legacy_request_ids = HashSet::new();
     loop {
+        #[cfg(windows)]
+        if let Some(error) = secret_fatal_exit_error(&secret_fatal) {
+            return Err(error);
+        }
         while let Ok(message) = incoming_rx.try_recv() {
             let message = message?;
             if message.kind == "extension.event" {
                 let Some(event) = message.event else {
                     continue;
                 };
-                let _ = secret_outbound_tx.try_send(serde_json::json!({
+                #[cfg(windows)]
+                let detail = format!("event={event}");
+                let send_result = secret_outbound_tx.try_send(serde_json::json!({
                     "version": PROTOCOL_VERSION,
                     "type": "secret.event",
                     "event": event,
                     "payload": message.payload,
                     "queuedAtUnixMs": unix_time_ms(),
                 }));
+                #[cfg(windows)]
+                note_secret_outbound_failure(send_result, &detail, &secret_reconnect_requested);
+                #[cfg(not(windows))]
+                let _ = send_result;
                 continue;
             }
             if message.kind != "extension.response" {
@@ -191,7 +216,9 @@ where
                 continue;
             }
             if secret_request_ids.remove(id) {
-                let _ = secret_outbound_tx.try_send(serde_json::json!({
+                #[cfg(windows)]
+                let detail = format!("responseId={}", &id[..id.len().min(8)]);
+                let send_result = secret_outbound_tx.try_send(serde_json::json!({
                     "version": PROTOCOL_VERSION,
                     "type": "secret.response",
                     "id": id,
@@ -200,6 +227,10 @@ where
                     "error": message.error,
                     "queuedAtUnixMs": unix_time_ms(),
                 }));
+                #[cfg(windows)]
+                note_secret_outbound_failure(send_result, &detail, &secret_reconnect_requested);
+                #[cfg(not(windows))]
+                let _ = send_result;
                 continue;
             }
             if !legacy_request_ids.remove(id) {
@@ -299,6 +330,80 @@ fn unix_time_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(all(windows, test))]
+static TEST_DIAG_LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// 向浏览器宿主诊断日志追加一行 JSON。
+///
+/// 该文件用于排查"扩展在、Host 在但密码通道已死"的假健康问题，只允许写
+/// 事件名和短标识符：严禁记录 token、用户名、密码或任何凭据 payload。
+/// 日志写不进去时静默忽略，诊断绝不能让桥接失败。
+#[cfg(windows)]
+fn log_host_diag(event: &str, detail: &str) {
+    let Ok(path) = host_diag_path() else {
+        return;
+    };
+    let _ = append_host_diag_line(&path, event, detail);
+}
+
+#[cfg(windows)]
+fn host_diag_path() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    if let Some(path) = TEST_DIAG_LOG_PATH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return Ok(path);
+    }
+    bridge_root().map(|root| root.join("host-diagnostics.log"))
+}
+
+#[cfg(windows)]
+fn append_host_diag_line(path: &Path, event: &str, detail: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("创建浏览器宿主诊断目录失败: {error}"))?;
+    }
+    let line = serde_json::json!({
+        "ts": unix_time_ms(),
+        "event": event,
+        "detail": detail,
+    });
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("打开浏览器宿主诊断日志失败: {error}"))?;
+    writeln!(file, "{line}").map_err(|error| format!("写入浏览器宿主诊断日志失败: {error}"))
+}
+
+/// 进程启动时调用：日志超过 256KB 时截断，只保留尾部（按换行对齐，避免
+/// 留下半行 JSON）。
+#[cfg(windows)]
+fn trim_host_diag_log(path: &Path) -> Result<(), String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("读取浏览器宿主诊断日志失败: {error}")),
+    };
+    if metadata.len() <= HOST_DIAG_MAX_BYTES {
+        return Ok(());
+    }
+    let bytes =
+        fs::read(path).map_err(|error| format!("读取浏览器宿主诊断日志失败: {error}"))?;
+    let tail = &bytes[bytes
+        .len()
+        .saturating_sub((HOST_DIAG_MAX_BYTES / 2) as usize)..];
+    let start = tail
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    fs::write(path, &tail[start..])
+        .map_err(|error| format!("截断浏览器宿主诊断日志失败: {error}"))
 }
 
 #[derive(Clone)]
@@ -716,16 +821,51 @@ fn connect_secret_pipe(
     Ok(pipe)
 }
 
+/// 把 connector 上报的 fatal 转成主循环的退出错误。主循环每次迭代都会调用：
+/// 一旦 connector 遇到不可恢复故障（线程卡死），Host 进程必须退出，让
+/// Firefox 在扩展重连时重新拉起，而不是继续刷心跳伪装健康。
+#[cfg(windows)]
+fn secret_fatal_exit_error(fatal: &OnceLock<String>) -> Option<String> {
+    fatal.get().map(|reason| {
+        log_host_diag("fatal", reason);
+        format!("密码浏览器安全通道发生不可恢复错误，宿主进程退出: {reason}")
+    })
+}
+
+/// outbound 队列 try_send 失败（Full/Disconnected）时不再静默丢弃：记录诊断
+/// （只写事件名或 request id 短码，绝不写 payload），并通知 connector 丢弃
+/// 当前连接、明确重建。
+#[cfg(windows)]
+fn note_secret_outbound_failure(
+    result: Result<(), mpsc::TrySendError<Value>>,
+    detail: &str,
+    reconnect_requested: &AtomicBool,
+) {
+    let queue = match result {
+        Ok(()) => return,
+        Err(mpsc::TrySendError::Full(_)) => "full",
+        Err(mpsc::TrySendError::Disconnected(_)) => "disconnected",
+    };
+    log_host_diag(
+        "outbound-send-failed",
+        &format!("{detail} queue={queue}"),
+    );
+    reconnect_requested.store(true, Ordering::Release);
+}
+
 #[cfg(windows)]
 fn start_secret_connector(
     connection_id: String,
     browser: String,
     command_sender: mpsc::Sender<Value>,
     outbound_receiver: mpsc::Receiver<Value>,
+    fatal: Arc<OnceLock<String>>,
+    reconnect_requested: Arc<AtomicBool>,
 ) {
     let _ = std::thread::Builder::new()
         .name("petaldesk-password-native-pipe".to_string())
         .spawn(move || {
+            log_host_diag("connector-started", &connection_id);
             if command_sender
                 .send(serde_json::json!({
                 "type": "secret.lifecycle",
@@ -734,17 +874,33 @@ fn start_secret_connector(
                 }))
                 .is_err()
             {
+                log_host_diag("connector-exit", "command-channel-closed");
                 return;
             }
             let outbound_receiver = Arc::new(Mutex::new(outbound_receiver));
+            // 桌面未运行时 endpoint 读取每秒失败一次且内容不变，去重后只记一次。
+            let mut last_endpoint_error = String::new();
+            // 握手失败每 500ms 重试一次，连续相同的失败只记一次。
+            let mut last_handshake_failure = String::new();
+            let mut note_handshake_failure = |detail: String| {
+                if detail != last_handshake_failure {
+                    log_host_diag("handshake-failed", &detail);
+                    last_handshake_failure = detail;
+                }
+            };
             loop {
                 let endpoint = match read_secret_endpoint() {
                     Ok(endpoint) => endpoint,
-                    Err(_) => {
+                    Err(error) => {
+                        if error != last_endpoint_error {
+                            log_host_diag("endpoint-unavailable", &error);
+                            last_endpoint_error = error;
+                        }
                         std::thread::sleep(Duration::from_secs(1));
                         continue;
                     }
                 };
+                last_endpoint_error.clear();
                 let handshake_connection_id = connection_id.clone();
                 let handshake_browser = browser.clone();
                 let handshake_thread = std::thread::Builder::new()
@@ -755,6 +911,7 @@ fn start_secret_connector(
                 let handshake_thread = match handshake_thread {
                     Ok(thread) => thread,
                     Err(_) => {
+                        note_handshake_failure("thread-unavailable".to_string());
                         let _ = command_sender.send(serde_json::json!({
                             "type": "secret.lifecycle",
                             "event": "secretDisconnected",
@@ -770,11 +927,13 @@ fn start_secret_connector(
                     SECRET_IO_STOP_TIMEOUT,
                 ) {
                     SecretHandshakeWait::Finished(Ok(Ok(pipe))) => pipe,
-                    SecretHandshakeWait::Finished(Ok(Err(_))) => {
+                    SecretHandshakeWait::Finished(Ok(Err(error))) => {
+                        note_handshake_failure(error);
                         std::thread::sleep(Duration::from_millis(500));
                         continue;
                     }
                     SecretHandshakeWait::Finished(Err(_)) => {
+                        note_handshake_failure("thread-panicked".to_string());
                         let _ = command_sender.send(serde_json::json!({
                             "type": "secret.lifecycle",
                             "event": "secretDisconnected",
@@ -784,6 +943,7 @@ fn start_secret_connector(
                         continue;
                     }
                     SecretHandshakeWait::TimedOutStopped => {
+                        note_handshake_failure("timeout".to_string());
                         let _ = command_sender.send(serde_json::json!({
                             "type": "secret.lifecycle",
                             "event": "secretDisconnected",
@@ -798,13 +958,22 @@ fn start_secret_connector(
                             "event": "secretDisconnected",
                             "payload": { "reason": "secret-pipe-handshake-stuck" },
                         }));
-                        eprintln!("browser secret pipe handshake did not stop after timeout");
+                        let reason = "browser secret pipe handshake did not stop after timeout";
+                        eprintln!("{reason}");
+                        log_host_diag("connector-exit", reason);
+                        let _ = fatal.set(reason.to_string());
                         return;
                     }
                 };
                 let mut reader = match pipe.try_clone() {
                     Ok(reader) => reader,
-                    Err(_) => continue,
+                    Err(error) => {
+                        log_host_diag(
+                            "connection-setup-failed",
+                            &format!("pipe-clone: {error}"),
+                        );
+                        continue;
+                    }
                 };
                 if command_sender
                     .send(serde_json::json!({
@@ -814,8 +983,10 @@ fn start_secret_connector(
                     }))
                     .is_err()
                 {
+                    log_host_diag("connector-exit", "command-channel-closed");
                     return;
                 }
+                log_host_diag("handshake-succeeded", "");
 
                 let stop = Arc::new(AtomicBool::new(false));
                 let (io_ended_tx, io_ended_rx) = mpsc::channel();
@@ -831,6 +1002,7 @@ fn start_secret_connector(
                 let reader_thread = match reader_thread {
                     Ok(thread) => thread,
                     Err(_) => {
+                        log_host_diag("worker-spawn-failed", "reader");
                         let _ = command_sender.send(serde_json::json!({
                             "type": "secret.lifecycle",
                             "event": "secretDisconnected",
@@ -869,20 +1041,35 @@ fn start_secret_connector(
                             },
                         }));
                         if !reader_stopped {
-                            eprintln!("browser secret pipe reader did not stop after writer spawn failure");
+                            let reason =
+                                "browser secret pipe reader did not stop after writer spawn failure";
+                            eprintln!("{reason}");
+                            log_host_diag("connector-exit", reason);
+                            let _ = fatal.set(reason.to_string());
                             return;
                         }
+                        log_host_diag("worker-spawn-failed", "writer");
                         std::thread::sleep(Duration::from_millis(500));
                         continue;
                     }
                 };
                 drop(io_ended_tx);
 
+                // 新连接开始消费 outbound 队列，旧连接期间积累的重建请求作废。
+                reconnect_requested.store(false, Ordering::Release);
                 let first_exit = loop {
                     match io_ended_rx.recv_timeout(SECRET_IO_POLL_INTERVAL) {
                         Ok(exit) => break exit,
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
                             break SecretIoExit::Reader(SecretReaderExit::PipeClosed);
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                            if reconnect_requested.swap(false, Ordering::AcqRel) =>
+                        {
+                            // 主循环无法把响应/事件塞进 outbound 队列：明确丢弃
+                            // 当前连接并重建，而不是让桌面端干等超时。
+                            log_host_diag("reconnect-requested", "outbound queue send failed");
+                            break SecretIoExit::Writer(SecretWriterExit::PipeClosed);
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) if reader_thread.is_finished() => {
                             break SecretIoExit::Reader(SecretReaderExit::PipeClosed);
@@ -908,15 +1095,30 @@ fn start_secret_connector(
                         "event": "secretDisconnected",
                         "payload": { "reason": "secret-pipe-worker-stuck" },
                     }));
-                    eprintln!("browser secret pipe worker did not stop; reconnect was abandoned");
+                    let reason = "browser secret pipe worker did not stop; reconnect was abandoned";
+                    eprintln!("{reason}");
+                    log_host_diag("connector-exit", reason);
+                    let _ = fatal.set(reason.to_string());
                     return;
                 }
+                log_host_diag(
+                    "worker-exit",
+                    &format!(
+                        "{}: {}",
+                        match first_exit {
+                            SecretIoExit::Reader(_) => "reader",
+                            SecretIoExit::Writer(_) => "writer",
+                        },
+                        first_exit.disconnect_reason()
+                    ),
+                );
                 let _ = command_sender.send(serde_json::json!({
                     "type": "secret.lifecycle",
                     "event": "secretDisconnected",
                     "payload": { "reason": first_exit.disconnect_reason() },
                 }));
                 if stop_connector {
+                    log_host_diag("connector-exit", first_exit.disconnect_reason());
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(500));
@@ -1272,5 +1474,153 @@ mod tests {
         endpoint.expires_at_unix_ms = now + SECRET_ENDPOINT_MAX_FUTURE.as_millis() + 1;
         assert!(!secret_endpoint_is_valid_at(&endpoint, true, now));
         assert!(is_process_alive(std::process::id()));
+    }
+
+    #[cfg(windows)]
+    static DIAG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(windows)]
+    struct TestTempDir(PathBuf);
+
+    #[cfg(windows)]
+    impl TestTempDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("petaldesk-host-test-{}", Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn diag_log(&self) -> PathBuf {
+            self.0.join("host-diagnostics.log")
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(windows)]
+    fn set_test_diag_log(path: PathBuf) {
+        *TEST_DIAG_LOG_PATH
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
+    }
+
+    #[cfg(windows)]
+    fn clear_test_diag_log() {
+        *TEST_DIAG_LOG_PATH
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fatal_flag_turns_into_a_host_exit_error() {
+        let _guard = DIAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = TestTempDir::new();
+        set_test_diag_log(temp.diag_log());
+
+        let fatal = OnceLock::new();
+        assert!(secret_fatal_exit_error(&fatal).is_none());
+        fatal
+            .set("browser secret pipe worker did not stop".to_string())
+            .unwrap();
+        let error = secret_fatal_exit_error(&fatal).expect("fatal flag must produce an error");
+        assert!(error.contains("browser secret pipe worker did not stop"));
+
+        let log = fs::read_to_string(temp.diag_log()).unwrap();
+        assert!(log.contains("\"event\":\"fatal\""));
+        assert!(log.contains("browser secret pipe worker did not stop"));
+        clear_test_diag_log();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_diag_log_appends_json_lines_and_trims_to_the_tail() {
+        let temp = TestTempDir::new();
+        let path = temp.diag_log();
+
+        append_host_diag_line(&path, "one", "first").unwrap();
+        append_host_diag_line(&path, "two", "second").unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        let lines = content.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        let first: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["event"], "one");
+        assert_eq!(first["detail"], "first");
+        assert!(first["ts"].is_number());
+        // 未超限时截断是无操作。
+        trim_host_diag_log(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), content);
+        // 不存在的文件同样视为无需截断。
+        trim_host_diag_log(&temp.0.join("missing.log")).unwrap();
+
+        let mut oversized = String::new();
+        while oversized.len() <= HOST_DIAG_MAX_BYTES as usize {
+            oversized.push_str(&format!(
+                "{{\"ts\":1,\"event\":\"fill\",\"detail\":\"{}\"}}\n",
+                "x".repeat(1024)
+            ));
+        }
+        oversized.push_str("{\"ts\":2,\"event\":\"tail\",\"detail\":\"last\"}\n");
+        fs::write(&path, oversized).unwrap();
+        trim_host_diag_log(&path).unwrap();
+        let trimmed = fs::read_to_string(&path).unwrap();
+        assert!(trimmed.len() <= HOST_DIAG_MAX_BYTES as usize);
+        assert!(trimmed.contains("\"event\":\"tail\""));
+        // 截断按换行对齐，留下的每一行都是完整 JSON。
+        for line in trimmed.lines() {
+            serde_json::from_str::<Value>(line).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn full_outbound_queue_flags_a_secret_reconnect() {
+        let _guard = DIAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp = TestTempDir::new();
+        set_test_diag_log(temp.diag_log());
+
+        let (sender, receiver) = mpsc::sync_channel::<Value>(1);
+        sender
+            .send(serde_json::json!({ "type": "secret.response", "id": "occupied" }))
+            .unwrap();
+        let result = sender.try_send(serde_json::json!({
+            "type": "secret.response",
+            "id": "abcdef0123456789",
+            "result": { "password": "do-not-log" },
+        }));
+        let reconnect = AtomicBool::new(false);
+        note_secret_outbound_failure(result, "responseId=abcdef01", &reconnect);
+        assert!(reconnect.load(Ordering::Acquire));
+
+        let log = fs::read_to_string(temp.diag_log()).unwrap();
+        assert!(log.contains("\"event\":\"outbound-send-failed\""));
+        assert!(log.contains("responseId=abcdef01"));
+        assert!(log.contains("queue=full"));
+        assert!(!log.contains("do-not-log"));
+
+        // 队列对端消失（connector 已退出）也要标记重建。
+        drop(receiver);
+        let result = sender.try_send(serde_json::json!({ "type": "secret.event" }));
+        let reconnect = AtomicBool::new(false);
+        note_secret_outbound_failure(result, "event=capture", &reconnect);
+        assert!(reconnect.load(Ordering::Acquire));
+        let log = fs::read_to_string(temp.diag_log()).unwrap();
+        assert!(log.contains("queue=disconnected"));
+
+        // 发送成功不改变标志、不写日志。
+        let reconnect = AtomicBool::new(false);
+        note_secret_outbound_failure(Ok(()), "event=capture", &reconnect);
+        assert!(!reconnect.load(Ordering::Acquire));
+        clear_test_diag_log();
     }
 }

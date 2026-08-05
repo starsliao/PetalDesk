@@ -176,10 +176,24 @@ function loadManager({ ambiguous = false, fieldScenario = "login", templateMulti
   }
   return {
     backgroundMessages,
+    clickButton(label) {
+      const button = createdElements.find((element) => element.tagName === "BUTTON" && element.textContent === label);
+      assert.ok(button, `the ${label} button should be visible in the page overlay`);
+      button.click();
+    },
     clickFillButton() {
       const button = createdElements.find((element) => element.tagName === "BUTTON" && element.textContent === "填充");
       assert.ok(button, "the fill button should be visible in the page overlay");
       button.click();
+    },
+    overlayButtons() {
+      return createdElements
+        .filter((element) => element.tagName === "BUTTON")
+        .map((element) => element.textContent);
+    },
+    overlayTitle() {
+      const heading = createdElements.find((element) => element.tagName === "H2");
+      return heading ? heading.textContent : "";
     },
     command(command, payload) {
       return new Promise((resolve) => {
@@ -382,4 +396,63 @@ test("pagehide notifies the background bridge before local candidate cleanup", (
   const harness = loadManager();
   harness.windowListeners.get("pagehide")({ type: "pagehide" });
   assert.equal(harness.backgroundMessages.at(-1).type, "petaldesk.password.page-closed");
+});
+
+test("a new capture match with accounts offers save-as-new plus per-account updates", async () => {
+  const harness = loadManager();
+  const result = await harness.command("captureMatch", {
+    accounts: [
+      { entryId: "entry-a", siteName: "Example", username: "alice" },
+      { entryId: "entry-b", siteName: "Example", username: "bob" },
+    ],
+    action: "new",
+    candidateId: "new-candidate",
+    confidence: "high",
+    origin: "https://accounts.google.com",
+    username: "alice",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.result.action, "new");
+  assert.deepEqual(harness.overlayButtons(), ["保存为新账户", "更新 alice", "更新 bob", "忽略"]);
+  harness.clickButton("保存为新账户");
+  await new Promise((resolve) => setImmediate(resolve));
+  const decision = harness.backgroundMessages.at(-1);
+  assert.equal(decision.type, "petaldesk.password.save-decision");
+  assert.equal(decision.action, "new");
+  assert.equal(Object.prototype.hasOwnProperty.call(decision, "entryId"), false);
+});
+
+test("a per-account update button sends a bound replace decision", async () => {
+  const harness = loadManager();
+  await harness.command("captureMatch", {
+    accounts: [
+      { entryId: "entry-a", siteName: "Example", username: "alice" },
+      { entryId: "entry-b", siteName: "Example", username: "bob" },
+    ],
+    action: "new",
+    candidateId: "new-candidate",
+    confidence: "high",
+    origin: "https://accounts.google.com",
+    username: "alice",
+  });
+  harness.clickButton("更新 bob");
+  await new Promise((resolve) => setImmediate(resolve));
+  const decision = harness.backgroundMessages.at(-1);
+  assert.equal(decision.type, "petaldesk.password.save-decision");
+  assert.equal(decision.action, "replace");
+  assert.equal(decision.entryId, "entry-b");
+});
+
+test("a locked capture match shows an unlock notice with only a close button", async () => {
+  const harness = loadManager();
+  const result = await harness.command("captureMatch", {
+    action: "locked",
+    candidateId: "locked-candidate",
+    origin: "https://accounts.google.com",
+    username: "alice",
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.result.action, "locked");
+  assert.equal(harness.overlayTitle(), "飞花密码库已锁定");
+  assert.deepEqual(harness.overlayButtons(), ["关闭"]);
 });

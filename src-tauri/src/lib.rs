@@ -330,9 +330,7 @@ fn spawn_open_tool(app: &tauri::AppHandle, tool: models::ToolName) {
             models::ToolName::Mfa => {
                 commands::open_mfa_window_inner(&app, &app.state()).map(|_| ())
             }
-            models::ToolName::Passwords => {
-                commands::open_password_window_inner(&app, &app.state()).map(|_| ())
-            }
+            models::ToolName::Passwords => commands::open_password_window(&app),
             models::ToolName::Screenshot => screenshot::start_capture_inner(&app).map(|_| ()),
         };
         if let Err(error) = result {

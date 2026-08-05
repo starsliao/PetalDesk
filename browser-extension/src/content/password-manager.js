@@ -532,6 +532,21 @@
           onClick: () => submitCaptureDecision(id, "replace", choice.entryId),
         });
       }
+    } else if (choices.length > 0 && candidate.suggestedAction === "new") {
+      actions.push({
+        label: "保存为新账户",
+        primary: true,
+        onClick: () => submitCaptureDecision(id, "new"),
+      });
+      for (const choice of choices) {
+        const label = choice.username
+          ? `更新 ${choice.username}`
+          : `更新 ${choice.siteName || "此账户"}`;
+        actions.push({
+          label,
+          onClick: () => submitCaptureDecision(id, "replace", choice.entryId),
+        });
+      }
     } else if (candidate.suggestedAction === "new" || candidate.suggestedAction === "update") {
       actions.push({
         label: isUpdate ? "更新到飞花" : "保存到飞花",
@@ -556,6 +571,14 @@
       title,
       `${candidate.origin}\n账户：${candidate.username || "请选择要更新的账户"}${notice ? `\n${notice}` : ""}${insecureOriginWarning(candidate.origin)}`,
       actions,
+    );
+  }
+
+  function showLockedPrompt(origin) {
+    createOverlay(
+      "飞花密码库已锁定",
+      `${origin}\n请先在飞花密码管理器中解锁密码库，然后再保存或更新这条登录信息。`,
+      [{ label: "关闭", onClick: removeOverlay }],
     );
   }
 
@@ -751,6 +774,13 @@
           activeCapturePrompt = null;
           removeOverlay();
           return { matched: true, dismissed: true };
+        }
+        if (payload.action === "locked") {
+          const candidateId = safeString(payload.candidateId, 160);
+          clearCandidate(candidateId);
+          activeCapturePrompt = null;
+          showLockedPrompt(templates.exactOrigin(payload.origin));
+          return { matched: true, dismissed: true, action: payload.action };
         }
         if (payload.action === "username-required") {
           const candidateId = safeString(payload.candidateId, 160);

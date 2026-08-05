@@ -30,6 +30,7 @@
     passwordApi,
     secondsUntilPasswordHidden,
     type PasswordApi,
+    type PasswordBrowserDiagEntry,
     type PasswordBrowserStatus,
     type PasswordEntryInput,
     type PasswordEntrySummary,
@@ -72,7 +73,6 @@
   let templateRecording = $state<PasswordTemplateRecordingTicket | null>(null);
   let templateCancelBusy = $state(false);
   let lockBusy = $state(false);
-  let authorizationRequested = $state(false);
   let revealTimers = new Map<string, number>();
   let countdownTimer: number | null = null;
   let browserStatusTimer: number | null = null;
@@ -249,7 +249,6 @@
     copyBusy = null;
     fillBusy = {};
     templateBusy = {};
-    authorizationRequested = false;
     if (status) {
       status = {
         ...status,
@@ -447,22 +446,11 @@
       return;
     }
     try {
-      const ticket = await api.startFill(entry.id);
-      if (ticket.actionRequired === "toolbar-click") {
-        authorizationRequested = true;
-        browser = { ...(browser ?? await api.getBrowserStatus()), capturePermission: "action-required" };
-        error = "请点击 Firefox 工具栏中的飞花图标完成密码权限授权；授权后回到已打开的页面确认填充，无需再次点击。";
-        return;
-      }
+      await api.startFill(entry.id);
       error = "";
       showToast(`已在 Firefox 中打开“${entry.siteName}”，请在页面确认填充`);
     } catch (reason) {
       await refreshBrowserStatus().catch(() => undefined);
-      if (browser?.capturePermission === "action-required") {
-        authorizationRequested = true;
-        error = "请点击 Firefox 工具栏中的飞花图标完成密码权限授权；授权后回到已打开的页面确认填充，无需再次点击。";
-        return;
-      }
       error = reasonMessage(reason, "无法连接 Firefox 扩展。你仍可以手动打开网址并复制凭据。");
       try {
         await notesApi.openExternalLink(entry.loginUrl);
@@ -648,15 +636,11 @@
     try {
       status = await api.setCaptureEnabled(enabled);
       syncRequiredRecovery(status);
-      authorizationRequested = enabled;
       await refreshBrowserStatus();
       if (!enabled) {
         showToast("登录信息检测已关闭");
       } else if (browser?.capturePermission === "granted") {
-        authorizationRequested = false;
         showToast("登录信息检测已开启");
-      } else if (browser?.capturePermission === "action-required") {
-        showToast("检测设置已保存，请在 Firefox 中完成授权");
       } else if (browser?.capturePermission === "unknown" || !browser?.capturePermission) {
         showToast("检测设置已保存，但 Firefox 扩展通信异常");
       } else if (browser?.capturePermission === "unavailable") {
@@ -677,13 +661,9 @@
       const previousPermission = browser?.capturePermission;
       const next = await api.getBrowserStatus();
       browser = next;
-      if (next.capturePermission === "granted") {
-        const newlyGranted = previousPermission === "action-required" || authorizationRequested;
-        authorizationRequested = false;
-        if (announceGrant && newlyGranted) {
-          error = "";
-          showToast(status?.captureEnabled ? "Firefox 已授权，登录信息检测已开启" : "Firefox 密码填充已授权");
-        }
+      if (next.capturePermission === "granted" && announceGrant && previousPermission && previousPermission !== "granted") {
+        error = "";
+        showToast(status?.captureEnabled ? "Firefox 已授权，登录信息检测已开启" : "Firefox 密码填充已授权");
       }
     })();
     browserStatusRefreshInFlight = request;
@@ -824,6 +804,35 @@
           : connection === "unsupported"
             ? "Firefox 不可用"
             : "Firefox 未连接";
+  }
+
+  function formatDiagTime(atUnixMs: number): string {
+    const date = new Date(atUnixMs);
+    return Number.isFinite(date.getTime()) ? date.toLocaleString("zh-CN", { hour12: false }) : "未知时间";
+  }
+
+  function capturePermissionLabel(permission: PasswordBrowserStatus["capturePermission"]): string {
+    return permission === "granted" ? "已随安装授予" : permission === "unavailable" ? "当前扩展不支持" : "未知";
+  }
+
+  function lastRequestLabel(entry: PasswordBrowserDiagEntry): string {
+    const outcome = entry.event === "completed" ? "成功" : "失败";
+    return `${entry.event} · ${outcome} · ${formatDiagTime(entry.atUnixMs)}`;
+  }
+
+  function shortConnectionId(connectionId: string): string {
+    return connectionId.length > 8 ? `${connectionId.slice(0, 8)}…` : connectionId;
+  }
+
+  async function copyDiagnostics(): Promise<void> {
+    const lines = (browser?.diagnostics ?? []).map((entry) =>
+      `${formatDiagTime(entry.atUnixMs)} ${entry.layer} ${entry.event} ${entry.detail}`.trim());
+    try {
+      await navigator.clipboard.writeText(lines.length > 0 ? lines.join("\n") : "（暂无诊断记录）");
+      showToast("诊断信息已复制");
+    } catch {
+      showToast("复制诊断信息失败");
+    }
   }
 
   onMount(() => {
@@ -979,20 +988,18 @@
     </div>
   {/if}
 
-  {#if browser?.connection === "connected" && browser.capturePermission === "action-required" && (authorizationRequested || status?.captureEnabled)}
-    <div class="consent-banner permission-banner" role="status">
-      <div class="banner-icon" aria-hidden="true"><LockKeyhole size={17} /></div>
-      <div class="banner-copy">
-        <strong>Firefox 密码权限等待授权</strong>
-        <span>点击 Firefox 工具栏中的飞花图标完成授权，然后回到已打开的页面确认填充，无需再次点击；登录信息检测也会按设置运行。</span>
-      </div>
-    </div>
-  {:else if browser?.connection === "connected" && (browser.capturePermission === "unknown" || !browser.capturePermission) && status?.captureEnabled}
+  {#if browser?.connection === "connected" && (browser.capturePermission === "unknown" || !browser.capturePermission) && status?.captureEnabled}
     <div class="consent-banner permission-banner" role="alert">
       <div class="banner-icon" aria-hidden="true"><AlertTriangle size={17} /></div>
       <div class="banner-copy">
         <strong>Firefox 扩展通信异常</strong>
-        <span>暂时无法读取密码权限状态；登录信息检测暂未运行，飞花会自动重试。</span>
+        {#if !browser?.stdioConnected}
+          <span>未检测到 Firefox 扩展连接，请确认扩展已安装并启用。</span>
+        {:else if !browser?.pipeConnected}
+          <span>Firefox 扩展已连接，桌面密码通道未建立，正在自动重试。</span>
+        {:else}
+          <span>暂时无法读取密码权限状态；登录信息检测暂未运行，飞花会自动重试。</span>
+        {/if}
       </div>
     </div>
   {:else if browser?.connection === "connected" && browser.capturePermission === "unavailable" && status?.captureEnabled}
@@ -1034,9 +1041,24 @@
     <div class="password-meta">
       <span>{filteredEntries.length} 个账户</span>
       {#if status?.captureConfigured}
-        <label class="capture-toggle"><input type="checkbox" checked={status.captureEnabled} disabled={captureBusy} onchange={(event) => void setCapture((event.currentTarget as HTMLInputElement).checked)} /><span>{status.captureEnabled && browser?.capturePermission === "action-required" ? "登录信息检测（等待 Firefox 授权）" : status.captureEnabled && browser?.capturePermission === "granted" ? "登录信息检测已开启" : "允许登录信息检测"}</span></label>
+        <label class="capture-toggle"><input type="checkbox" checked={status.captureEnabled} disabled={captureBusy} onchange={(event) => void setCapture((event.currentTarget as HTMLInputElement).checked)} /><span>{status.captureEnabled && browser?.capturePermission === "granted" ? "登录信息检测已开启" : "允许登录信息检测"}</span></label>
       {/if}
     </div>
+
+    {#if browser}
+      <details class="diagnostics-panel" data-testid="connection-diagnostics">
+        <summary>连接诊断</summary>
+        <dl class="diagnostics-grid">
+          <div><dt>密码权限</dt><dd>{capturePermissionLabel(browser.capturePermission)}</dd></div>
+          <div><dt>Firefox 扩展连接</dt><dd>{browser.stdioConnected ? "已连接" : "未连接"}</dd></div>
+          <div><dt>桌面密码通道</dt><dd>{browser.pipeConnected ? "已建立" : "未建立"}</dd></div>
+          <div><dt>最近请求结果</dt><dd>{browser.lastRequestOutcome ? lastRequestLabel(browser.lastRequestOutcome) : "暂无"}</dd></div>
+          <div><dt>扩展版本</dt><dd>{browser.extensionVersion ?? "未知"}</dd></div>
+          <div><dt>连接 ID</dt><dd>{browser.connectionId ? shortConnectionId(browser.connectionId) : "无"}</dd></div>
+        </dl>
+        <button type="button" class="secondary-button" onclick={() => void copyDiagnostics()}>复制诊断信息</button>
+      </details>
+    {/if}
 
     {#if filteredEntries.length === 0}
       <section class="empty-state"><KeyRound size={30} aria-hidden="true" /><h2>{searchText ? "没有匹配的账户" : "还没有保存账户"}</h2><p>{searchText ? "换一个站点名称、origin 或用户名试试。" : "添加第一个站点账户，之后可以从 Firefox 中确认填充。"}</p>{#if !searchText}<button type="button" class="secondary-button" onclick={resetEditor}><Plus size={14} aria-hidden="true" />添加账户</button>{/if}</section>
@@ -1047,7 +1069,7 @@
           {@const canFill = browser?.connection === "connected"}
           {@const fillPermission = browser?.capturePermission}
           {@const fillStatusUnavailable = fillPermission === "unavailable" || fillPermission === "unknown" || !fillPermission}
-          {@const fillActionLabel = !canFill || fillStatusUnavailable ? "打开站点" : fillPermission === "action-required" ? "授权后填充" : "打开并填充"}
+          {@const fillActionLabel = !canFill || fillStatusUnavailable ? "打开站点" : "打开并填充"}
           <article class="entry-row" data-testid={`password-entry-${entry.id}`}>
             <div class="entry-site-mark" aria-hidden="true">{shortSiteName(entry).slice(0, 1).toUpperCase()}</div>
             <div class="entry-main">
@@ -1061,11 +1083,11 @@
               {#if revealedEntry}<small>{revealCountdown(entry)} 秒后隐藏</small>{/if}
             </div>
             <div class="entry-actions">
-              <button type="button" class="icon-button" data-tooltip={fillPermission === "action-required" ? "先授权 Firefox 密码权限" : canFill && !fillStatusUnavailable ? (isHttpUrl(entry.loginUrl) ? "通过 HTTP 打开并填充" : "打开并填充") : fillPermission === "unknown" ? "扩展通信异常，暂时仅打开站点" : "打开站点"} aria-label={`${fillActionLabel} ${entry.siteName}`} disabled={Boolean(fillBusy[entry.id])} onclick={() => void openAndFill(entry)}><ExternalLink size={15} aria-hidden="true" /></button>
+              <button type="button" class="icon-button" data-tooltip={canFill && !fillStatusUnavailable ? (isHttpUrl(entry.loginUrl) ? "通过 HTTP 打开并填充" : "打开并填充") : fillPermission === "unknown" ? "扩展通信异常，暂时仅打开站点" : "打开站点"} aria-label={`${fillActionLabel} ${entry.siteName}`} disabled={Boolean(fillBusy[entry.id])} onclick={() => void openAndFill(entry)}><ExternalLink size={15} aria-hidden="true" /></button>
               <button type="button" class="icon-button" data-tooltip="复制用户名" aria-label={`复制 ${entry.siteName} 用户名`} disabled={copyBusy?.[entry.id] === "username"} onclick={() => void copyUsername(entry)}><Clipboard size={15} aria-hidden="true" /></button>
               <button type="button" class="icon-button" data-tooltip={revealedEntry ? "隐藏密码" : "显示密码"} aria-label={revealedEntry ? "隐藏密码" : "显示密码"} disabled={Boolean(revealBusy[entry.id])} onclick={() => void revealPassword(entry)}>{#if revealedEntry}<EyeOff size={15} aria-hidden="true" />{:else}<Eye size={15} aria-hidden="true" />{/if}</button>
               <button type="button" class="icon-button" data-tooltip="复制密码" aria-label={`复制 ${entry.siteName} 密码`} disabled={copyBusy?.[entry.id] === "password"} onclick={() => void copyPassword(entry)}><Copy size={15} aria-hidden="true" /></button>
-              <button type="button" class="icon-button" data-tooltip={!canFill ? "连接 Firefox 后录制模板" : fillPermission !== "granted" ? "先完成 Firefox 密码权限授权" : "录制站点模板"} aria-label={`录制 ${entry.siteName} 模板`} disabled={!canFill || fillPermission !== "granted" || Boolean(templateRecording) || Boolean(templateBusy[entry.id])} onclick={() => void startTemplateRecording(entry)}><ScanSearch size={15} aria-hidden="true" /></button>
+              <button type="button" class="icon-button" data-tooltip={!canFill ? "连接 Firefox 后录制模板" : fillPermission !== "granted" ? "Firefox 密码通道就绪后可录制" : "录制站点模板"} aria-label={`录制 ${entry.siteName} 模板`} disabled={!canFill || fillPermission !== "granted" || Boolean(templateRecording) || Boolean(templateBusy[entry.id])} onclick={() => void startTemplateRecording(entry)}><ScanSearch size={15} aria-hidden="true" /></button>
               <button type="button" class="icon-button" data-tooltip="编辑" aria-label={`编辑 ${entry.siteName}`} onclick={() => editEntry(entry)}><Sparkles size={15} aria-hidden="true" /></button>
               <button type="button" class="icon-button danger-icon" data-tooltip="删除" aria-label={`删除 ${entry.siteName}`} onclick={() => (pendingDelete = entry)}><Trash2 size={15} aria-hidden="true" /></button>
             </div>
@@ -1208,6 +1230,13 @@
   .password-meta { min-height: 34px; padding: 0 16px 8px; gap: 12px; color: var(--app-muted); font-size: 11px; }
   .capture-toggle { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
   .capture-toggle input, .check-row input, .generator-checks input { accent-color: var(--app-accent); }
+  .diagnostics-panel { margin: 0 16px 10px; padding: 8px 10px; color: var(--app-muted); font-size: 11px; background: var(--app-surface); border: 1px solid var(--app-border); border-radius: 6px; }
+  .diagnostics-panel summary { color: var(--app-fg); font-size: 12px; cursor: pointer; }
+  .diagnostics-grid { display: grid; margin: 8px 0; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 6px 14px; }
+  .diagnostics-grid > div { display: flex; min-width: 0; gap: 6px; }
+  .diagnostics-grid dt { flex: 0 0 auto; font-weight: 600; }
+  .diagnostics-grid dd { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .diagnostics-panel .secondary-button { min-height: 26px; }
   .entry-list { display: flex; min-height: 0; flex: 1; padding: 0 16px 18px; flex-direction: column; gap: 7px; overflow: auto; }
   .entry-row { display: grid; min-width: 0; padding: 11px 10px; grid-template-columns: 34px minmax(150px, 1fr) minmax(120px, .9fr) auto; align-items: center; gap: 10px; background: var(--app-surface); border: 1px solid var(--app-border); border-radius: 6px; }
   .entry-row:hover { border-color: var(--app-border-strong); box-shadow: 0 1px 2px rgb(0 0 0 / 6%); }
@@ -1269,6 +1298,7 @@
   @media (max-width: 700px) {
     .password-header { padding-right: 10px; padding-left: 10px; }
     .password-toolbar, .password-meta, .entry-list { padding-right: 10px; padding-left: 10px; }
+    .diagnostics-panel { margin-right: 10px; margin-left: 10px; }
     .entry-row { grid-template-columns: 32px minmax(0, 1fr) auto; }
     .entry-secret { grid-column: 2 / -1; grid-row: 2; }
     .entry-actions { grid-column: 2 / -1; grid-row: 3; justify-content: flex-start; }

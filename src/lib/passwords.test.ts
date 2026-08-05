@@ -177,7 +177,7 @@ describe("desktop password command contract", () => {
     expect(backendInvoke).toHaveBeenNthCalledWith(2, "cancel_password_template_recording", { sessionId: "recording-1" });
   });
 
-  it("preserves the Firefox toolbar action required by an ungranted fill", async () => {
+  it("normalizes fill tickets without any extra authorization step", async () => {
     (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
     backendInvoke.mockResolvedValue({
       sessionId: "fill-1",
@@ -185,14 +185,39 @@ describe("desktop password command contract", () => {
       browser: "firefox",
       origin: "https://example.com",
       expiresAt: 1_800_000_000_000,
-      actionRequired: "toolbar-click",
     });
 
-    await expect(passwordApi.startFill("entry-1")).resolves.toMatchObject({
+    const ticket = await passwordApi.startFill("entry-1");
+    expect(ticket).toEqual({
       sessionId: "fill-1",
-      actionRequired: "toolbar-click",
+      entryId: "entry-1",
+      browser: "firefox",
+      origin: "https://example.com",
+      expiresAt: 1_800_000_000_000,
     });
+    expect(ticket).not.toHaveProperty("actionRequired");
     expect(backendInvoke).toHaveBeenCalledWith("start_password_fill", { entryId: "entry-1" });
+  });
+
+  it("keeps the backend error code and routing fields on command failures", async () => {
+    (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
+    backendInvoke.mockRejectedValue({
+      code: "password_fill_start_failed",
+      message: "Firefox 扩展尚未连接。",
+      layer: "request",
+      requestId: "request-1",
+      connectionId: "connection-a",
+    });
+
+    const failure = await passwordApi.startFill("entry-1").catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe("Firefox 扩展尚未连接。");
+    expect(failure).toMatchObject({
+      code: "password_fill_start_failed",
+      layer: "request",
+      requestId: "request-1",
+      connectionId: "connection-a",
+    });
   });
 
   it("provides the Firefox install page when a disconnected backend omits it", async () => {
@@ -226,13 +251,65 @@ describe("desktop password command contract", () => {
     });
   });
 
+  it("normalizes layered connection and diagnostic fields from the backend", async () => {
+    (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
+    backendInvoke.mockResolvedValue({
+      browser: "firefox",
+      connection: "connected",
+      extension_installed: true,
+      native_host_installed: true,
+      extension_version: "1.2.0",
+      capture_permission: "granted",
+      authentication_consent: true,
+      stdio_connected: true,
+      pipe_connected: false,
+      connection_id: "connection-a",
+      diagnostics: [
+        { at_unix_ms: 1_800_000_000_000, layer: "stdio", event: "connected", detail: "connection-a" },
+        { atUnixMs: 1_800_000_001_000, layer: "request", event: "timeout", detail: "command=password.getStatus requestId=abc12345" },
+      ],
+      last_request_outcome: {
+        at_unix_ms: 1_800_000_001_000,
+        layer: "request",
+        event: "failed",
+        detail: "command=password.getStatus requestId=abc12345 outcome=timeout",
+      },
+    });
+
+    await expect(passwordApi.getBrowserStatus()).resolves.toMatchObject({
+      connection: "connected",
+      capturePermission: "granted",
+      authenticationConsent: true,
+      stdioConnected: true,
+      pipeConnected: false,
+      connectionId: "connection-a",
+      diagnostics: [
+        { atUnixMs: 1_800_000_000_000, layer: "stdio", event: "connected", detail: "connection-a" },
+        { atUnixMs: 1_800_000_001_000, layer: "request", event: "timeout", detail: "command=password.getStatus requestId=abc12345" },
+      ],
+      lastRequestOutcome: {
+        atUnixMs: 1_800_000_001_000,
+        layer: "request",
+        event: "failed",
+        detail: "command=password.getStatus requestId=abc12345 outcome=timeout",
+      },
+    });
+  });
+
   it("reports desktop browser-status command failures as communication errors", async () => {
     (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
-    backendInvoke.mockRejectedValue(new Error("native bridge timed out"));
+    backendInvoke.mockRejectedValue({
+      code: "password_browser_status_failed",
+      message: "native bridge timed out",
+    });
 
     await expect(passwordApi.getBrowserStatus()).resolves.toMatchObject({
       capturePermission: "unknown",
+      errorCode: "password_browser_status_failed",
       message: expect.stringContaining("通信异常"),
+    });
+    await expect(passwordApi.getBrowserStatus()).resolves.toMatchObject({
+      message: expect.stringContaining("native bridge timed out"),
     });
   });
 });

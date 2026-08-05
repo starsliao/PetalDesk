@@ -59,12 +59,26 @@
     return queryTabs(queryInfo);
   }
 
+  async function queryActiveTab() {
+    const tabs = await queryTabs({ active: true, currentWindow: true });
+    return Array.isArray(tabs) && tabs.length > 0 ? tabs[0] : null;
+  }
+
   function onTabRemoved(listener) {
     if (!extensionApi.tabs || !extensionApi.tabs.onRemoved
       || typeof extensionApi.tabs.onRemoved.addListener !== "function") {
       return false;
     }
     extensionApi.tabs.onRemoved.addListener(listener);
+    return true;
+  }
+
+  function onActivated(listener) {
+    if (!extensionApi.tabs || !extensionApi.tabs.onActivated
+      || typeof extensionApi.tabs.onActivated.addListener !== "function") {
+      return false;
+    }
+    extensionApi.tabs.onActivated.addListener(listener);
     return true;
   }
 
@@ -117,7 +131,9 @@
     extensionVersion: extensionApi.runtime.getManifest().version,
     getAllPermissions,
     getTab,
+    onActivated,
     onTabRemoved,
+    queryActiveTab,
     queryAllTabs,
     requestPermissions,
     queryTabs,

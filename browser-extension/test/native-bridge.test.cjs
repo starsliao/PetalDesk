@@ -81,6 +81,8 @@ function loadBridge(family = "chrome") {
     setTimeout,
   };
   let passwordDisconnects = 0;
+  let secretConnects = 0;
+  const nativeStates = [];
   if (family === "firefox") {
     context.PetalDeskPasswordBridge = {
       createPasswordBridge() {
@@ -89,8 +91,15 @@ function loadBridge(family = "chrome") {
           disconnect() {
             passwordDisconnects += 1;
           },
+          onSecretConnected() {
+            secretConnects += 1;
+            return Promise.resolve();
+          },
           route() {
             throw new Error("not used by this harness");
+          },
+          setNativeConnected(connected) {
+            nativeStates.push(connected === true);
           },
           supportsCommand() {
             return false;
@@ -116,13 +125,16 @@ function loadBridge(family = "chrome") {
   }
 
   return {
+    nativeDisconnect,
     nativeMessages,
+    nativeStates: () => Array.from(nativeStates),
     postedMessages,
     tabMessages,
     selectTab(tabId) {
       selectedTabId = tabId;
     },
     passwordDisconnects: () => passwordDisconnects,
+    secretConnects: () => secretConnects,
   };
 }
 
@@ -177,6 +189,22 @@ test("secret pipe lifecycle disconnect clears the Firefox password bridge", asyn
   });
   assert.equal(bridge.passwordDisconnects(), 1);
   assert.equal(bridge.postedMessages.length, 1);
+});
+
+test("secret pipe connect replays the active origin and tracks stdio state", async () => {
+  const bridge = loadBridge("firefox");
+  assert.deepEqual(bridge.nativeStates(), [true]);
+  await sendNativeRequest(bridge, {
+    protocolVersion: 1,
+    type: "extension.event",
+    event: "secretConnected",
+    payload: {},
+  });
+  assert.equal(bridge.secretConnects(), 1);
+  assert.equal(bridge.passwordDisconnects(), 0);
+  bridge.nativeDisconnect.listeners[0]();
+  assert.equal(bridge.nativeStates().at(-1), false);
+  assert.equal(bridge.passwordDisconnects(), 1);
 });
 
 test("capture commands stay bound to the tab and frame selected by prepare", async () => {
