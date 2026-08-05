@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="飞花 - PetalDesk 是一款面向 Windows 与 macOS 的本地便签和效率工具，支持 Markdown、截图、计时器、提醒、任务甘特图、本地 MFA，以及 Windows 本地密码管理器与 Firefox 安全填充。"
+      content="飞花 - PetalDesk 是 Windows 10/11 与 macOS 12+ 上的本地便签与效率工具：Markdown 便签、密码管理器、MFA 验证器、截图与长截图、任务甘特图、计时器与提醒。无账号、无云端依赖，数据始终在你手里。"
     />
     <meta name="theme-color" content="#f7f7f5" />
     <link rel="icon" href="./assets/app-icon.svg" type="image/svg+xml" />
@@ -14,21 +14,29 @@
       :root {
         color-scheme: light;
         --ink: #242426;
-        --muted: #656567;
-        --line: #d9d9d5;
+        --ink-soft: #3d3e42;
+        --muted: #5f5f63;
+        --faint: #8b8b8e;
+        --line: #e4e4df;
+        --line-strong: #d4d4cd;
         --paper: #f7f7f5;
+        --paper-warm: #f1f0ea;
         --white: #ffffff;
         --yellow: #fff0a8;
+        --yellow-soft: #fff7d6;
         --yellow-deep: #d2a500;
-        --pink: #f7d3dc;
-        --green: #d9efd4;
-        --blue: #d6e9f8;
+        --yellow-ink: #6b5510;
         --blue-action: #0875c9;
         --blue-action-hover: #0066ae;
-        --charcoal: #2f3033;
-        --charcoal-soft: #3d3e42;
-        --red: #d95d49;
-        --max-width: 1180px;
+        --blue-tint: #e9f3fc;
+        --green-tint: #e7f3e4;
+        --pink-tint: #fbe7ec;
+        --violet-tint: #f1ecfb;
+        --orange-tint: #fdeed9;
+        --shadow-sm: 0 1px 2px rgba(36, 36, 38, 0.05), 0 4px 14px rgba(36, 36, 38, 0.05);
+        --shadow-md: 0 2px 4px rgba(36, 36, 38, 0.06), 0 12px 32px rgba(36, 36, 38, 0.09);
+        --shadow-lg: 0 24px 60px rgba(36, 36, 38, 0.16);
+        --max-width: 1160px;
         font-family:
           "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", -apple-system,
           "Segoe UI", Arial, sans-serif;
@@ -43,7 +51,7 @@
 
       html {
         scroll-behavior: smooth;
-        scroll-padding-top: 78px;
+        scroll-padding-top: 84px;
       }
 
       body {
@@ -83,7 +91,8 @@
         z-index: 200;
         padding: 8px 12px;
         color: var(--white);
-        background: var(--charcoal);
+        background: var(--ink);
+        border-radius: 8px;
         transform: translateY(-180%);
       }
 
@@ -96,22 +105,23 @@
         margin-inline: auto;
       }
 
+      /* ---------- 导航 ---------- */
+
       .site-header {
         position: sticky;
         top: 0;
         z-index: 100;
-        height: 68px;
-        border-bottom: 1px solid rgba(36, 36, 38, 0.12);
-        background: rgba(247, 247, 245, 0.96);
+        border-bottom: 1px solid rgba(36, 36, 38, 0.09);
+        background: rgba(247, 247, 245, 0.88);
         backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
       }
 
       .nav {
         display: flex;
         align-items: center;
-        justify-content: space-between;
-        height: 100%;
-        gap: 24px;
+        height: 68px;
+        gap: 16px;
       }
 
       .brand {
@@ -119,54 +129,58 @@
         align-items: center;
         min-width: max-content;
         gap: 10px;
-        font-size: 20px;
+        font-size: 18px;
         font-weight: 800;
       }
 
       .brand img {
-        width: 36px;
-        height: 36px;
-        border-radius: 7px;
+        width: 34px;
+        height: 34px;
+        border-radius: 8px;
       }
 
       .nav-links {
         display: flex;
         align-items: center;
-        justify-content: flex-end;
-        gap: 6px;
-        font-size: 14px;
-        font-weight: 650;
+        gap: 2px;
+        margin-left: auto;
       }
 
       .nav-link {
-        padding: 8px 11px;
-        color: #555558;
-        border-bottom: 2px solid transparent;
+        padding: 8px 12px;
+        border-radius: 8px;
+        color: #54545a;
+        font-size: 14px;
+        font-weight: 650;
+        transition:
+          color 150ms ease,
+          background-color 150ms ease;
       }
 
       .nav-link:hover {
         color: var(--ink);
-        border-bottom-color: var(--ink);
+        background: rgba(36, 36, 38, 0.06);
       }
 
       .github-nav-link {
-        display: none;
+        display: inline-flex;
         align-items: center;
         justify-content: center;
-        width: 36px;
-        height: 36px;
+        width: 38px;
+        height: 38px;
+        margin-left: 8px;
         flex: 0 0 auto;
-        color: var(--white);
-        background: #24292f;
-        border: 1px solid #24292f;
-        border-radius: 50%;
+        color: var(--ink);
+        border: 1px solid var(--line-strong);
+        border-radius: 10px;
+        background: var(--white);
         transition:
           transform 160ms ease,
-          background-color 160ms ease;
+          border-color 160ms ease;
       }
 
       .github-nav-link:hover {
-        background: #111820;
+        border-color: var(--ink);
         transform: translateY(-1px);
       }
 
@@ -175,567 +189,611 @@
         height: 18px;
       }
 
-      .github-ribbon {
-        position: fixed;
-        top: 68px;
-        right: 0;
-        z-index: 90;
-        width: 156px;
-        height: 156px;
-        overflow: hidden;
-        pointer-events: none;
-      }
-
-      .github-ribbon-link {
-        position: absolute;
-        top: 31px;
-        right: -53px;
-        display: block;
-        width: 210px;
-        padding: 9px 0 8px;
-        color: var(--white);
-        background: #24292f;
-        border-top: 1px dashed rgba(255, 255, 255, 0.78);
-        border-bottom: 1px dashed rgba(255, 255, 255, 0.78);
-        box-shadow: 0 4px 12px rgba(36, 36, 38, 0.24);
-        font-size: 13px;
-        font-weight: 800;
-        line-height: 1.2;
-        text-align: center;
-        transform: rotate(45deg);
-        transition:
-          background-color 160ms ease,
-          box-shadow 160ms ease;
-        pointer-events: auto;
-      }
-
-      .github-ribbon-link:hover {
-        background: #111820;
-        box-shadow: 0 5px 15px rgba(36, 36, 38, 0.32);
-      }
-
-      .github-ribbon-link:focus-visible {
-        outline: 3px solid #e7b900;
-        outline-offset: -3px;
-      }
-
-      .nav-download,
-      .primary-action,
-      .download-action {
+      .btn {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        min-height: 42px;
-        padding: 9px 17px;
-        color: var(--white);
-        background: var(--blue-action);
-        border: 1px solid var(--blue-action);
-        border-radius: 6px;
-        font-weight: 750;
+        gap: 8px;
+        min-height: 44px;
+        padding: 10px 20px;
+        border: 1px solid transparent;
+        border-radius: 10px;
+        font-size: 15px;
+        font-weight: 700;
         line-height: 1.2;
-        box-shadow: 0 4px 10px rgba(8, 117, 201, 0.2);
         transition:
           transform 160ms ease,
-          background-color 160ms ease;
+          box-shadow 160ms ease,
+          background-color 160ms ease,
+          border-color 160ms ease;
       }
 
-      .nav-download:hover,
-      .primary-action:hover,
-      .download-action:hover {
+      .btn-primary {
+        color: var(--white);
+        background: var(--blue-action);
+        box-shadow: 0 6px 16px rgba(8, 117, 201, 0.24);
+      }
+
+      .btn-primary:hover {
         background: var(--blue-action-hover);
         transform: translateY(-1px);
       }
 
+      .btn-secondary {
+        color: var(--ink);
+        background: var(--white);
+        border-color: var(--line-strong);
+        box-shadow: var(--shadow-sm);
+      }
+
+      .btn-secondary:hover {
+        border-color: #a9a9a3;
+        transform: translateY(-1px);
+      }
+
+      .btn-dark {
+        color: var(--white);
+        background: var(--ink);
+        box-shadow: 0 6px 16px rgba(36, 36, 38, 0.22);
+      }
+
+      .btn-dark:hover {
+        background: #101011;
+        transform: translateY(-1px);
+      }
+
+      .nav-download {
+        min-height: 40px;
+        margin-left: 10px;
+        padding: 8px 16px;
+        font-size: 14px;
+      }
+
+      /* ---------- Hero ---------- */
+
       .hero {
-        height: calc(100vh - 116px);
-        height: calc(100svh - 116px);
-        min-height: 0;
-        max-height: 900px;
+        position: relative;
         overflow: hidden;
         border-bottom: 1px solid var(--line);
-        background: var(--paper);
+      }
+
+      .hero::before {
+        position: absolute;
+        inset: 0;
+        content: "";
+        background:
+          radial-gradient(660px 360px at 16% -6%, rgba(255, 240, 168, 0.9), transparent 70%),
+          radial-gradient(760px 400px at 86% 2%, rgba(255, 240, 168, 0.55), transparent 72%);
+        pointer-events: none;
       }
 
       .hero-inner {
-        display: grid;
-        grid-template-rows: auto minmax(0, 1fr);
-        height: 100%;
-        padding-top: 28px;
-      }
-
-      .hero-copy {
         position: relative;
-        z-index: 2;
-        max-width: 860px;
-        margin-inline: auto;
+        padding-block: clamp(54px, 8vh, 92px) clamp(64px, 9vh, 108px);
         text-align: center;
       }
 
-      .eyebrow {
+      .hero-eyebrow {
         display: inline-flex;
         align-items: center;
         gap: 8px;
-        margin: 0 0 8px;
-        color: #615126;
+        margin: 0;
+        padding: 6px 14px;
+        border: 1px solid rgba(210, 165, 0, 0.38);
+        border-radius: 999px;
+        color: var(--yellow-ink);
+        background: rgba(255, 240, 168, 0.66);
         font-size: 13px;
-        font-weight: 750;
-      }
-
-      .eyebrow::before {
-        width: 22px;
-        height: 4px;
-        content: "";
-        background: var(--yellow-deep);
+        font-weight: 700;
       }
 
       .hero h1 {
-        margin: 0;
-        font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
-        font-size: 58px;
+        max-width: 900px;
+        margin: 20px auto 0;
+        font-size: clamp(38px, 6vw, 62px);
         font-weight: 900;
-        line-height: 1.06;
-        letter-spacing: 0;
+        line-height: 1.16;
+        letter-spacing: -0.01em;
+      }
+
+      .hero h1 .hl {
+        padding-inline: 2px;
+        background: linear-gradient(transparent 58%, rgba(255, 240, 168, 0.95) 58%);
       }
 
       .hero-lead {
-        max-width: 700px;
-        margin: 10px auto 0;
-        color: #515154;
-        font-size: 18px;
+        max-width: 660px;
+        margin: 20px auto 0;
+        color: var(--muted);
+        font-size: clamp(16px, 2vw, 18px);
       }
 
       .hero-actions {
         display: flex;
         flex-wrap: wrap;
         justify-content: center;
-        gap: 10px;
-        margin-top: 17px;
+        gap: 12px;
+        margin-top: 32px;
       }
 
-      .secondary-action {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        min-height: 42px;
-        padding: 9px 17px;
-        border: 1px solid #a9a9a5;
-        border-radius: 6px;
-        background: rgba(255, 255, 255, 0.62);
-        font-weight: 750;
-        line-height: 1.2;
-        transition:
-          border-color 160ms ease,
-          background-color 160ms ease;
+      .hero-meta {
+        margin: 18px 0 0;
+        color: var(--faint);
+        font-size: 13px;
       }
 
-      .secondary-action:hover {
-        border-color: var(--ink);
-        background: var(--white);
+      .text-link {
+        color: var(--blue-action);
+        font-weight: 650;
+        border-bottom: 1px solid rgba(8, 117, 201, 0.35);
+        transition: border-color 150ms ease;
+      }
+
+      .text-link:hover {
+        border-bottom-color: var(--blue-action);
       }
 
       .hero-visual {
-        display: flex;
-        align-items: flex-end;
-        justify-content: center;
-        min-height: 0;
-        padding-top: 22px;
+        position: relative;
+        max-width: 920px;
+        margin: clamp(46px, 7vh, 76px) auto 0;
       }
 
-      .product-frame {
+      .hero-visual::before {
+        position: absolute;
+        inset: 6% -5% -8%;
+        content: "";
+        background: radial-gradient(closest-side, rgba(255, 240, 168, 0.95), rgba(255, 240, 168, 0));
+        filter: blur(12px);
+        pointer-events: none;
+      }
+
+      .shot-frame {
         position: relative;
-        width: min(920px, 88vw);
-        max-height: 100%;
         margin: 0;
         overflow: hidden;
-        border: 1px solid #bfc0bc;
-        border-bottom: 0;
-        border-radius: 7px 7px 0 0;
+        border: 1px solid rgba(36, 36, 38, 0.15);
+        border-radius: 14px;
         background: var(--white);
-        box-shadow: 0 22px 48px rgba(36, 36, 38, 0.18);
-        animation: product-arrive 560ms ease-out both;
+        box-shadow: var(--shadow-lg);
       }
 
-      .product-frame::before {
-        position: absolute;
-        top: 0;
-        left: 0;
-        z-index: 1;
-        width: 100%;
-        height: 4px;
-        content: "";
-        background: #dfbe2e;
+      .frame-bar {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        height: 34px;
+        padding-inline: 14px;
+        border-bottom: 1px solid rgba(36, 36, 38, 0.08);
+        background: #fbfaf7;
       }
 
-      .product-frame img {
+      .frame-bar span {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+      }
+
+      .frame-bar span:nth-child(1) {
+        background: #ee6a5e;
+      }
+
+      .frame-bar span:nth-child(2) {
+        background: #f4bf4f;
+      }
+
+      .frame-bar span:nth-child(3) {
+        background: #62c454;
+      }
+
+      .shot-frame img {
         width: 100%;
         height: auto;
       }
 
-      .section-peek {
-        display: flex;
-        align-items: center;
-        height: 48px;
-        color: var(--white);
-        background: var(--charcoal);
+      /* ---------- 信任数据条 ---------- */
+
+      .stats {
+        border-bottom: 1px solid var(--line);
+        background: var(--white);
       }
 
-      .section-peek a {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        width: 100%;
+      .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 24px;
+        padding-block: 38px;
+      }
+
+      .stat {
+        text-align: center;
+      }
+
+      .stat-num {
+        display: block;
+        font-size: clamp(26px, 3vw, 34px);
+        font-weight: 850;
+        line-height: 1.1;
+      }
+
+      .stat-label {
+        display: block;
+        margin-top: 6px;
         font-size: 14px;
         font-weight: 700;
       }
 
-      .section-peek .arrow {
-        color: var(--yellow);
-        font-size: 20px;
-        line-height: 1;
+      .stat-sub {
+        display: block;
+        margin-top: 2px;
+        color: var(--faint);
+        font-size: 12.5px;
       }
+
+      /* ---------- 章节通用 ---------- */
 
       .section {
-        padding-block: 112px;
+        padding-block: clamp(72px, 9vw, 112px);
       }
 
-      .section-heading {
-        display: grid;
-        grid-template-columns: minmax(460px, 0.9fr) minmax(300px, 1.1fr);
-        align-items: end;
-        gap: 56px;
-        margin-bottom: 60px;
-      }
-
-      .section-index {
-        display: block;
-        margin-bottom: 12px;
-        color: #77777a;
-        font-size: 13px;
-        font-weight: 800;
-      }
-
-      .section h2 {
-        max-width: 620px;
-        margin: 0;
-        font-size: 40px;
-        line-height: 1.24;
-        letter-spacing: 0;
-      }
-
-      .section-title-line {
-        display: block;
-        white-space: nowrap;
-      }
-
-      .section-intro {
-        max-width: 600px;
-        margin: 0;
-        color: var(--muted);
-        font-size: 17px;
-      }
-
-      .note-features {
-        display: grid;
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-        gap: 1px;
-        border: 1px solid #cacac6;
-        background: #cacac6;
-      }
-
-      .note-feature {
-        min-height: 245px;
-        padding: 28px 25px;
+      .band-white {
         background: var(--white);
       }
 
-      .note-feature:nth-child(1) {
-        border-top: 6px solid #dfbe2e;
+      .section-head {
+        max-width: 720px;
+        margin-bottom: clamp(38px, 5vw, 60px);
       }
 
-      .note-feature:nth-child(2) {
-        border-top: 6px solid #cd7188;
+      .section-head.center {
+        margin-inline: auto;
+        text-align: center;
       }
 
-      .note-feature:nth-child(3) {
-        border-top: 6px solid #68a46c;
-      }
-
-      .note-feature:nth-child(4) {
-        border-top: 6px solid #5292be;
-      }
-
-      .feature-label {
-        display: block;
-        margin-bottom: 42px;
-        color: #747477;
-        font-size: 12px;
-        font-weight: 800;
-      }
-
-      .note-feature h3 {
-        margin: 0 0 10px;
-        font-size: 20px;
-        line-height: 1.35;
-      }
-
-      .note-feature p {
-        margin: 0;
-        color: var(--muted);
-        font-size: 14px;
-      }
-
-      .mode-band {
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        margin-top: 36px;
-        border: 1px solid #c6c6c2;
-      }
-
-      .mode {
-        padding: 28px;
-      }
-
-      .mode + .mode {
-        border-left: 1px solid #c6c6c2;
-      }
-
-      .mode-name {
-        display: flex;
+      .kicker {
+        display: inline-flex;
         align-items: center;
         gap: 10px;
-        margin-bottom: 8px;
-        font-size: 17px;
-        font-weight: 800;
-      }
-
-      .mode-mark {
-        display: inline-grid;
-        width: 30px;
-        height: 30px;
-        place-items: center;
-        border-radius: 5px;
-        font-family: Consolas, monospace;
+        margin-bottom: 14px;
+        color: #8a6d00;
         font-size: 13px;
+        font-weight: 800;
+        letter-spacing: 0.14em;
       }
 
-      .mode:first-child .mode-mark {
+      .kicker::before {
+        width: 24px;
+        height: 3px;
+        content: "";
+        border-radius: 2px;
+        background: var(--yellow-deep);
+      }
+
+      .section-head.center .kicker::after {
+        width: 24px;
+        height: 3px;
+        content: "";
+        border-radius: 2px;
+        background: var(--yellow-deep);
+      }
+
+      .section h2 {
+        margin: 0;
+        font-size: clamp(28px, 4vw, 40px);
+        font-weight: 850;
+        line-height: 1.22;
+        letter-spacing: -0.01em;
+      }
+
+      .section-intro {
+        max-width: 640px;
+        margin: 16px 0 0;
+        color: var(--muted);
+        font-size: 17px;
+      }
+
+      .section-head.center .section-intro {
+        margin-inline: auto;
+      }
+
+      /* ---------- 功能卡片网格 ---------- */
+
+      .feature-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 20px;
+      }
+
+      .feature-card {
+        position: relative;
+        padding: 26px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: var(--white);
+        box-shadow: var(--shadow-sm);
+        transition:
+          transform 180ms ease,
+          box-shadow 180ms ease;
+      }
+
+      .feature-card:hover {
+        transform: translateY(-3px);
+        box-shadow: var(--shadow-md);
+      }
+
+      .feature-icon {
+        display: grid;
+        width: 46px;
+        height: 46px;
+        margin-bottom: 18px;
+        border-radius: 12px;
+        font-size: 22px;
+        place-items: center;
+      }
+
+      .feature-icon.yellow {
         background: var(--yellow);
       }
 
-      .mode:last-child .mode-mark {
-        background: var(--blue);
+      .feature-icon.blue {
+        background: var(--blue-tint);
       }
 
-      .mode p {
-        margin: 0;
-        color: var(--muted);
-        font-size: 14px;
+      .feature-icon.violet {
+        background: var(--violet-tint);
       }
 
-      .note-editor-figure {
-        display: grid;
-        grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr);
-        margin: 36px 0 0;
-        border: 1px solid #c6c6c2;
-        background: #f1f1ed;
+      .feature-icon.pink {
+        background: var(--pink-tint);
       }
 
-      .note-editor-shot {
-        display: grid;
-        min-width: 0;
-        padding: 34px 42px 42px;
-        place-items: center;
-        background:
-          linear-gradient(135deg, rgb(255 255 255 / 72%), transparent 52%),
-          #e7e8e3;
+      .feature-icon.green {
+        background: var(--green-tint);
       }
 
-      .note-editor-shot img {
-        display: block;
-        width: min(100%, 594px);
-        height: auto;
-        border: 1px solid rgb(64 64 65 / 18%);
-        box-shadow: 15px 15px 0 #d0d1cc;
+      .feature-icon.orange {
+        background: var(--orange-tint);
       }
 
-      .note-editor-figure figcaption {
-        display: flex;
-        align-items: flex-start;
-        flex-direction: column;
-        justify-content: center;
-        gap: 12px;
-        padding: 38px 34px;
-        border-left: 1px solid #c6c6c2;
-      }
-
-      .note-editor-kicker {
-        color: #77777a;
-        font-family: Consolas, monospace;
-        font-size: 12px;
-        font-weight: 800;
-        letter-spacing: 0.08em;
-      }
-
-      .note-editor-figure .caption-title {
-        color: var(--ink);
-        font-size: 23px;
-        line-height: 1.35;
-      }
-
-      .note-editor-figure figcaption p {
-        margin: 0;
-        color: var(--muted);
-        font-size: 14px;
-      }
-
-      .tools-section {
-        color: #f5f5f3;
-        background: var(--charcoal);
-      }
-
-      .tools-section .section-index,
-      .tools-section .section-intro {
-        color: #b9b9bc;
-      }
-
-      .tool-list {
-        display: grid;
-        grid-template-columns: repeat(5, minmax(0, 1fr));
-        margin-bottom: 38px;
-        border-top: 1px solid #5b5c60;
-        border-bottom: 1px solid #5b5c60;
-      }
-
-      .tool-item {
-        position: relative;
-        min-height: 180px;
-        padding: 26px 24px 28px;
-      }
-
-      .tool-item + .tool-item {
-        border-left: 1px solid #5b5c60;
-      }
-
-      .tool-number {
-        color: #a9aaad;
-        font-family: Consolas, monospace;
-        font-size: 12px;
-      }
-
-      .tool-item h3 {
-        margin: 42px 0 7px;
-        font-size: 19px;
-      }
-
-      .tool-item p {
-        margin: 0;
-        color: #c3c3c5;
-        font-size: 13px;
-      }
-
-      .tool-item:nth-child(1)::after,
-      .tool-item:nth-child(2)::after,
-      .tool-item:nth-child(3)::after,
-      .tool-item:nth-child(4)::after,
-      .tool-item:nth-child(5)::after {
+      .feature-tag {
         position: absolute;
-        top: -1px;
-        right: 20px;
-        width: 44px;
-        height: 5px;
-        content: "";
+        top: 24px;
+        right: 22px;
+        padding: 3px 10px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        color: var(--muted);
+        background: var(--paper);
+        font-size: 11.5px;
+        font-weight: 700;
       }
 
-      .tool-item:nth-child(1)::after {
-        background: #dfbe2e;
+      .feature-card h3 {
+        margin: 0 0 8px;
+        font-size: 17px;
       }
 
-      .tool-item:nth-child(2)::after {
-        background: #d87e93;
-      }
-
-      .tool-item:nth-child(3)::after {
-        background: #6dae73;
-      }
-
-      .tool-item:nth-child(4)::after {
-        background: #5ba0d0;
-      }
-
-      .tool-item:nth-child(5)::after {
-        background: #9a7bd0;
-      }
-
-      .screenshot-figure {
+      .feature-card p {
         margin: 0;
-        border: 1px solid #65666a;
-        background: #191a1c;
+        color: var(--muted);
+        font-size: 14px;
       }
 
-      .screenshot-figure + .screenshot-figure {
-        margin-top: 28px;
+      .wide-figure {
+        margin: clamp(36px, 5vw, 52px) 0 0;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: var(--white);
+        box-shadow: var(--shadow-sm);
       }
 
-      .screenshot-figure img {
+      .wide-figure img {
         width: 100%;
         height: auto;
-        aspect-ratio: 16 / 9;
-        object-fit: cover;
       }
 
-      .screenshot-figure figcaption {
+      .wide-figure figcaption {
         display: flex;
+        flex-wrap: wrap;
         align-items: center;
         justify-content: space-between;
-        gap: 24px;
-        min-height: 68px;
+        gap: 6px 20px;
         padding: 14px 20px;
-        border-top: 1px solid #65666a;
-        color: #c7c7c9;
-        font-size: 13px;
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 13.5px;
       }
 
-      .caption-title {
-        color: var(--white);
-        font-weight: 800;
+      .wide-figure figcaption strong {
+        color: var(--ink);
       }
+
+      /* ---------- 交替图文区块 ---------- */
+
+      .split {
+        display: grid;
+        grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
+        align-items: center;
+        gap: clamp(40px, 6vw, 80px);
+        padding-block: clamp(60px, 8vw, 100px);
+      }
+
+      .split:first-child {
+        padding-top: clamp(64px, 8vw, 104px);
+      }
+
+      .split:last-child {
+        padding-bottom: clamp(64px, 8vw, 104px);
+      }
+
+      .split + .split {
+        border-top: 1px solid var(--line);
+      }
+
+      .split.flip .split-media {
+        order: -1;
+      }
+
+      .split-text p.lead-in {
+        margin: 16px 0 0;
+        color: var(--muted);
+        font-size: 16px;
+      }
+
+      .check-list {
+        display: grid;
+        gap: 12px;
+        margin: 24px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .check-list li {
+        position: relative;
+        padding-left: 31px;
+        color: #43434a;
+        font-size: 15px;
+      }
+
+      .check-list li::before {
+        position: absolute;
+        top: 2px;
+        left: 0;
+        display: grid;
+        width: 19px;
+        height: 19px;
+        content: "✓";
+        border-radius: 6px;
+        color: var(--yellow-ink);
+        background: var(--yellow);
+        font-size: 12px;
+        font-weight: 800;
+        place-items: center;
+      }
+
+      .split-links {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 22px;
+        margin-top: 24px;
+        font-size: 14.5px;
+      }
+
+      .shot-panel {
+        padding: clamp(20px, 3vw, 38px);
+        border: 1px solid rgba(210, 165, 0, 0.3);
+        border-radius: 16px;
+        background: linear-gradient(160deg, #fff6cf, #fdf3d7 55%, #f8f2df);
+      }
+
+      .shot-panel.blue {
+        border-color: rgba(8, 117, 201, 0.2);
+        background: linear-gradient(160deg, #e9f3fc, #f2f8fd 60%, #f7fafc);
+      }
+
+      .shot-panel.violet {
+        border-color: rgba(124, 93, 200, 0.22);
+        background: linear-gradient(160deg, #f1ecfb, #f6f2fd 60%, #faf9fc);
+      }
+
+      .shot-panel.gray {
+        border-color: var(--line-strong);
+        background: linear-gradient(160deg, #f0f0ec, #f7f7f4 60%, #fafaf8);
+      }
+
+      .shot-panel img {
+        width: 100%;
+        height: auto;
+        border: 1px solid rgba(36, 36, 38, 0.16);
+        border-radius: 10px;
+        box-shadow: var(--shadow-md);
+      }
+
+      .shot-panel.narrow {
+        width: fit-content;
+        max-width: 100%;
+        margin-inline: auto;
+      }
+
+      .shot-panel.narrow img {
+        width: 320px;
+        max-width: 100%;
+        margin-inline: auto;
+      }
+
+      .callout {
+        display: flex;
+        gap: 14px;
+        margin-top: 28px;
+        padding: 18px 20px;
+        border: 1px solid rgba(210, 165, 0, 0.42);
+        border-radius: 12px;
+        background: linear-gradient(180deg, #fff8dc, #fff3c4);
+        box-shadow: var(--shadow-sm);
+      }
+
+      .callout-icon {
+        display: grid;
+        flex: 0 0 auto;
+        width: 36px;
+        height: 36px;
+        border: 1px solid rgba(210, 165, 0, 0.42);
+        border-radius: 9px;
+        background: var(--white);
+        font-size: 17px;
+        place-items: center;
+      }
+
+      .callout strong {
+        display: block;
+        margin-bottom: 4px;
+        color: #5d4a0c;
+        font-size: 15px;
+      }
+
+      .callout p {
+        margin: 0;
+        color: #6b5a1e;
+        font-size: 13.5px;
+        line-height: 1.7;
+      }
+
+      /* ---------- 数据归属 ---------- */
 
       .data-section {
-        background: #eff0ed;
+        border-block: 1px solid var(--line);
+        background: var(--paper-warm);
       }
 
       .data-layout {
         display: grid;
-        grid-template-columns: minmax(0, 0.95fr) minmax(360px, 1.05fr);
-        gap: 72px;
+        grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
         align-items: start;
+        gap: clamp(40px, 5vw, 72px);
+      }
+
+      .data-layout > * {
+        min-width: 0;
       }
 
       .data-points {
+        display: grid;
         margin: 0;
         padding: 0;
+        border-top: 1px solid var(--line-strong);
         list-style: none;
-        border-top: 1px solid #bcbdb9;
       }
 
       .data-points li {
-        display: grid;
-        grid-template-columns: 42px minmax(0, 1fr);
-        gap: 18px;
-        padding-block: 22px;
-        border-bottom: 1px solid #bcbdb9;
-      }
-
-      .data-point-number {
-        color: #707074;
-        font-family: Consolas, monospace;
-        font-size: 13px;
-        font-weight: 800;
+        padding: 17px 0;
+        border-bottom: 1px solid var(--line-strong);
       }
 
       .data-points strong {
         display: block;
-        margin-bottom: 4px;
+        margin-bottom: 3px;
+        font-size: 15.5px;
       }
 
       .data-points p {
@@ -744,117 +802,215 @@
         font-size: 14px;
       }
 
-      .directory-panel {
+      .dir-card {
         overflow: hidden;
-        border: 1px solid #1e1f21;
-        border-radius: 6px;
-        background: var(--charcoal);
-        box-shadow: 14px 14px 0 var(--yellow);
+        border: 1px solid #26262b;
+        border-radius: 14px;
+        background: #242426;
+        box-shadow: 0 18px 44px rgba(36, 36, 38, 0.22);
       }
 
-      .directory-titlebar {
+      .dir-bar {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        min-height: 46px;
-        padding: 10px 15px;
-        border-bottom: 1px solid #56575b;
-        color: #c9c9cb;
+        gap: 12px;
+        padding: 12px 16px;
+        border-bottom: 1px solid #3a3a40;
+        color: #b9b9bd;
         font-size: 12px;
       }
 
-      .directory-titlebar span:last-child {
+      .dir-bar span:last-child {
         color: #8f9093;
       }
 
-      .directory-panel pre {
+      .dir-card pre {
         margin: 0;
-        padding: 26px 22px 30px;
+        padding: 22px 20px 26px;
         overflow-x: auto;
-        color: #f3f3f1;
+        color: #f1f1ee;
         font-family: Consolas, "Cascadia Mono", monospace;
-        font-size: 13px;
-        line-height: 1.8;
+        font-size: 12.5px;
+        line-height: 1.78;
         white-space: pre;
       }
 
-      .directory-note {
-        margin: 28px 0 0;
+      .dir-card pre .dim {
+        color: #8f9093;
+      }
+
+      .dir-card pre .hl {
+        color: var(--yellow);
+      }
+
+      .dir-note {
+        margin: 18px 0 0;
         color: var(--muted);
         font-size: 13px;
       }
 
-      .install-section {
-        padding-block: 94px;
-        border-top: 1px solid #d6c25e;
-        border-bottom: 1px solid #d6c25e;
-        background: var(--yellow);
+      /* ---------- 平台对照表 ---------- */
+
+      .table-wrap {
+        overflow-x: auto;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: var(--white);
+        box-shadow: var(--shadow-sm);
       }
 
-      .install-layout {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) auto;
-        align-items: center;
-        gap: 60px;
-      }
-
-      .install-section h2 {
-        margin: 0;
-        font-size: 38px;
-        line-height: 1.25;
-      }
-
-      .install-section p {
-        max-width: 680px;
-        margin: 14px 0 0;
-        color: #5c5127;
-      }
-
-      .install-actions {
-        width: min(100%, 340px);
-      }
-
-      .download-option + .download-option {
-        margin-top: 16px;
-      }
-
-      .download-action {
+      .platform-table {
         width: 100%;
-        min-height: 52px;
-        background: var(--charcoal);
-        border-color: var(--charcoal);
-        box-shadow: 0 5px 12px rgba(36, 36, 38, 0.18);
+        min-width: 620px;
+        border-collapse: collapse;
+        font-size: 14.5px;
       }
 
-      .download-action:hover {
-        background: #171719;
+      .platform-table th,
+      .platform-table td {
+        padding: 15px 22px;
+        text-align: left;
       }
 
-      .download-meta {
-        margin-top: 10px;
-        color: #665b32;
+      .platform-table thead th {
+        border-bottom: 1px solid var(--line);
+        color: var(--muted);
+        background: #fbfaf5;
+        font-size: 12.5px;
+        font-weight: 800;
+        letter-spacing: 0.06em;
+      }
+
+      .platform-table tbody tr + tr td {
+        border-top: 1px solid var(--line);
+      }
+
+      .platform-table td:first-child {
+        font-weight: 700;
+      }
+
+      .cell-yes {
+        color: #1a7f4b;
+        font-weight: 700;
+      }
+
+      .cell-no {
+        color: #b0b0b4;
+      }
+
+      .platform-table .sub {
+        display: block;
+        margin-top: 2px;
+        color: var(--faint);
         font-size: 12px;
-        text-align: center;
+        font-weight: 400;
       }
 
-      .site-footer {
-        padding-block: 32px;
-        color: #a8a8aa;
-        background: #222225;
+      .table-note {
+        margin: 16px 4px 0;
+        color: var(--muted);
         font-size: 13px;
       }
 
-      .footer-inner {
+      /* ---------- 下载 ---------- */
+
+      .download-section {
+        border-block: 1px solid #ecd87f;
+        background: linear-gradient(180deg, #fff3bf, #ffed9e);
+      }
+
+      .download-cards {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 350px));
+        justify-content: center;
+        gap: 18px;
+        margin-top: 42px;
+      }
+
+      .dl-card {
+        padding: 26px;
+        border: 1px solid rgba(210, 165, 0, 0.4);
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.74);
+        box-shadow: var(--shadow-sm);
+        text-align: center;
+      }
+
+      .dl-platform {
+        display: block;
+        margin-bottom: 4px;
+        font-size: 17px;
+        font-weight: 800;
+      }
+
+      .dl-desc {
+        display: block;
+        margin-bottom: 18px;
+        color: #6b5a1e;
+        font-size: 13px;
+      }
+
+      .dl-card .btn {
+        width: 100%;
+        min-height: 52px;
+      }
+
+      .dl-meta {
+        margin-top: 12px;
+        color: #7a682f;
+        font-size: 12.5px;
+      }
+
+      .download-links {
         display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 8px 24px;
+        margin-top: 30px;
+        font-size: 14px;
+      }
+
+      .download-links .text-link {
+        color: #5d4a0c;
+        border-bottom-color: rgba(93, 74, 12, 0.4);
+      }
+
+      .download-links .text-link:hover {
+        border-bottom-color: #5d4a0c;
+      }
+
+      .upgrade-note {
+        max-width: 660px;
+        margin: 20px auto 0;
+        color: #6b5a1e;
+        font-size: 13px;
+        text-align: center;
+      }
+
+      /* ---------- 页脚 ---------- */
+
+      .site-footer {
+        padding-block: 44px 30px;
+        color: #a8a8ac;
+        background: #222225;
+        font-size: 14px;
+      }
+
+      .footer-top {
+        display: flex;
+        flex-wrap: wrap;
         align-items: center;
         justify-content: space-between;
-        gap: 22px;
+        gap: 18px 28px;
+        padding-bottom: 24px;
+        border-bottom: 1px solid #3a3a3f;
       }
 
       .footer-brand {
         display: inline-flex;
         align-items: center;
-        gap: 9px;
+        gap: 10px;
         color: var(--white);
         font-weight: 800;
       }
@@ -862,368 +1018,165 @@
       .footer-brand img {
         width: 28px;
         height: 28px;
-        border-radius: 5px;
+        border-radius: 6px;
       }
 
-      @keyframes product-arrive {
-        from {
-          opacity: 0;
-          transform: translateY(22px);
-        }
-        to {
-          opacity: 1;
-          transform: translateY(0);
-        }
+      .footer-tagline {
+        margin: 6px 0 0;
+        color: #8a8a8e;
+        font-size: 13px;
       }
 
-      @media (max-width: 980px) {
-        .section-heading {
-          grid-template-columns: 1fr;
-          gap: 20px;
-        }
+      .footer-links {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 24px;
+      }
 
-        .note-features,
-        .tool-list {
+      .footer-links a {
+        color: #c9c9cd;
+        transition: color 150ms ease;
+      }
+
+      .footer-links a:hover {
+        color: var(--white);
+      }
+
+      .footer-bottom {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        gap: 8px 24px;
+        padding-top: 20px;
+        color: #8a8a8e;
+        font-size: 12.5px;
+      }
+
+      /* ---------- 响应式 ---------- */
+
+      @media (max-width: 1000px) {
+        .feature-grid {
           grid-template-columns: repeat(2, minmax(0, 1fr));
         }
 
-        .note-feature:nth-child(3),
-        .note-feature:nth-child(4) {
-          border-top-width: 6px;
-        }
-
-        .tool-item:nth-child(3),
-        .tool-item:nth-child(5) {
-          border-left: 0;
-          border-top: 1px solid #5b5c60;
-        }
-
-        .tool-item:nth-child(4) {
-          border-top: 1px solid #5b5c60;
-        }
-
+        .split,
         .data-layout {
           grid-template-columns: 1fr;
-          gap: 48px;
         }
 
-        .directory-panel {
-          box-shadow: 10px 10px 0 var(--yellow);
+        .split {
+          gap: 36px;
+        }
+
+        .split.flip .split-media {
+          order: 0;
+        }
+      }
+
+      @media (max-width: 900px) {
+        .nav-link {
+          display: none;
         }
       }
 
       @media (max-width: 760px) {
-        .github-ribbon {
-          top: 62px;
-          width: 126px;
-          height: 126px;
-        }
-
-        .github-ribbon-link {
-          top: 25px;
-          right: -48px;
-          width: 172px;
-          padding-block: 7px;
-          font-size: 11px;
-        }
-
         .container {
-          width: min(calc(100% - 30px), var(--max-width));
+          width: min(calc(100% - 32px), var(--max-width));
         }
 
-        .site-header {
-          height: 62px;
+        .stats-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 22px 12px;
+          padding-block: 30px;
         }
 
-        .brand {
-          font-size: 18px;
+        .download-cards {
+          grid-template-columns: minmax(0, 1fr);
         }
+      }
 
-        .brand img {
-          width: 32px;
-          height: 32px;
-        }
-
-        .nav-link:nth-child(1),
-        .nav-link:nth-child(3) {
-          display: none;
-        }
-
-        .hero {
-          height: calc(100vh - 110px);
-          height: calc(100svh - 110px);
-        }
-
-        .hero-inner {
-          padding-top: 22px;
-        }
-
-        .hero h1 {
-          font-size: 45px;
-        }
-
-        .hero-lead {
-          max-width: 520px;
-          font-size: 16px;
-          line-height: 1.55;
-        }
-
-        .hero-actions {
-          margin-top: 14px;
-        }
-
-        .hero-visual {
-          padding-top: 18px;
-        }
-
-        .product-frame {
-          width: min(920px, 94vw);
-        }
-
-        .section {
-          padding-block: 78px;
-        }
-
-        .section-heading {
-          margin-bottom: 38px;
-        }
-
-        .section h2,
-        .install-section h2 {
-          font-size: 31px;
-        }
-
-        .section-intro {
-          font-size: 15px;
-        }
-
-        .mode-band {
+      @media (max-width: 680px) {
+        .feature-grid {
           grid-template-columns: 1fr;
-        }
-
-        .mode + .mode {
-          border-top: 1px solid #c6c6c2;
-          border-left: 0;
-        }
-
-        .note-editor-figure {
-          grid-template-columns: 1fr;
-        }
-
-        .note-editor-shot {
-          padding: 26px 34px 34px;
-        }
-
-        .note-editor-figure figcaption {
-          border-top: 1px solid #c6c6c2;
-          border-left: 0;
-        }
-
-        .screenshot-figure figcaption {
-          align-items: flex-start;
-          flex-direction: column;
-          gap: 4px;
-        }
-
-        .install-layout {
-          grid-template-columns: 1fr;
-          gap: 34px;
-        }
-
-        .install-actions {
-          width: 100%;
-        }
-
-        .footer-inner {
-          align-items: flex-start;
-          flex-direction: column;
         }
       }
 
       @media (max-width: 560px) {
-        .github-ribbon {
-          display: none;
-        }
-
-        .github-nav-link {
-          display: inline-flex;
-        }
-
         .nav {
+          height: 62px;
           gap: 10px;
         }
 
         .brand {
           gap: 8px;
-          font-size: 16px;
+          font-size: 15px;
         }
 
         .brand img {
-          width: 28px;
-          height: 28px;
+          width: 30px;
+          height: 30px;
         }
 
-        .nav-links {
-          gap: 2px;
-        }
-
-        .nav-link {
-          display: none;
+        .github-nav-link {
+          width: 36px;
+          height: 36px;
+          margin-left: 2px;
         }
 
         .nav-download {
           min-height: 38px;
-          padding-inline: 10px;
-          font-size: 12px;
-        }
-
-        .hero-inner {
-          padding-top: 17px;
-        }
-
-        .eyebrow {
-          margin-bottom: 5px;
-          font-size: 12px;
-        }
-
-        .hero h1 {
-          font-size: 40px;
-        }
-
-        .hero-lead {
-          margin-top: 7px;
-          font-size: 14px;
-        }
-
-        .hero-actions {
-          gap: 8px;
-          margin-top: 11px;
-        }
-
-        .primary-action,
-        .secondary-action {
-          min-height: 39px;
-          padding: 8px 13px;
+          margin-left: 6px;
+          padding-inline: 12px;
           font-size: 13px;
         }
 
-        .hero-visual {
-          padding-top: 14px;
+        .hero-inner {
+          padding-block: 44px 60px;
         }
 
-        .section-peek {
-          height: 48px;
+        .hero-actions .btn {
+          width: 100%;
         }
 
-        .section-peek a {
+        .hero-meta {
           font-size: 12px;
         }
 
-        .section {
-          padding-block: 64px;
+        .split {
+          padding-block: 52px;
         }
 
-        .section h2,
-        .install-section h2 {
-          font-size: 27px;
+        .split:first-child {
+          padding-top: 56px;
         }
 
-        .note-features,
-        .tool-list {
-          grid-template-columns: 1fr;
+        .split:last-child {
+          padding-bottom: 56px;
         }
 
-        .note-feature {
-          min-height: 0;
-          padding: 23px 20px;
+        .platform-table th,
+        .platform-table td {
+          padding: 13px 16px;
         }
 
-        .feature-label {
-          margin-bottom: 24px;
-        }
-
-        .tool-item {
-          min-height: 150px;
-        }
-
-        .tool-item + .tool-item {
-          border-top: 1px solid #5b5c60;
-          border-left: 0;
-        }
-
-        .tool-item h3 {
-          margin-top: 28px;
-        }
-
-        .mode {
-          padding: 22px 20px;
-        }
-
-        .note-editor-shot {
-          padding: 18px 20px 26px;
-        }
-
-        .note-editor-shot img {
-          box-shadow: 9px 9px 0 #d0d1cc;
-        }
-
-        .note-editor-figure figcaption {
-          padding: 26px 22px;
-        }
-
-        .data-layout {
-          gap: 36px;
-        }
-
-        .directory-panel {
-          max-width: calc(100% - 8px);
-          box-shadow: 8px 8px 0 var(--yellow);
-        }
-
-        .directory-titlebar span:last-child {
+        .dir-bar span:last-child {
           display: none;
         }
 
-        .directory-panel pre {
-          padding: 20px 16px 24px;
+        .dir-card pre {
           font-size: 11px;
         }
 
-        .install-section {
-          padding-block: 68px;
+        .footer-top,
+        .footer-bottom {
+          flex-direction: column;
+          align-items: flex-start;
         }
       }
 
       @media (max-width: 340px) {
         .brand span {
           display: none;
-        }
-
-        .section h2 {
-          font-size: 25px;
-        }
-      }
-
-      @media (max-height: 650px) and (min-width: 761px) {
-        .hero-inner {
-          padding-top: 15px;
-        }
-
-        .hero h1 {
-          font-size: 44px;
-        }
-
-        .hero-lead {
-          margin-top: 4px;
-          font-size: 15px;
-        }
-
-        .hero-actions {
-          margin-top: 10px;
-        }
-
-        .hero-visual {
-          padding-top: 12px;
         }
       }
 
@@ -1245,27 +1198,18 @@
   </head>
   <body>
     <a class="skip-link" href="#main">跳到主要内容</a>
-    <div class="github-ribbon">
-      <a
-        class="github-ribbon-link"
-        href="https://github.com/starsliao/PetalDesk"
-        target="_blank"
-        rel="noopener noreferrer"
-        aria-label="在新窗口打开 PetalDesk GitHub 仓库"
-        lang="en"
-      >Fork me on GitHub</a>
-    </div>
 
     <header class="site-header">
       <nav class="nav container" aria-label="主导航">
         <a class="brand" href="#top" aria-label="飞花 - PetalDesk 首页">
-          <img src="./assets/app-icon.svg" alt="" width="36" height="36" />
+          <img src="./assets/app-icon.svg" alt="" width="34" height="34" />
           <span>飞花 - PetalDesk</span>
         </a>
         <div class="nav-links">
-          <a class="nav-link" href="#notes">便签</a>
-          <a class="nav-link" href="#tools">小工具</a>
-          <a class="nav-link" href="#data">本地数据</a>
+          <a class="nav-link" href="#features">功能</a>
+          <a class="nav-link" href="#passwords">密码管理器</a>
+          <a class="nav-link" href="#screenshots">截图</a>
+          <a class="nav-link" href="#data">数据</a>
           <a
             class="github-nav-link"
             href="https://github.com/starsliao/PetalDesk"
@@ -1281,10 +1225,7 @@
               />
             </svg>
           </a>
-          <a
-            class="nav-download"
-            href="#download"
-          >下载 0.7.0</a>
+          <a class="btn btn-primary nav-download" href="#download">下载 0.7.0</a>
         </div>
       </nav>
     </header>
@@ -1292,311 +1233,451 @@
     <main id="main">
       <section class="hero" id="top" aria-labelledby="hero-title">
         <div class="hero-inner container">
-          <div class="hero-copy">
-            <p class="eyebrow">Windows 与 macOS 本地便签与效率工具</p>
-            <h1 id="hero-title">飞花 - PetalDesk</h1>
-            <p class="hero-lead">
-              让 Markdown 像普通文字一样自然，也让截图、提醒与任务安排留在一个安静的桌面空间里。
-            </p>
-            <div class="hero-actions">
-              <a
-                class="primary-action"
-                href="https://github.com/starsliao/PetalDesk/releases/download/v0.7.0/PetalDesk_0.7.0_x64-setup.exe"
-                download
-              >Windows x64</a>
-              <a
-                class="secondary-action"
-                href="https://github.com/starsliao/PetalDesk/releases/download/v0.7.0/PetalDesk_0.7.0_universal.dmg"
-                download
-              >macOS Universal</a>
-            </div>
+          <p class="hero-eyebrow">v0.7.0 现已发布 · Windows 10/11 与 macOS 12+</p>
+          <h1 id="hero-title">
+            把想法留在桌面，<br />把文件留在<span class="hl">自己手里</span>。
+          </h1>
+          <p class="hero-lead">
+            飞花 - PetalDesk 是本地便签与效率工具：Markdown 便签、密码管理器、MFA 验证器、截图与甘特图。无账号、无云端依赖，装好即用。
+          </p>
+          <div class="hero-actions">
+            <a
+              class="btn btn-primary"
+              href="https://github.com/starsliao/PetalDesk/releases/download/v0.7.0/PetalDesk_0.7.0_x64-setup.exe"
+              download
+            >下载 Windows 版</a>
+            <a
+              class="btn btn-secondary"
+              href="https://github.com/starsliao/PetalDesk/releases/download/v0.7.0/PetalDesk_0.7.0_universal.dmg"
+              download
+            >下载 macOS 版</a>
           </div>
+          <p class="hero-meta">
+            Windows 10/11 x64 · macOS 12+ Universal ·
+            <a class="text-link" href="https://github.com/starsliao/PetalDesk/releases" target="_blank" rel="noopener noreferrer">查看全部版本</a>
+          </p>
           <div class="hero-visual">
-            <figure class="product-frame">
+            <figure class="shot-frame">
+              <div class="frame-bar" aria-hidden="true"><span></span><span></span><span></span></div>
               <img
                 src="./assets/screenshots/main-window-0.2.1.png"
-                alt="飞花 - PetalDesk 主界面，展示黄色、绿色和蓝色本地便签"
-                width="1360"
-                height="820"
+                alt="飞花 - PetalDesk 主界面，展示黄色、绿色和蓝色本地便签与新建便签入口"
+                width="720"
+                height="650"
               />
             </figure>
           </div>
         </div>
       </section>
 
-      <div class="section-peek">
-        <div class="container">
-          <a href="#notes">
-            <span>一张便签，从记下当下开始</span>
-            <span class="arrow" aria-hidden="true">↓</span>
-          </a>
+      <div class="stats" aria-label="产品特点数据">
+        <div class="container stats-grid">
+          <div class="stat">
+            <span class="stat-num">0</span>
+            <span class="stat-label">账号注册</span>
+            <span class="stat-sub">打开就用</span>
+          </div>
+          <div class="stat">
+            <span class="stat-num">0</span>
+            <span class="stat-label">云端依赖</span>
+            <span class="stat-sub">离线也能用</span>
+          </div>
+          <div class="stat">
+            <span class="stat-num">100%</span>
+            <span class="stat-label">数据在本地</span>
+            <span class="stat-sub">文档目录里看得见</span>
+          </div>
+          <div class="stat">
+            <span class="stat-num">2</span>
+            <span class="stat-label">大桌面平台</span>
+            <span class="stat-sub">Windows 与 macOS</span>
+          </div>
         </div>
       </div>
 
-      <section class="section notes-section" id="notes" aria-labelledby="notes-title">
+      <section class="section" id="features" aria-labelledby="features-title">
         <div class="container">
-          <div class="section-heading">
-            <div>
-              <span class="section-index">01 / 便签</span>
-              <h2 id="notes-title">
-                <span class="section-title-line">简洁是外表，</span>
-                <span class="section-title-line">顺手才是日常。</span>
-              </h2>
-            </div>
+          <div class="section-head">
+            <span class="kicker">功能总览</span>
+            <h2 id="features-title">一个桌面，六件顺手的工具。</h2>
             <p class="section-intro">
-              便签可以独立打开、移动、缩放和置顶。主界面支持拖动手柄手动排列，新建便签追加在末尾，置顶时移到第一位；每一张的颜色、编辑样式与只读状态也都彼此独立。
+              便签之外，飞花把常用的桌面小事也一并照顾到——各自独立开窗，需要时出现，完成后退到一旁。
             </p>
           </div>
 
-          <div class="note-features">
-            <article class="note-feature">
-              <span class="feature-label">MARKDOWN</span>
-              <h3>所见即所得</h3>
-              <p>输入 Markdown 即时排版，支持本地图片与经过安全过滤的 HTTP/HTTPS 外链图片；保留源码切换、快捷格式、高亮和可跳转链接。</p>
+          <div class="feature-grid">
+            <article class="feature-card">
+              <span class="feature-icon yellow" aria-hidden="true">📝</span>
+              <h3>Markdown 便签</h3>
+              <p>Typora 风格即时排版，也有纯文本模式；颜色、置顶、只读逐张独立。</p>
             </article>
-            <article class="note-feature">
-              <span class="feature-label">COLOR</span>
-              <h3>一眼分清内容</h3>
-              <p>黄色、粉色、蓝色、绿色、紫色、灰色与炭笔色，让不同用途自然形成视觉分区。</p>
-            </article>
-            <article class="note-feature">
-              <span class="feature-label">WINDOW</span>
-              <h3>每张都是独立窗口</h3>
-              <p>独立便签右上角可展开便签列表并直接切换；Windows 还可配置托盘双击组合，macOS 可从菜单栏与 Dock 自然唤回。</p>
-            </article>
-            <article class="note-feature">
-              <span class="feature-label">FOCUS</span>
-              <h3>只读时只看内容</h3>
-              <p>一键隐藏工具栏并锁定正文与标题，查阅资料时不再担心误触修改。</p>
-            </article>
-          </div>
-
-          <div class="mode-band" aria-label="编辑模式">
-            <div class="mode">
-              <div class="mode-name"><span class="mode-mark">M↓</span>Markdown</div>
-              <p>适合结构化记录、清单、代码片段与图片笔记；排版结果直接留在编辑位置。</p>
-            </div>
-            <div class="mode">
-              <div class="mode-name"><span class="mode-mark">TXT</span>纯文本</div>
-              <p>适合快速摘录与临时草稿；不解析语法，只保留稳定的文字输入、查找和撤回重做。</p>
-            </div>
-          </div>
-
-          <figure class="note-editor-figure" id="note-editor-preview">
-            <div class="note-editor-shot">
-              <img
-                src="./assets/screenshots/markdown-note-editor.png"
-                alt="飞花 - PetalDesk 的黄色 Markdown 便签，顶部显示格式工具栏，正文展示标题、粗体和列表排版"
-                width="594"
-                height="666"
-                loading="lazy"
-              />
-            </div>
-            <figcaption>
-              <span class="note-editor-kicker">MARKDOWN NOTE</span>
-              <span class="caption-title">工具在手边，内容仍是主角。</span>
-              <p>格式、链接、图片、分隔线、查找与源码切换集中在一条轻量工具栏里，编辑和阅读不必来回切换窗口。</p>
-            </figcaption>
-          </figure>
-        </div>
-      </section>
-
-      <section class="section tools-section" id="tools" aria-labelledby="tools-title">
-        <div class="container">
-          <div class="section-heading">
-            <div>
-              <span class="section-index">02 / 小工具</span>
-              <h2 id="tools-title">
-                <span class="section-title-line">需要时出现，</span>
-                <span class="section-title-line">完成后退到一旁。</span>
-              </h2>
-            </div>
-            <p class="section-intro">
-              从托盘或便签窗口随时打开。计时、提醒、任务规划、MFA、密码管理与截图各自专注，不把主界面变成拥挤的控制台。
-            </p>
-          </div>
-
-          <div class="tool-list">
-            <article class="tool-item">
-              <span class="tool-number">01</span>
-              <h3>计时器</h3>
-              <p>透明电子数字、暂停与重置记录，位置、大小和透明度都能记住。</p>
-            </article>
-            <article class="tool-item">
-              <span class="tool-number">02</span>
-              <h3>提醒</h3>
-              <p>支持一次、间隔以及日、周、月、年周期，到点发送 Windows 或 macOS 系统通知。</p>
-            </article>
-            <article class="tool-item">
-              <span class="tool-number">03</span>
-              <h3>任务甘特图</h3>
-              <p>拖动排序、进度筛选与时间轴缩放，从小时细节看到长期安排。</p>
-            </article>
-            <article class="tool-item">
-              <span class="tool-number">04</span>
-              <h3>MFA 验证器</h3>
-              <p>TOTP 支持图片、链接、手动和批量导入；Windows 使用 DPAPI、macOS 使用 Keychain 实现本机免密。验证码默认隐藏、双击复制，单项经恢复密码验证后可安全导出，删除项可从加密回收站恢复。</p>
-            </article>
-            <article class="tool-item">
-              <span class="tool-number">05</span>
+            <article class="feature-card">
+              <span class="feature-icon blue" aria-hidden="true">🔑</span>
+              <span class="feature-tag">Windows</span>
               <h3>密码管理器</h3>
-              <p>Windows 本地加密保存多个站点账户。Firefox 扩展角标显示当前站点已保存的账户数量，弹窗可查看连接诊断与账户列表并直接发起填充；填充在页面再次确认后进行、绝不提交。登录检测开启后，完全一致的登录不会打扰，用户名或密码有变化时可选择保存为新账户或更新任一既有账户。</p>
+              <p>独立加密保险库保存站点账户，Firefox 扩展确认后才填充，绝不自动提交。</p>
             </article>
-            <article class="tool-item">
-              <span class="tool-number">06</span>
-              <h3>截图</h3>
-              <p>Windows 与 macOS 都能直接框选，再标注、复制、保存或贴图。长截图、浏览器增强与 Native Messaging 仅在 Windows 提供。</p>
+            <article class="feature-card">
+              <span class="feature-icon violet" aria-hidden="true">🛡️</span>
+              <h3>MFA 验证器</h3>
+              <p>标准 TOTP，扫码、图片、链接或批量导入；本机保护，免密解锁。</p>
+            </article>
+            <article class="feature-card">
+              <span class="feature-icon pink" aria-hidden="true">📸</span>
+              <span class="feature-tag">长截图 Windows</span>
+              <h3>截图与长截图</h3>
+              <p>F1 全局唤起，标注、马赛克、置顶贴图；长页面滚动拼接。</p>
+            </article>
+            <article class="feature-card">
+              <span class="feature-icon green" aria-hidden="true">📊</span>
+              <h3>任务甘特图</h3>
+              <p>排序、进度筛选、时间条拖动，从小时细节看到月度安排。</p>
+            </article>
+            <article class="feature-card">
+              <span class="feature-icon orange" aria-hidden="true">⏱️</span>
+              <h3>计时器与提醒</h3>
+              <p>透明电子管数字计时，一次或日周月年周期提醒，系统通知送达。</p>
             </article>
           </div>
 
-          <figure class="screenshot-figure">
+          <figure class="wide-figure">
             <img
               src="./assets/screenshots/gantt-tool.png"
-              alt="飞花 - PetalDesk 任务甘特图展示七项任务的完成状态、进度和时间安排"
+              alt="飞花任务甘特图窗口，展示七项任务的进度条与按天排列的时间轴"
               width="1280"
               height="720"
               loading="lazy"
             />
             <figcaption>
-              <span class="caption-title">任务进度与时间范围一览</span>
-              <span>状态筛选、拖动排序、小时级缩放与日期范围调整</span>
-            </figcaption>
-          </figure>
-
-          <figure class="screenshot-figure">
-            <img
-              src="./assets/screenshots/screenshot-tool-final.png"
-              alt="飞花 - PetalDesk 截图工具正在框选产品演示页面，显示标注工具栏、像素尺寸与取色放大镜"
-              width="1920"
-              height="1080"
-              loading="lazy"
-            />
-            <figcaption>
-              <span class="caption-title">跨平台区域截图，Windows 再加长截图</span>
-              <span>Windows 与 macOS 共享标注、复制、保存和贴图；滚动拼接与浏览器增强仅限 Windows</span>
+              <strong>任务甘特图</strong>
+              <span>拖动排序 · 进度筛选 · 时间条拖动 · 小时级缩放</span>
             </figcaption>
           </figure>
         </div>
       </section>
 
+      <div class="band-white">
+        <div class="container">
+          <section class="split" id="notes" aria-labelledby="notes-title">
+            <div class="split-text">
+              <span class="kicker">MARKDOWN 便签</span>
+              <h2 id="notes-title">写得随意，排得漂亮。</h2>
+              <p class="lead-in">
+                输入即排版，不用在编辑和预览之间来回切换。每张便签都是独立窗口，颜色、位置、状态各记各的。
+              </p>
+              <ul class="check-list">
+                <li>Markdown 即时排版（Typora 风格）与纯文本双模式</li>
+                <li>标题、颜色、置顶、只读逐张独立保存</li>
+                <li>窗口位置与大小逐张记忆，下次原样打开</li>
+                <li>删除进回收站，关闭驻留托盘，随时唤回</li>
+                <li>托盘四组双击动作可自由改绑</li>
+                <li>选中文本自动复制，少按一次 Ctrl+C</li>
+              </ul>
+            </div>
+            <div class="split-media">
+              <div class="shot-panel">
+                <img
+                  src="./assets/screenshots/markdown-note-editor.png"
+                  alt="飞花 Markdown 便签编辑器，黄色便签中展示标题、粗体与列表的即时排版效果"
+                  width="594"
+                  height="666"
+                  loading="lazy"
+                />
+              </div>
+            </div>
+          </section>
+
+          <section class="split flip" id="passwords" aria-labelledby="passwords-title">
+            <div class="split-text">
+              <span class="kicker">密码管理器 · WINDOWS</span>
+              <h2 id="passwords-title">密码锁在本机，填充先问过你。</h2>
+              <p class="lead-in">
+                站点账户保存在独立的 XChaCha20-Poly1305 加密保险库，日常用 Windows DPAPI 解锁，与 MFA 验证器共享同一个恢复密码。配套 Firefox 扩展把保险库带进浏览器：
+              </p>
+              <ul class="check-list">
+                <li>工具栏角标实时显示当前站点已保存的账户数</li>
+                <li>点击图标弹出诊断与账户弹窗，点账户直接在当前页发起填充</li>
+                <li>填充必须经页面浮层二次确认，绝不自动提交</li>
+                <li>登录检测：凭据完全一致不打扰；不一致可保存为新账户或更新任一既有账户；保险库锁定会明确提示</li>
+                <li>身份验证信息权限安装时一次性授予，没有二次授权</li>
+              </ul>
+              <div class="split-links">
+                <a class="text-link" href="./firefox.html">Firefox 扩展安装指南</a>
+                <a class="text-link" href="https://addons.mozilla.org/firefox/search/?q=PetalDesk" target="_blank" rel="noopener noreferrer">在 Firefox Add-ons 查找</a>
+              </div>
+            </div>
+            <div class="split-media">
+              <div class="shot-panel blue">
+                <img
+                  src="./assets/screenshots/password-manager-tool.png"
+                  alt="飞花密码管理器窗口，列出三个演示站点账户，密码以圆点隐藏"
+                  width="1640"
+                  height="1280"
+                  loading="lazy"
+                />
+              </div>
+            </div>
+          </section>
+
+          <section class="split" id="mfa" aria-labelledby="mfa-title">
+            <div class="split-text">
+              <span class="kicker">MFA 验证器</span>
+              <h2 id="mfa-title">两步验证码，也归本地管。</h2>
+              <p class="lead-in">
+                标准 TOTP，与主流验证器互相通用。从添加、查看到导出，都在一个安静的小窗口里完成。
+              </p>
+              <ul class="check-list">
+                <li>屏幕二维码扫描，也支持图片、链接与手动输入</li>
+                <li>一行一个批量导入，自动随机配图标</li>
+                <li>验证码默认隐藏，双击复制</li>
+                <li>拖动排序，右键置顶常用项</li>
+                <li>恢复密码验证后可导出 Base32、otpauth 或二维码</li>
+                <li>删除进加密回收站，随时可以恢复</li>
+              </ul>
+            </div>
+            <div class="split-media">
+              <div class="shot-panel violet narrow">
+                <img
+                  src="./assets/screenshots/mfa-tool.png"
+                  alt="飞花 MFA 验证器窗口，两个演示账户的验证码以圆点隐藏"
+                  width="1040"
+                  height="1280"
+                  loading="lazy"
+                />
+              </div>
+            </div>
+          </section>
+
+          <section class="split flip" id="screenshots" aria-labelledby="screenshots-title">
+            <div class="split-text">
+              <span class="kicker">截图 · 长截图</span>
+              <h2 id="screenshots-title">F1 一按，框住要说的事。</h2>
+              <p class="lead-in">
+                全局唤起、框选、标注、马赛克、模糊，然后复制、保存或置顶贴图。长截图（Windows）默认手动滚动：框选固定区域，回到窗口滚动，点完成即实时拼接，可暂停、重试、回退；自动滚动是高级模式。
+              </p>
+              <div class="callout">
+                <span class="callout-icon" aria-hidden="true">🦊</span>
+                <div>
+                  <strong>浏览器扩展增强：装了就行，操作不变。</strong>
+                  <p>
+                    安装扩展后不需要对它做任何操作，飞花里的长截图操作完全不变。当截图目标是 Chrome、Edge 或 Firefox 长页面并使用自动滚动模式时，飞花会自动启用“浏览器增强”引擎，滚动定位与拼接更稳定。扩展本身没有、也不需要任何长截图操作入口。
+                  </p>
+                </div>
+              </div>
+            </div>
+            <div class="split-media">
+              <div class="shot-panel gray">
+                <img
+                  src="./assets/screenshots/screenshot-tool-final.png"
+                  alt="飞花截图工具正在框选网页区域，工具栏提供箭头、文字、马赛克等标注与取色放大镜"
+                  width="1904"
+                  height="985"
+                  loading="lazy"
+                />
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+
       <section class="section data-section" id="data" aria-labelledby="data-title">
         <div class="container">
-          <div class="section-heading">
-            <div>
-              <span class="section-index">03 / 本地数据</span>
-              <h2 id="data-title">
-                <span class="section-title-line">你的内容，</span>
-                <span class="section-title-line">始终是你能看见的文件。</span>
-              </h2>
-            </div>
+          <div class="section-head">
+            <span class="kicker">数据归属</span>
+            <h2 id="data-title">你的内容，始终是你能看见的文件。</h2>
             <p class="section-intro">
-              飞花 - PetalDesk 把便签、附件、设置和小工具数据统一放进“飞花 - PetalDesk 数据存储”。它按本地读多写少设计；MFA 与密码库使用独立数据密钥，并协调同一恢复密码。
+              没有账号，也没有云端依赖。便签、设置与小工具数据统一放进“文档”下的 PetalDesk 数据目录，规则简单透明。
             </p>
           </div>
 
           <div class="data-layout">
-            <ol class="data-points">
+            <ul class="data-points">
               <li>
-                <span class="data-point-number">01</span>
-                <div>
-                  <strong>标准 Markdown 正文</strong>
-                  <p>每张便签以 note.md 保存，图片放在对应 assets 目录，不依赖专有数据库才能读取。</p>
-                </div>
+                <strong>note.md 是唯一真相</strong>
+                <p>每张便签一个文件夹：正文是标准 Markdown，图片存在 assets/，不依赖专有数据库也能读。</p>
               </li>
               <li>
-                <span class="data-point-number">02</span>
-                <div>
-                  <strong>普通数据一个目录完成迁移</strong>
-                  <p>复制完整数据目录并重新指定路径即可；MFA 与密码数据不会降级为明文，迁移后输入恢复密码即可重新绑定本机保护。</p>
-                </div>
+                <strong>原子写入</strong>
+                <p>先写临时文件再原子替换，写到一半断电也不会留下半个文件。</p>
               </li>
               <li>
-                <span class="data-point-number">03</span>
-                <div>
-                  <strong>便签与甘特图安全升级</strong>
-                  <p>旧便签元数据和旧甘特图会自动迁移；保存时校验版本、内容哈希或文件指纹，并保留冲突副本和有限备份。</p>
-                </div>
+                <strong>冲突不静默覆盖</strong>
+                <p>多窗口或同步盘造成冲突时写入 conflicts/，双方都保留，由你定夺。</p>
               </li>
-            </ol>
+              <li>
+                <strong>最近 5 份备份与回收站</strong>
+                <p>自动保留最近 5 份备份；删除的便签与 MFA 项先进回收站，可以恢复。</p>
+              </li>
+              <li>
+                <strong>整目录复制即迁移</strong>
+                <p>复制整个 PetalDesk 目录就能搬走全部数据；坚果云、OneDrive 只是可选的搬运工。</p>
+              </li>
+              <li>
+                <strong>保险库级加密</strong>
+                <p>MFA 与密码保险库使用随机密钥 XChaCha20-Poly1305 加密、Argon2id 恢复密码包装，Windows DPAPI / macOS Keychain 本机保护；换设备输入一次恢复密码即可重新绑定。</p>
+              </li>
+            </ul>
 
             <div>
-              <div class="directory-panel">
-                <div class="directory-titlebar">
+              <div class="dir-card">
+                <div class="dir-bar">
                   <span>文档 / PetalDesk</span>
-                  <span>可在安装或设置中修改</span>
+                  <span>可在设置中自定义</span>
                 </div>
-                <pre aria-label="飞花 - PetalDesk 数据存储目录结构">PetalDesk/
+                <pre aria-label="飞花 - PetalDesk 数据目录结构">PetalDesk/
 └─ .petaldesk/
    ├─ notes/
    │  └─ &lt;note-id&gt;/
-   │     ├─ note.md
+   │     ├─ <span class="hl">note.md</span>        <span class="dim">← 唯一真相</span>
    │     ├─ meta.json
    │     └─ assets/
    ├─ tools/
    │  ├─ gantt/
-   │  │  ├─ gantt.json
-   │  │  ├─ backups/
-   │  │  └─ conflicts/
-   │  ├─ mfa/ (认证加密保险库)
-   │  └─ passwords/ (独立密码保险库)
+   │  ├─ mfa/              <span class="dim">← XChaCha20-Poly1305 保险库</span>
+   │  └─ passwords/        <span class="dim">← 独立加密保险库</span>
    ├─ state/
-   │  ├─ note-order.json
-   │  └─ windows.json
-   ├─ backups/
-   ├─ journal/
+   ├─ <span class="hl">backups/</span>             <span class="dim">← 最近 5 份</span>
    ├─ trash/
-   └─ conflicts/</pre>
+   └─ <span class="hl">conflicts/</span>           <span class="dim">← 冲突副本，不静默覆盖</span></pre>
               </div>
-              <p class="directory-note">
-                Windows 的 `%LOCALAPPDATA%\PetalDesk` 或 macOS 的 `~/Library/Application Support/PetalDesk` 只保存当前数据目录指针、可重建索引和调试日志，不属于需要迁移的业务内容。
-              </p>
-              <p class="directory-note">
-                已安装 0.5.2 或更高版本的 Windows 用户可以在飞花内自动更新到 0.7.0，无需重新下载安装。macOS 0.5.0 是首个公开版本，0.7.0 可直接覆盖升级。首次启动会自动兼容旧便签元数据和旧甘特图文件，并在写入新格式前保留迁移备份。同机升级不需要恢复密码。
+              <p class="dir-note">
+                数据目录默认位于系统“文档”下的 PetalDesk，可在设置中自定义位置；坚果云、OneDrive 等同步盘只是可选搬运，飞花不依赖任何云服务。
               </p>
             </div>
           </div>
         </div>
       </section>
 
-      <section class="install-section" id="download" aria-labelledby="download-title">
-        <div class="container install-layout">
-          <div>
-            <h2 id="download-title">现在，把飞花 - PetalDesk 放到桌面。</h2>
-            <p>
-              Windows x64 安装器会自动检查 WebView2；macOS Universal DMG 同时支持 Intel 与 Apple Silicon。macOS 普通截图首次使用时需要授予“屏幕录制”权限。
+      <section class="section" id="platforms" aria-labelledby="platforms-title">
+        <div class="container">
+          <div class="section-head">
+            <span class="kicker">平台对照</span>
+            <h2 id="platforms-title">两个平台，一份清楚的对照表。</h2>
+            <p class="section-intro">
+              核心体验在两个平台一致；少数能力依赖 Windows 平台接口，macOS 后续逐步补齐。
             </p>
           </div>
-          <div class="install-actions">
-            <div class="download-option">
+
+          <div class="table-wrap">
+            <table class="platform-table">
+              <thead>
+                <tr>
+                  <th scope="col">功能</th>
+                  <th scope="col">Windows 10/11</th>
+                  <th scope="col">macOS 12+</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Markdown 便签</td>
+                  <td class="cell-yes">✓ 支持</td>
+                  <td class="cell-yes">✓ 支持</td>
+                </tr>
+                <tr>
+                  <td>任务甘特图 · 计时器 · 提醒</td>
+                  <td class="cell-yes">✓ 支持</td>
+                  <td class="cell-yes">✓ 支持</td>
+                </tr>
+                <tr>
+                  <td>截图（标注 · 马赛克 · 贴图）</td>
+                  <td class="cell-yes">✓ 支持</td>
+                  <td class="cell-yes">✓ 支持<span class="sub">首次使用需授予“屏幕录制”权限</span></td>
+                </tr>
+                <tr>
+                  <td>MFA 验证器</td>
+                  <td class="cell-yes">✓ 支持<span class="sub">DPAPI 本机保护</span></td>
+                  <td class="cell-yes">✓ 支持<span class="sub">Keychain 本机保护</span></td>
+                </tr>
+                <tr>
+                  <td>密码管理器</td>
+                  <td class="cell-yes">✓ 支持<span class="sub">含 Firefox 扩展填充</span></td>
+                  <td class="cell-no">— 暂不提供</td>
+                </tr>
+                <tr>
+                  <td>长截图</td>
+                  <td class="cell-yes">✓ 支持<span class="sub">手动滚动 + 自动滚动高级模式</span></td>
+                  <td class="cell-no">— 暂不提供</td>
+                </tr>
+                <tr>
+                  <td>浏览器联动（Firefox 扩展）</td>
+                  <td class="cell-yes">✓ 支持<span class="sub">长截图增强 + 密码填充</span></td>
+                  <td class="cell-no">— 暂不提供</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="table-note">
+            升级：Windows 0.5.2 及以上可在应用内自动更新到 0.7.0；macOS 下载新版 DMG 覆盖安装即可。
+          </p>
+        </div>
+      </section>
+
+      <section class="section download-section" id="download" aria-labelledby="download-title">
+        <div class="container">
+          <div class="section-head center" style="margin-bottom: 0;">
+            <span class="kicker">下载</span>
+            <h2 id="download-title">现在，把飞花放到你的桌面。</h2>
+            <p class="section-intro">
+              当前版本 0.7.0。装好即用，不需要账号。
+            </p>
+          </div>
+
+          <div class="download-cards">
+            <div class="dl-card">
+              <span class="dl-platform">Windows 10 / 11</span>
+              <span class="dl-desc">x64 · 联网安装包 · 自动检查 WebView2</span>
               <a
-                class="download-action"
+                class="btn btn-primary"
                 href="https://github.com/starsliao/PetalDesk/releases/download/v0.7.0/PetalDesk_0.7.0_x64-setup.exe"
                 download
-              >下载 Windows x64 版 0.7.0</a>
-              <div class="download-meta">Windows 10 / 11 · x64 · 联网安装包</div>
+              >下载 Windows 版 0.7.0</a>
+              <div class="dl-meta">0.5.2 及以上可应用内自动更新</div>
             </div>
-            <div class="download-option">
+            <div class="dl-card">
+              <span class="dl-platform">macOS 12+</span>
+              <span class="dl-desc">Universal DMG · Intel + Apple Silicon</span>
               <a
-                class="download-action"
+                class="btn btn-dark"
                 href="https://github.com/starsliao/PetalDesk/releases/download/v0.7.0/PetalDesk_0.7.0_universal.dmg"
                 download
               >下载 macOS 版 0.7.0</a>
-              <div class="download-meta">macOS 12+ · Intel + Apple Silicon · Universal DMG</div>
+              <div class="dl-meta">手动覆盖安装即完成升级</div>
             </div>
           </div>
+
+          <div class="download-links">
+            <a class="text-link" href="https://github.com/starsliao/PetalDesk/releases" target="_blank" rel="noopener noreferrer">全部版本</a>
+            <a class="text-link" href="./firefox.html">Firefox 扩展指南</a>
+            <a class="text-link" href="https://addons.mozilla.org/firefox/search/?q=PetalDesk" target="_blank" rel="noopener noreferrer">在 AMO 查找扩展</a>
+          </div>
+          <p class="upgrade-note">
+            macOS 截图首次使用需授予“屏幕录制”权限；Windows 安装器为联网安装包，会自动检查 WebView2 运行库。
+          </p>
         </div>
       </section>
     </main>
 
     <footer class="site-footer">
-      <div class="container footer-inner">
-        <div class="footer-brand">
-          <img src="./assets/app-icon.svg" alt="" width="28" height="28" />
-          <span>飞花 - PetalDesk</span>
+      <div class="container">
+        <div class="footer-top">
+          <div>
+            <div class="footer-brand">
+              <img src="./assets/app-icon.svg" alt="" width="28" height="28" />
+              <span>飞花 - PetalDesk</span>
+            </div>
+            <p class="footer-tagline">把想法留在桌面，把文件留在自己手里。</p>
+          </div>
+          <nav class="footer-links" aria-label="页脚导航">
+            <a href="https://github.com/starsliao/PetalDesk" target="_blank" rel="noopener noreferrer">GitHub</a>
+            <a href="https://github.com/starsliao/PetalDesk/issues" target="_blank" rel="noopener noreferrer">Issues</a>
+            <a href="./firefox.html">Firefox 扩展</a>
+            <a href="./privacy.html">隐私政策</a>
+          </nav>
         </div>
-        <span>本地优先 · 数据可见 · Windows 与 macOS 桌面体验</span>
-        <a href="./firefox.html">Firefox 扩展</a>
-        <a href="./privacy.html">隐私政策</a>
+        <div class="footer-bottom">
+          <span>Rust + Tauri 2 · Svelte 5 · 系统 WebView（无 Electron）· Firefox 扩展（MV3）</span>
+          <span>v0.7.0 · 本地优先，数据可见</span>
+        </div>
       </div>
     </footer>
   </body>

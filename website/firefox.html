@@ -11,49 +11,66 @@
       :root {
         color-scheme: light;
         --ink: #242426;
-        --muted: #656567;
-        --line: #d9d9d5;
+        --muted: #5f5f63;
+        --faint: #8b8b8e;
+        --line: #e4e4df;
+        --line-strong: #d4d4cd;
         --paper: #f7f7f5;
         --white: #ffffff;
         --blue: #0875c9;
         --blue-hover: #0066ae;
-        --yellow: #fff4bf;
+        --yellow: #fff0a8;
+        --yellow-deep: #d2a500;
+        --yellow-ink: #6b5510;
+        --shadow-sm: 0 1px 2px rgba(36, 36, 38, 0.05), 0 4px 14px rgba(36, 36, 38, 0.05);
+        --shadow-md: 0 2px 4px rgba(36, 36, 38, 0.06), 0 12px 32px rgba(36, 36, 38, 0.09);
         font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", -apple-system, "Segoe UI", Arial, sans-serif;
         font-synthesis: none;
       }
 
       * { box-sizing: border-box; }
-      body { margin: 0; min-width: 320px; color: var(--ink); background: var(--paper); line-height: 1.65; letter-spacing: 0; }
+      body { margin: 0; min-width: 320px; color: var(--ink); background: var(--paper); line-height: 1.65; letter-spacing: 0; -webkit-font-smoothing: antialiased; }
       a { color: inherit; text-underline-offset: 3px; }
-      header { border-bottom: 1px solid var(--line); background: var(--white); }
+      :focus-visible { outline: 3px solid #e7b900; outline-offset: 3px; }
+      header { border-bottom: 1px solid rgba(36, 36, 38, 0.09); background: rgba(247, 247, 245, 0.88); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
       nav, .inner, footer { width: min(calc(100% - 40px), 920px); margin-inline: auto; }
-      nav { display: flex; align-items: center; justify-content: space-between; min-height: 66px; gap: 20px; }
-      .brand { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; font-weight: 800; }
-      .brand img { width: 34px; height: 34px; border-radius: 7px; }
-      .back { color: var(--muted); font-size: 14px; }
-      .intro { padding-block: 64px 52px; background: var(--white); border-bottom: 1px solid var(--line); }
-      h1 { margin: 0; max-width: 760px; font-size: clamp(34px, 6vw, 58px); line-height: 1.12; letter-spacing: 0; }
-      .lead { max-width: 690px; margin: 18px 0 28px; color: var(--muted); font-size: 18px; }
-      .actions { display: flex; flex-wrap: wrap; gap: 10px; }
-      .primary, .secondary { display: inline-flex; align-items: center; justify-content: center; min-height: 42px; padding: 9px 16px; border: 1px solid var(--blue); border-radius: 6px; font-weight: 700; text-decoration: none; }
-      .primary { color: var(--white); background: var(--blue); }
-      .primary:hover { background: var(--blue-hover); border-color: var(--blue-hover); }
-      .secondary { color: var(--blue); background: var(--white); }
-      .status { padding-block: 18px; background: var(--yellow); border-bottom: 1px solid #e2ce73; }
-      .status p { margin: 0; font-size: 14px; }
-      main { padding-block: 42px 66px; }
-      section { padding-block: 24px; border-bottom: 1px solid var(--line); }
-      h2 { margin: 0 0 12px; font-size: 22px; letter-spacing: 0; }
+      nav { display: flex; align-items: center; justify-content: space-between; min-height: 68px; gap: 20px; }
+      .brand { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; font-size: 18px; font-weight: 800; }
+      .brand img { width: 34px; height: 34px; border-radius: 8px; }
+      .back { padding: 8px 12px; border-radius: 8px; color: var(--muted); font-size: 14px; font-weight: 650; text-decoration: none; transition: color 150ms ease, background-color 150ms ease; }
+      .back:hover { color: var(--ink); background: rgba(36, 36, 38, 0.06); }
+      .intro { position: relative; padding-block: 68px 58px; background: var(--white); border-bottom: 1px solid var(--line); overflow: hidden; }
+      .intro::before { position: absolute; inset: 0; content: ""; background: radial-gradient(560px 300px at 12% -10%, rgba(255, 240, 168, 0.85), transparent 70%), radial-gradient(560px 300px at 92% 0%, rgba(255, 240, 168, 0.5), transparent 72%); pointer-events: none; }
+      .intro .inner { position: relative; }
+      h1 { margin: 0; max-width: 760px; font-size: clamp(34px, 6vw, 56px); font-weight: 850; line-height: 1.14; letter-spacing: -0.01em; }
+      .lead { max-width: 690px; margin: 18px 0 30px; color: var(--muted); font-size: 18px; }
+      .actions { display: flex; flex-wrap: wrap; gap: 12px; }
+      .primary, .secondary { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 10px 20px; border: 1px solid transparent; border-radius: 10px; font-size: 15px; font-weight: 700; line-height: 1.2; text-decoration: none; transition: transform 160ms ease, box-shadow 160ms ease, background-color 160ms ease, border-color 160ms ease; }
+      .primary { color: var(--white); background: var(--blue); box-shadow: 0 6px 16px rgba(8, 117, 201, 0.24); }
+      .primary:hover { background: var(--blue-hover); transform: translateY(-1px); }
+      .secondary { color: var(--ink); background: var(--white); border-color: var(--line-strong); box-shadow: var(--shadow-sm); }
+      .secondary:hover { border-color: #a9a9a3; transform: translateY(-1px); }
+      .status { padding-block: 18px; background: var(--yellow); border-bottom: 1px solid #e7d878; }
+      .status p { margin: 0; color: var(--yellow-ink); font-size: 14px; }
+      main { padding-block: 46px 70px; }
+      section { margin-bottom: 20px; padding: 26px 28px; border: 1px solid var(--line); border-radius: 14px; background: var(--white); box-shadow: var(--shadow-sm); }
+      section:last-child { margin-bottom: 0; }
+      h2 { margin: 0 0 12px; font-size: 21px; font-weight: 800; letter-spacing: 0; }
       p { margin: 0 0 12px; }
+      section p:last-child, section ul:last-child, section ol:last-child { margin-bottom: 0; }
       ol, ul { margin: 8px 0 0; padding-left: 24px; }
       li + li { margin-top: 8px; }
-      code { padding: 1px 4px; border-radius: 3px; background: #e9e9e5; }
-      footer { padding-block: 24px 40px; color: var(--muted); font-size: 14px; }
+      code { padding: 1px 5px; border-radius: 4px; background: #eeeeea; }
+      footer { padding-block: 26px 42px; color: var(--muted); font-size: 14px; }
       footer a { color: var(--blue); }
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+      }
       @media (max-width: 560px) {
         nav, .inner, footer { width: min(calc(100% - 28px), 920px); }
-        .intro { padding-top: 46px; }
+        .intro { padding-block: 48px 44px; }
         .actions a { width: 100%; }
+        section { padding: 22px 20px; }
       }
     </style>
   </head>
