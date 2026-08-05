@@ -59,7 +59,7 @@
     <main>
       <h1>浏览器增强隐私政策</h1>
       <p class="lead">飞花浏览器增强只与同一台 Windows 电脑上的飞花桌面应用通信，不运营云端账号，也不把浏览数据或凭据上传到飞花服务器。</p>
-      <p class="updated">最后更新：2026 年 8 月 4 日</p>
+      <p class="updated">最后更新：2026 年 8 月 5 日</p>
 
       <section>
         <h2>适用范围</h2>
@@ -71,7 +71,7 @@
         <ul>
           <li>长截图所需的网站活动数据，例如滚动位置、视口尺寸和页面稳定状态。</li>
           <li>用于把密码请求绑定到正确页面的精确网址 origin、标签页、文档和 frame 标识。</li>
-          <li>仅在用户开启密码功能并授予 Firefox 可选权限后处理的用户名和密码。</li>
+          <li>仅在用户开启密码功能后处理的用户名和密码（所需数据权限已在扩展安装时作为必要权限确认）。</li>
         </ul>
         <p>扩展不会为广告、分析或画像收集页面正文、完整浏览历史、付款信息、健康信息、位置或广告标识符。</p>
       </section>
@@ -104,20 +104,20 @@
 
       <section>
         <h2>用户选择与联系</h2>
-        <p>用户可以拒绝或撤销 Firefox 的可选身份验证信息权限、关闭登录检测、删除已保存账户，或卸载扩展。拒绝密码权限不会影响长截图。</p>
+        <p>身份验证信息权限为安装时的必要权限：用户可以在安装时拒绝（扩展将无法启用）、在飞花中关闭登录检测、手动锁定密码保险库、删除已保存账户，或卸载扩展。</p>
         <p>隐私与支持问题请通过 <a href="https://github.com/starsliao/PetalDesk/issues">PetalDesk GitHub Issues</a> 联系项目维护者。</p>
       </section>
 
       <div class="english" lang="en">
         <section>
           <h2>PetalDesk Browser Companion Privacy Notice</h2>
-          <p>Last updated: August 4, 2026</p>
+          <p>Last updated: August 5, 2026</p>
           <p>PetalDesk Browser Companion communicates only with the PetalDesk desktop application on the same Windows computer. It has no PetalDesk cloud account and does not upload browsing data or credentials to a PetalDesk server.</p>
         </section>
 
         <section>
           <h2>Information handled and purpose</h2>
-          <p>The extension handles website activity needed for user-initiated long screenshots; exact origins and tab, document, and frame identifiers needed to bind a password request; and usernames and passwords only after the user enables password features and grants Firefox's optional authentication-information permission.</p>
+          <p>The extension handles website activity needed for user-initiated long screenshots; exact origins and tab, document, and frame identifiers needed to bind a password request; and usernames and passwords only after the user enables password features. The authentication-information permission is required and granted once at install time.</p>
           <p>A fill offer contains no password. Credentials are requested only after the user confirms the in-page prompt. The extension fills fields but never submits a form. When login detection is enabled, a short-lived candidate is sent to the local encrypted vault to decide whether it is unchanged, new, or an update.</p>
         </section>
 
@@ -130,7 +130,7 @@
         <section>
           <h2>Controls and contact</h2>
           <p>Password operations require an exact scheme, host, and port match, a bound target page, and visible confirmation. HTTPS is required by default; HTTP requires a separate per-origin opt-in. The extension never bypasses CAPTCHA, passkeys, SMS verification, security keys, or MFA.</p>
-          <p>Users may revoke the optional permission, disable login detection, delete accounts, or uninstall the extension. Questions can be filed through <a href="https://github.com/starsliao/PetalDesk/issues">PetalDesk GitHub Issues</a>.</p>
+          <p>The authentication-information permission is required at install time. Users may decline it during installation (the extension cannot run without it), disable login detection, lock the password vault, delete accounts, or uninstall the extension. Questions can be filed through <a href="https://github.com/starsliao/PetalDesk/issues">PetalDesk GitHub Issues</a>.</p>
         </section>
       </div>
     </main>
