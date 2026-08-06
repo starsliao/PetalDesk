@@ -12,7 +12,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+// Read 只被同步帧读取（非 Windows 路径与测试）使用；Windows 生产路径全部
+// 走重叠 I/O 原语。
+#[cfg(any(not(windows), test))]
+use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
@@ -73,10 +77,12 @@ struct SecretConnectionControl {
     retired: AtomicBool,
     #[cfg(windows)]
     pipe: Mutex<Option<std::fs::File>>,
+    // 每代连接一个手动重置事件：retire 时 signal，挂在重叠 I/O 等待
+    // （WaitForMultipleObjects([op_event, stop_event])）里的 reader/writer
+    // 随即醒来，CancelIoEx 自己挂起的操作并退出。CancelSynchronousIo 对重叠
+    // 等待无效，线程句柄注册机制已随之移除。
     #[cfg(windows)]
-    reader_thread: Mutex<Option<std::os::windows::io::OwnedHandle>>,
-    #[cfg(windows)]
-    writer_thread: Mutex<Option<std::os::windows::io::OwnedHandle>>,
+    stop_event: SecretPipeEvent,
 }
 
 struct SecretInner {
@@ -101,9 +107,7 @@ impl SecretConnectionControl {
                 format!("failed to clone browser secret pipe shutdown handle: {error}")
             })?)),
             #[cfg(windows)]
-            reader_thread: Mutex::new(None),
-            #[cfg(windows)]
-            writer_thread: Mutex::new(None),
+            stop_event: SecretPipeEvent::new_manual_reset()?,
         })
     }
 
@@ -114,9 +118,8 @@ impl SecretConnectionControl {
             #[cfg(windows)]
             pipe: Mutex::new(None),
             #[cfg(windows)]
-            reader_thread: Mutex::new(None),
-            #[cfg(windows)]
-            writer_thread: Mutex::new(None),
+            stop_event: SecretPipeEvent::new_manual_reset()
+                .expect("failed to create test secret pipe stop event"),
         }
     }
 
@@ -125,37 +128,8 @@ impl SecretConnectionControl {
     }
 
     #[cfg(windows)]
-    fn register_reader_thread(&self) -> Result<(), String> {
-        self.register_current_thread(&self.reader_thread)
-    }
-
-    #[cfg(not(windows))]
-    fn register_reader_thread(&self) -> Result<(), String> {
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    fn register_writer_thread(&self) -> Result<(), String> {
-        self.register_current_thread(&self.writer_thread)
-    }
-
-    #[cfg(not(windows))]
-    fn register_writer_thread(&self) -> Result<(), String> {
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    fn register_current_thread(
-        &self,
-        slot: &Mutex<Option<std::os::windows::io::OwnedHandle>>,
-    ) -> Result<(), String> {
-        let handle = current_thread_owned_handle()?;
-        let mut slot = lock_unpoisoned(slot);
-        *slot = Some(handle);
-        if self.is_retired() {
-            cancel_registered_thread(&mut slot);
-        }
-        Ok(())
+    fn stop_event(&self) -> &SecretPipeEvent {
+        &self.stop_event
     }
 
     fn retire(&self) -> bool {
@@ -164,41 +138,12 @@ impl SecretConnectionControl {
         }
         #[cfg(windows)]
         {
-            cancel_registered_thread(&mut lock_unpoisoned(&self.reader_thread));
-            cancel_registered_thread(&mut lock_unpoisoned(&self.writer_thread));
+            // 手动重置事件保持 signaled：无论 worker 正挂在等待里还是尚未进入
+            // 下一次操作，都会在标志检查或等待处醒来并自行取消挂起操作。
+            self.stop_event.signal();
             disconnect_registered_pipe(&self.pipe);
         }
         true
-    }
-}
-
-#[cfg(windows)]
-fn current_thread_owned_handle() -> Result<std::os::windows::io::OwnedHandle, String> {
-    use std::os::windows::io::FromRawHandle;
-    use windows_sys::Win32::System::Threading::{GetCurrentThreadId, OpenThread, THREAD_TERMINATE};
-
-    let handle = unsafe { OpenThread(THREAD_TERMINATE, 0, GetCurrentThreadId()) };
-    if handle.is_null() {
-        return Err(format!(
-            "failed to retain browser secret worker thread: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle as _) })
-}
-
-#[cfg(windows)]
-fn cancel_registered_thread(slot: &mut Option<std::os::windows::io::OwnedHandle>) {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
-    use windows_sys::Win32::System::IO::CancelSynchronousIo;
-
-    let Some(handle) = slot.take() else { return };
-    if unsafe { CancelSynchronousIo(handle.as_raw_handle() as _) } == 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(ERROR_NOT_FOUND as i32) {
-            eprintln!("failed to cancel browser secret worker I/O: {error}");
-        }
     }
 }
 
@@ -217,6 +162,359 @@ fn disconnect_registered_pipe(pipe: &Mutex<Option<std::fs::File>>) {
         }
     }
     pipe.take();
+}
+
+/// 手动重置事件：每代连接一个 stop 事件（SecretConnectionControl 持有），
+/// 每个 I/O 线程另有自己的操作事件。
+#[cfg(windows)]
+struct SecretPipeEvent(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl SecretPipeEvent {
+    fn new_manual_reset() -> Result<Self, String> {
+        use windows_sys::Win32::System::Threading::CreateEventW;
+        let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if handle.is_null() {
+            Err(format!(
+                "CreateEventW failed: {}",
+                std::io::Error::last_os_error()
+            ))
+        } else {
+            Ok(Self(handle))
+        }
+    }
+
+    fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.0
+    }
+
+    fn signal(&self) {
+        use windows_sys::Win32::System::Threading::SetEvent;
+        unsafe { SetEvent(self.0) };
+    }
+
+    fn reset(&self) {
+        use windows_sys::Win32::System::Threading::ResetEvent;
+        unsafe { ResetEvent(self.0) };
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SecretPipeEvent {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+// SetEvent/WaitForMultipleObjects 可以安全地从多个线程作用于同一事件句柄。
+#[cfg(windows)]
+unsafe impl Send for SecretPipeEvent {}
+#[cfg(windows)]
+unsafe impl Sync for SecretPipeEvent {}
+
+/// 一次重叠管道 I/O 的结局。
+#[cfg(windows)]
+#[derive(Debug)]
+enum SecretPipeIo {
+    /// 操作完成，值为本次传输的字节数。
+    Completed(usize),
+    /// 对端关闭或断开（管道视角的 EOF）。
+    Ended,
+    /// 其他 I/O 错误。
+    Failed(String),
+    /// 停止事件触发，挂起操作已被 CancelIoEx 取消。
+    Stopped,
+}
+
+#[cfg(windows)]
+fn classify_secret_pipe_error(context: &str, error: &std::io::Error) -> SecretPipeIo {
+    use windows_sys::Win32::Foundation::{
+        ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_NOT_CONNECTED,
+    };
+    let Some(code) = error.raw_os_error() else {
+        return SecretPipeIo::Failed(format!("{context}: {error}"));
+    };
+    if code == ERROR_OPERATION_ABORTED as i32 {
+        SecretPipeIo::Stopped
+    } else if code == ERROR_BROKEN_PIPE as i32
+        || code == ERROR_PIPE_NOT_CONNECTED as i32
+        || code == ERROR_NO_DATA as i32
+    {
+        SecretPipeIo::Ended
+    } else {
+        SecretPipeIo::Failed(format!("{context}: {error}"))
+    }
+}
+
+/// 在 overlapped 句柄上发起一次 ReadFile 并等待结果。每次操作使用调用线程
+/// 自己的 OVERLAPPED+事件，因此 reader/writer 可以在同一管道句柄上并发挂起
+/// 各自的读/写——这正是"同步句柄有挂起读时写死锁"的修复点。
+#[cfg(windows)]
+fn secret_pipe_read(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    op_event: &SecretPipeEvent,
+    stop_event: Option<&SecretPipeEvent>,
+    buffer: &mut [u8],
+) -> SecretPipeIo {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_IO_PENDING};
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    op_event.reset();
+    let mut overlapped = OVERLAPPED::default();
+    overlapped.hEvent = op_event.handle();
+    let read = unsafe {
+        ReadFile(
+            pipe,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            std::ptr::null_mut(),
+            &mut overlapped,
+        )
+    };
+    if read != 0 {
+        return collect_secret_pipe_io(pipe, &overlapped, "failed to read browser secret frame");
+    }
+    let error = unsafe { GetLastError() };
+    if error != ERROR_IO_PENDING {
+        return classify_secret_pipe_error(
+            "failed to read browser secret frame",
+            &std::io::Error::from_raw_os_error(error as i32),
+        );
+    }
+    wait_secret_pipe_io(pipe, &overlapped, stop_event, "failed to read browser secret frame")
+}
+
+/// `secret_pipe_read` 的写方向对应物。
+#[cfg(windows)]
+fn secret_pipe_write(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    op_event: &SecretPipeEvent,
+    stop_event: Option<&SecretPipeEvent>,
+    bytes: &[u8],
+) -> SecretPipeIo {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_IO_PENDING};
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    op_event.reset();
+    let mut overlapped = OVERLAPPED::default();
+    overlapped.hEvent = op_event.handle();
+    let written = unsafe {
+        WriteFile(
+            pipe,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            std::ptr::null_mut(),
+            &mut overlapped,
+        )
+    };
+    if written != 0 {
+        return collect_secret_pipe_io(pipe, &overlapped, "failed to write browser secret frame");
+    }
+    let error = unsafe { GetLastError() };
+    if error != ERROR_IO_PENDING {
+        return classify_secret_pipe_error(
+            "failed to write browser secret frame",
+            &std::io::Error::from_raw_os_error(error as i32),
+        );
+    }
+    wait_secret_pipe_io(pipe, &overlapped, stop_event, "failed to write browser secret frame")
+}
+
+/// 同步完成（ReadFile/WriteFile 直接返回 TRUE）或等待完成后取实际字节数。
+#[cfg(windows)]
+fn collect_secret_pipe_io(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    overlapped: &windows_sys::Win32::System::IO::OVERLAPPED,
+    context: &str,
+) -> SecretPipeIo {
+    use windows_sys::Win32::System::IO::GetOverlappedResult;
+    let mut transferred = 0_u32;
+    if unsafe { GetOverlappedResult(pipe, overlapped, &mut transferred, 0) } != 0 {
+        SecretPipeIo::Completed(transferred as usize)
+    } else {
+        classify_secret_pipe_error(context, &std::io::Error::last_os_error())
+    }
+}
+
+/// 等待一个已挂起的重叠操作：操作事件与停止事件先到先赢。停止路径取消挂起
+/// 操作并以 bWait=TRUE 取一次结果，确保内核不再持有 OVERLAPPED 和缓冲区之后
+/// 它们才离开作用域。
+#[cfg(windows)]
+fn wait_secret_pipe_io(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    overlapped: &windows_sys::Win32::System::IO::OVERLAPPED,
+    stop_event: Option<&SecretPipeEvent>,
+    context: &str,
+) -> SecretPipeIo {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult};
+    use windows_sys::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
+
+    let waited = if let Some(stop_event) = stop_event {
+        let handles = [overlapped.hEvent, stop_event.handle()];
+        unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) }
+    } else {
+        let handles = [overlapped.hEvent];
+        unsafe { WaitForMultipleObjects(1, handles.as_ptr(), 0, INFINITE) }
+    };
+    if waited == WAIT_OBJECT_0 {
+        return collect_secret_pipe_io(pipe, overlapped, context);
+    }
+    let _ = unsafe { CancelIoEx(pipe, overlapped) };
+    let mut transferred = 0_u32;
+    let _ = unsafe { GetOverlappedResult(pipe, overlapped, &mut transferred, 1) };
+    if waited == WAIT_OBJECT_0 + 1 {
+        SecretPipeIo::Stopped
+    } else {
+        SecretPipeIo::Failed(format!(
+            "{context}: pipe wait failed: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+/// 重叠版 read_exact：字节管道允许部分读，循环累积直到填满缓冲区。
+#[cfg(windows)]
+fn secret_pipe_read_exact(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    op_event: &SecretPipeEvent,
+    stop_event: Option<&SecretPipeEvent>,
+    buffer: &mut [u8],
+) -> SecretPipeIo {
+    let mut filled = 0_usize;
+    while filled < buffer.len() {
+        match secret_pipe_read(pipe, op_event, stop_event, &mut buffer[filled..]) {
+            SecretPipeIo::Completed(0) => return SecretPipeIo::Ended,
+            SecretPipeIo::Completed(bytes) => filled += bytes,
+            other => return other,
+        }
+    }
+    SecretPipeIo::Completed(filled)
+}
+
+/// 重叠版 write_all：部分写时循环写满。
+#[cfg(windows)]
+fn secret_pipe_write_all(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    op_event: &SecretPipeEvent,
+    stop_event: Option<&SecretPipeEvent>,
+    bytes: &[u8],
+) -> SecretPipeIo {
+    let mut written = 0_usize;
+    while written < bytes.len() {
+        match secret_pipe_write(pipe, op_event, stop_event, &bytes[written..]) {
+            SecretPipeIo::Completed(0) => return SecretPipeIo::Ended,
+            SecretPipeIo::Completed(bytes) => written += bytes,
+            other => return other,
+        }
+    }
+    SecretPipeIo::Completed(written)
+}
+
+/// 帧级 I/O 的结局；Ended/Failed 保持 read_frame 的 EOF/错误区分，供读循环
+/// 沿用 "read-loop-ended"/"read-loop-failed" 的退休原因。
+#[cfg(windows)]
+#[derive(Debug)]
+enum SecretFrameIo {
+    Frame(Value),
+    Written,
+    Ended,
+    Failed(String),
+    Stopped,
+}
+
+/// 帧格式与 read_frame 相同：4 字节 LE 长度前缀 + JSON。
+#[cfg(windows)]
+fn read_frame_overlapped(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    op_event: &SecretPipeEvent,
+    stop_event: Option<&SecretPipeEvent>,
+) -> SecretFrameIo {
+    let mut length = [0_u8; 4];
+    match secret_pipe_read_exact(pipe, op_event, stop_event, &mut length) {
+        SecretPipeIo::Completed(_) => {}
+        SecretPipeIo::Ended => return SecretFrameIo::Ended,
+        SecretPipeIo::Failed(error) => return SecretFrameIo::Failed(error),
+        SecretPipeIo::Stopped => return SecretFrameIo::Stopped,
+    }
+    let length = u32::from_le_bytes(length) as usize;
+    if length == 0 || length > MAX_SECRET_MESSAGE_BYTES {
+        return SecretFrameIo::Failed(format!(
+            "browser secret frame length is invalid: {length}"
+        ));
+    }
+    let mut bytes = vec![0_u8; length];
+    match secret_pipe_read_exact(pipe, op_event, stop_event, &mut bytes) {
+        SecretPipeIo::Completed(_) => {}
+        SecretPipeIo::Ended => return SecretFrameIo::Ended,
+        SecretPipeIo::Failed(error) => return SecretFrameIo::Failed(error),
+        SecretPipeIo::Stopped => return SecretFrameIo::Stopped,
+    }
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => SecretFrameIo::Frame(value),
+        Err(error) => SecretFrameIo::Failed(format!("browser secret frame is invalid: {error}")),
+    }
+}
+
+/// `write_frame` 的重叠版：同一帧格式，写完即对端可见，无需 flush。
+#[cfg(windows)]
+fn write_frame_overlapped(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    op_event: &SecretPipeEvent,
+    stop_event: Option<&SecretPipeEvent>,
+    value: &Value,
+) -> SecretFrameIo {
+    let bytes = match encode_frame(value) {
+        Ok(bytes) => bytes,
+        Err(error) => return SecretFrameIo::Failed(error),
+    };
+    match secret_pipe_write_all(pipe, op_event, stop_event, &bytes) {
+        SecretPipeIo::Completed(_) => SecretFrameIo::Written,
+        SecretPipeIo::Ended => SecretFrameIo::Ended,
+        SecretPipeIo::Failed(error) => SecretFrameIo::Failed(error),
+        SecretPipeIo::Stopped => SecretFrameIo::Stopped,
+    }
+}
+
+/// 写一帧的最小抽象：生产路径是 `OverlappedFrameWriter`（重叠管道写 + stop
+/// 事件唤醒），测试与非 Windows 平台用任意 `Write`。
+trait SecretFrameWriter {
+    /// 写一帧；Err 表示连接级失败，调用方据此退休该 generation。
+    fn write_frame(&mut self, value: &Value) -> Result<(), String>;
+}
+
+#[cfg(any(not(windows), test))]
+impl<W: Write> SecretFrameWriter for W {
+    fn write_frame(&mut self, value: &Value) -> Result<(), String> {
+        write_frame(self, value)
+    }
+}
+
+#[cfg(windows)]
+struct OverlappedFrameWriter<'a> {
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    op_event: SecretPipeEvent,
+    stop_event: &'a SecretPipeEvent,
+}
+
+#[cfg(windows)]
+impl SecretFrameWriter for OverlappedFrameWriter<'_> {
+    fn write_frame(&mut self, value: &Value) -> Result<(), String> {
+        match write_frame_overlapped(self.pipe, &self.op_event, Some(self.stop_event), value) {
+            SecretFrameIo::Written => Ok(()),
+            // retire 唤醒：按写失败退出（与 CancelSynchronousIo 时代一致，
+            // close_connection_generation 对同一代的重复关闭是幂等的）。
+            SecretFrameIo::Stopped => Err("browser secret connection was retired".to_string()),
+            SecretFrameIo::Ended => Err("browser secret pipe closed".to_string()),
+            SecretFrameIo::Failed(error) => Err(error),
+            SecretFrameIo::Frame(_) => {
+                Err("browser secret pipe write returned an unexpected frame".to_string())
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -663,6 +961,9 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String>
     result
 }
 
+/// 同步帧读取。Windows 生产路径的管道句柄已改为 FILE_FLAG_OVERLAPPED（同步
+/// ReadFile 在其上是未定义行为），此函数保留给非 Windows 路径与测试使用。
+#[cfg(any(not(windows), test))]
 fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Value>, String> {
     let mut length = [0_u8; 4];
     match reader.read_exact(&mut length) {
@@ -683,7 +984,7 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Value>, String> {
         .map_err(|error| format!("browser secret frame is invalid: {error}"))
 }
 
-fn write_frame<W: Write>(writer: &mut W, value: &Value) -> Result<(), String> {
+fn encode_frame(value: &Value) -> Result<Vec<u8>, String> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| format!("failed to encode browser secret frame: {error}"))?;
     if bytes.is_empty() || bytes.len() > MAX_SECRET_MESSAGE_BYTES {
@@ -692,10 +993,19 @@ fn write_frame<W: Write>(writer: &mut W, value: &Value) -> Result<(), String> {
             bytes.len()
         ));
     }
-    let length = (bytes.len() as u32).to_le_bytes();
+    let mut frame = Vec::with_capacity(4 + bytes.len());
+    frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&bytes);
+    Ok(frame)
+}
+
+/// 同步帧写入（含 flush），语义不变；保留给非 Windows 路径与测试使用。
+/// Windows 生产写入路径是 `write_frame_overlapped`（管道写完即可见，无 flush）。
+#[cfg(any(not(windows), test))]
+fn write_frame<W: Write>(writer: &mut W, value: &Value) -> Result<(), String> {
+    let frame = encode_frame(value)?;
     writer
-        .write_all(&length)
-        .and_then(|_| writer.write_all(&bytes))
+        .write_all(&frame)
         .and_then(|_| writer.flush())
         .map_err(|error| format!("failed to write browser secret frame: {error}"))
 }
@@ -706,6 +1016,23 @@ fn establish_secret_connection(
     pipe: &mut std::fs::File,
     inner: &SecretInner,
 ) -> Result<(String, BrowserFamily, std::fs::File, Arc<SecretConnectionControl>), String> {
+    // Windows 的管道句柄带 FILE_FLAG_OVERLAPPED，握手读写也必须走重叠结构；
+    // 握手阶段尚无 stop 事件，等待语义与原先的同步阻塞一致（对端静默则一直等，
+    // 对端断开则报错退出）。
+    #[cfg(windows)]
+    let handshake_raw = {
+        use std::os::windows::io::AsRawHandle;
+        pipe.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
+    };
+    #[cfg(windows)]
+    let handshake_event = SecretPipeEvent::new_manual_reset()?;
+    #[cfg(windows)]
+    let hello = match read_frame_overlapped(handshake_raw, &handshake_event, None) {
+        SecretFrameIo::Frame(hello) => hello,
+        SecretFrameIo::Failed(error) => return Err(error),
+        _ => return Err("browser secret pipe closed".to_string()),
+    };
+    #[cfg(not(windows))]
     let hello = read_frame(pipe)?.ok_or_else(|| "browser secret pipe closed".to_string())?;
     let expected_token = lock_unpoisoned(&inner.token).clone();
     if hello.get("type").and_then(Value::as_str) != Some("secret.hello")
@@ -733,24 +1060,28 @@ fn establish_secret_connection(
         .ok_or_else(|| "browser secret handshake has no process ID".to_string())?;
     #[cfg(windows)]
     validate_named_pipe_client(pipe, declared_process_id)?;
-    write_frame(
-        pipe,
-        &serde_json::json!({
-            "version": SECRET_PROTOCOL_VERSION,
-            "type": "secret.ready",
-        }),
-    )?;
+    let ready = serde_json::json!({
+        "version": SECRET_PROTOCOL_VERSION,
+        "type": "secret.ready",
+    });
+    #[cfg(windows)]
+    match write_frame_overlapped(handshake_raw, &handshake_event, None, &ready) {
+        SecretFrameIo::Written => {}
+        SecretFrameIo::Failed(error) => return Err(error),
+        _ => return Err("browser secret pipe closed".to_string()),
+    }
+    #[cfg(not(windows))]
+    write_frame(pipe, &ready)?;
 
     let reader = pipe
         .try_clone()
         .map_err(|error| format!("failed to clone browser secret pipe: {error}"))?;
     let control = Arc::new(SecretConnectionControl::new(pipe)?);
-    control.register_reader_thread()?;
     Ok((connection_id, browser, reader, control))
 }
 
 fn handle_pipe_connection(mut pipe: std::fs::File, inner: Arc<SecretInner>) -> Result<(), String> {
-    let (connection_id, browser, mut reader, control) =
+    let (connection_id, browser, reader, control) =
         match establish_secret_connection(&mut pipe, &inner) {
             Ok(established) => established,
             Err(error) => {
@@ -764,6 +1095,21 @@ fn handle_pipe_connection(mut pipe: std::fs::File, inner: Arc<SecretInner>) -> R
         "succeeded",
         format!("connectionId={connection_id} browser={}", browser.as_str()),
     );
+    // reader 的操作事件（Windows）：每个线程自己的 OVERLAPPED+事件，与 writer
+    // 在同一管道句柄上并发挂起互不阻塞。创建失败与建立阶段失败同等处理。
+    #[cfg(windows)]
+    let reader_event = match SecretPipeEvent::new_manual_reset() {
+        Ok(event) => event,
+        Err(error) => {
+            record_diag(&inner, "handshake", "failed", error.clone());
+            return Err(error);
+        }
+    };
+    #[cfg(windows)]
+    let reader_raw = {
+        use std::os::windows::io::AsRawHandle;
+        reader.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
+    };
     let (outbound_tx, outbound_rx) = mpsc::sync_channel::<Value>(32);
     let generation = Uuid::new_v4();
     insert_connection_generation(
@@ -803,17 +1149,41 @@ fn handle_pipe_connection(mut pipe: std::fs::File, inner: Arc<SecretInner>) -> R
     let writer_connection_id = connection_id.clone();
     let writer_control = control.clone();
     let writer = std::thread::spawn(move || {
-        if writer_control.register_writer_thread().is_err() {
-            close_connection_generation(
-                &writer_inner,
-                &writer_connection_id,
-                browser,
-                generation,
-                &writer_control,
-                "writer-register-failed",
-            );
-            return;
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            let writer_raw = pipe.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+            let stop_source = writer_control.clone();
+            match SecretPipeEvent::new_manual_reset() {
+                Ok(op_event) => {
+                    let frame_writer = OverlappedFrameWriter {
+                        pipe: writer_raw,
+                        op_event,
+                        stop_event: stop_source.stop_event(),
+                    };
+                    run_connection_writer(
+                        frame_writer,
+                        outbound_rx,
+                        writer_inner,
+                        writer_connection_id,
+                        browser,
+                        generation,
+                        writer_control,
+                    );
+                }
+                Err(_) => {
+                    close_connection_generation(
+                        &writer_inner,
+                        &writer_connection_id,
+                        browser,
+                        generation,
+                        &writer_control,
+                        "writer-register-failed",
+                    );
+                }
+            }
         }
+        #[cfg(not(windows))]
         run_connection_writer(
             pipe,
             outbound_rx,
@@ -822,14 +1192,29 @@ fn handle_pipe_connection(mut pipe: std::fs::File, inner: Arc<SecretInner>) -> R
             browser,
             generation,
             writer_control,
-        )
+        );
     });
 
     // Keep the read error until after connection cleanup. A browser process can
     // disappear with a BrokenPipe/ConnectionReset error instead of a clean EOF;
     // returning through `?` here would leave stale connection state behind.
     let read_result = (|| {
-        while let Some(message) = read_frame(&mut reader)? {
+        loop {
+            #[cfg(windows)]
+            let next = match read_frame_overlapped(
+                reader_raw,
+                &reader_event,
+                Some(control.stop_event()),
+            ) {
+                SecretFrameIo::Frame(message) => Some(message),
+                SecretFrameIo::Failed(error) => return Err(error),
+                // Ended：对端断开；Stopped：retire 唤醒（该代的退休已由发起方
+                // 记录，此处的关闭是幂等空操作）；Written：读路径不可达。
+                _ => None,
+            };
+            #[cfg(not(windows))]
+            let next = read_frame(&mut &reader)?;
+            let Some(message) = next else { break };
             match message.get("type").and_then(Value::as_str) {
                 Some("secret.response") => {
                     let Some(id) = message.get("id").and_then(Value::as_str) else {
@@ -888,7 +1273,7 @@ fn handle_pipe_connection(mut pipe: std::fs::File, inner: Arc<SecretInner>) -> R
     read_result
 }
 
-fn run_connection_writer<W: Write>(
+fn run_connection_writer<W: SecretFrameWriter>(
     mut writer: W,
     outbound_rx: mpsc::Receiver<Value>,
     inner: Arc<SecretInner>,
@@ -906,7 +1291,7 @@ fn run_connection_writer<W: Write>(
         if control.is_retired() {
             break;
         }
-        if write_frame(&mut writer, &message).is_err() {
+        if writer.write_frame(&message).is_err() {
             close_connection_generation(
                 &inner,
                 &connection_id,
@@ -1112,23 +1497,28 @@ fn create_and_connect_pipe(pipe_name: &str) -> Result<std::fs::File, String> {
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::{
-        GetLastError, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE,
+        GetLastError, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE,
     };
-    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
+    use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
         PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
+    use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
 
     let name = std::ffi::OsStr::new(pipe_name)
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
     let security = CurrentUserSecurity::new()?;
+    // 服务器端句柄同样必须带 FILE_FLAG_OVERLAPPED：同步句柄上"有挂起阻塞读时
+    // 另一线程的 WriteFile 永久阻塞"。代价是该句柄上的所有 I/O（含
+    // ConnectNamedPipe 和握手）都必须走 OVERLAPPED。
     let handle = unsafe {
         CreateNamedPipeW(
             name.as_ptr(),
-            PIPE_ACCESS_DUPLEX,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_UNLIMITED_INSTANCES,
             64 * 1024,
@@ -1143,14 +1533,42 @@ fn create_and_connect_pipe(pipe_name: &str) -> Result<std::fs::File, String> {
             std::io::Error::last_os_error()
         ));
     }
-    let connected = unsafe { ConnectNamedPipe(handle, std::ptr::null_mut()) } != 0
-        || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
-    if !connected {
+    let connect = (|| {
+        let connect_event = SecretPipeEvent::new_manual_reset()?;
+        let mut overlapped = OVERLAPPED::default();
+        overlapped.hEvent = connect_event.handle();
+        if unsafe { ConnectNamedPipe(handle, &mut overlapped) } != 0 {
+            return Ok(());
+        }
+        let error = unsafe { GetLastError() };
+        if error == ERROR_PIPE_CONNECTED {
+            return Ok(());
+        }
+        if error != ERROR_IO_PENDING {
+            return Err(format!(
+                "ConnectNamedPipe failed: {}",
+                std::io::Error::from_raw_os_error(error as i32)
+            ));
+        }
+        // 等待客户端接入；与原先的同步等待语义一致（对端不连则一直等）。
+        if unsafe { WaitForSingleObject(connect_event.handle(), INFINITE) } != 0 {
+            return Err(format!(
+                "ConnectNamedPipe wait failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let mut transferred = 0_u32;
+        if unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 0) } == 0 {
+            return Err(format!(
+                "ConnectNamedPipe failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = connect {
         unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
-        return Err(format!(
-            "ConnectNamedPipe failed: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(error);
     }
     Ok(unsafe { std::fs::File::from_raw_handle(handle as _) })
 }
@@ -1789,45 +2207,73 @@ mod tests {
         let (server, client) = connected_test_named_pipe();
 
         let control = Arc::new(SecretConnectionControl::new(&server).unwrap());
-        let mut reader = server.try_clone().unwrap();
+        let reader = server.try_clone().unwrap();
         let reader_control = control.clone();
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (finished_tx, finished_rx) = mpsc::sync_channel(1);
         let reader_thread = std::thread::spawn(move || {
-            reader_control.register_reader_thread().unwrap();
-            started_tx.send(()).unwrap();
-            let result = read_frame(&mut reader);
+            use std::os::windows::io::AsRawHandle;
+            let raw = reader.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+            let op_event = SecretPipeEvent::new_manual_reset().unwrap();
+            let result = read_frame_overlapped(raw, &op_event, Some(reader_control.stop_event()));
             let _ = finished_tx.send(result);
         });
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // 让 reader 先挂起在重叠读上（客户端保持静默）。
+        std::thread::sleep(Duration::from_millis(300));
 
         assert!(control.retire());
         let result = finished_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("retired named pipe reader remained blocked");
-        assert!(result.is_err() || matches!(result, Ok(None)));
+        assert!(
+            matches!(result, SecretFrameIo::Stopped),
+            "retired reader observed {result:?} instead of the stop event"
+        );
         reader_thread.join().unwrap();
         drop(client);
     }
 
+    /// 核心回归：服务器端 overlapped 句柄上"有挂起读时写必须完成"（同步句柄
+    /// 在同一情形下的死锁正是本次修复对象）。
     #[cfg(windows)]
-    struct NotifyingPipeWriter {
-        pipe: std::fs::File,
-        started: Option<SyncSender<()>>,
-    }
+    #[test]
+    fn server_end_overlapped_write_completes_while_read_is_pending() {
+        use std::os::windows::io::AsRawHandle;
+        let (server, mut client) = connected_test_named_pipe();
+        let control = Arc::new(SecretConnectionControl::new(&server).unwrap());
+        let reader_control = control.clone();
+        let reader = server.try_clone().unwrap();
+        let reader_thread = std::thread::spawn(move || {
+            let raw = reader.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+            let op_event = SecretPipeEvent::new_manual_reset().unwrap();
+            read_frame_overlapped(raw, &op_event, Some(reader_control.stop_event()))
+        });
+        // 让读先挂起；客户端保持静默（不写任何东西）。
+        std::thread::sleep(Duration::from_millis(300));
 
-    #[cfg(windows)]
-    impl Write for NotifyingPipeWriter {
-        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-            if let Some(started) = self.started.take() {
-                let _ = started.send(());
-            }
-            self.pipe.write(buffer)
-        }
+        let raw = server.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        let op_event = SecretPipeEvent::new_manual_reset().unwrap();
+        let frame = serde_json::json!({
+            "type": "secret.command",
+            "id": "overlapped-server-write",
+            "command": "ping",
+        });
+        let started = Instant::now();
+        let outcome = write_frame_overlapped(raw, &op_event, None, &frame);
+        assert!(
+            matches!(outcome, SecretFrameIo::Written),
+            "server-end write failed behind a pending read: {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "server-end write blocked behind the pending read"
+        );
+        // 客户端同步读到完整帧。
+        let received = read_frame(&mut client).unwrap().unwrap();
+        assert_eq!(received, frame);
 
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.pipe.flush()
-        }
+        assert!(control.retire());
+        let reader_outcome = reader_thread.join().unwrap();
+        assert!(matches!(reader_outcome, SecretFrameIo::Stopped));
     }
 
     #[cfg(windows)]
@@ -1855,16 +2301,20 @@ mod tests {
                 control: control.clone(),
             },
         );
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
         let writer_inner = inner.clone();
         let writer_control = control.clone();
         let writer = std::thread::spawn(move || {
-            writer_control.register_writer_thread().unwrap();
+            use std::os::windows::io::AsRawHandle;
+            let raw = server.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+            let stop_source = writer_control.clone();
+            let op_event = SecretPipeEvent::new_manual_reset().unwrap();
+            let frame_writer = OverlappedFrameWriter {
+                pipe: raw,
+                op_event,
+                stop_event: stop_source.stop_event(),
+            };
             run_connection_writer(
-                NotifyingPipeWriter {
-                    pipe: server,
-                    started: Some(started_tx),
-                },
+                frame_writer,
                 receiver,
                 writer_inner,
                 "blocked-writer".to_string(),
@@ -1873,7 +2323,8 @@ mod tests {
                 writer_control,
             );
         });
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // 512KB 远超 64KB 管道缓冲且客户端不读：写必然挂起在重叠 I/O 上。
+        std::thread::sleep(Duration::from_millis(300));
 
         let _ = close_connection_generation(
             &inner,

@@ -628,17 +628,23 @@ impl SecretIoExit {
 }
 
 #[cfg(windows)]
-fn run_secret_reader<R: Read>(
-    reader: &mut R,
+fn run_secret_reader(
+    pipe: &std::fs::File,
     command_sender: &mpsc::Sender<Value>,
     stop: &AtomicBool,
+    stop_event: &SecretPipeEvent,
 ) -> SecretReaderExit {
+    use std::os::windows::io::AsRawHandle;
+    let Ok(op_event) = SecretPipeEvent::new_manual_reset() else {
+        return SecretReaderExit::PipeClosed;
+    };
+    let raw = pipe.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
     loop {
         if stop.load(Ordering::Acquire) {
             return SecretReaderExit::Stopped;
         }
-        match read_secret_frame(reader) {
-            Ok(Some(command))
+        match read_secret_frame_overlapped(raw, &op_event, Some(stop_event), None) {
+            SecretFrameIo::Frame(command)
                 if command.get("type").and_then(Value::as_str) == Some("secret.command") =>
             {
                 if stop.load(Ordering::Acquire) {
@@ -648,18 +654,27 @@ fn run_secret_reader<R: Read>(
                     return SecretReaderExit::CommandChannelClosed;
                 }
             }
-            Ok(Some(_)) => {}
-            Ok(None) | Err(_) => return SecretReaderExit::PipeClosed,
+            SecretFrameIo::Frame(_) => {}
+            SecretFrameIo::Stopped => return SecretReaderExit::Stopped,
+            SecretFrameIo::Written
+            | SecretFrameIo::Closed
+            | SecretFrameIo::TimedOut => return SecretReaderExit::PipeClosed,
         }
     }
 }
 
 #[cfg(windows)]
-fn run_secret_writer<W: Write>(
-    writer: &mut W,
+fn run_secret_writer(
+    pipe: &std::fs::File,
     outbound_receiver: &Mutex<mpsc::Receiver<Value>>,
     stop: &AtomicBool,
+    stop_event: &SecretPipeEvent,
 ) -> SecretWriterExit {
+    use std::os::windows::io::AsRawHandle;
+    let Ok(op_event) = SecretPipeEvent::new_manual_reset() else {
+        return SecretWriterExit::PipeClosed;
+    };
+    let raw = pipe.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
     loop {
         if stop.load(Ordering::Acquire) {
             return SecretWriterExit::Stopped;
@@ -686,31 +701,345 @@ fn run_secret_writer<W: Write>(
         if unix_time_ms().saturating_sub(queued_at) > 30_000 {
             continue;
         }
-        if write_secret_frame(writer, &message).is_err() {
-            return SecretWriterExit::PipeClosed;
+        // 重叠写入完成后桌面端立即可见，不需要（也不存在）flush。
+        match write_secret_frame_overlapped(raw, &op_event, Some(stop_event), None, &message) {
+            SecretFrameIo::Written => {}
+            SecretFrameIo::Stopped => return SecretWriterExit::Stopped,
+            SecretFrameIo::Frame(_)
+            | SecretFrameIo::Closed
+            | SecretFrameIo::TimedOut => return SecretWriterExit::PipeClosed,
         }
     }
 }
 
+/// 手动重置事件（每代连接一个 stop 事件 + 每个 I/O 线程一个操作事件）。
+/// connector 停止 worker 时 signal stop 事件，等待中的重叠 I/O 随
+/// WaitForMultipleObjects([op_event, stop_event]) 醒来，线程随后 CancelIoEx
+/// 自己挂起的操作并退出——CancelSynchronousIo 对重叠等待无效，已弃用。
 #[cfg(windows)]
-fn cancel_secret_thread_io<T>(thread: &JoinHandle<T>) -> Result<(), String> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
-    use windows_sys::Win32::System::IO::CancelSynchronousIo;
+struct SecretPipeEvent(windows_sys::Win32::Foundation::HANDLE);
 
-    if unsafe { CancelSynchronousIo(thread.as_raw_handle() as _) } != 0 {
-        return Ok(());
+#[cfg(windows)]
+impl SecretPipeEvent {
+    fn new_manual_reset() -> Result<Self, String> {
+        use windows_sys::Win32::System::Threading::CreateEventW;
+        let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if handle.is_null() {
+            Err(format!(
+                "CreateEventW failed: {}",
+                io::Error::last_os_error()
+            ))
+        } else {
+            Ok(Self(handle))
+        }
     }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(ERROR_NOT_FOUND as i32) {
-        Ok(())
-    } else {
-        Err(format!("failed to cancel browser secret pipe I/O: {error}"))
+
+    fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.0
+    }
+
+    fn signal(&self) {
+        use windows_sys::Win32::System::Threading::SetEvent;
+        unsafe { SetEvent(self.0) };
+    }
+
+    fn reset(&self) {
+        use windows_sys::Win32::System::Threading::ResetEvent;
+        unsafe { ResetEvent(self.0) };
     }
 }
 
 #[cfg(windows)]
-fn cancel_and_join_secret_thread<T>(
+impl Drop for SecretPipeEvent {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+// SetEvent/WaitForMultipleObjects 可以安全地从多个线程作用于同一事件句柄。
+#[cfg(windows)]
+unsafe impl Send for SecretPipeEvent {}
+#[cfg(windows)]
+unsafe impl Sync for SecretPipeEvent {}
+
+/// 一次重叠管道 I/O 的结局。
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SecretPipeIo {
+    /// 操作完成，值为本次传输的字节数。
+    Completed(usize),
+    /// 管道已关闭或对端断开。
+    Closed,
+    /// 停止事件触发，挂起操作已被 CancelIoEx 取消。
+    Stopped,
+    /// 等待超时，挂起操作已被 CancelIoEx 取消。
+    TimedOut,
+}
+
+/// 在 overlapped 句柄上发起一次 ReadFile 并等待结果。每次操作使用调用线程
+/// 自己的 OVERLAPPED+事件，因此 reader/writer 可以在同一管道句柄上并发挂起
+/// 各自的读/写——这正是"同步句柄有挂起读时写死锁"的修复点。
+#[cfg(windows)]
+fn secret_pipe_read(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    op_event: &SecretPipeEvent,
+    stop_event: Option<&SecretPipeEvent>,
+    timeout: Option<Duration>,
+    buffer: &mut [u8],
+) -> SecretPipeIo {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_IO_PENDING};
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    op_event.reset();
+    let mut overlapped = OVERLAPPED::default();
+    overlapped.hEvent = op_event.handle();
+    let read = unsafe {
+        ReadFile(
+            pipe,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            std::ptr::null_mut(),
+            &mut overlapped,
+        )
+    };
+    if read != 0 {
+        return collect_secret_pipe_io(pipe, &overlapped);
+    }
+    if unsafe { GetLastError() } != ERROR_IO_PENDING {
+        return SecretPipeIo::Closed;
+    }
+    wait_secret_pipe_io(pipe, &overlapped, stop_event, timeout)
+}
+
+/// `secret_pipe_read` 的写方向对应物。
+#[cfg(windows)]
+fn secret_pipe_write(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    op_event: &SecretPipeEvent,
+    stop_event: Option<&SecretPipeEvent>,
+    timeout: Option<Duration>,
+    bytes: &[u8],
+) -> SecretPipeIo {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_IO_PENDING};
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    op_event.reset();
+    let mut overlapped = OVERLAPPED::default();
+    overlapped.hEvent = op_event.handle();
+    let written = unsafe {
+        WriteFile(
+            pipe,
+            bytes.as_ptr(),
+            bytes.len() as u32,
+            std::ptr::null_mut(),
+            &mut overlapped,
+        )
+    };
+    if written != 0 {
+        return collect_secret_pipe_io(pipe, &overlapped);
+    }
+    if unsafe { GetLastError() } != ERROR_IO_PENDING {
+        return SecretPipeIo::Closed;
+    }
+    wait_secret_pipe_io(pipe, &overlapped, stop_event, timeout)
+}
+
+/// 同步完成（ReadFile/WriteFile 直接返回 TRUE）时取实际字节数。
+#[cfg(windows)]
+fn collect_secret_pipe_io(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    overlapped: &windows_sys::Win32::System::IO::OVERLAPPED,
+) -> SecretPipeIo {
+    use windows_sys::Win32::System::IO::GetOverlappedResult;
+    let mut transferred = 0_u32;
+    if unsafe { GetOverlappedResult(pipe, overlapped, &mut transferred, 0) } != 0 {
+        SecretPipeIo::Completed(transferred as usize)
+    } else {
+        SecretPipeIo::Closed
+    }
+}
+
+/// 等待一个已挂起的重叠操作：操作事件、停止事件、超时三者先到先赢。
+/// 停止/超时路径取消挂起操作并以 bWait=TRUE 取一次结果，确保内核不再持有
+/// OVERLAPPED 和缓冲区之后它们才离开作用域。
+#[cfg(windows)]
+fn wait_secret_pipe_io(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    overlapped: &windows_sys::Win32::System::IO::OVERLAPPED,
+    stop_event: Option<&SecretPipeEvent>,
+    timeout: Option<Duration>,
+) -> SecretPipeIo {
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult};
+    use windows_sys::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
+
+    let timeout_ms = timeout.map_or(INFINITE, |timeout| {
+        u32::try_from(timeout.as_millis()).unwrap_or(INFINITE - 1)
+    });
+    let waited = if let Some(stop_event) = stop_event {
+        let handles = [overlapped.hEvent, stop_event.handle()];
+        unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, timeout_ms) }
+    } else {
+        let handles = [overlapped.hEvent];
+        unsafe { WaitForMultipleObjects(1, handles.as_ptr(), 0, timeout_ms) }
+    };
+    if waited == WAIT_OBJECT_0 {
+        return collect_secret_pipe_io(pipe, overlapped);
+    }
+    let _ = unsafe { CancelIoEx(pipe, overlapped) };
+    let mut transferred = 0_u32;
+    let _ = unsafe { GetOverlappedResult(pipe, overlapped, &mut transferred, 1) };
+    if waited == WAIT_TIMEOUT {
+        SecretPipeIo::TimedOut
+    } else if waited == WAIT_OBJECT_0 + 1 {
+        SecretPipeIo::Stopped
+    } else {
+        SecretPipeIo::Closed
+    }
+}
+
+#[cfg(windows)]
+fn remaining_secret_io(deadline: Option<Instant>) -> Option<Duration> {
+    deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
+}
+
+/// 重叠版 read_exact：字节管道允许部分读，循环累积直到填满缓冲区。
+#[cfg(windows)]
+fn secret_pipe_read_exact(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    op_event: &SecretPipeEvent,
+    stop_event: Option<&SecretPipeEvent>,
+    deadline: Option<Instant>,
+    buffer: &mut [u8],
+) -> SecretPipeIo {
+    let mut filled = 0_usize;
+    while filled < buffer.len() {
+        match secret_pipe_read(
+            pipe,
+            op_event,
+            stop_event,
+            remaining_secret_io(deadline),
+            &mut buffer[filled..],
+        ) {
+            SecretPipeIo::Completed(0) => return SecretPipeIo::Closed,
+            SecretPipeIo::Completed(bytes) => filled += bytes,
+            other => return other,
+        }
+    }
+    SecretPipeIo::Completed(filled)
+}
+
+/// 重叠版 write_all：部分写时循环写满。
+#[cfg(windows)]
+fn secret_pipe_write_all(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    op_event: &SecretPipeEvent,
+    stop_event: Option<&SecretPipeEvent>,
+    deadline: Option<Instant>,
+    bytes: &[u8],
+) -> SecretPipeIo {
+    let mut written = 0_usize;
+    while written < bytes.len() {
+        match secret_pipe_write(
+            pipe,
+            op_event,
+            stop_event,
+            remaining_secret_io(deadline),
+            &bytes[written..],
+        ) {
+            SecretPipeIo::Completed(0) => return SecretPipeIo::Closed,
+            SecretPipeIo::Completed(bytes) => written += bytes,
+            other => return other,
+        }
+    }
+    SecretPipeIo::Completed(written)
+}
+
+/// 帧级 I/O 的结局；除 Frame/Written 外都映射为 reader/writer 的退出原因。
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SecretFrameIo {
+    Frame(Value),
+    Written,
+    Closed,
+    Stopped,
+    TimedOut,
+}
+
+#[cfg(windows)]
+fn encode_secret_frame(value: &Value) -> Result<Vec<u8>, String> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|error| format!("failed to encode browser secret message: {error}"))?;
+    if bytes.is_empty() || bytes.len() > MAX_NATIVE_MESSAGE_BYTES {
+        return Err(format!(
+            "browser secret message length is invalid: {}",
+            bytes.len()
+        ));
+    }
+    let mut frame = Vec::with_capacity(4 + bytes.len());
+    frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&bytes);
+    Ok(frame)
+}
+
+/// 帧格式不变：4 字节 LE 长度前缀 + JSON。deadline 覆盖整帧（长度+正文）。
+#[cfg(windows)]
+fn read_secret_frame_overlapped(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    op_event: &SecretPipeEvent,
+    stop_event: Option<&SecretPipeEvent>,
+    deadline: Option<Instant>,
+) -> SecretFrameIo {
+    let mut length = [0_u8; 4];
+    match secret_pipe_read_exact(pipe, op_event, stop_event, deadline, &mut length) {
+        SecretPipeIo::Completed(_) => {}
+        SecretPipeIo::Stopped => return SecretFrameIo::Stopped,
+        SecretPipeIo::TimedOut => return SecretFrameIo::TimedOut,
+        SecretPipeIo::Closed => return SecretFrameIo::Closed,
+    }
+    let length = u32::from_le_bytes(length) as usize;
+    if length == 0 || length > MAX_NATIVE_MESSAGE_BYTES {
+        return SecretFrameIo::Closed;
+    }
+    let mut bytes = vec![0_u8; length];
+    match secret_pipe_read_exact(pipe, op_event, stop_event, deadline, &mut bytes) {
+        SecretPipeIo::Completed(_) => {}
+        SecretPipeIo::Stopped => return SecretFrameIo::Stopped,
+        SecretPipeIo::TimedOut => return SecretFrameIo::TimedOut,
+        SecretPipeIo::Closed => return SecretFrameIo::Closed,
+    }
+    serde_json::from_slice(&bytes)
+        .map(SecretFrameIo::Frame)
+        .unwrap_or(SecretFrameIo::Closed)
+}
+
+/// `write_secret_frame` 的重叠版：同一帧格式，写完即对端可见，无需 flush。
+#[cfg(windows)]
+fn write_secret_frame_overlapped(
+    pipe: windows_sys::Win32::Foundation::HANDLE,
+    op_event: &SecretPipeEvent,
+    stop_event: Option<&SecretPipeEvent>,
+    deadline: Option<Instant>,
+    value: &Value,
+) -> SecretFrameIo {
+    let Ok(bytes) = encode_secret_frame(value) else {
+        return SecretFrameIo::Closed;
+    };
+    match secret_pipe_write_all(pipe, op_event, stop_event, deadline, &bytes) {
+        SecretPipeIo::Completed(_) => SecretFrameIo::Written,
+        SecretPipeIo::Stopped => SecretFrameIo::Stopped,
+        SecretPipeIo::TimedOut => SecretFrameIo::TimedOut,
+        SecretPipeIo::Closed => SecretFrameIo::Closed,
+    }
+}
+
+/// 在 deadline 前 join 一个已被 signal 停止的 secret 线程。返回 None 表示
+/// worker 卡死，connector 据此走 `secret-pipe-worker-stuck` 的 fatal 兜底。
+#[cfg(windows)]
+fn join_secret_thread<T>(
     thread: JoinHandle<T>,
     deadline: Instant,
 ) -> Option<std::thread::Result<T>> {
@@ -718,7 +1047,6 @@ fn cancel_and_join_secret_thread<T>(
         if thread.is_finished() {
             return Some(thread.join());
         }
-        let _ = cancel_secret_thread_io(&thread);
         if Instant::now() >= deadline {
             return thread.is_finished().then(|| thread.join());
         }
@@ -737,7 +1065,7 @@ fn join_finished_secret_worker(thread: &mut Option<JoinHandle<()>>) {
 }
 
 #[cfg(windows)]
-fn cancel_and_join_secret_workers(
+fn join_secret_workers(
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
     deadline: Instant,
@@ -749,12 +1077,6 @@ fn cancel_and_join_secret_workers(
         join_finished_secret_worker(&mut writer);
         if reader.is_none() && writer.is_none() {
             return true;
-        }
-        if let Some(thread) = reader.as_ref() {
-            let _ = cancel_secret_thread_io(thread);
-        }
-        if let Some(thread) = writer.as_ref() {
-            let _ = cancel_secret_thread_io(thread);
         }
         if Instant::now() >= deadline {
             join_finished_secret_worker(&mut reader);
@@ -785,7 +1107,9 @@ fn wait_secret_handshake_thread<T>(
     if thread.is_finished() {
         return SecretHandshakeWait::Finished(thread.join());
     }
-    match cancel_and_join_secret_thread(thread, Instant::now() + stop_timeout) {
+    // 握手的重叠 I/O 自带 SECRET_HANDSHAKE_TIMEOUT 超时（等待带超时、超时
+    // CancelIoEx），线程只会短暂超出外层 deadline，宽限期内必然自行退出。
+    match join_secret_thread(thread, Instant::now() + stop_timeout) {
         Some(_) => SecretHandshakeWait::TimedOutStopped,
         None => SecretHandshakeWait::TimedOutRunning,
     }
@@ -797,13 +1121,30 @@ fn connect_secret_pipe(
     connection_id: String,
     browser: String,
 ) -> Result<std::fs::File, String> {
-    let mut pipe = OpenOptions::new()
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+
+    // 必须以 FILE_FLAG_OVERLAPPED 打开：同步客户端句柄上"有挂起阻塞读时
+    // WriteFile 永久阻塞"（Windows 同步管道句柄的已知行为）；重叠句柄让
+    // reader/writer 两线程在同一管道上并发挂起各自的操作。代价是该句柄上的
+    // 所有 I/O（包括握手）都必须走 OVERLAPPED。
+    let pipe = OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(FILE_FLAG_OVERLAPPED)
         .open(&endpoint.pipe_name)
         .map_err(|error| format!("failed to open browser secret pipe: {error}"))?;
-    write_secret_frame(
-        &mut pipe,
+    let raw = pipe.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let op_event = SecretPipeEvent::new_manual_reset()?;
+    // 整个握手共享 SECRET_HANDSHAKE_TIMEOUT 预算：等待带超时、超时即取消，
+    // 握手线程不会永久卡死；外层 TimedOutRunning→fatal 的兜底仍然保留。
+    let deadline = Instant::now() + SECRET_HANDSHAKE_TIMEOUT;
+    match write_secret_frame_overlapped(
+        raw,
+        &op_event,
+        None,
+        Some(deadline),
         &serde_json::json!({
             "version": PROTOCOL_VERSION,
             "type": "secret.hello",
@@ -812,13 +1153,27 @@ fn connect_secret_pipe(
             "browser": browser,
             "processId": std::process::id(),
         }),
-    )?;
-    let ready = read_secret_frame(&mut pipe)?
-        .ok_or_else(|| "browser secret pipe closed during handshake".to_string())?;
-    if ready.get("type").and_then(Value::as_str) != Some("secret.ready") {
-        return Err("browser secret handshake was rejected".to_string());
+    ) {
+        SecretFrameIo::Written => {}
+        SecretFrameIo::TimedOut => {
+            return Err("browser secret pipe handshake timed out".to_string());
+        }
+        SecretFrameIo::Frame(_) | SecretFrameIo::Stopped | SecretFrameIo::Closed => {
+            return Err("browser secret pipe closed during handshake".to_string());
+        }
     }
-    Ok(pipe)
+    match read_secret_frame_overlapped(raw, &op_event, None, Some(deadline)) {
+        SecretFrameIo::Frame(ready)
+            if ready.get("type").and_then(Value::as_str) == Some("secret.ready") =>
+        {
+            Ok(pipe)
+        }
+        SecretFrameIo::Frame(_) => Err("browser secret handshake was rejected".to_string()),
+        SecretFrameIo::TimedOut => Err("browser secret pipe handshake timed out".to_string()),
+        SecretFrameIo::Written | SecretFrameIo::Stopped | SecretFrameIo::Closed => {
+            Err("browser secret pipe closed during handshake".to_string())
+        }
+    }
 }
 
 /// 把 connector 上报的 fatal 转成主循环的退出错误。主循环每次迭代都会调用：
@@ -921,7 +1276,7 @@ fn start_secret_connector(
                         continue;
                     }
                 };
-                let mut pipe = match wait_secret_handshake_thread(
+                let pipe = match wait_secret_handshake_thread(
                     handshake_thread,
                     SECRET_HANDSHAKE_TIMEOUT,
                     SECRET_IO_STOP_TIMEOUT,
@@ -965,7 +1320,7 @@ fn start_secret_connector(
                         return;
                     }
                 };
-                let mut reader = match pipe.try_clone() {
+                let reader = match pipe.try_clone() {
                     Ok(reader) => reader,
                     Err(error) => {
                         log_host_diag(
@@ -989,14 +1344,30 @@ fn start_secret_connector(
                 log_host_diag("handshake-succeeded", "");
 
                 let stop = Arc::new(AtomicBool::new(false));
+                let stop_event = match SecretPipeEvent::new_manual_reset() {
+                    Ok(event) => Arc::new(event),
+                    Err(error) => {
+                        log_host_diag(
+                            "connection-setup-failed",
+                            &format!("stop-event: {error}"),
+                        );
+                        continue;
+                    }
+                };
                 let (io_ended_tx, io_ended_rx) = mpsc::channel();
                 let reader_commands = command_sender.clone();
                 let reader_stop = stop.clone();
+                let reader_stop_event = stop_event.clone();
                 let reader_ended = io_ended_tx.clone();
                 let reader_thread = std::thread::Builder::new()
                     .name("petaldesk-password-native-reader".to_string())
                     .spawn(move || {
-                        let exit = run_secret_reader(&mut reader, &reader_commands, &reader_stop);
+                        let exit = run_secret_reader(
+                            &reader,
+                            &reader_commands,
+                            &reader_stop,
+                            &reader_stop_event,
+                        );
                         let _ = reader_ended.send(SecretIoExit::Reader(exit));
                     });
                 let reader_thread = match reader_thread {
@@ -1015,20 +1386,27 @@ fn start_secret_connector(
 
                 let writer_receiver = outbound_receiver.clone();
                 let writer_stop = stop.clone();
+                let writer_stop_event = stop_event.clone();
                 let writer_ended = io_ended_tx.clone();
                 let writer_thread = std::thread::Builder::new()
                     .name("petaldesk-password-native-writer".to_string())
                     .spawn(move || {
-                        let exit = run_secret_writer(&mut pipe, &writer_receiver, &writer_stop);
+                        let exit = run_secret_writer(
+                            &pipe,
+                            &writer_receiver,
+                            &writer_stop,
+                            &writer_stop_event,
+                        );
                         let _ = writer_ended.send(SecretIoExit::Writer(exit));
                     });
                 let writer_thread = match writer_thread {
                     Ok(thread) => thread,
                     Err(_) => {
                         stop.store(true, Ordering::Release);
+                        stop_event.signal();
                         let deadline = Instant::now() + SECRET_IO_STOP_TIMEOUT;
                         let reader_stopped =
-                            cancel_and_join_secret_thread(reader_thread, deadline).is_some();
+                            join_secret_thread(reader_thread, deadline).is_some();
                         let _ = command_sender.send(serde_json::json!({
                             "type": "secret.lifecycle",
                             "event": "secretDisconnected",
@@ -1081,9 +1459,13 @@ fn start_secret_connector(
                     }
                 };
                 stop.store(true, Ordering::Release);
+                // 手动重置事件保持 signaled：无论 worker 正挂在等待里还是尚未进入
+                // 下一次操作，都会在标志检查或 WaitForMultipleObjects 处醒来并
+                // CancelIoEx 自己的挂起操作，不存在 missed-cancel 窗口。
+                stop_event.signal();
                 let deadline = Instant::now() + SECRET_IO_STOP_TIMEOUT;
                 let workers_stopped =
-                    cancel_and_join_secret_workers(reader_thread, writer_thread, deadline);
+                    join_secret_workers(reader_thread, writer_thread, deadline);
 
                 let mut stop_connector = first_exit.stops_connector();
                 while let Ok(exit) = io_ended_rx.try_recv() {
@@ -1186,7 +1568,9 @@ fn is_process_alive(process_id: u32) -> bool {
     alive
 }
 
-#[cfg(windows)]
+/// 同步帧读取。生产代码的客户端句柄已改为 FILE_FLAG_OVERLAPPED（同步
+/// ReadFile 在其上是未定义行为），此函数只保留给测试里的同步服务器端使用。
+#[cfg(all(windows, test))]
 fn read_secret_frame<R: Read>(reader: &mut R) -> Result<Option<Value>, String> {
     let mut length = [0_u8; 4];
     match reader.read_exact(&mut length) {
@@ -1209,19 +1593,13 @@ fn read_secret_frame<R: Read>(reader: &mut R) -> Result<Option<Value>, String> {
         .map_err(|error| format!("browser secret message is invalid: {error}"))
 }
 
-#[cfg(windows)]
+/// 同步帧写入（含 flush），语义不变，只保留给测试里的同步服务器端使用；
+/// 生产写入路径是 `write_secret_frame_overlapped`（管道写完即可见，无 flush）。
+#[cfg(all(windows, test))]
 fn write_secret_frame<W: Write>(writer: &mut W, value: &Value) -> Result<(), String> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|error| format!("failed to encode browser secret message: {error}"))?;
-    if bytes.is_empty() || bytes.len() > MAX_NATIVE_MESSAGE_BYTES {
-        return Err(format!(
-            "browser secret message length is invalid: {}",
-            bytes.len()
-        ));
-    }
+    let frame = encode_secret_frame(value)?;
     writer
-        .write_all(&(bytes.len() as u32).to_le_bytes())
-        .and_then(|_| writer.write_all(&bytes))
+        .write_all(&frame)
         .and_then(|_| writer.flush())
         .map_err(|error| format!("failed to write browser secret message: {error}"))
 }
@@ -1298,13 +1676,81 @@ mod tests {
         })));
     }
 
+    /// 真实管道对：服务器端（CreateNamedPipeW，同步句柄，模拟桌面端）+
+    /// 客户端（生产实现同款 OpenOptions + FILE_FLAG_OVERLAPPED）。
+    #[cfg(windows)]
+    struct TestSecretPipePair {
+        server: std::fs::File,
+        client: std::fs::File,
+    }
+
+    #[cfg(windows)]
+    impl TestSecretPipePair {
+        fn new() -> Self {
+            use std::os::windows::ffi::OsStrExt;
+            use std::os::windows::fs::OpenOptionsExt;
+            use std::os::windows::io::FromRawHandle;
+            use windows_sys::Win32::Foundation::{
+                GetLastError, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE,
+            };
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
+            };
+            use windows_sys::Win32::System::Pipes::{
+                ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE,
+                PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+            };
+
+            let name = format!(r"\\.\pipe\PetalDesk-password-test-{}", Uuid::new_v4());
+            let wide = std::ffi::OsStr::new(&name)
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            let server_handle = unsafe {
+                CreateNamedPipeW(
+                    wide.as_ptr(),
+                    PIPE_ACCESS_DUPLEX,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                    1,
+                    64 * 1024,
+                    64 * 1024,
+                    5_000,
+                    std::ptr::null(),
+                )
+            };
+            assert_ne!(server_handle, INVALID_HANDLE_VALUE);
+            let server_handle = server_handle as usize;
+            let connect_thread = std::thread::spawn(move || {
+                let server_handle = server_handle as *mut core::ffi::c_void;
+                let connected = unsafe { ConnectNamedPipe(server_handle, std::ptr::null_mut()) } != 0
+                    || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
+                assert!(connected, "ConnectNamedPipe failed in test pipe");
+                server_handle as usize
+            });
+            let client = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(FILE_FLAG_OVERLAPPED)
+                .open(&name)
+                .unwrap();
+            let server_handle = connect_thread.join().unwrap();
+            Self {
+                server: unsafe { std::fs::File::from_raw_handle(server_handle as _) },
+                client,
+            }
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn secret_reader_reports_a_closed_pipe() {
+        let pair = TestSecretPipePair::new();
+        drop(pair.server);
         let (command_tx, _command_rx) = mpsc::channel();
         let stop = AtomicBool::new(false);
+        let stop_event = SecretPipeEvent::new_manual_reset().unwrap();
         assert_eq!(
-            run_secret_reader(&mut Cursor::new(Vec::<u8>::new()), &command_tx, &stop),
+            run_secret_reader(&pair.client, &command_tx, &stop, &stop_event),
             SecretReaderExit::PipeClosed
         );
     }
@@ -1312,21 +1758,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn secret_writer_reports_a_pipe_write_failure() {
-        struct BrokenWriter;
-
-        impl Write for BrokenWriter {
-            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-                Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "test pipe closed",
-                ))
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
+        let pair = TestSecretPipePair::new();
+        drop(pair.server);
         let (outbound_tx, outbound_rx) = mpsc::channel();
         outbound_tx
             .send(serde_json::json!({
@@ -1335,125 +1768,181 @@ mod tests {
             }))
             .unwrap();
         let stop = AtomicBool::new(false);
+        let stop_event = SecretPipeEvent::new_manual_reset().unwrap();
         assert_eq!(
-            run_secret_writer(&mut BrokenWriter, &Mutex::new(outbound_rx), &stop),
+            run_secret_writer(&pair.client, &Mutex::new(outbound_rx), &stop, &stop_event),
             SecretWriterExit::PipeClosed
         );
     }
 
     #[cfg(windows)]
     #[test]
-    fn cancelling_synchronous_io_releases_a_blocked_pipe_reader() {
-        use std::os::windows::io::FromRawHandle;
-        use windows_sys::Win32::Foundation::HANDLE;
-        use windows_sys::Win32::System::Pipes::CreatePipe;
-
-        let mut read_handle: HANDLE = std::ptr::null_mut();
-        let mut write_handle: HANDLE = std::ptr::null_mut();
-        assert_ne!(
-            unsafe { CreatePipe(&mut read_handle, &mut write_handle, std::ptr::null(), 0,) },
-            0
-        );
-        let mut reader = unsafe { std::fs::File::from_raw_handle(read_handle as _) };
-        let writer = unsafe { std::fs::File::from_raw_handle(write_handle as _) };
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
-        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+    fn stop_event_releases_a_blocked_pipe_reader() {
+        let pair = TestSecretPipePair::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_event = Arc::new(SecretPipeEvent::new_manual_reset().unwrap());
+        let (command_tx, _command_rx) = mpsc::channel::<Value>();
+        let reader_client = pair.client;
+        let reader_stop = stop.clone();
+        let reader_stop_event = stop_event.clone();
         let reader_thread = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let mut byte = [0_u8; 1];
-            let result = reader.read_exact(&mut byte);
-            let _ = finished_tx.send(result.is_err());
+            run_secret_reader(&reader_client, &command_tx, &reader_stop, &reader_stop_event)
         });
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-
-        let joined =
-            cancel_and_join_secret_thread(reader_thread, Instant::now() + SECRET_IO_STOP_TIMEOUT);
-        let cancelled = finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        drop(writer);
-        assert!(cancelled, "blocked pipe read was not cancelled");
-        assert!(joined.is_some(), "cancelled pipe reader did not stop");
+        // 让 reader 先挂起在读上（桌面侧保持静默）。
+        std::thread::sleep(Duration::from_millis(100));
+        stop.store(true, Ordering::Release);
+        stop_event.signal();
+        let outcome = join_secret_thread(reader_thread, Instant::now() + SECRET_IO_STOP_TIMEOUT);
+        drop(pair.server);
+        assert_eq!(
+            outcome.map(std::thread::Result::unwrap),
+            Some(SecretReaderExit::Stopped),
+            "blocked overlapped reader was not released by the stop event"
+        );
     }
 
     #[cfg(windows)]
     #[test]
-    fn worker_stop_retries_after_a_missed_cancel_window() {
-        use std::os::windows::io::FromRawHandle;
-        use windows_sys::Win32::Foundation::HANDLE;
-        use windows_sys::Win32::System::Pipes::CreatePipe;
-
-        let mut read_handle: HANDLE = std::ptr::null_mut();
-        let mut write_handle: HANDLE = std::ptr::null_mut();
-        assert_ne!(
-            unsafe { CreatePipe(&mut read_handle, &mut write_handle, std::ptr::null(), 0,) },
-            0
-        );
-        let mut reader = unsafe { std::fs::File::from_raw_handle(read_handle as _) };
-        let writer = unsafe { std::fs::File::from_raw_handle(write_handle as _) };
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
-        let (proceed_tx, proceed_rx) = mpsc::sync_channel(1);
-        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+    fn signaled_stop_covers_workers_that_have_not_entered_io_yet() {
+        // 手动重置 stop 事件保持 signaled，不存在 CancelSynchronousIo 的
+        // missed-cancel 窗口：worker 即使在 signal 之后才进入循环，也会在
+        // 标志检查处直接退出。
+        let pair = TestSecretPipePair::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_event = Arc::new(SecretPipeEvent::new_manual_reset().unwrap());
+        stop.store(true, Ordering::Release);
+        stop_event.signal();
+        let (command_tx, _command_rx) = mpsc::channel::<Value>();
+        let reader_stop = stop.clone();
+        let reader_stop_event = stop_event.clone();
+        let reader_client = pair.client;
         let reader_thread = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            proceed_rx.recv().unwrap();
-            let mut byte = [0_u8; 1];
-            let result = reader.read_exact(&mut byte);
-            finished_tx.send(result.is_err()).unwrap();
-        });
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        let release_thread = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            proceed_tx.send(()).unwrap();
+            let _ =
+                run_secret_reader(&reader_client, &command_tx, &reader_stop, &reader_stop_event);
         });
         let other_worker = std::thread::spawn(|| {});
-        let stopped = cancel_and_join_secret_workers(
+        let stopped = join_secret_workers(
             reader_thread,
             other_worker,
             Instant::now() + SECRET_IO_STOP_TIMEOUT,
         );
-        drop(writer);
-        release_thread.join().unwrap();
+        drop(pair.server);
         assert!(
             stopped,
-            "workers did not stop after the missed-cancel window"
-        );
-        assert!(
-            finished_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            "the worker did not observe cancellation after entering pipe I/O"
+            "workers did not stop after the stop event was signaled"
         );
     }
 
     #[cfg(windows)]
     #[test]
-    fn handshake_timeout_cancels_a_blocked_pipe_operation() {
-        use std::os::windows::io::FromRawHandle;
-        use windows_sys::Win32::Foundation::HANDLE;
-        use windows_sys::Win32::System::Pipes::CreatePipe;
-
-        let mut read_handle: HANDLE = std::ptr::null_mut();
-        let mut write_handle: HANDLE = std::ptr::null_mut();
-        assert_ne!(
-            unsafe { CreatePipe(&mut read_handle, &mut write_handle, std::ptr::null(), 0,) },
-            0
-        );
-        let mut reader = unsafe { std::fs::File::from_raw_handle(read_handle as _) };
-        let writer = unsafe { std::fs::File::from_raw_handle(write_handle as _) };
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
+    fn handshake_wait_returns_after_a_self_timing_out_operation() {
+        // 重叠 I/O 自带超时 + CancelIoEx：被静默管道卡住的握手操作会自行超时，
+        // 无需外部取消，wait_secret_handshake_thread 在宽限期内 join 到它。
+        let pair = TestSecretPipePair::new();
+        let (done_tx, done_rx) = mpsc::channel();
         let handshake_thread = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let mut byte = [0_u8; 1];
-            let _ = reader.read_exact(&mut byte);
+            use std::os::windows::io::AsRawHandle;
+            let raw = pair.client.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+            let op_event = SecretPipeEvent::new_manual_reset().unwrap();
+            let outcome = read_secret_frame_overlapped(
+                raw,
+                &op_event,
+                None,
+                Some(Instant::now() + Duration::from_millis(50)),
+            );
+            done_tx.send(outcome).unwrap();
         });
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let outcome = wait_secret_handshake_thread(
             handshake_thread,
-            Duration::from_millis(25),
+            Duration::from_millis(10),
             SECRET_IO_STOP_TIMEOUT,
         );
-        drop(writer);
+        drop(pair.server);
         assert!(
             matches!(outcome, SecretHandshakeWait::TimedOutStopped),
-            "handshake timeout did not cancel the blocked operation"
+            "self-timing-out handshake operation was not joined within the grace period"
         );
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            SecretFrameIo::TimedOut,
+            "overlapped read on a silent pipe did not time out"
+        );
+    }
+
+    /// 核心回归：overlapped 客户端句柄上"有挂起读时写必须完成"（同步句柄
+    /// 在同一情形下的死锁正是本次修复对象）。走生产路径
+    /// run_secret_reader/run_secret_writer。
+    #[cfg(windows)]
+    #[test]
+    fn overlapped_pipe_writes_complete_while_a_read_is_pending() {
+        let pair = TestSecretPipePair::new();
+        let mut server = pair.server;
+        let client = pair.client;
+        let reader_client = client.try_clone().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_event = Arc::new(SecretPipeEvent::new_manual_reset().unwrap());
+        let (command_tx, command_rx) = mpsc::channel::<Value>();
+        let reader_stop = stop.clone();
+        let reader_stop_event = stop_event.clone();
+        let reader_thread = std::thread::spawn(move || {
+            let _ =
+                run_secret_reader(&reader_client, &command_tx, &reader_stop, &reader_stop_event);
+        });
+        let (outbound_tx, outbound_rx) = mpsc::channel::<Value>();
+        let writer_stop = stop.clone();
+        let writer_stop_event = stop_event.clone();
+        let writer_thread = std::thread::spawn(move || {
+            let _ = run_secret_writer(
+                &client,
+                &Mutex::new(outbound_rx),
+                &writer_stop,
+                &writer_stop_event,
+            );
+        });
+        // 让 reader 挂起在读上；桌面侧保持静默（不写任何东西）。
+        std::thread::sleep(Duration::from_millis(100));
+
+        // 服务器在独立线程同步 I/O：若写真的死锁，只会拖住这个断言而不是
+        // 整个测试进程。读完响应后立刻反向写一条 secret.command，验证挂起的
+        // 读同样能完成。
+        let (received_tx, received_rx) = mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let received = read_secret_frame(&mut server);
+            let command = serde_json::json!({
+                "type": "secret.command",
+                "id": "server-ping",
+                "command": "ping",
+            });
+            let answered = write_secret_frame(&mut server, &command).map(|_| command);
+            let _ = received_tx.send((received, answered));
+        });
+        let frame = serde_json::json!({
+            "type": "secret.response",
+            "id": "overlapped-write",
+            "ok": true,
+            "queuedAtUnixMs": unix_time_ms(),
+        });
+        outbound_tx.send(frame.clone()).unwrap();
+        let (received, answered) = received_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("write deadlocked behind the pending read");
+        let received = received.unwrap().unwrap();
+        assert_eq!(received, frame);
+        let command = answered.unwrap();
+        let forwarded = command_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("pending read did not complete while writing");
+        assert_eq!(forwarded, command);
+
+        stop.store(true, Ordering::Release);
+        stop_event.signal();
+        let workers_stopped = join_secret_workers(
+            reader_thread,
+            writer_thread,
+            Instant::now() + SECRET_IO_STOP_TIMEOUT,
+        );
+        server_thread.join().unwrap();
+        assert!(workers_stopped, "secret workers did not stop after the test");
     }
 
     #[cfg(windows)]
