@@ -861,7 +861,12 @@ impl PasswordBrowserService {
             .and_then(|epoch| store.browser_fill_data_at(entry_id, epoch));
         let data = match data {
             Ok(data) => data,
-            Err(_) => {
+            Err(error) => {
+                self.bridge.record_event(
+                    "fill",
+                    "fill-request-rejected",
+                    format!("tabId={tab_id} origin={origin} reason={}", error.code),
+                );
                 // Locked vault or a stale entry id: push a locked badge so the
                 // popup re-reads the state instead of waiting for the fill.
                 self.push_badge(&event.connection_id, tab_id, origin, true, Vec::new());
@@ -869,6 +874,11 @@ impl PasswordBrowserService {
             }
         };
         if data.origin != origin {
+            self.bridge.record_event(
+                "fill",
+                "fill-request-rejected",
+                format!("tabId={tab_id} origin={origin} reason=origin-mismatch"),
+            );
             return;
         }
         let session_id = Uuid::new_v4().to_string();
@@ -902,6 +912,11 @@ impl PasswordBrowserService {
                 "allowInsecureHttp": data.allow_insecure_http,
             }),
             REQUEST_TIMEOUT,
+        );
+        self.bridge.record_event(
+            "fill",
+            "offer-fill-direct",
+            format!("tabId={tab_id} origin={origin} ok={}", result.is_ok()),
         );
         if result.is_err() {
             lock_unpoisoned(&self.fills).remove(&session_id);
@@ -940,7 +955,20 @@ impl PasswordBrowserService {
             .or_default()
             .insert(tab_id, origin.to_string());
         let (locked, accounts) = badge_accounts(store, origin);
-        self.push_badge(&event.connection_id, tab_id, origin, locked, accounts);
+        self.bridge.record_event(
+            "badge",
+            "origin-active",
+            format!(
+                "tabId={tab_id} origin={origin} locked={locked} accounts={}",
+                accounts.len()
+            ),
+        );
+        let result = self.push_badge_result(&event.connection_id, tab_id, origin, locked, accounts);
+        self.bridge.record_event(
+            "badge",
+            "push",
+            format!("tabId={tab_id} ok={}", result.is_ok()),
+        );
     }
 
     fn push_badge(
@@ -951,7 +979,18 @@ impl PasswordBrowserService {
         locked: bool,
         accounts: Vec<PasswordCaptureAccount>,
     ) {
-        let _ = self.bridge.request_connection(
+        let _ = self.push_badge_result(connection_id, tab_id, origin, locked, accounts);
+    }
+
+    fn push_badge_result(
+        &self,
+        connection_id: &str,
+        tab_id: i64,
+        origin: &str,
+        locked: bool,
+        accounts: Vec<PasswordCaptureAccount>,
+    ) -> Result<Value, String> {
+        self.bridge.request_connection(
             connection_id,
             "password.updateBadge",
             serde_json::json!({
@@ -961,7 +1000,7 @@ impl PasswordBrowserService {
                 "accounts": accounts,
             }),
             BADGE_REQUEST_TIMEOUT,
-        );
+        )
     }
 
     /// Recomputes and pushes the badge for every tracked tab. Called after

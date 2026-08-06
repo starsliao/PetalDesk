@@ -1363,13 +1363,14 @@
         return { documentId: null, origin: "", tabId: null };
       }
       const context = tabContexts.get(tabId);
-      let origin = context ? context.origin : "";
+      let origin = "";
+      try {
+        origin = templates.exactOrigin(tab.url);
+      } catch (_error) {
+        origin = "";
+      }
       if (!origin) {
-        try {
-          origin = templates.exactOrigin(tab.url);
-        } catch (_error) {
-          origin = "";
-        }
+        origin = context ? context.origin : "";
       }
       return {
         documentId: context ? context.documentId : null,
@@ -1493,15 +1494,38 @@
       api.onActivated((activeInfo) => {
         const tabId = activeInfo && Number.isInteger(activeInfo.tabId) ? activeInfo.tabId : null;
         if (tabId == null) return;
-        const context = tabContexts.get(tabId);
-        if (context && context.origin) {
-          postEvent("originActive", { origin: context.origin, tabId });
-          return;
-        }
-        // No content script has announced this tab, so a badge left over from
-        // a previous page must not survive the switch.
-        clearTabAccounts(tabId);
+        // Always trust the live tab URL: the cached origin can be stale when a
+        // navigation happened while the desktop channel was down, or when the
+        // page moved without a full reload (SPA).
+        void liveTabOrigin(tabId).then((origin) => {
+          if (origin) {
+            const context = tabContexts.get(tabId);
+            tabContexts.set(tabId, { documentId: context ? context.documentId : null, origin });
+            postEvent("originActive", { origin, tabId });
+            return;
+          }
+          // No fillable origin on this tab, so a badge left over from
+          // a previous page must not survive the switch. The desktop drops
+          // its tracking entry on an empty origin.
+          postEvent("originActive", { origin: "", tabId });
+          clearTabAccounts(tabId);
+        });
       });
+    }
+
+    async function liveTabOrigin(tabId) {
+      if (typeof api.getTab === "function") {
+        const tab = await api.getTab(tabId).catch(() => null);
+        if (tab && tab.url) {
+          try {
+            return templates.exactOrigin(tab.url);
+          } catch (_error) {
+            return "";
+          }
+        }
+      }
+      const context = tabContexts.get(tabId);
+      return context ? context.origin : "";
     }
 
     async function onSecretConnected() {

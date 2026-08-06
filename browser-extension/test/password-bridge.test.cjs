@@ -28,7 +28,7 @@ function loadBridge() {
   };
   const api = {
     browserFamily: "firefox",
-    extensionVersion: "0.7.1",
+    extensionVersion: "0.7.2",
     action: {
       async setBadgeText(value) {
         actionUpdates.badgeTexts.push(JSON.parse(JSON.stringify(value)));
@@ -367,7 +367,7 @@ test("updateBadge trims and validates accounts, and tab removal clears the cache
   assert.equal(state.tab.locked, false);
 });
 
-test("tab-ready reports the active origin and tab activation replays it", async () => {
+test("tab-ready reports the active origin and tab activation replays the live url", async () => {
   const harness = loadBridge();
   harness.tabs.set(70, { id: 70, url: "https://example.test/login" });
   const sender = {
@@ -382,10 +382,18 @@ test("tab-ready reports the active origin and tab activation replays it", async 
   );
   assert.equal(harness.events.at(-1).event, "originActive");
   assert.deepEqual(harness.events.at(-1).payload, { origin: "https://example.test", tabId: 70 });
+  // The tab navigated while the desktop channel was down: the cached origin is
+  // stale, so activation must report the live tab url instead.
+  harness.tabs.set(70, { id: 70, url: "https://new-origin.test/home" });
   harness.tabActivations.listeners[0]({ tabId: 70, windowId: 1 });
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(harness.events.at(-1).event, "originActive");
-  assert.deepEqual(harness.events.at(-1).payload, { origin: "https://example.test", tabId: 70 });
+  assert.deepEqual(harness.events.at(-1).payload, { origin: "https://new-origin.test", tabId: 70 });
+  // A non-web tab clears the badge and tells the desktop to drop its tracking.
+  harness.tabs.set(71, { id: 71, url: "about:newtab" });
   harness.tabActivations.listeners[0]({ tabId: 71, windowId: 1 });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(harness.events.at(-1).payload, { origin: "", tabId: 71 });
   assert.deepEqual(harness.actionUpdates.badgeTexts.at(-1), { tabId: 71, text: "" });
 });
 
@@ -441,7 +449,7 @@ test("popup state reports diagnostics recorded at the command boundary", async (
   await harness.bridge.route({ command: "password.getStatus", payload: {} });
   let state = await harness.sendPopup({ type: "petaldesk.popup.getState" });
   assert.equal(state.diagnostics.nativeConnected, true);
-  assert.equal(state.diagnostics.extensionVersion, "0.7.1");
+  assert.equal(state.diagnostics.extensionVersion, "0.7.2");
   assert.equal(state.diagnostics.lastCommandOk, true);
   assert.equal(state.diagnostics.lastCommandErrorCode, null);
   assert.equal(typeof state.diagnostics.lastCommandAt, "number");

@@ -813,6 +813,11 @@ impl BrowserSecretBridge {
         });
     }
 
+    /// 给编排层（password_browser）记录业务事件到诊断环。禁止写入秘密。
+    pub(crate) fn record_event(&self, layer: &'static str, event: &'static str, detail: impl Into<String>) {
+        record_diag(&self.inner, layer, event, detail);
+    }
+
     /// 最近 N 条诊断（按时间升序）。供密码状态接口展示通道健康状况。
     pub(crate) fn diag_snapshot(&self, limit: usize) -> Vec<DiagEntry> {
         let diag = lock_unpoisoned(&self.inner.diag);
