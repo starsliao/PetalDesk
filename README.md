@@ -2,7 +2,7 @@
 
 > 把想法留在桌面，把文件留在自己手里。
 
-[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows x64](https://github.com/starsliao/PetalDesk/releases/download/v0.7.2/PetalDesk_0.7.2_x64-setup.exe) · [下载 macOS Universal](https://github.com/starsliao/PetalDesk/releases/download/v0.7.2/PetalDesk_0.7.2_universal.dmg)
+[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows x64](https://github.com/starsliao/PetalDesk/releases/download/v0.7.3/PetalDesk_0.7.3_x64-setup.exe) · [下载 macOS Universal](https://github.com/starsliao/PetalDesk/releases/download/v0.7.3/PetalDesk_0.7.3_universal.dmg)
 
 飞花 - PetalDesk 是一款面向 Windows 10/11 与 macOS 12+ 的本地便签与效率工具。它启动快、界面安静，支持 Markdown 即时排版、纯文本、图片、搜索、回收站，以及截图、任务规划和本地 MFA 验证器等随时可以唤起的小工具。没有账号、没有云端依赖，内容保留在你的本地数据目录中。
 
@@ -32,9 +32,9 @@
 | --- | --- |
 | <img src="website/assets/screenshots/password-manager-tool.png" alt="飞花 - PetalDesk 密码管理器" width="500" /> | <img src="website/assets/screenshots/mfa-tool.png" alt="飞花 - PetalDesk MFA 验证器" width="260" /> |
 
-### 0.7.2 平台支持
+### 0.7.3 平台支持
 
-`0.7.2` 修复了密码通道自 0.6.3 以来的根因：Windows 同步命名管道在挂起读时另一方向写入会永久阻塞，桌面端与 Native Host 双端均改为重叠 I/O，连接不再每几秒超时重连；同时修复扩展在通道恢复后仍上报过期站点 origin 的问题（标签页激活时一律读取实时 URL），并补充角标/填充全链路的连接诊断事件。`0.7.1` 将远程桌面与录屏的敏感窗口保护改为可选设置：默认在远程桌面会话中也允许打开 MFA 验证器与密码管理器，窗口内容不再对截图和录屏隐藏；需要旧行为时可在 设置 > 隐私与安全 中开启"保护敏感窗口"。`0.7.0` 为 Firefox 扩展新增站点账户数角标与诊断/账户弹窗，弹窗中点击账户即可在当前页发起填充；登录检测现在支持"保存为新账户或选择更新任一既有账户"，保险库支持浏览器后台会话，密码窗口关闭时角标、捕获与填充仍可用，手动锁定后立即停止。Firefox"与扩展开发者分享身份验证信息"改为安装时必要权限，不再要求工具栏二次授权。`0.6.3` 修复 Firefox 原生消息通道断开后造成的飞花卡顿、密码权限误报和扩展按钮无反馈，并为通道握手与重连增加超时保护。`0.6.2` 已修复密码管理器图标提示、窗口关闭和手动锁定交互，取消闲置 15 分钟自动锁定；远程桌面会话中不再打开会被系统隐藏的 MFA 与密码管理器窗口，而是直接说明原因并提示回到本机使用。
+`0.7.3` 按使用反馈简化密码体验：扩展弹窗中点击账户直接填充（不再要求页面二次确认，填充后页面短暂提示且绝不自动提交）；登录检测改为始终开启，提交登录即提示保存/更新（不再判断登录是否成功），并移除密码管理器中的检测开关与首次引导；弹窗账户新增菜单，可复制用户名、复制密码（由桌面端写入剪贴板，凭据不经过扩展）和删除账户（二次确认）；Windows 安装器检测到旧版本时直接覆盖更新，不再询问卸载。`0.7.2` 修复了密码通道自 0.6.3 以来的根因：Windows 同步命名管道在挂起读时另一方向写入会永久阻塞，桌面端与 Native Host 双端均改为重叠 I/O，连接不再每几秒超时重连；同时修复扩展在通道恢复后仍上报过期站点 origin 的问题（标签页激活时一律读取实时 URL），并补充角标/填充全链路的连接诊断事件。`0.7.1` 将远程桌面与录屏的敏感窗口保护改为可选设置：默认在远程桌面会话中也允许打开 MFA 验证器与密码管理器，窗口内容不再对截图和录屏隐藏；需要旧行为时可在 设置 > 隐私与安全 中开启"保护敏感窗口"。`0.7.0` 为 Firefox 扩展新增站点账户数角标与诊断/账户弹窗，弹窗中点击账户即可在当前页发起填充；登录检测现在支持"保存为新账户或选择更新任一既有账户"，保险库支持浏览器后台会话，密码窗口关闭时角标、捕获与填充仍可用，手动锁定后立即停止。Firefox"与扩展开发者分享身份验证信息"改为安装时必要权限，不再要求工具栏二次授权。`0.6.3` 修复 Firefox 原生消息通道断开后造成的飞花卡顿、密码权限误报和扩展按钮无反馈，并为通道握手与重连增加超时保护。`0.6.2` 已修复密码管理器图标提示、窗口关闭和手动锁定交互，取消闲置 15 分钟自动锁定；远程桌面会话中不再打开会被系统隐藏的 MFA 与密码管理器窗口，而是直接说明原因并提示回到本机使用。
 
 | 能力 | Windows 10/11 x64 | macOS 12+（Intel / Apple Silicon） |
 | --- | --- | --- |
@@ -95,15 +95,15 @@ MFA 与密码管理器同样可以随整个数据目录迁移。首次启用任�
 
 ### 升级与兼容
 
-Windows 上的 `0.5.2` 是自动更新桥接版本；已安装该版本或更高版本的用户可直接在飞花内更新到 `0.7.2`，无需重新运行本地安装流程。macOS 的 `0.5.0` 是首个公开版本，`0.7.2` 可以直接覆盖升级，但当前仍使用手动下载安装。首次启动时会自动识别旧的 `飞花/.feihua` 存储布局、旧便签元数据和旧甘特图数组格式，转换到当前 `.petaldesk/` 结构；便签正文 `note.md` 不会被改写，甘特图转换前会保留迁移备份。同机升级不需要输入全局恢复密码；恢复密码由 MFA 与密码管理器全局共用，用于跨设备恢复两个保险库，以及主动导出单个 MFA 账户。旧数据损坏或格式版本过新时，飞花会保留原文件并阻止静默覆盖。
+Windows 上的 `0.5.2` 是自动更新桥接版本；已安装该版本或更高版本的用户可直接在飞花内更新到 `0.7.3`，无需重新运行本地安装流程。macOS 的 `0.5.0` 是首个公开版本，`0.7.3` 可以直接覆盖升级，但当前仍使用手动下载安装。首次启动时会自动识别旧的 `飞花/.feihua` 存储布局、旧便签元数据和旧甘特图数组格式，转换到当前 `.petaldesk/` 结构；便签正文 `note.md` 不会被改写，甘特图转换前会保留迁移备份。同机升级不需要输入全局恢复密码；恢复密码由 MFA 与密码管理器全局共用，用于跨设备恢复两个保险库，以及主动导出单个 MFA 账户。旧数据损坏或格式版本过新时，飞花会保留原文件并阻止静默覆盖。
 
 ## 安装与运行
 
-Windows 新用户可下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.7.2/PetalDesk_0.7.2_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。`0.5.2` 起默认开启自动检查与后台下载；“关于飞花 - PetalDesk”中可以手动检查或关闭自动更新，下载完成后仍由用户选择何时重启安装。
+Windows 新用户可下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.7.3/PetalDesk_0.7.3_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。`0.5.2` 起默认开启自动检查与后台下载；“关于飞花 - PetalDesk”中可以手动检查或关闭自动更新，下载完成后仍由用户选择何时重启安装。
 
 没有 WebView2 或下载权限时，安装器会明确提示失败原因，不会静默留下无法启动的程序。未签名构建可能显示“未知发布者”，这是 Windows 对代码签名的正常提示。
 
-macOS 用户下载 [Universal DMG](https://github.com/starsliao/PetalDesk/releases/download/v0.7.2/PetalDesk_0.7.2_universal.dmg)，将应用拖入“应用程序”即可。同一个 DMG 同时包含 Intel（x86_64）和 Apple Silicon（arm64）代码，不需要按芯片下载不同安装包。普通截图首次使用时，请在“系统设置 > 隐私与安全性 > 屏幕录制”中允许 PetalDesk；未签名、未公证的测试构建可能被 Gatekeeper 阻止，正式发布方式见 [`docs/publishing.md`](docs/publishing.md)。
+macOS 用户下载 [Universal DMG](https://github.com/starsliao/PetalDesk/releases/download/v0.7.3/PetalDesk_0.7.3_universal.dmg)，将应用拖入“应用程序”即可。同一个 DMG 同时包含 Intel（x86_64）和 Apple Silicon（arm64）代码，不需要按芯片下载不同安装包。普通截图首次使用时，请在“系统设置 > 隐私与安全性 > 屏幕录制”中允许 PetalDesk；未签名、未公证的测试构建可能被 Gatekeeper 阻止，正式发布方式见 [`docs/publishing.md`](docs/publishing.md)。
 
 Windows 安装包已经包含长截图和密码管理器所需的 Native Messaging Host。首版密码自动填充与登录检测只由 Firefox 扩展提供；安装器不会静默安装扩展，用户需从 [Firefox 扩展安装页](https://starsliao.github.io/PetalDesk/firefox.html) 进入 AMO 并确认安装。不安装扩展仍可在密码管理器中打开站点、复制凭据并使用 Windows 通用长截图；安装后无需任何额外操作，浏览器长页面会在自动滚动模式下自动获得更稳定的滚动定位和拼接效果。macOS 版本不安装 Native Messaging Host，也不提供密码管理器、长截图或浏览器增强模式。
 

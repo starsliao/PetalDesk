@@ -117,14 +117,17 @@ state. `password.updateBadge` caches up to 16 account summaries
 (`entryId`/`username`/`siteName`, never secrets) for one tab, mirrors the
 count into the toolbar badge, and backs the action popup. The popup talks to
 the background over `petaldesk.popup.*` runtime messages (`getState`, `fill`,
-`openManager`) that only accept the extension's own popup sender.
+`openManager`, `copySecret`, `deleteEntry`) that only accept the extension's
+own popup sender; `copySecret` and `deleteEntry` are forwarded to the desktop
+as bare events so credentials never pass through the extension.
 
 Password events use
 `{ "type": "extension.event", "event": "...", "payload": { ... } }`.
 The event names are `tabReady`, `fillConfirm`, `fillResult`,
 `captureCandidate`, `saveDecision`, `originActive`, `fillRequest`,
-`openPasswordManager`, `templateRecordingReady`, `templateRecordingProgress`,
-`templateRecordingResult`, and `templateRecordingCancelled`.
+`openPasswordManager`, `copySecret`, `deleteEntry`, `templateRecordingReady`,
+`templateRecordingProgress`, `templateRecordingResult`, and
+`templateRecordingCancelled`.
 `password.captureMatch` can return `new`, `update`, `same`, `select`,
 `username-required`, or `locked`; a `select` or `new` decision with accounts
 is completed by a bound `replace` save action, and `locked` dismisses the
@@ -133,13 +136,18 @@ candidate available for a short retry window and clears it only after a
 confirmed success.
 
 The two-phase fill protocol is mandatory: `password.offerFill` contains no
-password; after the page overlay produces `fillConfirm`, the host sends one
-`password.provideCredentials` command. `password.offerFillDirect` skips
+password; after the page produces `fillConfirm`, the host sends one
+`password.provideCredentials` command. Fill offers carry `direct: true`, so
+the content script confirms immediately without a page overlay and shows a
+short auto-dismissing notice once the fields are filled; the overlay is still
+used for template recording. `password.offerFillDirect` skips
 `password.open` by binding an existing tab, frame, and exact origin into a
 ready session, then follows the same offer and confirmation steps. The
 request is bound to one session,
 tab, top-level frame, document, and exact origin. Content scripts fill fields
-and dispatch `input`/`change` events but never submit the form. Login candidates
+and dispatch `input`/`change` events but never submit the form. A submitted
+password form is reported as a high-confidence success immediately; the save
+prompt does not wait for a post-submit success signal. Login candidates
 stay in extension memory for at most 30 seconds. A username captured on the
 first page of a two-step login can remain in memory for at most two minutes on
 the same tab and exact origin. Neither value is written to extension storage.

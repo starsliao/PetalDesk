@@ -527,10 +527,15 @@ Function un.PetalDeskUnregisterNativeMessagingHost
   RMDir "$LOCALAPPDATA\PetalDesk\NativeMessaging"
 FunctionEnd
 
-; Stop before file copying if Firefox still owns the long-lived Native Messaging
-; host. This hook intentionally changes no storage or browser registration state.
+; Stop the browser bridge host before file copying. Firefox owns this helper and
+; respawns it the moment it dies, so prompting the user to close it can loop
+; forever; a silent kill plus the rename-aside file write (see
+; build-windows-installer.ps1) is the reliable upgrade path.
 !macro NSIS_HOOK_PREINSTALL
-  !insertmacro CheckIfAppIsRunning "petaldesk-browser-host.exe" "PetalDesk browser integration"
+  nsExec::ExecToStack '"$SYSDIR\taskkill.exe" /F /IM petaldesk-browser-host.exe'
+  Pop $0
+  Pop $1
+  Sleep 500
 !macroend
 
 ; Persist only after Tauri's running-app guard and application file/registry

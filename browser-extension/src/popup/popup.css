@@ -116,6 +116,44 @@ button.account .username {
   overflow-wrap: anywhere;
 }
 
+.account-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.account-row button.account {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
+}
+
+button.menu-trigger {
+  flex: none;
+  padding: 7px 8px;
+}
+
+.account-menu {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.account-menu button {
+  padding: 5px 8px;
+}
+
+.account-menu .confirm-label {
+  color: #566573;
+}
+
+button.danger {
+  border-color: #b00020;
+  color: #b00020;
+}
+
 .version {
   color: #93a1af;
   font-size: 11px;

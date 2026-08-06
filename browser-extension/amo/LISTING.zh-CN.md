@@ -53,5 +53,5 @@
 - 支持页面：https://github.com/starsliao/PetalDesk/issues
 - 项目主页：https://starsliao.github.io/PetalDesk/
 - 隐私政策公开 URL：https://starsliao.github.io/PetalDesk/privacy.html
-- Windows 安装包公开 URL：https://github.com/starsliao/PetalDesk/releases/download/v0.7.2/PetalDesk_0.7.2_x64-setup.exe
+- Windows 安装包公开 URL：https://github.com/starsliao/PetalDesk/releases/download/v0.7.3/PetalDesk_0.7.3_x64-setup.exe
 - 许可证：MIT

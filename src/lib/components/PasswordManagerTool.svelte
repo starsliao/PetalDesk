@@ -126,7 +126,6 @@
   let recoveryCurrentInput = $state<HTMLInputElement | null>(null);
   let recoveryInput = $state<HTMLInputElement | null>(null);
 
-  let captureBusy = $state(false);
   let filteredEntries = $derived.by(() => {
     const query = searchText.trim().toLocaleLowerCase();
     if (!query) return entries;
@@ -630,31 +629,6 @@
     }
   }
 
-  async function setCapture(enabled: boolean): Promise<void> {
-    if (captureBusy) return;
-    captureBusy = true;
-    try {
-      status = await api.setCaptureEnabled(enabled);
-      syncRequiredRecovery(status);
-      await refreshBrowserStatus();
-      if (!enabled) {
-        showToast("登录信息检测已关闭");
-      } else if (browser?.capturePermission === "granted") {
-        showToast("登录信息检测已开启");
-      } else if (browser?.capturePermission === "unknown" || !browser?.capturePermission) {
-        showToast("检测设置已保存，但 Firefox 扩展通信异常");
-      } else if (browser?.capturePermission === "unavailable") {
-        showToast("检测设置已保存，但当前扩展不支持密码权限");
-      } else {
-        showToast("登录信息检测设置已保存");
-      }
-    } catch (reason) {
-      error = reasonMessage(reason, "更新登录检测设置失败。");
-    } finally {
-      captureBusy = false;
-    }
-  }
-
   function refreshBrowserStatus(announceGrant = false): Promise<void> {
     if (browserStatusRefreshInFlight) return browserStatusRefreshInFlight;
     const request = (async () => {
@@ -974,20 +948,6 @@
     </div>
   {/if}
 
-  {#if status && !status.captureConfigured && status.available && !status.locked}
-    <div class="consent-banner" role="region" aria-label="登录信息检测授权">
-      <div class="banner-icon" aria-hidden="true"><LockKeyhole size={17} /></div>
-      <div class="banner-copy">
-        <strong>首次开启登录信息检测</strong>
-        <span>扩展只在你同意后观察登录提交，并在检测到新增或密码变化时询问是否保存。</span>
-      </div>
-      <div class="banner-actions">
-        <button type="button" class="primary-button" disabled={captureBusy} onclick={() => void setCapture(true)}>开启检测</button>
-        <button type="button" class="quiet-button" disabled={captureBusy} onclick={() => void setCapture(false)}>暂不开启</button>
-      </div>
-    </div>
-  {/if}
-
   {#if browser?.connection === "connected" && (browser.capturePermission === "unknown" || !browser.capturePermission) && status?.captureEnabled}
     <div class="consent-banner permission-banner" role="alert">
       <div class="banner-icon" aria-hidden="true"><AlertTriangle size={17} /></div>
@@ -1040,9 +1000,6 @@
 
     <div class="password-meta">
       <span>{filteredEntries.length} 个账户</span>
-      {#if status?.captureConfigured}
-        <label class="capture-toggle"><input type="checkbox" checked={status.captureEnabled} disabled={captureBusy} onchange={(event) => void setCapture((event.currentTarget as HTMLInputElement).checked)} /><span>{status.captureEnabled && browser?.capturePermission === "granted" ? "登录信息检测已开启" : "允许登录信息检测"}</span></label>
-      {/if}
     </div>
 
     {#if browser}
@@ -1187,7 +1144,7 @@
   :global(.password-tool .icon-button[data-tooltip]::after) { display: none !important; content: none !important; }
   .floating-tooltip { position: fixed; z-index: 3000; width: max-content; max-width: min(220px, calc(100vw - 16px)); padding: 5px 8px; color: #ffffff; font-size: 12px; line-height: 1.3; white-space: nowrap; pointer-events: none; background: #252525; border-radius: 4px; box-shadow: 0 2px 8px rgb(0 0 0 / 20%); }
   .password-header { display: flex; min-height: 58px; padding: 10px 16px; align-items: center; justify-content: space-between; gap: 14px; border-bottom: 1px solid var(--app-border); background: var(--app-surface); }
-  .title-block, .header-actions, .banner-copy, .banner-actions, .password-toolbar, .password-meta, .entry-heading, .entry-actions, .generator-row, .dialog-actions { display: flex; align-items: center; }
+  .title-block, .header-actions, .banner-copy, .password-toolbar, .password-meta, .entry-heading, .entry-actions, .generator-row, .dialog-actions { display: flex; align-items: center; }
   .title-block { min-width: 0; gap: 10px; }
   .tool-mark { display: inline-grid; width: 34px; height: 34px; color: #ffffff; place-items: center; background: #1677b9; border-radius: 7px; }
   h1, h2, p { margin: 0; }
@@ -1207,7 +1164,6 @@
   .banner-copy { min-width: 0; flex: 1; flex-direction: column; align-items: flex-start; gap: 2px; }
   .banner-copy strong { font-size: 12px; }
   .banner-copy span { color: var(--app-muted); font-size: 11px; line-height: 1.4; }
-  .banner-actions { flex: 0 0 auto; gap: 6px; }
   .error-banner, .recovery-notice { display: flex; padding: 8px 16px; align-items: center; gap: 7px; color: #a4231a; font-size: 12px; background: #fff2f0; border-bottom: 1px solid #f2c4bf; }
   .error-banner > span { min-width: 0; flex: 1; }
   .recovery-notice { color: #78520f; background: #fff8e7; border-color: #ead3a3; }
@@ -1218,18 +1174,15 @@
   .search-box:focus-within { border-color: var(--app-focus); box-shadow: 0 0 0 1px var(--app-focus); }
   .search-box input { min-width: 0; flex: 1; height: 100%; padding: 0; color: var(--app-fg); background: transparent; border: 0; outline: 0; font-size: 12px; }
   .clear-search { display: inline-grid; width: 22px; height: 22px; padding: 0; place-items: center; color: var(--app-muted); background: transparent; border: 0; cursor: pointer; }
-  .primary-button, .secondary-button, .quiet-button { display: inline-flex; min-height: 30px; padding: 5px 10px; align-items: center; justify-content: center; gap: 6px; font-size: 12px; border-radius: 4px; cursor: pointer; }
+  .primary-button, .secondary-button { display: inline-flex; min-height: 30px; padding: 5px 10px; align-items: center; justify-content: center; gap: 6px; font-size: 12px; border-radius: 4px; cursor: pointer; }
   .primary-button { color: #ffffff; background: var(--app-accent); border: 1px solid #00589f; }
   .primary-button:hover { background: #005ba9; }
   .secondary-button { color: var(--app-fg); background: var(--app-surface); border: 1px solid var(--app-border-strong); }
   .secondary-button:hover { background: var(--app-surface-hover); }
-  .quiet-button { padding-right: 4px; padding-left: 4px; color: var(--app-muted); background: transparent; border: 1px solid transparent; }
-  .quiet-button:hover { color: var(--app-fg); background: rgb(0 0 0 / 5%); }
   button:disabled { cursor: not-allowed; opacity: .58; }
   .add-button { flex: 0 0 auto; }
   .password-meta { min-height: 34px; padding: 0 16px 8px; gap: 12px; color: var(--app-muted); font-size: 11px; }
-  .capture-toggle { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
-  .capture-toggle input, .check-row input, .generator-checks input { accent-color: var(--app-accent); }
+  .check-row input, .generator-checks input { accent-color: var(--app-accent); }
   .diagnostics-panel { margin: 0 16px 10px; padding: 8px 10px; color: var(--app-muted); font-size: 11px; background: var(--app-surface); border: 1px solid var(--app-border); border-radius: 6px; }
   .diagnostics-panel summary { color: var(--app-fg); font-size: 12px; cursor: pointer; }
   .diagnostics-grid { display: grid; margin: 8px 0; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 6px 14px; }
@@ -1303,6 +1256,5 @@
     .entry-secret { grid-column: 2 / -1; grid-row: 2; }
     .entry-actions { grid-column: 2 / -1; grid-row: 3; justify-content: flex-start; }
     .browser-banner, .consent-banner, .recording-banner { padding-right: 10px; padding-left: 10px; align-items: flex-start; flex-wrap: wrap; }
-    .banner-actions { margin-left: 38px; }
   }
 </style>

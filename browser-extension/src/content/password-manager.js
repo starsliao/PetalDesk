@@ -19,13 +19,11 @@
   const TEMPLATE_PROGRESS_MESSAGE = "petaldesk.password.template-recording-progress";
   const TEMPLATE_CANCEL_MESSAGE = "petaldesk.password.template-recording-cancelled";
   const CANDIDATE_TTL_MS = 30_000;
-  const SUCCESS_SETTLE_MS = 900;
   const OVERLAY_ID = "petaldesk-password-overlay";
 
   let captureEnabled = false;
   let captureAllowedHttpOrigins = new Set();
   let captureListenerInstalled = false;
-  let pendingSubmission = null;
   let activeOffer = null;
   let activeCapturePrompt = null;
   let activeRecording = null;
@@ -336,6 +334,7 @@
     clearActiveOffer();
     const offer = {
       allowInsecureHttp: payload.allowInsecureHttp === true,
+      direct: payload.direct === true,
       entryId: safeString(payload.entryId, 160),
       expiresAt: Date.now() + 2 * 60 * 1_000,
       offerId,
@@ -351,6 +350,18 @@
       removeOverlay();
     }, 2 * 60 * 1_000);
     activeOffer = offer;
+    if (offer.direct) {
+      // Direct fills skip the page confirmation: the account was already
+      // chosen in PetalDesk, so confirm immediately and await fillSecret.
+      offer.confirmed = true;
+      void sendBackground({
+        type: FILL_CONFIRM_MESSAGE,
+        sessionId,
+        offerId,
+        origin,
+      }).catch(() => {});
+      return { offerId, state: "confirmed", origin, sessionId };
+    }
     createOverlay(
       "飞花密码管理器",
       `当前页面：${origin}\n账户：${activeOffer.username || "未提供"}${insecureOriginWarning(origin)}\n是否填充？不会自动提交表单。`,
@@ -400,6 +411,8 @@
     }
     let password = String(payload.password || "");
     let username = payload.username == null ? activeOffer.username : String(payload.username);
+    const directFill = activeOffer.direct === true;
+    let fillNotice = "";
     try {
       if (!password || password.length > 4_096) throw new Error("The password is invalid");
       const fields = templates.identifyLoginFields(root.document, {
@@ -428,6 +441,11 @@
         fillInputValue(fields.passwordField, password);
         filledPassword = true;
       }
+      if (directFill) {
+        fillNotice = username
+          ? `已填充 ${username}，未自动提交。`
+          : "已填充密码，未自动提交。";
+      }
       return {
         filledPassword,
         filledUsername,
@@ -443,6 +461,7 @@
       if (Object.prototype.hasOwnProperty.call(payload, "username")) payload.username = "";
       clearActiveOffer();
       removeOverlay();
+      if (fillNotice) showFillNotice(fillNotice);
     }
   }
 
@@ -470,22 +489,6 @@
     };
   }
 
-  function candidateSucceeded(beforeUrl, form, passwordField) {
-    const urlChanged = String(root.location.href) !== beforeUrl;
-    const stillAttached = form && typeof form.contains === "function" && passwordField
-      ? form.contains(passwordField)
-      : true;
-    const fields = (() => {
-      try {
-        return templates.identifyLoginFields(root.document, { origin: currentOrigin() });
-      } catch (_error) {
-        return null;
-      }
-    })();
-    const passwordVisible = Boolean(fields && fields.passwordField);
-    return urlChanged || !stillAttached || !passwordVisible;
-  }
-
   function clearCandidate(candidateId) {
     const timer = candidateTimers.get(candidateId);
     if (timer != null) clearTimeout(timer);
@@ -508,9 +511,7 @@
     const isUpdate = candidate.suggestedAction === "update";
     const id = candidate.candidateId;
     const choices = Array.isArray(candidate.accountChoices) ? candidate.accountChoices : [];
-    const title = confidence === "low"
-      ? "请确认是否登录成功"
-      : isUpdate ? "更新飞花中的密码？" : "保存登录信息到飞花？";
+    const title = isUpdate ? "更新飞花中的密码？" : "保存登录信息到飞花？";
     activeCapturePrompt = { ...activeCapturePrompt, ...candidate, confidence };
     if (activeCapturePrompt.savePending) {
       createOverlay(
@@ -596,6 +597,14 @@
     if (timer && typeof timer.unref === "function") timer.unref();
   }
 
+  function showFillNotice(message) {
+    const notice = createOverlay("飞花密码管理器", message, []);
+    const timer = setTimeout(() => {
+      if (overlay === notice) removeOverlay();
+    }, 2_000);
+    if (timer && typeof timer.unref === "function") timer.unref();
+  }
+
   function submitCaptureDecision(candidateId, action, entryId = null) {
     if (!activeCapturePrompt || activeCapturePrompt.candidateId !== candidateId || activeCapturePrompt.savePending) return;
     activeCapturePrompt.savePending = true;
@@ -625,25 +634,8 @@
     });
   }
 
-  function completeCandidate(candidateId) {
-    if (!captureEnabled || !pendingSubmission || pendingSubmission.candidateId !== candidateId) return;
-    const submission = pendingSubmission;
-    pendingSubmission = null;
-    const confidence = candidateSucceeded(
-      submission.beforeUrl,
-      submission.form,
-      submission.passwordField,
-    ) ? submission.confidence : "low";
-    void sendBackground({
-      type: CAPTURE_SUCCESS_MESSAGE,
-      candidateId,
-      confidence,
-      origin: submission.origin,
-    }).catch(() => clearCandidate(candidateId));
-  }
-
   function scheduleCandidate(form) {
-    if (!captureEnabled || !form || pendingSubmission) return;
+    if (!captureEnabled || !form) return;
     const values = candidateValues(form);
     if (!values) return;
     if (!values.password && values.username) {
@@ -660,14 +652,6 @@
     }
     const candidateId = randomId("candidate");
     const candidate = { ...values, candidateId };
-    pendingSubmission = {
-      beforeUrl: String(root.location.href),
-      candidateId,
-      confidence: values.confidence,
-      form,
-      origin: values.origin,
-      passwordField: templates.identifyLoginFields(form, { origin: currentOrigin() }).passwordField,
-    };
     scheduleCandidateExpiry(candidateId);
     const submitted = sendBackground({ type: CAPTURE_SUBMITTED_MESSAGE, candidate });
     candidate.password = "";
@@ -680,13 +664,23 @@
       }
       activeCapturePrompt = {
         candidateId,
-        confidence: values.confidence,
+        confidence: "high",
         origin: values.origin,
         suggestedAction: null,
         username: values.username,
       };
+      // A submitted password form is reported as successful immediately; the
+      // save prompt must not wait for a post-submit navigation signal.
+      return sendBackground({
+        type: CAPTURE_SUCCESS_MESSAGE,
+        candidateId,
+        confidence: "high",
+        origin: values.origin,
+      });
     }).catch((error) => {
-      if (pendingSubmission && pendingSubmission.candidateId === candidateId) pendingSubmission = null;
+      if (activeCapturePrompt && activeCapturePrompt.candidateId === candidateId) {
+        activeCapturePrompt = null;
+      }
       clearCandidate(candidateId);
       if (error && error.code === "PASSWORD_USERNAME_UNKNOWN") {
         createOverlay(
@@ -696,7 +690,6 @@
         );
       }
     });
-    setTimeout(() => completeCandidate(candidateId), SUCCESS_SETTLE_MS);
   }
 
   function onSubmit(event) {
@@ -736,7 +729,6 @@
 
   function stopCapture() {
     captureEnabled = false;
-    pendingSubmission = null;
     activeCapturePrompt = null;
     for (const candidateId of candidateTimers.keys()) clearCandidate(candidateId);
     if (captureListenerInstalled) {
@@ -868,7 +860,6 @@
   root.document.addEventListener("visibilitychange", () => {
     if (root.document.visibilityState === "hidden") {
       notifyDocumentClosed();
-      pendingSubmission = null;
       for (const candidateId of candidateTimers.keys()) clearCandidate(candidateId);
       activeCapturePrompt = null;
       if (!activeRecording) removeOverlay();
@@ -877,7 +868,6 @@
   });
   root.addEventListener("pagehide", () => {
     notifyDocumentClosed();
-    pendingSubmission = null;
     clearActiveOffer();
     activeCapturePrompt = null;
     for (const candidateId of candidateTimers.keys()) clearCandidate(candidateId);

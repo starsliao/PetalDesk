@@ -599,7 +599,12 @@ impl PasswordStore {
             &[INTERNAL_DATA_DIR, "tools", "recovery"],
         )?;
         let settings_path = root.join(SETTINGS_FILE);
-        let settings = load_settings(&settings_path)?;
+        let mut settings = load_settings(&settings_path)?;
+        // Login detection is mandatory since 0.7.2: the stored toggle is
+        // normalized on load so every settings read observes capture as
+        // enabled, including files written by older versions.
+        settings.capture_configured = true;
+        settings.capture_enabled = true;
         let vault_path = root.join(VAULT_FILE);
         let recovery_state = if vault_path.exists() {
             if read_envelope(&vault_path).is_ok() {
@@ -776,7 +781,6 @@ impl PasswordStore {
         self.validate_epoch(epoch)?;
         #[cfg(all(not(windows), not(test)))]
         {
-            let settings = lock_unpoisoned(&self.settings).clone();
             return Ok(PasswordStatus {
                 available: false,
                 locked: true,
@@ -784,8 +788,9 @@ impl PasswordStore {
                 protection: "unavailable".to_string(),
                 recovery_state: PasswordRecoveryState::Unavailable,
                 shared_recovery_configured: false,
-                capture_configured: settings.capture_configured,
-                capture_enabled: false,
+                // Login detection is mandatory since 0.7.2.
+                capture_configured: true,
+                capture_enabled: true,
                 session_epoch: epoch,
                 recovered_from_backup: false,
                 message: Some("密码管理器首版仅支持 Windows。".to_string()),
@@ -803,7 +808,6 @@ impl PasswordStore {
                 .map(|vault| (false, vault.payload.entries.len()))
                 .unwrap_or((self.vault_path.exists(), 0))
         };
-        let settings = lock_unpoisoned(&self.settings).clone();
         Ok(PasswordStatus {
             available,
             locked,
@@ -814,8 +818,11 @@ impl PasswordStore {
                 runtime.recovery_state,
                 PasswordRecoveryState::Ready | PasswordRecoveryState::PasswordRequired
             ),
-            capture_configured: settings.capture_configured,
-            capture_enabled: settings.capture_enabled,
+            // Login detection is mandatory since 0.7.2: report it as always
+            // configured and enabled regardless of the stored setting, so the
+            // first-run banner and toggle never appear again.
+            capture_configured: true,
+            capture_enabled: true,
             session_epoch: epoch,
             recovered_from_backup: runtime.recovered_from_backup,
             message: if manually_locked {
@@ -1169,6 +1176,9 @@ impl PasswordStore {
     ) -> AppResult<PasswordCaptureDecision> {
         let capture_enabled = lock_unpoisoned(&self.settings).capture_enabled;
         if !capture_enabled {
+            // Dead since 0.7.2: login detection is mandatory, so the stored
+            // setting is normalized to true on load and on every
+            // set_capture_enabled_at call. Kept in case a toggle returns.
             return Ok(PasswordCaptureDecision {
                 action: PasswordCaptureAction::Disabled,
                 entry_id: None,
@@ -1282,8 +1292,11 @@ impl PasswordStore {
         self.validate_epoch(epoch)?;
         let mut settings = lock_unpoisoned(&self.settings);
         let previous = settings.clone();
+        // Login detection is mandatory since 0.7.2: the toggle remains only
+        // for API compatibility and normalizes the stored setting to true.
+        let _ = enabled;
         settings.capture_configured = true;
-        settings.capture_enabled = enabled;
+        settings.capture_enabled = true;
         if let Err(error) = atomic_write_json(&self.settings_path, &*settings) {
             *settings = previous;
             return Err(error);
@@ -3433,16 +3446,63 @@ mod tests {
             .capture_decision(candidate("https://other.example.com", "alice", "one"))
             .unwrap();
         assert_eq!(other_origin.action, PasswordCaptureAction::Create);
-        let disabled_store = {
-            let root = tempdir().unwrap();
-            let store = PasswordStore::load(root.path()).unwrap();
-            store.activate();
-            store
-        };
-        let disabled = disabled_store
+        // Login detection is mandatory since 0.7.2: even a fresh store that
+        // never stored a capture setting evaluates candidates instead of
+        // reporting Disabled. The TempDir must outlive the store.
+        let fresh_root = tempdir().unwrap();
+        let fresh_store = PasswordStore::load(fresh_root.path()).unwrap();
+        fresh_store.activate();
+        let fresh = fresh_store
             .capture_decision(candidate("https://example.com", "alice", "one"))
             .unwrap();
-        assert_eq!(disabled.action, PasswordCaptureAction::Disabled);
+        assert_eq!(fresh.action, PasswordCaptureAction::Create);
+    }
+
+    #[test]
+    fn capture_setting_is_forced_on_since_0_7_2() {
+        let (_root, store) = test_store();
+        // The legacy toggle is a no-op: asking to disable capture still
+        // reports configured and enabled.
+        store.set_capture_enabled(false).unwrap();
+        let status = store.status().unwrap();
+        assert!(status.capture_configured);
+        assert!(status.capture_enabled);
+        let decision = store
+            .capture_decision(candidate("https://example.com", "alice", "one"))
+            .unwrap();
+        assert_eq!(decision.action, PasswordCaptureAction::Create);
+    }
+
+    #[test]
+    fn stored_capture_toggle_is_normalized_on_load() {
+        // A settings file written before 0.7.2 with the toggle off must load
+        // as enabled so the Disabled branch in capture_decision_at stays dead.
+        let root = tempdir().unwrap();
+        let settings_dir = root
+            .path()
+            .join(INTERNAL_DATA_DIR)
+            .join("tools")
+            .join(PASSWORDS_DIR);
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        std::fs::write(
+            settings_dir.join(SETTINGS_FILE),
+            serde_json::json!({
+                "schemaVersion": SETTINGS_SCHEMA_VERSION,
+                "captureConfigured": false,
+                "captureEnabled": false,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = PasswordStore::load(root.path()).unwrap();
+        store.activate();
+        let status = store.status().unwrap();
+        assert!(status.capture_configured);
+        assert!(status.capture_enabled);
+        let decision = store
+            .capture_decision(candidate("https://example.com", "alice", "one"))
+            .unwrap();
+        assert_eq!(decision.action, PasswordCaptureAction::Create);
     }
 
     #[test]

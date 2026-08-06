@@ -395,17 +395,27 @@
       if (username.length > 1_024) {
         throw bridgeError("PASSWORD_PROTOCOL_INVALID", "username is too long");
       }
-      const result = await sendContent(session, "fillOffer", {
-        allowInsecureHttp: session.allowInsecureHttp,
-        entryId: session.entryId,
-        offerId,
-        origin,
-        sessionId: session.sessionId,
-        userTemplate: payload.userTemplate || null,
-        username,
-      });
+      // Bind the offer before delivery: a direct fill confirms itself from the
+      // page, and that fill-confirm can arrive before sendContent resolves.
       session.offerId = offerId;
       session.state = "awaiting-confirmation";
+      let result;
+      try {
+        result = await sendContent(session, "fillOffer", {
+          allowInsecureHttp: session.allowInsecureHttp,
+          direct: true,
+          entryId: session.entryId,
+          offerId,
+          origin,
+          sessionId: session.sessionId,
+          userTemplate: payload.userTemplate || null,
+          username,
+        });
+      } catch (error) {
+        session.offerId = null;
+        session.state = "ready";
+        throw error;
+      }
       renewSession(session);
       return { ...result, tabId: session.tabId, frameId: session.frameId };
     }
@@ -1067,18 +1077,6 @@
           tabId: binding.tabId,
         });
       }
-      for (const record of candidates.values()) {
-        if (
-          record.promoted
-          || record.tabId !== binding.tabId
-          || record.frameId !== binding.frameId
-          || record.origin !== binding.origin
-          || record.documentId && binding.documentId && record.documentId === binding.documentId
-        ) continue;
-        // A navigation after a submitted form is useful evidence, but not a
-        // definitive success signal. The page prompt remains low confidence.
-        promoteCandidate(record, "low", binding);
-      }
       const originCaptureAllowed = binding.origin.startsWith("https://")
         || captureInsecureOrigins.has(binding.origin);
       return {
@@ -1402,14 +1400,7 @@
 
     async function popupFill(message) {
       const entryId = requiredString(message.entryId, "entryId", 160);
-      const active = await activeTabContext();
-      if (active.tabId == null) {
-        throw bridgeError("PASSWORD_TARGET_INVALID", "No active browser tab is available");
-      }
-      const cached = tabAccounts.get(active.tabId);
-      if (!cached || cached.locked || !cached.accounts.some((account) => account.entryId === entryId)) {
-        throw bridgeError("PASSWORD_TARGET_MISMATCH", "The requested account is not available on this tab");
-      }
+      const active = await cachedPopupAccount(entryId);
       const posted = postEvent("fillRequest", {
         documentId: active.documentId,
         entryId,
@@ -1430,6 +1421,44 @@
       return { accepted: true };
     }
 
+    async function cachedPopupAccount(entryId) {
+      const active = await activeTabContext();
+      if (active.tabId == null) {
+        throw bridgeError("PASSWORD_TARGET_INVALID", "No active browser tab is available");
+      }
+      const cached = tabAccounts.get(active.tabId);
+      if (!cached || cached.locked || !cached.accounts.some((account) => account.entryId === entryId)) {
+        throw bridgeError("PASSWORD_TARGET_MISMATCH", "The requested account is not available on this tab");
+      }
+      return active;
+    }
+
+    async function popupCopySecret(message) {
+      const entryId = requiredString(message.entryId, "entryId", 160);
+      const field = String(message.field || "");
+      if (field !== "username" && field !== "password") {
+        throw bridgeError("PASSWORD_PROTOCOL_INVALID", "The copy field is invalid");
+      }
+      await cachedPopupAccount(entryId);
+      // The desktop writes the clipboard; credentials never pass the extension.
+      const posted = postEvent("copySecret", { entryId, field });
+      if (!posted) {
+        throw bridgeError("PASSWORD_NATIVE_DISCONNECTED", "PetalDesk native host is disconnected");
+      }
+      return { accepted: true };
+    }
+
+    async function popupDeleteEntry(message) {
+      const entryId = requiredString(message.entryId, "entryId", 160);
+      await cachedPopupAccount(entryId);
+      // The desktop deletes the entry and pushes a badge refresh afterwards.
+      const posted = postEvent("deleteEntry", { entryId });
+      if (!posted) {
+        throw bridgeError("PASSWORD_NATIVE_DISCONNECTED", "PetalDesk native host is disconnected");
+      }
+      return { accepted: true };
+    }
+
     function onPopupMessage(message, sender) {
       // The action popup is an extension page without a tab; content scripts
       // and other extensions must never reach these handlers.
@@ -1440,6 +1469,8 @@
         case "petaldesk.popup.getState": return popupGetState();
         case "petaldesk.popup.fill": return popupFill(message);
         case "petaldesk.popup.openManager": return popupOpenManager();
+        case "petaldesk.popup.copySecret": return popupCopySecret(message);
+        case "petaldesk.popup.deleteEntry": return popupDeleteEntry(message);
         default: return null;
       }
     }

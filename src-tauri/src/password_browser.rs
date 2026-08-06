@@ -506,10 +506,10 @@ impl PasswordBrowserService {
             return;
         }
         for connection_id in connection_ids {
-            // The extension permission is mandatory at install time, so the
-            // desktop setting maps directly onto the capture switch. Skip the
+            // Login detection is mandatory since 0.7.2: the stored setting
+            // is ignored and capture is always pushed as enabled. Skip the
             // broadcast when nothing changed since the last successful sync.
-            let desired = (status.capture_enabled, insecure_origins.clone());
+            let desired = (true, insecure_origins.clone());
             if lock_unpoisoned(&self.synced_capture).get(&connection_id) == Some(&desired) {
                 continue;
             }
@@ -550,6 +550,8 @@ impl PasswordBrowserService {
             }
             "originActive" => self.handle_origin_active(&app.state(), &event),
             "fillRequest" => self.handle_fill_request(&app.state(), &event),
+            "copySecret" => self.handle_copy_secret(&app.state(), &event),
+            "deleteEntry" => self.handle_delete_entry(app, &event),
             "openPasswordManager" => {
                 if let Err(error) = crate::commands::open_password_window(app) {
                     eprintln!("打开密码管理器窗口失败: {error}");
@@ -920,6 +922,96 @@ impl PasswordBrowserService {
         );
         if result.is_err() {
             lock_unpoisoned(&self.fills).remove(&session_id);
+        }
+    }
+
+    /// The popup's account menu asks to copy one entry field into the system
+    /// clipboard. `copy_field_at` validates the entry id format and
+    /// existence, and reuses the store's clipboard lease, so the copy keeps
+    /// the same auto-clear and window-close semantics as the password
+    /// window's copy commands. Failures only land in the diagnostic log and
+    /// never contain secret material.
+    fn handle_copy_secret(&self, store: &PasswordStore, event: &BrowserSecretEvent) {
+        let Some(entry_id) = event
+            .payload
+            .get("entryId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+        else {
+            self.bridge
+                .record_event("popup", "copy-secret-failed", "reason=invalid-entry-id");
+            return;
+        };
+        let password = match event.payload.get("field").and_then(Value::as_str) {
+            Some("username") => false,
+            Some("password") => true,
+            _ => {
+                self.bridge
+                    .record_event("popup", "copy-secret-failed", "reason=invalid-field");
+                return;
+            }
+        };
+        let result = store
+            .require_any_epoch()
+            .and_then(|epoch| store.copy_field_at(entry_id, password, epoch));
+        if let Err(error) = result {
+            self.bridge.record_event(
+                "popup",
+                "copy-secret-failed",
+                format!(
+                    "field={} reason={}",
+                    if password { "password" } else { "username" },
+                    error.code
+                ),
+            );
+        }
+    }
+
+    /// The popup's account menu asks to delete one vault entry. On success
+    /// the password window is notified and badges are recomputed, mirroring
+    /// the save-decision flow.
+    fn handle_delete_entry(&self, app: &AppHandle, event: &BrowserSecretEvent) {
+        let store = app.state::<PasswordStore>();
+        if let Some(entry_id) = self.delete_entry_from_event(&store, event) {
+            let _ = app.emit_to(
+                "passwords",
+                "password_entries_changed",
+                serde_json::json!({ "entryId": entry_id, "action": "delete" }),
+            );
+            self.refresh_badges(&store);
+        }
+    }
+
+    /// Applies the popup's delete request. Returns the deleted entry id so
+    /// the dispatcher can notify the password window and refresh badges.
+    fn delete_entry_from_event(
+        &self,
+        store: &PasswordStore,
+        event: &BrowserSecretEvent,
+    ) -> Option<String> {
+        let Some(entry_id) = event
+            .payload
+            .get("entryId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+        else {
+            self.bridge
+                .record_event("popup", "delete-entry-failed", "reason=invalid-entry-id");
+            return None;
+        };
+        match store
+            .require_any_epoch()
+            .and_then(|epoch| store.delete_entry_at(entry_id, epoch))
+        {
+            Ok(()) => Some(entry_id.to_string()),
+            Err(error) => {
+                self.bridge.record_event(
+                    "popup",
+                    "delete-entry-failed",
+                    format!("reason={}", error.code),
+                );
+                None
+            }
         }
     }
 
@@ -2761,6 +2853,192 @@ mod tests {
         let syncs = recorded.requests_for("password.setCaptureEnabled");
         assert_eq!(syncs.len(), 2);
         assert_eq!(syncs[1]["payload"]["enabled"], true);
+    }
+
+    #[test]
+    fn sync_capture_always_pushes_enabled_since_0_7_2() {
+        let (_root, store) = test_store();
+        {
+            let epoch = store.require_active_epoch().unwrap();
+            // The legacy toggle no longer disables capture.
+            store.set_capture_enabled_at(false, epoch).unwrap();
+        }
+        let (service, recorded) = connected_service("connection-a");
+
+        service.sync_capture_from_store(&store);
+        let syncs = recorded.requests_for("password.setCaptureEnabled");
+        assert_eq!(syncs.len(), 1);
+        assert_eq!(syncs[0]["payload"]["enabled"], true);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_secret_copies_username_and_password() {
+        let (_root, store) = test_store();
+        let entry = create_entry(&store, "https://example.com/login", "alice", "one");
+        let (service, _recorded) = connected_service("connection-a");
+
+        service.handle_copy_secret(
+            &store,
+            &secret_event(
+                "connection-a",
+                "copySecret",
+                serde_json::json!({ "entryId": entry.id, "field": "username" }),
+            ),
+        );
+        service.handle_copy_secret(
+            &store,
+            &secret_event(
+                "connection-a",
+                "copySecret",
+                serde_json::json!({ "entryId": entry.id, "field": "password" }),
+            ),
+        );
+
+        let diag = service.bridge.diag_snapshot(20);
+        assert!(diag.iter().all(|entry| entry.event != "copy-secret-failed"));
+        // The password copy replaced the username copy on the clipboard.
+        assert_eq!(read_clipboard_text().as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn copy_secret_rejects_bad_field_unknown_entry_and_locked_vault() {
+        let (_root, store) = test_store();
+        let entry = create_entry(&store, "https://example.com/login", "alice", "one");
+        let (service, _recorded) = connected_service("connection-a");
+
+        for payload in [
+            serde_json::json!({ "entryId": entry.id, "field": "notes" }),
+            serde_json::json!({ "entryId": Uuid::new_v4(), "field": "password" }),
+            serde_json::json!({ "entryId": "not-a-uuid", "field": "password" }),
+        ] {
+            service.handle_copy_secret(&store, &secret_event("connection-a", "copySecret", payload));
+        }
+        store.lock_current_session().unwrap();
+        service.handle_copy_secret(
+            &store,
+            &secret_event(
+                "connection-a",
+                "copySecret",
+                serde_json::json!({ "entryId": entry.id, "field": "password" }),
+            ),
+        );
+
+        let diag = service.bridge.diag_snapshot(20);
+        let failures = diag
+            .iter()
+            .filter(|entry| entry.event == "copy-secret-failed")
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 4);
+        // Diagnostics never carry secret material.
+        assert!(failures
+            .iter()
+            .all(|entry| !entry.detail.contains("alice") && !entry.detail.contains("one")));
+    }
+
+    #[test]
+    fn delete_entry_removes_the_vault_entry() {
+        let (_root, store) = test_store();
+        let entry = create_entry(&store, "https://example.com/login", "alice", "one");
+        let (service, _recorded) = connected_service("connection-a");
+
+        let deleted = service.delete_entry_from_event(
+            &store,
+            &secret_event(
+                "connection-a",
+                "deleteEntry",
+                serde_json::json!({ "entryId": entry.id }),
+            ),
+        );
+        assert_eq!(deleted.as_deref(), Some(entry.id.as_str()));
+        let epoch = store.require_active_epoch().unwrap();
+        assert!(store.list_entries_at(epoch).unwrap().is_empty());
+        let diag = service.bridge.diag_snapshot(20);
+        assert!(diag
+            .iter()
+            .all(|entry| entry.event != "delete-entry-failed"));
+    }
+
+    #[test]
+    fn delete_entry_rejects_unknown_malformed_and_locked_requests() {
+        let (_root, store) = test_store();
+        let entry = create_entry(&store, "https://example.com/login", "alice", "one");
+        let (service, _recorded) = connected_service("connection-a");
+
+        for payload in [
+            serde_json::json!({ "entryId": Uuid::new_v4() }),
+            serde_json::json!({ "entryId": "not-a-uuid" }),
+        ] {
+            let deleted = service.delete_entry_from_event(
+                &store,
+                &secret_event("connection-a", "deleteEntry", payload),
+            );
+            assert!(deleted.is_none());
+        }
+        // The rejected requests did not touch the vault.
+        let epoch = store.require_active_epoch().unwrap();
+        assert_eq!(store.list_entries_at(epoch).unwrap().len(), 1);
+
+        store.lock_current_session().unwrap();
+        let deleted = service.delete_entry_from_event(
+            &store,
+            &secret_event(
+                "connection-a",
+                "deleteEntry",
+                serde_json::json!({ "entryId": entry.id }),
+            ),
+        );
+        assert!(deleted.is_none());
+
+        let diag = service.bridge.diag_snapshot(20);
+        assert_eq!(
+            diag.iter()
+                .filter(|entry| entry.event == "delete-entry-failed")
+                .count(),
+            3
+        );
+    }
+
+    /// Reads CF_UNICODETEXT from the system clipboard for the copy-secret
+    /// test. Windows-only like the clipboard implementation itself.
+    #[cfg(windows)]
+    fn read_clipboard_text() -> Option<String> {
+        use windows_sys::Win32::System::DataExchange::{
+            CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+        };
+        use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+        const CF_UNICODETEXT: u32 = 13;
+        if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
+            return None;
+        }
+        let result = (|| {
+            if unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT) } == 0 {
+                return None;
+            }
+            let handle = unsafe { GetClipboardData(CF_UNICODETEXT) };
+            if handle.is_null() {
+                return None;
+            }
+            let size = unsafe { GlobalSize(handle) } as usize;
+            let ptr = unsafe { GlobalLock(handle) } as *const u16;
+            if ptr.is_null() || size < 2 {
+                return None;
+            }
+            let units = unsafe { std::slice::from_raw_parts(ptr, size / 2) };
+            let end = units
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(units.len());
+            let text = String::from_utf16_lossy(&units[..end]);
+            unsafe {
+                let _ = GlobalUnlock(handle);
+            }
+            Some(text)
+        })();
+        unsafe {
+            CloseClipboard();
+        }
+        result
     }
 
     #[test]

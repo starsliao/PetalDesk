@@ -37,7 +37,7 @@
   - `SecretConnectionControl.retire()`：改为 stop 事件信号 + `CancelIoEx`，保留 `DisconnectNamedPipe`；所有 retire 调用点语义不变。
 - 测试：cargo 全量 349 通过；核心回归"有挂起读时写必须在 2s 内完成"两端各一份。
 
-**注意**：这两处修复随 0.7.2 发布。修复版的 host 与桌面端 exe 在发布前已手工部署到本机安装目录（见 §6）。
+**注意**：这两处修复随 0.7.3 发布。修复版的 host 与桌面端 exe 在发布前已手工部署到本机安装目录（见 §6）。
 
 ## 4. 调试工具箱（都在 `test-results/`，git 不跟踪）
 
@@ -93,7 +93,7 @@
 - `%LOCALAPPDATA%\PetalDesk\petaldesk.exe`：**修复版桌面端**（重叠 I/O + 新前端 + badge/fill 诊断点）。原版备份 `petaldesk.prev` / `petaldesk.old-0.7.1`。
 - 部署手法：进程占用 exe 时先 `mv` 改名（Windows 允许重命名运行中的 exe）再 `cp` 新文件；重启桌面端即生效；Firefox 扩展会在重连时自动拉起新 host。
 - Firefox 扩展：about:debugging **临时加载**的 `browser-extension/dist/firefox`（= 0.7.1 代码，当前最新；0.7.2 无扩展侧改动）。重启 Firefox 后需重新加载。
-- 版本状态：0.7.2 已发布（包含管道修复与扩展 origin 修复）。
+- 版本状态：0.7.3 已发布（包含管道修复、扩展 origin 实时化、点击即填、检测强制开启与弹窗账户菜单）。
 
 ## 7. 复现/验证清单
 

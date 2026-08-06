@@ -137,7 +137,7 @@ function loadManager({ ambiguous = false, fieldScenario = "login", templateMulti
       },
     },
     sendMessage(message, callback) {
-      backgroundMessages.push(message);
+      backgroundMessages.push(JSON.parse(JSON.stringify(message)));
       const response = message.type === "petaldesk.password.template-recording-progress"
         ? { completed: message.field === "password" }
         : { captureEnabled: false };
@@ -195,11 +195,16 @@ function loadManager({ ambiguous = false, fieldScenario = "login", templateMulti
       const heading = createdElements.find((element) => element.tagName === "H2");
       return heading ? heading.textContent : "";
     },
+    overlayMessage() {
+      const paragraphs = createdElements.filter((element) => element.tagName === "P");
+      return paragraphs.length ? paragraphs.at(-1).textContent : "";
+    },
     command(command, payload) {
       return new Promise((resolve) => {
         runtimeMessages[0]({ type: "petaldesk.password.command", command, payload }, null, resolve);
       });
     },
+    document,
     documentListeners,
     windowListeners,
     inputs: { duplicatePassword, newPassword, password, username },
@@ -240,6 +245,71 @@ test("password pages require an explicit overlay confirmation and never submit",
   assert.equal(result.result.submitted, false);
   assert.equal(credentials.password, "");
   assert.equal(harness.submitted(), false);
+});
+
+test("direct fill offers confirm themselves and fill without a confirmation overlay", async () => {
+  const harness = loadManager();
+  const offer = await harness.command("fillOffer", {
+    direct: true,
+    entryId: "entry-direct",
+    offerId: "offer-direct",
+    origin: "https://accounts.google.com",
+    sessionId: "session-direct",
+    username: "alice@example.com",
+  });
+  assert.equal(offer.ok, true);
+  assert.equal(offer.result.state, "confirmed");
+  // No confirmation overlay is shown for a direct fill.
+  assert.deepEqual(harness.overlayButtons(), []);
+  // The content script confirms immediately on the user's behalf.
+  const confirm = harness.backgroundMessages.at(-1);
+  assert.equal(confirm.type, "petaldesk.password.fill-confirm");
+  assert.equal(confirm.sessionId, "session-direct");
+  assert.equal(confirm.offerId, "offer-direct");
+  assert.equal(confirm.origin, "https://accounts.google.com");
+  const credentials = {
+    offerId: "offer-direct",
+    origin: "https://accounts.google.com",
+    password: "secret-password",
+    sessionId: "session-direct",
+    username: "alice@example.com",
+  };
+  const result = await harness.command("fillSecret", credentials);
+  assert.equal(result.ok, true);
+  assert.equal(result.result.submitted, false);
+  assert.equal(harness.inputs.username.value, "alice@example.com");
+  assert.equal(harness.inputs.password.value, "secret-password");
+  assert.equal(credentials.password, "");
+  // A lightweight notice replaces the confirmation overlay after filling.
+  assert.equal(harness.overlayTitle(), "飞花密码管理器");
+  assert.match(harness.overlayMessage(), /已填充 alice@example\.com，未自动提交/);
+  assert.deepEqual(harness.overlayButtons(), []);
+  assert.equal(harness.submitted(), false);
+});
+
+test("a submitted password form is reported as a success immediately", async () => {
+  const harness = loadManager();
+  const enabled = await harness.command("captureEnable", {});
+  assert.equal(enabled.ok, true);
+  assert.equal(enabled.result.enabled, true);
+  harness.inputs.username.value = "alice";
+  harness.inputs.password.value = "secret-password";
+  harness.documentListeners.get("submit")({ target: harness.document });
+  // A single microtask flush is enough: there is no post-submit settle delay.
+  await new Promise((resolve) => setImmediate(resolve));
+  const types = harness.backgroundMessages.map((message) => message.type);
+  const submittedIndex = types.indexOf("petaldesk.password.capture-submitted");
+  assert.notEqual(submittedIndex, -1);
+  assert.equal(types[submittedIndex + 1], "petaldesk.password.capture-success");
+  const submittedMessage = harness.backgroundMessages[submittedIndex];
+  assert.equal(submittedMessage.candidate.username, "alice");
+  assert.equal(submittedMessage.candidate.password, "secret-password");
+  const successMessage = harness.backgroundMessages[submittedIndex + 1];
+  assert.equal(successMessage.candidateId, submittedMessage.candidate.candidateId);
+  assert.equal(successMessage.confidence, "high");
+  assert.equal(successMessage.origin, "https://accounts.google.com");
+  // Disabling capture clears the in-memory candidate TTL timer.
+  await harness.command("captureDisable", {});
 });
 
 test("ambiguous login fields fail closed before credentials are written", async () => {

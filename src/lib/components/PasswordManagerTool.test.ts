@@ -42,22 +42,18 @@ afterEach(() => {
 });
 
 describe("PasswordManagerTool", () => {
-  it("renders searchable multi-account entries and records first-use capture consent", async () => {
+  it("renders searchable multi-account entries without a capture consent switch", async () => {
     const api = createBrowserPasswordApi();
-    const setCaptureEnabled = vi.spyOn(api, "setCaptureEnabled");
     const view = render(PasswordManagerTool, { api });
 
     expect(await view.findByText("personal@example.com")).toBeInTheDocument();
     expect(view.getByText("demo@example.com")).toBeInTheDocument();
-    expect(view.getByRole("region", { name: "登录信息检测授权" })).toBeInTheDocument();
+    expect(view.queryByRole("region", { name: "登录信息检测授权" })).not.toBeInTheDocument();
+    expect(view.queryByText("允许登录信息检测")).not.toBeInTheDocument();
 
     await fireEvent.input(view.getByRole("searchbox", { name: "搜索密码账户" }), { target: { value: "personal@" } });
     expect(view.getByText("personal@example.com")).toBeInTheDocument();
     expect(view.queryByText("demo@contoso.example")).not.toBeInTheDocument();
-
-    await fireEvent.click(view.getByRole("button", { name: "开启检测" }));
-    await waitFor(() => expect(setCaptureEnabled).toHaveBeenCalledWith(true));
-    expect(await view.findByText("允许登录信息检测")).toBeInTheDocument();
   });
 
   it("adds an account with generated password controls and explicit HTTP consent", async () => {

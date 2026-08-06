@@ -525,10 +525,19 @@ if (-not $installerText.Contains("Register-PetalDeskNativeHost.ps1")) {
 # The host cannot be a tauri.conf.json resource: Cargo executes Tauri's build
 # script before this binary exists, so resource validation would make the host
 # depend on its own output. Add it only after Tauri has generated installer.nsi.
+# A running exe cannot be overwritten and Firefox may respawn the host at any
+# moment, so both the main binary and the host are installed via rename-aside:
+# renaming a locked executable succeeds and the running process keeps the old
+# file while new launches get the new binary.
 $nativeHostSourceForNsis = [System.IO.Path]::GetFullPath($nativeHostReleaseExe)
 $nativeHostSourceForNsis = $nativeHostSourceForNsis.Replace('$', '$$').Replace('"', '$\"')
-$nativeHostInstallInstruction = '  File "/oname=$INSTDIR\{0}" "{1}"' -f `
-    $nativeHostBinaryName, $nativeHostSourceForNsis
+$nativeHostInstallInstruction = @(
+    '  IfFileExists "$INSTDIR\petaldesk-browser-host.exe" 0 petaldesk_host_binary_absent',
+    '  Delete "$INSTDIR\petaldesk-browser-host.locked-old"',
+    '  Rename "$INSTDIR\petaldesk-browser-host.exe" "$INSTDIR\petaldesk-browser-host.locked-old"',
+    '  petaldesk_host_binary_absent:',
+    ('  File "/oname=$INSTDIR\{0}" "{1}"' -f $nativeHostBinaryName, $nativeHostSourceForNsis)
+) -join [Environment]::NewLine
 $nativeHostDeleteInstruction = '  Delete "$INSTDIR\{0}"' -f $nativeHostBinaryName
 $nativeHostInstallPattern = '(?m)^[ \t]*File(?:[ \t]+/a)?[ \t]+"/oname=(?:\$INSTDIR\\)?{0}"[ \t]+"{1}"[ \t]*\r?$' -f `
     [regex]::Escape($nativeHostBinaryName), [regex]::Escape($nativeHostSourceForNsis)
@@ -575,6 +584,55 @@ foreach ($edit in $nativeHostInstallerEdits) {
         throw "Native Messaging Host $($edit.Description)指令注入失败（期望 1，实际 $instructionCount）。"
     }
 }
+
+# Skip Tauri NSIS template's maintenance page for upgrades: when an older
+# version is detected, update in place (overwrite) instead of asking whether to
+# uninstall first. This matches the behavior of Tauri's /UPDATE auto-update mode.
+# Same-version reinstalls and downgrades keep the maintenance page.
+$semverCompareAnchor = @(
+    '  nsis_tauri_utils::SemverCompare "${VERSION}" $R0',
+    '  Pop $R0'
+) -join [Environment]::NewLine
+$semverCompareAnchorCount = ([regex]::Matches(
+    $installerText,
+    [regex]::Escape($semverCompareAnchor)
+)).Count
+if ($semverCompareAnchorCount -ne 1) {
+    throw "无法唯一定位 NSIS 版本比较位置（期望 1，实际 $semverCompareAnchorCount），Tauri 的 NSIS 模板可能已经变化。"
+}
+$installerText = $installerText.Replace(
+    $semverCompareAnchor,
+    @(
+        $semverCompareAnchor,
+        '  ; PetalDesk: upgrades update in place; the maintenance page only appears',
+        '  ; for same-version reinstalls and downgrades.',
+        '  ${If} $R0 = 1',
+        '    Abort',
+        '  ${EndIf}'
+    ) -join [Environment]::NewLine
+)
+
+# The same rename-aside resilience for the main binary: if the user dismisses
+# the running-app prompt, the upgrade still completes instead of failing the
+# file write with an Abort/Retry/Ignore error.
+$mainBinaryInstruction = '  File "${MAINBINARYSRCPATH}"'
+$mainBinaryInstructionCount = ([regex]::Matches(
+    $installerText,
+    [regex]::Escape($mainBinaryInstruction)
+)).Count
+if ($mainBinaryInstructionCount -ne 1) {
+    throw "无法唯一定位主程序写入指令（期望 1，实际 $mainBinaryInstructionCount），Tauri 的 NSIS 模板可能已经变化。"
+}
+$installerText = $installerText.Replace(
+    $mainBinaryInstruction,
+    @(
+        '  IfFileExists "$INSTDIR\petaldesk.exe" 0 petaldesk_main_binary_absent',
+        '  Delete "$INSTDIR\petaldesk.locked-old"',
+        '  Rename "$INSTDIR\petaldesk.exe" "$INSTDIR\petaldesk.locked-old"',
+        '  petaldesk_main_binary_absent:',
+        $mainBinaryInstruction
+    ) -join [Environment]::NewLine
+)
 
 # Keep Tauri's productName as the stable internal identity. Only replace NSIS
 # presentation fields; install paths, registry keys, executable names, and the
@@ -748,12 +806,13 @@ $preInstallMacroBody = $preInstallMacroMatches[0].Groups['body'].Value
 if ($preInstallMacroBody.Contains('PetalDeskPersistStoragePath')) {
     throw "数据存储路径不能在 NSIS_HOOK_PREINSTALL 中持久化；此时飞花 - PetalDesk 运行检查尚未通过。"
 }
+$nativeHostPreInstallKill = 'taskkill.exe" /F /IM petaldesk-browser-host.exe'
 $preInstallHostGuardCount = ([regex]::Matches(
     $preInstallMacroBody,
-    [regex]::Escape($nativeHostProcessGuard)
+    [regex]::Escape($nativeHostPreInstallKill)
 )).Count
 if ($preInstallHostGuardCount -ne 1) {
-    throw "NSIS_HOOK_PREINSTALL 必须唯一定义运行中 Native Messaging Host 检查。"
+    throw "NSIS_HOOK_PREINSTALL 必须唯一定义 Native Messaging Host 静默结束（taskkill）。"
 }
 if (-not $storageHooksText.Contains("!macro NSIS_HOOK_POSTINSTALL")) {
     throw "数据存储目录 hooks 未定义 NSIS_HOOK_POSTINSTALL。"

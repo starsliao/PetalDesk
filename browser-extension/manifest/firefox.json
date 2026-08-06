@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "飞花 - PetalDesk 浏览器增强",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "飞花 Firefox 浏览器增强，支持长截图和经确认的密码填充。",
   "homepage_url": "https://starsliao.github.io/PetalDesk/",
   "icons": {

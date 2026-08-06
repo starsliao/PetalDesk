@@ -28,7 +28,7 @@ function loadBridge() {
   };
   const api = {
     browserFamily: "firefox",
-    extensionVersion: "0.7.2",
+    extensionVersion: "0.7.3",
     action: {
       async setBadgeText(value) {
         actionUpdates.badgeTexts.push(JSON.parse(JSON.stringify(value)));
@@ -180,6 +180,8 @@ test("fill sessions bind the new tab, origin, frame, and confirmation before rec
       username: "alice@example.com",
     },
   });
+  assert.equal(harness.tabMessages.at(-1).message.command, "fillOffer");
+  assert.equal(harness.tabMessages.at(-1).message.payload.direct, true);
   await assert.rejects(
     harness.bridge.route({
       command: "password.provideCredentials",
@@ -274,6 +276,7 @@ test("offerFillDirect creates a ready session on the live tab and follows the co
   assert.equal(offered.tabId, 80);
   assert.equal(harness.tabMessages.at(-1).message.command, "fillOffer");
   assert.equal(harness.tabMessages.at(-1).message.payload.entryId, "entry-1");
+  assert.equal(harness.tabMessages.at(-1).message.payload.direct, true);
   const sender = {
     documentId: "document-80",
     frameId: 0,
@@ -296,6 +299,59 @@ test("offerFillDirect creates a ready session on the live tab and follows the co
     origin: "https://example.test",
     password: "secret-password",
     sessionId: "direct-1",
+  };
+  const filled = await harness.bridge.route({ command: "password.provideCredentials", payload: credentials });
+  assert.equal(filled.filledPassword, true);
+  assert.equal(credentials.password, "");
+  assert.equal(harness.events.at(-1).event, "fillResult");
+});
+
+test("a direct fill confirmation arriving before the offer resolves is honored", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(81, { id: 81, url: "https://example.test/login" });
+  const sender = {
+    documentId: "document-81",
+    frameId: 0,
+    tab: { id: 81, url: "https://example.test/login" },
+    url: "https://example.test/login",
+  };
+  const originalSendTabMessage = harness.api.sendTabMessage;
+  let confirmation = null;
+  harness.api.sendTabMessage = async (tabId, message, options) => {
+    if (message.command === "fillOffer") {
+      // Direct fills confirm from the page while the offer is still in flight.
+      confirmation = harness.sendContent(
+        {
+          type: "petaldesk.password.fill-confirm",
+          offerId: message.payload.offerId,
+          origin: message.payload.origin,
+          sessionId: message.payload.sessionId,
+        },
+        sender,
+      );
+    }
+    return originalSendTabMessage(tabId, message, options);
+  };
+  await harness.bridge.route({
+    command: "password.offerFillDirect",
+    payload: {
+      documentId: "document-81",
+      entryId: "entry-1",
+      frameId: 0,
+      offerId: "offer-1",
+      origin: "https://example.test",
+      sessionId: "direct-race",
+      tabId: 81,
+      username: "alice",
+    },
+  });
+  assert.ok(confirmation, "the fill offer should reach the page");
+  assert.equal((await confirmation).confirmed, true);
+  const credentials = {
+    offerId: "offer-1",
+    origin: "https://example.test",
+    password: "secret-password",
+    sessionId: "direct-race",
   };
   const filled = await harness.bridge.route({ command: "password.provideCredentials", payload: credentials });
   assert.equal(filled.filledPassword, true);
@@ -449,7 +505,7 @@ test("popup state reports diagnostics recorded at the command boundary", async (
   await harness.bridge.route({ command: "password.getStatus", payload: {} });
   let state = await harness.sendPopup({ type: "petaldesk.popup.getState" });
   assert.equal(state.diagnostics.nativeConnected, true);
-  assert.equal(state.diagnostics.extensionVersion, "0.7.2");
+  assert.equal(state.diagnostics.extensionVersion, "0.7.3");
   assert.equal(state.diagnostics.lastCommandOk, true);
   assert.equal(state.diagnostics.lastCommandErrorCode, null);
   assert.equal(typeof state.diagnostics.lastCommandAt, "number");
@@ -522,6 +578,93 @@ test("popup fill validates the cached account and posts a fill request", async (
   assert.equal(opened.accepted, true);
   assert.equal(harness.events.at(-1).event, "openPasswordManager");
   assert.deepEqual(harness.events.at(-1).payload, {});
+});
+
+test("popup copy and delete validate the cached account and post bare events", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(86, { id: 86, url: "https://example.test/login" });
+  harness.setActiveTab(86);
+  await harness.bridge.route({
+    command: "password.updateBadge",
+    payload: {
+      accounts: [
+        { entryId: "entry-a", siteName: "Example", username: "alice" },
+        { entryId: "entry-b", siteName: "Example", username: "bob" },
+      ],
+      origin: "https://example.test",
+      tabId: 86,
+    },
+  });
+  const badField = await harness.sendPopup({ type: "petaldesk.popup.copySecret", entryId: "entry-a", field: "totp" });
+  assert.equal(badField.ok, false);
+  assert.equal(badField.error.code, "PASSWORD_PROTOCOL_INVALID");
+  const unknown = await harness.sendPopup({ type: "petaldesk.popup.copySecret", entryId: "entry-unknown", field: "password" });
+  assert.equal(unknown.ok, false);
+  assert.equal(unknown.error.code, "PASSWORD_TARGET_MISMATCH");
+  const copied = await harness.sendPopup({ type: "petaldesk.popup.copySecret", entryId: "entry-a", field: "password" });
+  assert.equal(copied.accepted, true);
+  assert.equal(harness.events.at(-1).event, "copySecret");
+  assert.deepEqual(harness.events.at(-1).payload, { entryId: "entry-a", field: "password" });
+  const copiedUsername = await harness.sendPopup({ type: "petaldesk.popup.copySecret", entryId: "entry-b", field: "username" });
+  assert.equal(copiedUsername.accepted, true);
+  assert.deepEqual(harness.events.at(-1).payload, { entryId: "entry-b", field: "username" });
+  const deleted = await harness.sendPopup({ type: "petaldesk.popup.deleteEntry", entryId: "entry-a" });
+  assert.equal(deleted.accepted, true);
+  assert.equal(harness.events.at(-1).event, "deleteEntry");
+  // The delete event carries only the entry ID: no site or account metadata.
+  assert.deepEqual(harness.events.at(-1).payload, { entryId: "entry-a" });
+  // A locked vault rejects copy and delete for cached accounts.
+  await harness.bridge.route({
+    command: "password.updateBadge",
+    payload: {
+      accounts: [{ entryId: "entry-a", siteName: "Example", username: "alice" }],
+      locked: true,
+      origin: "https://example.test",
+      tabId: 86,
+    },
+  });
+  const lockedCopy = await harness.sendPopup({ type: "petaldesk.popup.copySecret", entryId: "entry-a", field: "password" });
+  assert.equal(lockedCopy.ok, false);
+  assert.equal(lockedCopy.error.code, "PASSWORD_TARGET_MISMATCH");
+  const lockedDelete = await harness.sendPopup({ type: "petaldesk.popup.deleteEntry", entryId: "entry-a" });
+  assert.equal(lockedDelete.ok, false);
+  assert.equal(lockedDelete.error.code, "PASSWORD_TARGET_MISMATCH");
+});
+
+test("popup copy and delete reject content-script and foreign senders", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(87, { id: 87, url: "https://example.test/login" });
+  harness.setActiveTab(87);
+  await harness.bridge.route({
+    command: "password.updateBadge",
+    payload: {
+      accounts: [{ entryId: "entry-a", siteName: "Example", username: "alice" }],
+      origin: "https://example.test",
+      tabId: 87,
+    },
+  });
+  const forgedCopy = await harness.sendPopup(
+    { type: "petaldesk.popup.copySecret", entryId: "entry-a", field: "password" },
+    {
+      documentId: "forged-document",
+      frameId: 0,
+      id: "petaldesk-capture@petaldesk.app",
+      tab: { id: 87, url: "https://example.test/login" },
+      url: "https://example.test/login",
+    },
+  );
+  assert.equal(forgedCopy.ok, false);
+  assert.equal(forgedCopy.error.code, "PASSWORD_TARGET_INVALID");
+  const foreignDelete = await harness.sendPopup(
+    { type: "petaldesk.popup.deleteEntry", entryId: "entry-a" },
+    { id: "other-extension@example.test" },
+  );
+  assert.equal(foreignDelete.ok, false);
+  assert.equal(foreignDelete.error.code, "PASSWORD_TARGET_INVALID");
+  assert.equal(
+    harness.events.some((event) => event.event === "copySecret" || event.event === "deleteEntry"),
+    false,
+  );
 });
 
 test("capture candidates remain in memory until a bound save decision and then clear", async () => {
