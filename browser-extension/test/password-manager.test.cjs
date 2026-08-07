@@ -73,6 +73,10 @@ function loadManager({ ambiguous = false, fieldScenario = "login", templateMulti
       return this[name] || null;
     }
 
+    hasAttribute(name) {
+      return name === "hidden" && this.hidden === true;
+    }
+
     getClientRects() {
       return [{}];
     }
@@ -88,21 +92,30 @@ function loadManager({ ambiguous = false, fieldScenario = "login", templateMulti
     }
   }
 
-  const generic = fieldScenario !== "login";
-  const username = new FakeInput(generic
-    ? fieldScenario === "search" ? { name: "q", type: "text" } : { autocomplete: "username", name: "account", type: "email" }
-    : { name: "identifier", type: "email" });
-  const password = new FakeInput(generic
-    ? { autocomplete: "current-password", name: "currentPassword", type: "password" }
-    : { autocomplete: templateMultiple ? "current-password" : "", name: "Passwd", type: "password" });
-  const duplicatePassword = new FakeInput({
-    autocomplete: templateMultiple ? "new-password" : "",
-    name: "Passwd",
-    type: "password",
-  });
+  const generic = fieldScenario !== "login" && fieldScenario !== "netease";
+  const netease = fieldScenario === "netease";
+  const username = new FakeInput(netease
+    ? { name: "email", type: "email" }
+    : generic
+      ? fieldScenario === "search" ? { name: "q", type: "text" } : { autocomplete: "username", name: "account", type: "email" }
+      : { name: "identifier", type: "email" });
+  const password = new FakeInput(netease
+    ? { autocomplete: "new-password", name: "password", type: "password" }
+    : generic
+      ? { autocomplete: "current-password", name: "currentPassword", type: "password" }
+      : { autocomplete: templateMultiple ? "current-password" : "", name: "Passwd", type: "password" });
+  const duplicatePassword = new FakeInput(netease
+    ? { autocomplete: "new-password", name: "password", type: "password", hidden: true }
+    : {
+      autocomplete: templateMultiple ? "new-password" : "",
+      name: "Passwd",
+      type: "password",
+    });
   const newPassword = new FakeInput({ autocomplete: "new-password", name: "newPassword", type: "password" });
   const inputs = fieldScenario === "empty"
     ? []
+    : netease
+      ? [username, password, duplicatePassword]
     : fieldScenario === "multiple-passwords"
       ? [username, password, newPassword]
       : ambiguous || templateMultiple ? [username, password, duplicatePassword] : [username, password];
@@ -436,7 +449,7 @@ test("fill offers are silently ignored when the page has no login fields", async
   assert.equal(credentials.password, "");
 });
 
-test("a same-site iframe confirms a broadcast offer and receives the secret", async () => {
+test("a trusted iframe confirms a broadcast offer and receives the secret", async () => {
   const harness = loadManager({
     frame: {
       ancestorOrigins: ["https://mail.163.com"],
@@ -473,6 +486,38 @@ test("a same-site iframe confirms a broadcast offer and receives the secret", as
   assert.equal(credentials.password, "");
 });
 
+test("the NetEase iframe template ignores a hidden password mirror", async () => {
+  const harness = loadManager({
+    fieldScenario: "netease",
+    frame: { href: "https://dl.reg.163.com/login", top: false },
+  });
+  const offer = await harness.command("fillOffer", {
+    direct: true,
+    entryId: "entry-163-visible",
+    offerId: "offer-163-visible",
+    origin: "https://mail.163.com",
+    sessionId: "session-163-visible",
+    username: "alice@163.com",
+  });
+  assert.equal(offer.ok, true);
+  assert.equal(offer.result.state, "confirmed");
+  const credentials = {
+    offerId: "offer-163-visible",
+    origin: "https://mail.163.com",
+    password: "secret-password",
+    sessionId: "session-163-visible",
+    username: "alice@163.com",
+  };
+  const result = await harness.command("fillSecret", credentials);
+  assert.equal(result.ok, true);
+  assert.equal(result.result.filledUsername, true);
+  assert.equal(result.result.filledPassword, true);
+  assert.equal(harness.inputs.username.value, "alice@163.com");
+  assert.equal(harness.inputs.password.value, "secret-password");
+  assert.equal(harness.inputs.duplicatePassword.value, "");
+  assert.equal(credentials.password, "");
+});
+
 test("a cross-site iframe silently ignores a broadcast fill offer", async () => {
   const harness = loadManager({
     frame: { href: "https://ads.example.net/banner", top: false },
@@ -495,7 +540,21 @@ test("a cross-site iframe silently ignores a broadcast fill offer", async () => 
   assert.equal(harness.inputs.password.value, "");
 });
 
-test("a same-site iframe without login fields silently ignores the offer", async () => {
+test("a cross-origin iframe cannot install capture listeners for another top site", async () => {
+  const harness = loadManager({
+    frame: { href: "https://attacker.github.io/phish", top: false },
+  });
+  const enabled = await harness.command("captureEnable", {
+    insecureOrigins: [],
+    topLevelOrigin: "https://victim.github.io",
+  });
+  assert.equal(enabled.ok, true);
+  assert.equal(enabled.result.enabled, false);
+  assert.equal(harness.documentListeners.has("click"), false);
+  assert.equal(harness.documentListeners.has("submit"), false);
+});
+
+test("a trusted iframe without login fields silently ignores the offer", async () => {
   const harness = loadManager({
     fieldScenario: "empty",
     frame: { href: "https://dl.reg.163.com/frame", top: false },
@@ -562,6 +621,52 @@ test("an iframe capture falls back to its own origin without ancestorOrigins", a
   assert.ok(submitted);
   assert.equal(submitted.candidate.origin, "https://dl.reg.163.com");
   assert.equal(submitted.candidate.frameOrigin, "https://dl.reg.163.com");
+  await harness.command("captureDisable", {});
+});
+
+test("a semantic login anchor click captures a password form", async () => {
+  const harness = loadManager({
+    fieldScenario: "netease",
+    frame: { href: "https://dl.reg.163.com/login", top: false },
+  });
+  await harness.command("captureEnable", {});
+  harness.inputs.username.value = "alice";
+  harness.inputs.password.value = "secret-password";
+  const loginAnchor = {
+    id: "dologin",
+    tagName: "A",
+    textContent: "登录",
+    type: "",
+    getAttribute(name) {
+      return name === "data-action" ? "dologin" : null;
+    },
+    closest(selector) {
+      return selector === "form" ? null : this;
+    },
+  };
+  harness.documentListeners.get("click")({ target: loginAnchor, isTrusted: false });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    harness.backgroundMessages.some(
+      (message) => message.type === "petaldesk.password.capture-submitted",
+    ),
+    false,
+    "a page-scripted click must not capture credentials",
+  );
+  harness.documentListeners.get("click")({ target: loginAnchor, isTrusted: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  const submitted = harness.backgroundMessages.find(
+    (message) => message.type === "petaldesk.password.capture-submitted",
+  );
+  assert.ok(submitted, "a semantic login anchor should report its candidate");
+  assert.equal(submitted.candidate.origin, "https://dl.reg.163.com");
+  assert.equal(submitted.candidate.username, "alice");
+  assert.equal(submitted.candidate.password, "secret-password");
+  const success = harness.backgroundMessages.find(
+    (message) => message.type === "petaldesk.password.capture-success",
+  );
+  assert.ok(success, "a semantic login anchor should immediately promote its candidate");
+  assert.equal(success.candidateId, submitted.candidate.candidateId);
   await harness.command("captureDisable", {});
 });
 

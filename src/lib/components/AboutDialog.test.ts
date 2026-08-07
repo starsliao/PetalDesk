@@ -35,6 +35,19 @@ function mockApi(overrides: Partial<UpdateApi> = {}): UpdateApi {
 }
 
 describe("AboutDialog", () => {
+  it("shows the package timestamp next to the current version", () => {
+    const buildTimestamp = 1_704_067_200;
+    const rendered = render(AboutDialog, {
+      currentVersion: "0.7.4",
+      buildTimestamp,
+      supported: false,
+    });
+
+    const packagedAt = rendered.getByText(/^打包时间 /);
+    expect(packagedAt).toHaveAttribute("datetime", new Date(buildTimestamp * 1000).toISOString());
+    expect(rendered.getByText("v0.7.4")).toBeInTheDocument();
+  });
+
   it("enables automatic updates by default and supports a manual check", async () => {
     const api = mockApi();
     const rendered = render(AboutDialog, { currentVersion: "0.6.0", supported: true, api });

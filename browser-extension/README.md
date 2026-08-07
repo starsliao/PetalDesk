@@ -144,16 +144,23 @@ used for template recording. `password.offerFillDirect` skips
 `password.open` by binding an existing tab and exact origin into a
 ready session, then follows the same offer and confirmation steps. The
 request is bound to one session, tab, document, and exact origin. Fill offers
-are broadcast to every frame of the tab: a frame answers only when it is the
-offer origin itself or same-site with it (e.g. the `dl.reg.163.com` login
-iframe inside `mail.163.com`) and contains login fields, so the confirming
-same-site frame becomes the sole `fillSecret` target. Login capture follows
-the same rule: a same-site iframe reports candidates with the top-level
-origin plus its own `frameOrigin`, and cross-site frames are discarded.
+prefer a secret-free frame capability snapshot (`hasUsername`/`hasPassword`)
+so the background can target the known login frame directly. A broadcast is
+used only as a fallback for frames created after the snapshot; its single
+Promise response is never treated as the authoritative frame binding. A
+frame participates only when it is the offer origin itself or an explicitly
+declared login frame (currently `dl.reg.163.com` inside `mail.163.com`) and
+contains login fields, and the sender metadata on `fillConfirm` binds that frame as
+the sole `fillSecret` target. Login capture follows the same rule: the
+background derives the live top-level origin from the sender's tab and keeps
+the submitting frame's own `frameOrigin`. This supports Firefox 140-147,
+where `Location.ancestorOrigins` is unavailable, while cross-site frames are
+discarded.
 Content scripts fill fields
 and dispatch `input`/`change` events but never submit the form. A submitted
-password form is reported as a high-confidence success immediately; the save
-prompt does not wait for a post-submit success signal. Login candidates
+password form, a semantic login control (including anchor-based controls), or
+an Enter action is reported as a high-confidence success immediately; the
+save prompt does not wait for a post-submit success signal. Login candidates
 stay in extension memory for at most 30 seconds. A username captured on the
 first page of a two-step login can remain in memory for at most two minutes on
 the same tab and exact origin. Neither value is written to extension storage.

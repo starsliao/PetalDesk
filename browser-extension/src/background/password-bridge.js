@@ -92,6 +92,7 @@
     const captureUsernames = new Map();
     const recordings = new Map();
     const tabContexts = new Map();
+    const tabFrames = new Map();
     const tabAccounts = new Map();
     const diagnostics = {
       lastCommandAt: null,
@@ -116,6 +117,78 @@
     function clearTabAccounts(tabId) {
       tabAccounts.delete(tabId);
       setBadgeText(tabId, "");
+    }
+
+    function setFrameContext(binding, fields = {}) {
+      let frames = tabFrames.get(binding.tabId);
+      if (!frames) {
+        frames = new Map();
+        tabFrames.set(binding.tabId, frames);
+      }
+      frames.set(binding.frameId, {
+        documentId: binding.documentId,
+        hasPassword: fields.hasPassword === true,
+        hasUsername: fields.hasUsername === true,
+        origin: binding.origin,
+        updatedAt: Date.now(),
+      });
+    }
+
+    function clearFrameContext(tabId, frameId = null, documentId = null) {
+      const frames = tabFrames.get(tabId);
+      if (!frames) return;
+      if (frameId == null) {
+        tabFrames.delete(tabId);
+        return;
+      }
+      const current = frames.get(frameId);
+      if (!current || !documentId || !current.documentId || current.documentId === documentId) {
+        frames.delete(frameId);
+      }
+      if (frames.size === 0) tabFrames.delete(tabId);
+    }
+
+    async function topLevelOrigin(binding, sender) {
+      // MessageSender.tab.url is the top-level tab URL even when the message
+      // came from a child frame. Prefer a live tabs.get result when available,
+      // then fall back to the sender/context snapshot for older Firefox builds.
+      const urls = [];
+      if (typeof api.getTab === "function") {
+        const tab = await api.getTab(binding.tabId).catch(() => null);
+        if (tab && tab.url) urls.push(tab.url);
+      }
+      if (sender && sender.tab && sender.tab.url) urls.push(sender.tab.url);
+      const context = tabContexts.get(binding.tabId);
+      if (context && context.origin) urls.push(context.origin);
+      for (const value of urls) {
+        try {
+          return templates.exactOrigin(value);
+        } catch (_error) {
+          // Try the next source; non-web tabs are not valid capture targets.
+        }
+      }
+      return "";
+    }
+
+    // Runtime messages from a child frame carry that frame's URL in
+    // `sender.url`, while `sender.tab.url` remains the top-level tab URL.
+    // Keep a synchronous snapshot for fill-confirm/cancel validation (those
+    // handlers intentionally do not await a browser API call).  Firefox 140
+    // does not expose Location.ancestorOrigins, so the content script may
+    // report the child origin as its `origin` field.
+    function topLevelOriginSnapshot(binding, sender) {
+      const values = [];
+      if (sender && sender.tab && sender.tab.url) values.push(sender.tab.url);
+      const context = tabContexts.get(binding.tabId);
+      if (context && context.origin) values.push(context.origin);
+      for (const value of values) {
+        try {
+          return templates.exactOrigin(value);
+        } catch (_error) {
+          // Continue with the next trusted snapshot.
+        }
+      }
+      return "";
     }
 
     function postEvent(event, payload) {
@@ -145,6 +218,7 @@
           sessionId: session.sessionId,
           tabId: session.tabId,
           frameId: session.frameId,
+          frameOrigin: session.frameOrigin,
           origin: session.origin,
           status: "expired",
           submitted: false,
@@ -226,6 +300,10 @@
       const tabId = optionalRoutingId(sender && sender.tab && sender.tab.id, "tabId");
       const documentId = sender && sender.documentId ? String(sender.documentId) : null;
       clearTabState(tabId, documentId, { preserveUsernameStage: true });
+      if (tabId != null) {
+        const frameId = optionalRoutingId(sender && sender.frameId, "frameId") ?? 0;
+        clearFrameContext(tabId, frameId === 0 ? null : frameId, documentId);
+      }
       postEvent("pageClosed", { documentId, tabId });
       return { cleared: true, tabId, documentId };
     }
@@ -290,12 +368,13 @@
       return origin;
     }
 
-    async function sendContent(session, command, payload, { broadcast = false } = {}) {
+    async function sendContent(session, command, payload, { broadcast = false, frameId = null } = {}) {
       await validateLiveTab(session);
+      const targetFrameId = frameId == null ? session.frameId : frameId;
       const response = await api.sendTabMessage(
         session.tabId,
         { type: CONTENT_MESSAGE_TYPE, command, payload },
-        broadcast ? undefined : { frameId: session.frameId },
+        broadcast ? undefined : { frameId: targetFrameId },
       );
       if (!response || response.ok !== true) {
         throw bridgeError(
@@ -306,6 +385,33 @@
         );
       }
       return response.result || {};
+    }
+
+    function fillFrameCandidates(session) {
+      const frames = tabFrames.get(session.tabId);
+      if (!frames || frames.size === 0) return [];
+      const candidates = Array.from(frames.entries())
+        .filter(([frameId, frame]) => {
+          if (!Number.isInteger(frameId) || frameId < 0) return false;
+          if (!templates.frameOriginAllowed(session.origin, frame.origin)) return false;
+          if (session.documentId && frame.documentId && frameId === session.frameId
+            && frame.documentId !== session.documentId) return false;
+          return true;
+        })
+        .sort(([leftId, left], [rightId, right]) => {
+          // Prefer a frame that advertises a password field, then a username
+          // field, and only then the top-level frame. This avoids a username
+          // shell claiming a direct fill before the real iframe responds.
+          const score = (frame, frameId) => (frame.hasPassword ? 30 : 0)
+            + (frame.hasUsername ? 10 : 0)
+            + (frameId === 0 ? 0 : 1);
+          return score(right, rightId) - score(left, leftId);
+        })
+        .map(([frameId]) => frameId);
+      if (Number.isInteger(session.frameId) && !candidates.includes(session.frameId)) {
+        candidates.unshift(session.frameId);
+      }
+      return candidates;
     }
 
     async function openPasswordTab(payload) {
@@ -346,6 +452,7 @@
         entryId: requiredString(payload.entryId, "entryId", 160),
         expiresAt: 0,
         frameId: 0,
+        frameOrigin: origin,
         offerId: null,
         origin,
         sessionId,
@@ -383,8 +490,8 @@
       const requestedTabId = optionalRoutingId(payload.tabId, "tabId") ?? session.tabId;
       const origin = templates.exactOrigin(payload.origin);
       // The offer is broadcast to every frame of the tab, so a requested
-      // frameId is advisory only: the binding to a concrete frame (possibly a
-      // same-site iframe) is established by the fill-confirm message.
+      // frameId is advisory only: the binding to a concrete frame (possibly an
+      // explicitly trusted login iframe) is established by fill-confirm.
       if (requestedTabId !== session.tabId || origin !== session.origin) {
         throw bridgeError("PASSWORD_TARGET_MISMATCH", "The fill offer target does not match its session");
       }
@@ -397,12 +504,9 @@
       // page, and that fill-confirm can arrive before sendContent resolves.
       session.offerId = offerId;
       session.state = "awaiting-confirmation";
-      // Broadcast the offer to every frame: the login form may live in a
-      // same-site iframe (e.g. dl.reg.163.com inside mail.163.com), and each
-      // frame decides for itself whether it can fill this origin.
       let result;
       try {
-        result = await sendContent(session, "fillOffer", {
+        const offerPayload = {
           allowInsecureHttp: session.allowInsecureHttp,
           direct: true,
           entryId: session.entryId,
@@ -411,7 +515,31 @@
           sessionId: session.sessionId,
           userTemplate: payload.userTemplate || null,
           username,
-        }, { broadcast: true });
+        };
+        const frameIds = fillFrameCandidates(session);
+        let lastError = null;
+        for (const frameId of frameIds) {
+          try {
+            const candidate = await sendContent(session, "fillOffer", offerPayload, { frameId });
+            if (!candidate.ignored) {
+              result = candidate;
+              break;
+            }
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        if (!result) {
+          // A frame may have been created after tab-ready (common for SPA
+          // login widgets). Keep the broadcast fallback for that case; the
+          // confirmation event is still the authoritative frame binding.
+          try {
+            result = await sendContent(session, "fillOffer", offerPayload, { broadcast: true });
+          } catch (error) {
+            if (lastError) throw lastError;
+            throw error;
+          }
+        }
       } catch (error) {
         session.offerId = null;
         session.state = "ready";
@@ -463,6 +591,7 @@
         entryId: requiredString(payload.entryId, "entryId", 160),
         expiresAt: 0,
         frameId,
+        frameOrigin: origin,
         offerId: null,
         origin,
         sessionId,
@@ -513,6 +642,7 @@
       postEvent("fillResult", {
         ...result,
         frameId: session.frameId,
+        frameOrigin: session.frameOrigin,
         origin: session.origin,
         sessionId: session.sessionId,
         status: "filled",
@@ -544,6 +674,7 @@
         sessionId: session.sessionId,
         tabId: session.tabId,
         frameId: session.frameId,
+        frameOrigin: session.frameOrigin,
         origin: session.origin,
         status: "cancelled",
         submitted: false,
@@ -647,13 +778,16 @@
         const allowed = origin.startsWith("https://") || captureInsecureOrigins.has(origin);
         const command = captureEnabled && allowed ? "captureEnable" : "captureDisable";
         // No frameId: every frame of the tab toggles its own login detection,
-        // so same-site iframes can report submitted credentials too.
+        // so explicitly trusted login frames can report credentials too.
         await api.sendTabMessage(
           tab.id,
           {
             type: CONTENT_MESSAGE_TYPE,
             command,
-            payload: { insecureOrigins: Array.from(captureInsecureOrigins) },
+            payload: {
+              insecureOrigins: Array.from(captureInsecureOrigins),
+              topLevelOrigin: origin,
+            },
           },
         ).catch(() => {});
       }));
@@ -822,6 +956,10 @@
         frameId: record.promptBinding.frameId,
         frameOrigin: record.frameOrigin,
         origin: record.origin,
+        // New desktop builds also accept a trusted frame origin here, but
+        // the top-level value keeps the event compatible with older builds
+        // that required promptOrigin to equal the vault origin.
+        promptOrigin: record.origin,
         password: record.password,
         source: record.source,
         stage: record.stage,
@@ -950,13 +1088,13 @@
         throw bridgeError("PASSWORD_CANDIDATE_EXPIRED", "The login candidate has expired");
       }
       const sameFrame = binding.frameId === record.frameId && binding.origin === record.origin;
-      const sameSiteFrame = binding.frameId === record.frameId
+      const trustedFrame = binding.frameId === record.frameId
         && Boolean(record.frameOrigin)
         && binding.origin === record.frameOrigin
-        && templates.sameSite(record.frameOrigin, record.origin);
+        && templates.frameOriginAllowed(record.origin, record.frameOrigin);
       if (
         binding.tabId !== record.tabId
-        || !sameFrame && !sameSiteFrame
+        || !sameFrame && !trustedFrame
         || record.documentId && binding.documentId && binding.documentId !== record.documentId
       ) {
         throw bridgeError("PASSWORD_TARGET_MISMATCH", "The success signal came from another page");
@@ -979,11 +1117,18 @@
         if (!announcedOrigin || announcedOrigin !== binding.origin) {
           throw bridgeError("PASSWORD_TARGET_MISMATCH", "The ready page did not match its browser frame");
         }
-        const frameCaptureAllowed = binding.origin.startsWith("https://")
-          || captureInsecureOrigins.has(binding.origin);
+        setFrameContext(binding, message);
+        const frameTopOrigin = await topLevelOrigin(binding, sender);
+        const trustedFrame = Boolean(frameTopOrigin)
+          && templates.frameOriginAllowed(frameTopOrigin, binding.origin);
+        const frameCaptureAllowed = trustedFrame && (
+          binding.origin.startsWith("https://")
+          || captureInsecureOrigins.has(binding.origin)
+        );
         return {
           captureEnabled: Boolean(captureEnabled && frameCaptureAllowed),
           insecureOrigins: Array.from(captureInsecureOrigins),
+          topLevelOrigin: frameTopOrigin,
         };
       }
       if (!announcedOrigin) {
@@ -997,6 +1142,16 @@
       if (announcedOrigin !== binding.origin) {
         throw bridgeError("PASSWORD_TARGET_MISMATCH", "The ready page did not match its browser frame");
       }
+      const previousContext = tabContexts.get(binding.tabId);
+      // A child frame can announce itself before the top document's content
+      // script finishes (especially when a login iframe is inserted during
+      // parsing). Do not discard that fresh capability snapshot merely
+      // because the top-frame context has not been recorded yet; clear the
+      // map only when an established top document actually changes.
+      if (previousContext && previousContext.documentId !== binding.documentId) {
+        clearFrameContext(binding.tabId);
+      }
+      setFrameContext(binding, message);
       tabContexts.set(binding.tabId, { documentId: binding.documentId, origin: binding.origin });
       postEvent("originActive", { origin: binding.origin, tabId: binding.tabId });
       const cachedAccounts = tabAccounts.get(binding.tabId);
@@ -1077,6 +1232,7 @@
             sessionId: session.sessionId,
             tabId: session.tabId,
             frameId: binding.frameId,
+            frameOrigin: binding.origin,
             origin: binding.origin,
             status: "origin-rejected",
             submitted: false,
@@ -1111,7 +1267,18 @@
       return {
         captureEnabled: Boolean(captureEnabled && originCaptureAllowed),
         insecureOrigins: Array.from(captureInsecureOrigins),
+        topLevelOrigin: binding.origin,
       };
+    }
+
+    async function onFrameState(message, sender) {
+      const binding = senderBinding(sender);
+      const origin = templates.exactOrigin(message.origin);
+      if (origin !== binding.origin) {
+        throw bridgeError("PASSWORD_TARGET_MISMATCH", "The frame state origin did not match its browser frame");
+      }
+      setFrameContext(binding, message);
+      return { accepted: true, frameId: binding.frameId };
     }
 
     function sessionForContent(message, sender) {
@@ -1124,25 +1291,44 @@
       const frameOrigin = message.frameOrigin == null
         ? binding.origin
         : templates.exactOrigin(message.frameOrigin);
-      // The bound frame is the exact top-level frame the session started on.
-      // Once a same-site iframe confirmed, the session is re-bound to it, so
-      // later messages from that frame take the same-site path below.
-      const boundFrame = binding.frameId === session.frameId && binding.origin === session.origin;
+      const frameMatches = binding.frameId === session.frameId;
+      const topOrigin = topLevelOriginSnapshot(binding, sender);
+      const trustedFrame = binding.frameId > 0
+        && templates.frameOriginAllowed(session.origin, binding.origin)
+        // A child frame is trusted only when Firefox's Tab.url (or the
+        // validated top-frame context) still names the session origin.
+        && topOrigin === session.origin;
+      // Firefox 140 does not expose location.ancestorOrigins. In that case a
+      // child frame reports its own origin in `message.origin`; accept either
+      // the requested top-level origin or the verified child origin, but only
+      // for an explicitly trusted frame during the initial confirmation.
+      const claimedOriginAllowed = origin === session.origin
+        || trustedFrame && origin === binding.origin;
+      const frameAllowed = frameMatches
+        || session.state === "awaiting-confirmation" && trustedFrame;
       if (
-        binding.tabId !== session.tabId
-        || origin !== session.origin
-        || offerId !== session.offerId
-        || frameOrigin !== binding.origin
-        || boundFrame && session.documentId && binding.documentId && binding.documentId !== session.documentId
+        session.state === "awaiting-confirmation"
+        && !frameMatches
+        && !trustedFrame
+        && frameOrigin === binding.origin
       ) {
-        throw bridgeError("PASSWORD_TARGET_MISMATCH", "The page message does not match its fill session");
-      }
-      if (!boundFrame && !templates.sameSite(binding.origin, session.origin)) {
-        // A cross-site frame must never confirm or cancel another site's fill.
+        // Preserve a distinct diagnostic for a cross-site frame attempting to
+        // claim an offer; callers use this to retire the pending session.
         throw bridgeError(
           "PASSWORD_CROSS_SITE_FRAME",
-          "The page frame is not same-site with the fill session",
+          "The page frame is not trusted for the fill session",
         );
+      }
+      if (
+        binding.tabId !== session.tabId
+        || topOrigin !== session.origin
+        || !claimedOriginAllowed
+        || offerId !== session.offerId
+        || frameOrigin !== binding.origin
+        || !frameAllowed
+        || frameMatches && session.documentId && binding.documentId && binding.documentId !== session.documentId
+      ) {
+        throw bridgeError("PASSWORD_TARGET_MISMATCH", "The page message does not match its fill session");
       }
       return { binding, frameOrigin, session };
     }
@@ -1163,10 +1349,14 @@
         throw bridgeError("PASSWORD_SESSION_STATE", "The fill offer is not awaiting confirmation");
       }
       if (binding.frameId !== session.frameId) {
-        // The login form lives in a same-site iframe: bind the session to the
+        // The login form lives in a trusted iframe: bind the session to the
         // confirming frame so credentials are delivered only there.
         session.frameId = binding.frameId;
+        // A child document has its own Firefox document id. Retain that id for
+        // subsequent frame-bound messages such as fill-cancel.
+        session.documentId = binding.documentId;
       }
+      session.frameOrigin = frameOrigin;
       session.state = "confirmed";
       renewSession(session);
       postEvent("fillConfirm", {
@@ -1183,9 +1373,10 @@
     }
 
     function onFillCancel(message, sender) {
-      const { session } = sessionForContent(message, sender);
+      const { frameOrigin, session } = sessionForContent(message, sender);
       postEvent("fillResult", {
         frameId: session.frameId,
+        frameOrigin,
         origin: session.origin,
         sessionId: session.sessionId,
         status: "cancelled",
@@ -1201,12 +1392,16 @@
         throw bridgeError("PASSWORD_CAPTURE_DISABLED", "Login detection is disabled");
       }
       const binding = senderBinding(sender);
-      if (binding.frameId !== 0) {
-        throw bridgeError("PASSWORD_TARGET_INVALID", "Cross-frame login detection is not supported");
+      const origin = await topLevelOrigin(binding, sender);
+      if (!origin) {
+        throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The username-stage tab has no HTTP origin");
       }
-      const origin = templates.exactOrigin(message.origin);
-      if (origin !== binding.origin) {
+      const claimedOrigin = templates.exactOrigin(message.origin);
+      if (binding.frameId === 0 && claimedOrigin !== origin) {
         throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The username-stage origin is invalid");
+      }
+      if (binding.frameId > 0 && !templates.frameOriginAllowed(origin, binding.origin)) {
+        throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The username-stage frame is cross-site");
       }
       if (origin.startsWith("http://") && !captureInsecureOrigins.has(origin)) {
         throw bridgeError("PASSWORD_INSECURE_ORIGIN", "HTTP login detection was not enabled for this origin");
@@ -1240,7 +1435,7 @@
         ? message.candidate
         : {};
       const candidateId = requiredString(value.candidateId, "candidateId", 160);
-      const origin = templates.exactOrigin(value.origin);
+      const claimedOrigin = templates.exactOrigin(value.origin);
       // origin is the top-level origin; frameOrigin is the submitting frame's
       // own origin and must agree with the browser-reported sender URL.
       const frameOrigin = value.frameOrigin == null
@@ -1249,11 +1444,15 @@
       if (frameOrigin !== binding.origin) {
         throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The login candidate frame origin is invalid");
       }
+      const origin = await topLevelOrigin(binding, sender);
+      if (!origin) {
+        throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The login candidate tab has no HTTP origin");
+      }
       if (binding.frameId === 0) {
-        if (origin !== binding.origin) {
+        if (claimedOrigin !== binding.origin || claimedOrigin !== origin) {
           throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The login candidate origin is invalid");
         }
-      } else if (!templates.sameSite(frameOrigin, origin)) {
+      } else if (!templates.frameOriginAllowed(origin, frameOrigin)) {
         // A cross-site iframe must never attach credentials to the top site.
         throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The login candidate came from a cross-site frame");
       }
@@ -1304,7 +1503,7 @@
       password = "";
       username = "";
       value.password = "";
-      return { accepted: true, candidateId, expiresInMs: CANDIDATE_TTL_MS };
+      return { accepted: true, candidateId, expiresInMs: CANDIDATE_TTL_MS, origin };
     }
 
     function onSaveDecision(message, sender) {
@@ -1351,7 +1550,10 @@
           documentId: binding.documentId,
           frameId: binding.frameId,
           origin: record.origin,
-          promptOrigin: binding.origin,
+          // Keep promptOrigin compatible with desktop builds that require it
+          // to match the top-level vault origin. The exact prompt frame is
+          // independently bound by tabId/frameId/documentId above.
+          promptOrigin: record.origin,
           tabId: binding.tabId,
         });
         return { accepted: true, action, candidateId };
@@ -1367,7 +1569,7 @@
         documentId: binding.documentId,
         frameId: binding.frameId,
         origin: record.origin,
-        promptOrigin: binding.origin,
+        promptOrigin: record.origin,
         tabId: binding.tabId,
         ...(action === "replace" ? { entryId } : {}),
       });
@@ -1556,6 +1758,7 @@
       switch (message.type) {
         case "petaldesk.password.page-closed": return onPageClosed(sender);
         case "petaldesk.password.tab-ready": return onTabReady(message, sender);
+        case "petaldesk.password.frame-state": return onFrameState(message, sender);
         case "petaldesk.password.fill-confirm": return onFillConfirm(message, sender);
         case "petaldesk.password.fill-cancel": return onFillCancel(message, sender);
         case "petaldesk.password.capture-username-stage": return onCaptureUsernameStage(message, sender);
@@ -1592,6 +1795,7 @@
     if (typeof api.onTabRemoved === "function") {
       api.onTabRemoved((tabId) => {
         tabContexts.delete(tabId);
+        tabFrames.delete(tabId);
         tabAccounts.delete(tabId);
         clearTabState(tabId);
         postEvent("pageClosed", { documentId: null, tabId });
@@ -1652,6 +1856,7 @@
       captureEnabled = false;
       void broadcastCaptureState().catch(() => {});
       for (const sessionId of Array.from(sessions.keys())) clearSession(sessionId);
+      tabFrames.clear();
       clearCaptureState();
     }
 

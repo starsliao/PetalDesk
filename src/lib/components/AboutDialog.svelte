@@ -18,6 +18,7 @@
 
   interface Props {
     currentVersion?: string;
+    buildTimestamp?: number;
     supported?: boolean;
     api?: UpdateApi;
     onclose?: () => void;
@@ -25,6 +26,7 @@
 
   let {
     currentVersion = "",
+    buildTimestamp,
     supported = updaterApi.isSupported(),
     api = updaterApi,
     onclose,
@@ -47,6 +49,7 @@
   let actionError = $state<string | null>(null);
 
   let displayedVersion = $derived(updateState.currentVersion || currentVersion || "未知");
+  let displayedBuild = $derived(formatBuildTimestamp(buildTimestamp));
   let working = $derived(
     actionBusy
       || updateState.phase === "checking"
@@ -70,6 +73,17 @@
     if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
     if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
     return `${bytes} B`;
+  }
+
+  function formatBuildTimestamp(timestamp: number | undefined): { iso: string; label: string } | null {
+    if (!Number.isFinite(timestamp) || !timestamp || timestamp <= 0) return null;
+    const date = new Date(timestamp * 1000);
+    if (Number.isNaN(date.getTime())) return null;
+    const pad = (value: number): string => String(value).padStart(2, "0");
+    return {
+      iso: date.toISOString(),
+      label: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`,
+    };
   }
 
   function handleKeydown(event: KeyboardEvent): void {
@@ -210,6 +224,9 @@
       <span>当前版本</span>
       <strong>v{displayedVersion}</strong>
       <span class="platform-badge">Windows</span>
+      {#if displayedBuild}
+        <time class="build-time" datetime={displayedBuild.iso}>打包时间 {displayedBuild.label}</time>
+      {/if}
     </div>
 
     <section class="update-section" aria-labelledby="update-title">
@@ -437,7 +454,8 @@
 
   .version-line {
     min-height: 38px;
-    padding: 0 20px;
+    padding: 7px 20px;
+    flex-wrap: wrap;
     gap: 8px;
     color: var(--app-muted);
     font-size: 12px;
@@ -458,6 +476,12 @@
     background: #e6f3ff;
     border: 1px solid #bfddf5;
     border-radius: 999px;
+  }
+
+  .build-time {
+    margin-left: auto;
+    color: var(--app-muted);
+    font-variant-numeric: tabular-nums;
   }
 
   .update-section {
@@ -720,6 +744,11 @@
 
     .version-line {
       padding-inline: 14px;
+    }
+
+    .build-time {
+      width: 100%;
+      margin-left: 0;
     }
 
     .section-heading,

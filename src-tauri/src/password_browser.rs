@@ -761,8 +761,18 @@ impl PasswordBrowserService {
             lock_unpoisoned(&self.fills).remove(session_id);
             return;
         };
+        let confirmation_document_id = event
+            .payload
+            .get("documentId")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 256)
+            .map(str::to_string);
+        let Some(confirmation_document_id) = confirmation_document_id else {
+            lock_unpoisoned(&self.fills).remove(session_id);
+            return;
+        };
         // Bind the session to the frame that confirmed the fill: for a
-        // same-site iframe fill this is the first moment the real frame is
+        // trusted iframe fill this is the first moment the real frame is
         // known, and the credentials must go back to that frame.
         let frame_id = event.payload.get("frameId").and_then(Value::as_i64);
         {
@@ -781,7 +791,10 @@ impl PasswordBrowserService {
                 "origin": session.origin,
                 "tabId": session.tab_id,
                 "frameId": frame_id,
-                "documentId": session.document_id,
+                // Firefox assigns a distinct document id to an iframe. Keep
+                // the top-level id in the session, but route credentials with
+                // the id of the confirming frame.
+                "documentId": confirmation_document_id,
                 "username": data.username,
                 "password": data.password,
             }),
@@ -1165,18 +1178,34 @@ impl PasswordBrowserService {
         if frame_id < 0 {
             return;
         }
-        if frame_id > 0 {
-            // A candidate submitted inside an iframe is only acceptable when
-            // the frame reports its own origin and that origin is same-site
-            // with the top-level one; anything else is dropped silently.
-            let accepted = event
-                .payload
-                .get("frameOrigin")
-                .and_then(Value::as_str)
-                .is_some_and(|frame_origin| same_site(frame_origin, &origin));
-            if !accepted {
+        let frame_origin = event
+            .payload
+            .get("frameOrigin")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 2_048)
+            .map(str::to_string);
+        let frame_origin = if frame_id == 0 {
+            // Top-frame messages historically omitted frameOrigin; bind them
+            // to the already validated top-level origin in that case.
+            frame_origin.unwrap_or_else(|| origin.clone())
+        } else {
+            // A child frame must identify its own origin. Falling back to the
+            // top-level origin would make a missing binding indistinguishable
+            // from an explicitly trusted iframe.
+            let Some(frame_origin) = frame_origin else {
+                return;
+            };
+            frame_origin
+        };
+        if frame_id == 0 {
+            if frame_origin != origin {
                 return;
             }
+        } else if !frame_origin_allowed(&origin, &frame_origin) {
+            // A candidate submitted inside an iframe is only acceptable when
+            // the frame reports an origin explicitly delegated by the
+            // top-level one; anything else is dropped silently.
+            return;
         }
         let Some(document_id) = event
             .payload
@@ -1191,9 +1220,19 @@ impl PasswordBrowserService {
             .payload
             .get("promptOrigin")
             .and_then(Value::as_str)
-            .unwrap_or(origin.as_str())
+            // Older extensions did not include promptOrigin. For an iframe,
+            // the submitting frame is the only trustworthy prompt surface.
+            .unwrap_or(if frame_id > 0 {
+                frame_origin.as_str()
+            } else {
+                origin.as_str()
+            })
             .to_string();
-        if prompt_origin != origin {
+        let prompt_matches = prompt_origin == origin
+            || (frame_id > 0
+                && prompt_origin == frame_origin
+                && frame_origin_allowed(&origin, &prompt_origin));
+        if !prompt_matches {
             return;
         }
         let allow_insecure_http = origin.starts_with("http://");
@@ -1827,51 +1866,22 @@ fn unix_time_ms() -> u128 {
         .as_millis()
 }
 
-/// Multi-level public suffixes shared with the extension's sameSite check.
-/// When a host's last two labels are listed here, its registrable domain
-/// spans the last three labels instead of two. Keep in sync with the
-/// extension side byte for byte.
-const MULTI_LEVEL_PUBLIC_SUFFIXES: &[&str] = &[
-    "co.uk", "org.uk", "ac.uk", "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
-    "com.au", "net.au", "org.au", "co.nz", "com.hk", "com.tw", "co.jp", "or.jp", "com.sg",
-    "com.my", "co.kr", "com.br", "com.mx", "com.tr", "co.in", "firm.in",
-];
-
-/// Reports whether two origins belong to the same site: equal origins always
-/// match; otherwise both must parse to non-IP hosts whose registrable
-/// domains match. Scheme and port are ignored. Mirrors the extension's
-/// sameSite check so iframe fills and captures accept exactly the same
-/// frames on both sides.
-pub(crate) fn same_site(origin_a: &str, origin_b: &str) -> bool {
-    if origin_a == origin_b {
-        return true;
-    }
-    match (registrable_domain(origin_a), registrable_domain(origin_b)) {
-        (Some(domain_a), Some(domain_b)) => domain_a == domain_b,
-        _ => false,
-    }
-}
-
-fn registrable_domain(origin: &str) -> Option<String> {
-    let url = Url::parse(origin).ok()?;
-    let host = match url.host() {
-        Some(url::Host::Domain(host)) if !host.is_empty() => host,
-        _ => return None,
-    };
-    let labels = host.split('.').collect::<Vec<_>>();
-    let last_two = labels[labels.len().saturating_sub(2)..].join(".");
-    if MULTI_LEVEL_PUBLIC_SUFFIXES.contains(&last_two.as_str()) {
-        Some(labels[labels.len().saturating_sub(3)..].join("."))
-    } else {
-        Some(last_two)
-    }
+/// Returns whether a top-level origin may delegate password handling to a
+/// frame origin. The policy is directional and deny-by-default: equal origins
+/// work everywhere, while cross-origin frames require an explicit audited
+/// pair. Do not replace this with registrable-domain or public-suffix guesses.
+fn frame_origin_allowed(top_origin: &str, frame_origin: &str) -> bool {
+    top_origin == frame_origin
+        || matches!(
+            (top_origin, frame_origin),
+            ("https://mail.163.com", "https://dl.reg.163.com")
+        )
 }
 
 /// Frame policy for fill events: the top-level frame (0) keeps the exact
-/// binding; any other frame must report its own origin and it must be
-/// same-site with the session's top-level origin. A session still bound to
-/// the top level adopts the confirming frame; once bound, only that frame
-/// matches.
+/// binding; any other frame must report its own explicitly delegated origin.
+/// A session still bound to the top level adopts the confirming frame; once
+/// bound, only that frame matches.
 fn fill_frame_origin_allowed(session: &FillSession, payload: &Value) -> bool {
     match payload.get("frameId").and_then(Value::as_i64) {
         Some(0) => session.frame_id == Some(0),
@@ -1880,7 +1890,7 @@ fn fill_frame_origin_allowed(session: &FillSession, payload: &Value) -> bool {
                 && payload
                     .get("frameOrigin")
                     .and_then(Value::as_str)
-                    .is_some_and(|frame_origin| same_site(frame_origin, &session.origin))
+                    .is_some_and(|frame_origin| frame_origin_allowed(&session.origin, frame_origin))
         }
         _ => false,
     }
@@ -1920,9 +1930,29 @@ fn bind_fill_tab_ready(session: &mut FillSession, payload: &Value) -> bool {
 }
 
 fn fill_confirmation_matches(session: &FillSession, payload: &Value) -> bool {
+    let Some(frame_id) = payload.get("frameId").and_then(Value::as_i64) else {
+        return false;
+    };
+    let Some(document_id) = payload
+        .get("documentId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+    else {
+        return false;
+    };
+    let document_matches = if frame_id == 0 {
+        session.document_id.as_deref() == Some(document_id)
+    } else if frame_id > 0 {
+        // A trusted iframe has its own Firefox document id. The session's
+        // top-level id remains the navigation binding; frame origin/id checks
+        // below ensure the confirmation still belongs to this tab session.
+        session.frame_id == Some(0) || session.frame_id == Some(frame_id)
+    } else {
+        false
+    };
     payload.get("origin").and_then(Value::as_str) == Some(session.origin.as_str())
         && payload.get("tabId").and_then(Value::as_i64) == session.tab_id
-        && payload.get("documentId").and_then(Value::as_str) == session.document_id.as_deref()
+        && document_matches
         && fill_frame_origin_allowed(session, payload)
 }
 
@@ -2825,43 +2855,41 @@ mod tests {
     }
 
     #[test]
-    fn same_site_matches_registrable_domains_and_rejects_ips() {
-        for (origin_a, origin_b) in [
-            // Exact equality always matches, even for IP origins.
-            ("https://example.com", "https://example.com"),
-            ("https://127.0.0.1:8080", "https://127.0.0.1:8080"),
-            // The 163 mail pair: top-level page and login iframe.
-            ("https://mail.163.com", "https://dl.reg.163.com"),
-            ("https://a.example.com", "https://b.example.com"),
-            // Scheme and port are ignored; only the registrable domain counts.
-            ("http://example.com:8080", "https://example.com"),
-            // Multi-level public suffixes extend the registrable domain.
-            ("https://www.example.co.uk", "https://login.example.co.uk"),
-            ("https://example.com.cn", "https://mail.example.com.cn"),
+    fn frame_origin_policy_is_directional_and_deny_by_default() {
+        for origin in [
+            "https://example.com",
+            "https://127.0.0.1:8080",
+            "https://mail.163.com",
         ] {
-            assert!(same_site(origin_a, origin_b), "{origin_a} vs {origin_b}");
-            assert!(same_site(origin_b, origin_a), "{origin_b} vs {origin_a}");
+            assert!(frame_origin_allowed(origin, origin));
         }
-        for (origin_a, origin_b) in [
-            // Different registrable domains never match.
-            ("https://example.com", "https://other.com"),
-            ("https://163.com", "https://126.com"),
-            // co.uk is a public suffix: two co.uk domains are not same-site.
-            ("https://example.co.uk", "https://other.co.uk"),
-            ("https://example.com", "https://example.co.uk"),
-            // IP literals and unparseable origins only match exactly.
-            ("https://127.0.0.1:8080", "http://127.0.0.1"),
-            ("https://10.0.0.1", "https://10.0.0.2"),
-            ("not a url", "https://example.com"),
-            ("https://example.com", ""),
+
+        assert!(frame_origin_allowed(
+            "https://mail.163.com",
+            "https://dl.reg.163.com"
+        ));
+        assert!(!frame_origin_allowed(
+            "https://dl.reg.163.com",
+            "https://mail.163.com"
+        ));
+
+        for (top_origin, frame_origin) in [
+            ("https://a.example.com", "https://b.example.com"),
+            ("https://example.com", "http://example.com"),
+            ("https://example.com", "https://example.com:8443"),
+            ("https://victim.github.io", "https://attacker.github.io"),
+            ("https://victim.appspot.com", "https://attacker.appspot.com"),
+            ("https://victim.pages.dev", "https://attacker.pages.dev"),
         ] {
-            assert!(!same_site(origin_a, origin_b), "{origin_a} vs {origin_b}");
-            assert!(!same_site(origin_b, origin_a), "{origin_b} vs {origin_a}");
+            assert!(
+                !frame_origin_allowed(top_origin, frame_origin),
+                "{top_origin} must not delegate to {frame_origin}"
+            );
         }
     }
 
     #[test]
-    fn fill_confirm_accepts_same_site_iframe_and_binds_the_session_frame() {
+    fn fill_confirm_accepts_explicit_163_iframe_and_binds_the_session_frame() {
         let (_root, store) = test_store();
         let entry = create_entry(&store, "https://mail.163.com/login", "alice", "one");
         let (service, recorded) = connected_service("connection-a");
@@ -2894,7 +2922,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        // The login form lives in a same-site iframe; the confirm reports the
+        // The login form lives in a trusted iframe; the confirm reports the
         // real frame together with the frame's own origin.
         service.handle_fill_confirm(
             &store,
@@ -2908,7 +2936,7 @@ mod tests {
                     "tabId": 7,
                     "frameId": 9,
                     "frameOrigin": "https://dl.reg.163.com",
-                    "documentId": "document-9",
+                    "documentId": "iframe-document-9",
                 }),
             ),
         );
@@ -2917,7 +2945,7 @@ mod tests {
         let payload = &credentials[0]["payload"];
         assert_eq!(payload["tabId"], 7);
         assert_eq!(payload["frameId"], 9);
-        assert_eq!(payload["documentId"], "document-9");
+        assert_eq!(payload["documentId"], "iframe-document-9");
         assert_eq!(payload["username"], "alice");
         assert_eq!(payload["password"], "one");
         {
@@ -3008,7 +3036,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_candidate_accepts_same_site_iframe_and_binds_the_frame() {
+    fn capture_candidate_accepts_explicit_163_iframe_and_binds_the_frame() {
         let (_root, store) = test_store();
         let (service, recorded) = connected_service("connection-a");
 
@@ -3021,6 +3049,7 @@ mod tests {
                     "candidateId": "candidate-frame",
                     "origin": "https://mail.163.com",
                     "frameOrigin": "https://dl.reg.163.com",
+                    "promptOrigin": "https://mail.163.com",
                     "username": "alice",
                     "password": "one",
                     "tabId": 7,
@@ -3065,7 +3094,7 @@ mod tests {
             ),
         );
         let Some((entry_id, action)) = saved else {
-            panic!("same-site iframe save decision must succeed");
+            panic!("trusted iframe save decision must succeed");
         };
         assert_eq!(action, "new");
         let epoch = store.require_active_epoch().unwrap();
@@ -3075,6 +3104,44 @@ mod tests {
         let results = recorded.requests_for("password.saveResult");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["payload"]["success"], true);
+    }
+
+    #[test]
+    fn capture_candidate_keeps_legacy_iframe_prompt_origin_compatible() {
+        let (_root, store) = test_store();
+        let (service, _recorded) = connected_service("connection-a");
+
+        service.handle_capture_candidate(
+            &store,
+            &secret_event(
+                "connection-a",
+                "captureCandidate",
+                serde_json::json!({
+                    "candidateId": "candidate-frame-legacy",
+                    "origin": "https://mail.163.com",
+                    "frameOrigin": "https://dl.reg.163.com",
+                    "username": "alice",
+                    "password": "one",
+                    "tabId": 7,
+                    "frameId": 9,
+                    "documentId": "document-legacy",
+                }),
+            ),
+        );
+
+        let captures = lock_unpoisoned(&service.captures);
+        let capture = captures.get("candidate-frame-legacy").unwrap();
+        assert_eq!(capture.prompt_origin, "https://dl.reg.163.com");
+        assert!(capture_decision_matches(
+            capture,
+            &serde_json::json!({
+                "origin": "https://mail.163.com",
+                "promptOrigin": "https://dl.reg.163.com",
+                "tabId": 7,
+                "frameId": 9,
+                "documentId": "document-legacy",
+            }),
+        ));
     }
 
     #[test]
@@ -3092,6 +3159,36 @@ mod tests {
                 "tabId": 7,
                 "frameId": 9,
                 "documentId": "document-1",
+            }),
+            serde_json::json!({
+                "candidateId": "candidate-github-tenant",
+                "origin": "https://victim.github.io",
+                "frameOrigin": "https://attacker.github.io",
+                "username": "alice",
+                "password": "one",
+                "tabId": 7,
+                "frameId": 9,
+                "documentId": "document-github",
+            }),
+            serde_json::json!({
+                "candidateId": "candidate-appspot-tenant",
+                "origin": "https://victim.appspot.com",
+                "frameOrigin": "https://attacker.appspot.com",
+                "username": "alice",
+                "password": "one",
+                "tabId": 7,
+                "frameId": 9,
+                "documentId": "document-appspot",
+            }),
+            serde_json::json!({
+                "candidateId": "candidate-pages-tenant",
+                "origin": "https://victim.pages.dev",
+                "frameOrigin": "https://attacker.pages.dev",
+                "username": "alice",
+                "password": "one",
+                "tabId": 7,
+                "frameId": 9,
+                "documentId": "document-pages",
             }),
             serde_json::json!({
                 "candidateId": "candidate-no-frame-origin",

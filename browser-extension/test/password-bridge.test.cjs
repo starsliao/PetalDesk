@@ -28,7 +28,7 @@ function loadBridge() {
   };
   const api = {
     browserFamily: "firefox",
-    extensionVersion: "0.7.3",
+    extensionVersion: "0.7.4",
     action: {
       async setBadgeText(value) {
         actionUpdates.badgeTexts.push(JSON.parse(JSON.stringify(value)));
@@ -229,7 +229,11 @@ test("fill sessions bind the new tab, origin, frame, and confirmation before rec
   const result = await harness.bridge.route({ command: "password.provideCredentials", payload: credentials });
   assert.equal(result.filledPassword, true);
   assert.equal(credentials.password, "");
-  assert.equal(harness.events.at(-1).event, "fillResult");
+  const fillResult = harness.events.at(-1);
+  assert.equal(fillResult.event, "fillResult");
+  assert.equal(fillResult.payload.frameId, 0);
+  assert.equal(fillResult.payload.frameOrigin, "https://accounts.google.com");
+  assert.equal(fillResult.payload.origin, "https://accounts.google.com");
   assert.equal(Object.prototype.hasOwnProperty.call(harness.events.at(-1).payload, "password"), false);
 });
 
@@ -509,7 +513,7 @@ test("popup state reports diagnostics recorded at the command boundary", async (
   await harness.bridge.route({ command: "password.getStatus", payload: {} });
   let state = await harness.sendPopup({ type: "petaldesk.popup.getState" });
   assert.equal(state.diagnostics.nativeConnected, true);
-  assert.equal(state.diagnostics.extensionVersion, "0.7.3");
+  assert.equal(state.diagnostics.extensionVersion, "0.7.4");
   assert.equal(state.diagnostics.lastCommandOk, true);
   assert.equal(state.diagnostics.lastCommandErrorCode, null);
   assert.equal(typeof state.diagnostics.lastCommandAt, "number");
@@ -1159,7 +1163,7 @@ test("HTTP origins require an explicit allowlist for opening and capture", async
   assert.equal(opened.origin, "http://intranet.test");
 });
 
-test("a same-site iframe confirms the broadcast offer and receives the secret alone", async () => {
+test("a trusted iframe confirms the broadcast offer and receives the secret alone", async () => {
   const harness = loadBridge();
   harness.tabs.set(88, { id: 88, url: "https://mail.163.com/" });
   await harness.bridge.route({
@@ -1212,12 +1216,147 @@ test("a same-site iframe confirms the broadcast offer and receives the secret al
   assert.equal(credentials.password, "");
   const secret = harness.tabMessages.at(-1);
   assert.equal(secret.message.command, "fillSecret");
-  // The password is delivered only to the confirmed same-site frame.
+  // The password is delivered only to the confirmed trusted frame.
   assert.equal(secret.options.frameId, 7);
-  assert.equal(harness.events.at(-1).event, "fillResult");
+  const iframeResult = harness.events.at(-1);
+  assert.equal(iframeResult.event, "fillResult");
+  assert.equal(iframeResult.payload.frameId, 7);
+  assert.equal(iframeResult.payload.frameOrigin, "https://dl.reg.163.com");
+  assert.equal(iframeResult.payload.origin, "https://mail.163.com");
 });
 
-test("a same-site iframe stays bound across a two-step fill", async () => {
+test("known login frames receive a direct fill offer before the broadcast fallback", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(90, { id: 90, url: "https://mail.163.com/" });
+  await harness.sendContent(
+    {
+      type: "petaldesk.password.tab-ready",
+      hasPassword: false,
+      hasUsername: false,
+      origin: "https://mail.163.com",
+    },
+    {
+      documentId: "document-90",
+      frameId: 0,
+      tab: { id: 90, url: "https://mail.163.com/" },
+      url: "https://mail.163.com/",
+    },
+  );
+  await harness.sendContent(
+    {
+      type: "petaldesk.password.frame-state",
+      hasPassword: true,
+      hasUsername: true,
+      origin: "https://dl.reg.163.com",
+    },
+    {
+      documentId: "iframe-document-90",
+      frameId: 7,
+      tab: { id: 90, url: "https://mail.163.com/" },
+      url: "https://dl.reg.163.com/login",
+    },
+  );
+  await harness.bridge.route({
+    command: "password.offerFillDirect",
+    payload: {
+      documentId: "document-90",
+      entryId: "entry-163",
+      offerId: "offer-targeted-90",
+      origin: "https://mail.163.com",
+      sessionId: "targeted-90",
+      tabId: 90,
+      username: "alice@163.com",
+    },
+  });
+  const offer = harness.tabMessages.at(-1);
+  assert.equal(offer.message.command, "fillOffer");
+  assert.equal(offer.options.frameId, 7);
+});
+
+test("a Firefox iframe confirmation may report its own origin without ancestorOrigins", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(89, { id: 89, url: "https://mail.163.com/" });
+  await harness.bridge.route({
+    command: "password.offerFillDirect",
+    payload: {
+      documentId: "document-89",
+      entryId: "entry-163",
+      offerId: "offer-firefox-origin",
+      origin: "https://mail.163.com",
+      sessionId: "iframe-firefox-origin",
+      tabId: 89,
+      username: "alice@163.com",
+    },
+  });
+  const confirmed = await harness.sendContent(
+    {
+      type: "petaldesk.password.fill-confirm",
+      frameOrigin: "https://dl.reg.163.com",
+      // Firefox 140-147 has no location.ancestorOrigins, so the content
+      // script falls back to its own frame origin here.
+      origin: "https://dl.reg.163.com",
+      offerId: "offer-firefox-origin",
+      sessionId: "iframe-firefox-origin",
+    },
+    {
+      documentId: "iframe-document-89",
+      frameId: 7,
+      tab: { id: 89, url: "https://mail.163.com/" },
+      url: "https://dl.reg.163.com/login",
+    },
+  );
+  assert.equal(confirmed.confirmed, true);
+  assert.equal(harness.events.at(-1).payload.origin, "https://mail.163.com");
+  assert.equal(harness.events.at(-1).payload.frameOrigin, "https://dl.reg.163.com");
+});
+
+test("top-frame readiness does not erase an earlier iframe capability snapshot", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(90, { id: 90, url: "https://mail.163.com/" });
+  const iframeSender = {
+    documentId: "iframe-document-90",
+    frameId: 7,
+    tab: { id: 90, url: "https://mail.163.com/" },
+    url: "https://dl.reg.163.com/login",
+  };
+  await harness.sendContent(
+    {
+      type: "petaldesk.password.frame-state",
+      origin: "https://dl.reg.163.com",
+      hasPassword: true,
+      hasUsername: true,
+    },
+    iframeSender,
+  );
+  await harness.sendContent(
+    {
+      type: "petaldesk.password.tab-ready",
+      origin: "https://mail.163.com",
+    },
+    {
+      documentId: "top-document-90",
+      frameId: 0,
+      tab: { id: 90, url: "https://mail.163.com/" },
+      url: "https://mail.163.com/",
+    },
+  );
+  await harness.bridge.route({
+    command: "password.offerFillDirect",
+    payload: {
+      entryId: "entry-163",
+      offerId: "offer-ready-order",
+      origin: "https://mail.163.com",
+      sessionId: "ready-order",
+      tabId: 90,
+      username: "alice@163.com",
+    },
+  });
+  const offer = harness.tabMessages.at(-1);
+  assert.equal(offer.message.command, "fillOffer");
+  assert.equal(offer.options.frameId, 7);
+});
+
+test("a trusted iframe stays bound across a two-step fill", async () => {
   const harness = loadBridge();
   harness.tabs.set(76, { id: 76, url: "https://mail.163.com/" });
   await harness.bridge.route({
@@ -1333,7 +1472,7 @@ test("a cross-site iframe confirmation is rejected and clears the fill session",
       },
       evilSender,
     ),
-    /same-site/i,
+    /trusted/i,
   );
   assert.equal(harness.events.some((event) => event.event === "fillConfirm"), false);
   // The session was dropped: no credentials can be provided afterwards.
@@ -1350,6 +1489,77 @@ test("a cross-site iframe confirmation is rejected and clears the fill session",
     /expired/i,
   );
   assert.equal(harness.tabMessages.some((entry) => entry.message.command === "fillSecret"), false);
+});
+
+test("a shared-hosting tenant iframe cannot confirm another tenant's fill", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(96, { id: 96, url: "https://victim.github.io/login" });
+  await harness.bridge.route({
+    command: "password.offerFillDirect",
+    payload: {
+      entryId: "entry-tenant",
+      offerId: "offer-tenant",
+      origin: "https://victim.github.io",
+      sessionId: "iframe-tenant",
+      tabId: 96,
+      username: "alice",
+    },
+  });
+  await assert.rejects(
+    harness.sendContent(
+      {
+        type: "petaldesk.password.fill-confirm",
+        frameOrigin: "https://attacker.github.io",
+        offerId: "offer-tenant",
+        origin: "https://victim.github.io",
+        sessionId: "iframe-tenant",
+      },
+      {
+        documentId: "attacker-document",
+        frameId: 12,
+        tab: { id: 96, url: "https://victim.github.io/login" },
+        url: "https://attacker.github.io/phish",
+      },
+    ),
+    /trusted/i,
+  );
+  assert.equal(harness.events.some((event) => event.event === "fillConfirm"), false);
+});
+
+test("a trusted iframe cannot confirm after the top-level origin changes", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(97, { id: 97, url: "https://mail.163.com/" });
+  await harness.bridge.route({
+    command: "password.offerFillDirect",
+    payload: {
+      entryId: "entry-navigation",
+      offerId: "offer-navigation",
+      origin: "https://mail.163.com",
+      sessionId: "iframe-navigation",
+      tabId: 97,
+      username: "alice@163.com",
+    },
+  });
+  harness.tabs.set(97, { id: 97, url: "https://evil.example/" });
+  await assert.rejects(
+    harness.sendContent(
+      {
+        type: "petaldesk.password.fill-confirm",
+        frameOrigin: "https://dl.reg.163.com",
+        offerId: "offer-navigation",
+        origin: "https://dl.reg.163.com",
+        sessionId: "iframe-navigation",
+      },
+      {
+        documentId: "stale-iframe-document",
+        frameId: 7,
+        tab: { id: 97, url: "https://evil.example/" },
+        url: "https://dl.reg.163.com/login",
+      },
+    ),
+    /trusted|does not match/i,
+  );
+  assert.equal(harness.events.some((event) => event.event === "fillConfirm"), false);
 });
 
 test("a forged frameOrigin that disagrees with the sender URL is rejected", async () => {
@@ -1388,7 +1598,7 @@ test("a forged frameOrigin that disagrees with the sender URL is rejected", asyn
   assert.equal(harness.events.some((event) => event.event === "fillConfirm"), false);
 });
 
-test("a same-site iframe capture candidate promotes with its frame origin", async () => {
+test("a trusted iframe capture candidate promotes with its frame origin", async () => {
   const harness = loadBridge();
   harness.tabs.set(92, { id: 92, url: "https://mail.163.com/" });
   await harness.bridge.route({ command: "password.setCaptureEnabled", payload: { enabled: true } });
@@ -1401,7 +1611,9 @@ test("a same-site iframe capture candidate promotes with its frame origin", asyn
   const candidate = {
     candidateId: "iframe-candidate",
     frameOrigin: "https://dl.reg.163.com",
-    origin: "https://mail.163.com",
+    // Firefox 140-147 lacks ancestorOrigins, so the content script reports
+    // its own frame origin and the background derives the top-level origin.
+    origin: "https://dl.reg.163.com",
     password: "iframe-secret",
     username: "alice",
   };
@@ -1425,8 +1637,27 @@ test("a same-site iframe capture candidate promotes with its frame origin", asyn
   assert.equal(nativeCandidate.event, "captureCandidate");
   assert.equal(nativeCandidate.payload.origin, "https://mail.163.com");
   assert.equal(nativeCandidate.payload.frameOrigin, "https://dl.reg.163.com");
+  assert.equal(nativeCandidate.payload.promptOrigin, "https://mail.163.com");
   assert.equal(nativeCandidate.payload.frameId, 7);
   assert.equal(nativeCandidate.payload.password, "iframe-secret");
+
+  await harness.bridge.route({
+    command: "password.captureMatch",
+    payload: { action: "new", candidateId: "iframe-candidate" },
+  });
+  const decision = await harness.sendContent(
+    {
+      type: "petaldesk.password.save-decision",
+      action: "new",
+      candidateId: "iframe-candidate",
+    },
+    iframeSender,
+  );
+  assert.equal(decision.accepted, true);
+  const saveEvent = harness.events.at(-1);
+  assert.equal(saveEvent.event, "saveDecision");
+  assert.equal(saveEvent.payload.origin, "https://mail.163.com");
+  assert.equal(saveEvent.payload.promptOrigin, "https://mail.163.com");
 });
 
 test("a cross-site iframe capture candidate is discarded", async () => {
@@ -1497,6 +1728,7 @@ test("capture enable broadcasts to every frame of the tab", async () => {
   const enable = harness.tabMessages.find((entry) => entry.message.command === "captureEnable");
   assert.ok(enable, "the capture enable command should be sent");
   assert.equal(enable.options, undefined);
+  assert.equal(enable.message.payload.topLevelOrigin, "https://example.test");
 });
 
 test("an iframe tab-ready learns the capture state without tab bookkeeping", async () => {
@@ -1514,6 +1746,7 @@ test("an iframe tab-ready learns the capture state without tab bookkeeping", asy
     iframeSender,
   );
   assert.equal(ready.captureEnabled, true);
+  assert.equal(ready.topLevelOrigin, "https://mail.163.com");
   // No originActive event and no badge/bookkeeping for a non-top frame.
   assert.equal(harness.events.some((event) => event.event === "originActive"), false);
   await assert.rejects(
@@ -1535,4 +1768,21 @@ test("an iframe tab-ready learns the capture state without tab bookkeeping", asy
   );
   assert.equal(harness.events.at(-1).event, "originActive");
   assert.deepEqual(harness.events.at(-1).payload, { origin: "https://mail.163.com", tabId: 75 });
+});
+
+test("an undeclared cross-origin iframe never learns an enabled capture state", async () => {
+  const harness = loadBridge();
+  await harness.bridge.route({ command: "password.setCaptureEnabled", payload: { enabled: true } });
+  harness.tabs.set(98, { id: 98, url: "https://victim.github.io/login" });
+  const ready = await harness.sendContent(
+    { type: "petaldesk.password.tab-ready", origin: "https://attacker.github.io" },
+    {
+      documentId: "attacker-document-98",
+      frameId: 8,
+      tab: { id: 98, url: "https://victim.github.io/login" },
+      url: "https://attacker.github.io/phish",
+    },
+  );
+  assert.equal(ready.captureEnabled, false);
+  assert.equal(ready.topLevelOrigin, "https://victim.github.io");
 });

@@ -1315,7 +1315,7 @@
               <span class="feature-icon blue" aria-hidden="true">🔑</span>
               <span class="feature-tag">Windows</span>
               <h3>密码管理器</h3>
-              <p>独立加密保险库保存站点账户，Firefox 扩展确认后才填充，绝不自动提交。</p>
+              <p>独立加密保险库保存站点账户，点选账户后由 Firefox 扩展直接填充，绝不自动提交。</p>
             </article>
             <article class="feature-card">
               <span class="feature-icon violet" aria-hidden="true">🛡️</span>
@@ -1390,15 +1390,15 @@
           <section class="split flip" id="passwords" aria-labelledby="passwords-title">
             <div class="split-text">
               <span class="kicker">密码管理器 · WINDOWS</span>
-              <h2 id="passwords-title">密码锁在本机，填充先问过你。</h2>
+              <h2 id="passwords-title">密码锁在本机，点选账户才填充。</h2>
               <p class="lead-in">
                 站点账户保存在独立的 XChaCha20-Poly1305 加密保险库，日常用 Windows DPAPI 解锁，与 MFA 验证器共享同一个恢复密码。配套 Firefox 扩展把保险库带进浏览器：
               </p>
               <ul class="check-list">
                 <li>工具栏角标实时显示当前站点已保存的账户数</li>
                 <li>点击图标弹出诊断与账户弹窗，点账户直接在当前页发起填充</li>
-                <li>填充必须经页面浮层二次确认，绝不自动提交</li>
-                <li>登录检测：凭据完全一致不打扰；不一致可保存为新账户或更新任一既有账户；保险库锁定会明确提示</li>
+                <li>点选账户后直接填入目标页面，短暂提示结果，绝不自动提交</li>
+                <li>登录检测始终开启：提交后立即判断；凭据完全一致不打扰，不一致可保存为新账户或更新任一既有账户</li>
                 <li>身份验证信息权限安装时一次性授予，没有二次授权</li>
               </ul>
               <div class="split-links">

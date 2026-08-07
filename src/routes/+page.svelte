@@ -1175,6 +1175,7 @@
 {#if !isToolWindow && aboutOpen}
   <AboutDialog
     currentVersion={appInfo?.version ?? ""}
+    buildTimestamp={appInfo?.buildTimestamp}
     onclose={() => (aboutOpen = false)}
   />
 {/if}

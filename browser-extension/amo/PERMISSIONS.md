@@ -10,7 +10,7 @@ Required to communicate with the PetalDesk Native Messaging Host installed on th
 
 ### `tabs`
 
-Required to create the exact login tab requested by PetalDesk and bind a fill session to its tab ID, top-level frame, document, and exact origin. It is also used to cancel a request when that target changes. Tab activation and navigation events additionally refresh the per-site account-count badge.
+Required to create the exact login tab requested by PetalDesk and bind a fill session to its tab ID, document, top-level origin, and validated login frame. It is also used to cancel a request when that target changes. Tab activation and navigation events additionally refresh the per-site account-count badge.
 
 ### `<all_urls>` host access
 
@@ -18,7 +18,7 @@ Long screenshots and password forms can occur on user-selected sites, so the con
 
 ### `action`
 
-The toolbar button opens a popup showing layered connection diagnostics (install-time data permission, Native Host stdio, desktop password channel, recent request outcome, extension version), the accounts saved for the current exact origin, and a button that opens the PetalDesk password manager. Choosing an account in the popup starts a fill on the current page; the in-page overlay confirmation still applies. The badge on the button shows how many accounts PetalDesk has stored for the current site.
+The toolbar button opens a popup showing layered connection diagnostics (install-time data permission, Native Host stdio, desktop password channel, recent request outcome, extension version), the accounts saved for the current exact origin, and a button that opens the PetalDesk password manager. Choosing an account in the popup fills the current page directly and shows a short result notice. The badge on the button shows how many accounts PetalDesk has stored for the current site.
 
 ## Firefox data collection permissions
 
@@ -36,8 +36,8 @@ Password filling and login detection handle usernames and passwords. This catego
 
 - The toolbar badge shows only the number of saved accounts for the exact current origin; it is cleared when the vault is manually locked.
 - Fill offers contain the account label/username but no password.
-- The password is requested only after the page overlay sends `fillConfirm` for the bound session.
+- A password is requested only for a user-triggered fill after the background validates `fillConfirm` from the bound content frame. This message contains frame identity but no password.
 - Filled credentials are removed from message objects immediately after use.
 - Login candidates remain only in extension memory for at most 30 seconds. A username-only first step may remain for at most two minutes so the same tab can complete a two-step login on the exact same origin.
 - No password, candidate, or fill message is written to browser storage, disk, console, or the legacy screenshot file spool.
-- The extension never submits a form, bypasses MFA, solves CAPTCHA, or fills cross-origin frames.
+- The extension never submits a form, bypasses MFA, solves CAPTCHA, or fills an arbitrary cross-origin frame. Cross-origin delegation is deny-by-default; the only current audited mapping is the `dl.reg.163.com` login frame embedded by `mail.163.com`.

@@ -14,11 +14,13 @@
   const CAPTURE_SUBMITTED_MESSAGE = "petaldesk.password.capture-submitted";
   const CAPTURE_SUCCESS_MESSAGE = "petaldesk.password.capture-success";
   const PAGE_CLOSED_MESSAGE = "petaldesk.password.page-closed";
+  const FRAME_STATE_MESSAGE = "petaldesk.password.frame-state";
   const CAPTURE_USERNAME_STAGE_MESSAGE = "petaldesk.password.capture-username-stage";
   const SAVE_DECISION_MESSAGE = "petaldesk.password.save-decision";
   const TEMPLATE_PROGRESS_MESSAGE = "petaldesk.password.template-recording-progress";
   const TEMPLATE_CANCEL_MESSAGE = "petaldesk.password.template-recording-cancelled";
   const CANDIDATE_TTL_MS = 30_000;
+  const CANDIDATE_DEDUP_MS = 1_500;
   const OVERLAY_ID = "petaldesk-password-overlay";
 
   let captureEnabled = false;
@@ -30,6 +32,13 @@
   let recordingListenerInstalled = false;
   let overlay = null;
   const candidateTimers = new Map();
+  let candidateScheduleTimer = null;
+  let candidateScheduleGeneration = 0;
+  let lastCandidateFingerprint = "";
+  let lastCandidateAt = 0;
+  let lastCandidateClearTimer = null;
+  let fieldObserver = null;
+  let fieldStateTimer = null;
 
   function errorMessage(error) {
     return error instanceof Error ? error.message : String(error || "Unknown error");
@@ -62,8 +71,8 @@
   }
 
   // Fill offers are broadcast to every frame: a frame may participate when it
-  // is the offer origin itself or same-site with it (e.g. the dl.reg.163.com
-  // login iframe inside mail.163.com). Cross-site frames must never fill.
+  // is the offer origin itself or an explicitly trusted login frame (e.g.
+  // dl.reg.163.com inside mail.163.com). Other cross-origin frames never fill.
   function fillOriginAllowed(requestedOrigin, { allowInsecureHttp = false } = {}) {
     let origin;
     let ownOrigin;
@@ -73,7 +82,7 @@
     } catch (_error) {
       return false;
     }
-    if (origin !== ownOrigin && !templates.sameSite(origin, ownOrigin)) return false;
+    if (!templates.frameOriginAllowed(origin, ownOrigin)) return false;
     if (ownOrigin.startsWith("http://")) {
       return allowInsecureHttp || captureAllowedHttpOrigins.has(ownOrigin);
     }
@@ -105,6 +114,41 @@
     } catch (_error) {
       return null;
     }
+  }
+
+  function loginFieldState() {
+    try {
+      const fields = templates.identifyLoginFields(root.document, { origin: currentOrigin() });
+      return {
+        hasPassword: Boolean(fields.passwordField),
+        hasUsername: Boolean(fields.usernameField),
+      };
+    } catch (_error) {
+      return { hasPassword: false, hasUsername: false };
+    }
+  }
+
+  function announceFrameState() {
+    let origin;
+    try {
+      origin = currentOrigin();
+    } catch (_error) {
+      return;
+    }
+    const state = loginFieldState();
+    void sendBackground({
+      type: FRAME_STATE_MESSAGE,
+      origin,
+      ...state,
+    }).catch(() => {});
+  }
+
+  function scheduleFrameStateAnnouncement(delayMs = 0) {
+    if (fieldStateTimer != null) clearTimeout(fieldStateTimer);
+    fieldStateTimer = setTimeout(() => {
+      fieldStateTimer = null;
+      announceFrameState();
+    }, Math.max(0, delayMs));
   }
 
   function randomId(prefix) {
@@ -370,9 +414,9 @@
     const sessionId = safeString(payload.sessionId, 160);
     const offerId = safeString(payload.offerId || randomId("offer"), 160);
     if (!sessionId) throw new Error("A fill session is required");
-    // The offer reaches every frame of the tab. Frames that are not same-site
-    // with the offer origin, or that contain no login fields, stay silent so
-    // the frame holding the login form is the only one that answers.
+    // The offer reaches every frame of the tab. Frames that are not explicitly
+    // trusted for the offer origin, or that contain no login fields, stay
+    // silent so the frame holding the login form is the only one that answers.
     if (!fillOriginAllowed(origin, { allowInsecureHttp: payload.allowInsecureHttp === true })) {
       return { ignored: true, offerId, sessionId };
     }
@@ -690,94 +734,189 @@
     });
   }
 
-  function scheduleCandidate(form) {
+  function scheduleCandidate(form, delayMs = 0) {
     if (!captureEnabled || !form) return;
-    const values = candidateValues(form);
-    if (!values) return;
-    if (!values.password && values.username) {
-      const staged = {
-        origin: values.origin,
-        type: CAPTURE_USERNAME_STAGE_MESSAGE,
-        username: values.username,
-      };
-      void sendBackground(staged).finally(() => {
-        staged.username = "";
-        values.username = "";
+    if (candidateScheduleTimer != null) clearTimeout(candidateScheduleTimer);
+    const generation = ++candidateScheduleGeneration;
+    const run = () => {
+      if (generation !== candidateScheduleGeneration || !captureEnabled) return;
+      candidateScheduleTimer = null;
+      const values = candidateValues(form);
+      if (!values) return;
+
+      // A submit event and a click/Enter event often describe the same login.
+      // Suppress the duplicate candidate while still allowing a later login
+      // with a changed password to create a new prompt.
+      const fingerprint = `${values.origin}\u0000${values.username}\u0000${values.password}`;
+      if (fingerprint === lastCandidateFingerprint && Date.now() - lastCandidateAt < CANDIDATE_DEDUP_MS) {
+        return;
+      }
+      lastCandidateFingerprint = fingerprint;
+      lastCandidateAt = Date.now();
+      if (lastCandidateClearTimer != null) clearTimeout(lastCandidateClearTimer);
+      const rememberedAt = lastCandidateAt;
+      lastCandidateClearTimer = setTimeout(() => {
+        if (lastCandidateAt !== rememberedAt) return;
+        lastCandidateFingerprint = "";
+        lastCandidateAt = 0;
+        lastCandidateClearTimer = null;
+      }, CANDIDATE_DEDUP_MS);
+      if (lastCandidateClearTimer && typeof lastCandidateClearTimer.unref === "function") {
+        lastCandidateClearTimer.unref();
+      }
+
+      if (!values.password && values.username) {
+        const staged = {
+          origin: values.origin,
+          type: CAPTURE_USERNAME_STAGE_MESSAGE,
+          username: values.username,
+        };
+        void sendBackground(staged).finally(() => {
+          staged.username = "";
+          values.username = "";
+        });
+        return;
+      }
+      const candidateId = randomId("candidate");
+      const candidate = { ...values, candidateId };
+      const candidateOrigin = values.origin;
+      const candidateUsername = values.username;
+      scheduleCandidateExpiry(candidateId);
+
+      // Keep a separate wire object until Firefox has cloned the message. A
+      // few WebExtension implementations clone asynchronously; clearing the
+      // same object immediately can otherwise erase the password in transit.
+      const wireCandidate = { ...candidate };
+      const submitted = sendBackground({
+        type: CAPTURE_SUBMITTED_MESSAGE,
+        candidate: wireCandidate,
       });
-      return;
+      candidate.password = "";
+      values.password = "";
+      void submitted.then((response) => {
+        if (response && response.ok === false) {
+          const error = new Error(response.error && response.error.message || "Login capture was rejected");
+          error.code = response.error && response.error.code;
+          throw error;
+        }
+        const topOrigin = response && response.origin || candidateOrigin;
+        activeCapturePrompt = {
+          candidateId,
+          confidence: "high",
+          origin: topOrigin,
+          suggestedAction: null,
+          username: candidateUsername,
+        };
+        // A submitted password form is reported as successful immediately; the
+        // save prompt must not wait for a post-submit navigation signal.
+        return sendBackground({
+          type: CAPTURE_SUCCESS_MESSAGE,
+          candidateId,
+          confidence: "high",
+          origin: topOrigin,
+        });
+      }).catch((error) => {
+        if (activeCapturePrompt && activeCapturePrompt.candidateId === candidateId) {
+          activeCapturePrompt = null;
+        }
+        clearCandidate(candidateId);
+        if (error && error.code === "PASSWORD_USERNAME_UNKNOWN") {
+          createOverlay(
+            "无法确定要更新的账户",
+            `${candidateOrigin}\n请在飞花密码管理器中手动选择对应账户并更新密码。`,
+            [{ label: "关闭", onClick: removeOverlay }],
+          );
+        }
+      }).finally(() => {
+        wireCandidate.password = "";
+        wireCandidate.username = "";
+      });
+    };
+    const delay = Math.max(0, delayMs);
+    if (delay > 0) {
+      candidateScheduleTimer = setTimeout(run, delay);
+    } else {
+      // Defer one microtask so a page's own click handler can finish updating
+      // the fields, without adding a macrotask delay to the save prompt.
+      void Promise.resolve().then(run);
     }
-    const candidateId = randomId("candidate");
-    const candidate = { ...values, candidateId };
-    scheduleCandidateExpiry(candidateId);
-    const submitted = sendBackground({ type: CAPTURE_SUBMITTED_MESSAGE, candidate });
-    candidate.password = "";
-    values.password = "";
-    void submitted.then((response) => {
-      if (response && response.ok === false) {
-        const error = new Error(response.error && response.error.message || "Login capture was rejected");
-        error.code = response.error && response.error.code;
-        throw error;
-      }
-      activeCapturePrompt = {
-        candidateId,
-        confidence: "high",
-        origin: values.origin,
-        suggestedAction: null,
-        username: values.username,
-      };
-      // A submitted password form is reported as successful immediately; the
-      // save prompt must not wait for a post-submit navigation signal.
-      return sendBackground({
-        type: CAPTURE_SUCCESS_MESSAGE,
-        candidateId,
-        confidence: "high",
-        origin: values.origin,
-      });
-    }).catch((error) => {
-      if (activeCapturePrompt && activeCapturePrompt.candidateId === candidateId) {
-        activeCapturePrompt = null;
-      }
-      clearCandidate(candidateId);
-      if (error && error.code === "PASSWORD_USERNAME_UNKNOWN") {
-        createOverlay(
-          "无法确定要更新的账户",
-          `${values.origin}\n请在飞花密码管理器中手动选择对应账户并更新密码。`,
-          [{ label: "关闭", onClick: removeOverlay }],
+  }
+
+  function likelyLoginAction(target) {
+    if (!target) return null;
+    let control = target;
+    try {
+      if (typeof target.closest === "function") {
+        control = target.closest(
+          'button, input[type="button"], input[type="submit"], input[type="image"], [role="button"], a, [data-action]'
         );
       }
-    });
+    } catch (_error) {
+      control = target;
+    }
+    if (!control) return null;
+    const tag = String(control.tagName || "").toLowerCase();
+    const type = String(control.type || control.getAttribute && control.getAttribute("type") || "").toLowerCase();
+    const text = [
+      control.id,
+      control.name,
+      control.className,
+      control.textContent,
+      control.getAttribute && control.getAttribute("aria-label"),
+      control.getAttribute && control.getAttribute("data-action"),
+    ].map((value) => String(value || "")).join(" ");
+    const explicitSubmit = (tag === "input" && ["submit", "image"].includes(type))
+      || tag === "button" && type === "submit";
+    const semanticLogin = /(?:login|log[ -]?in|sign[ -]?in|submit|authenticate|dologin|登录|登陆|提交|进入|继续|下一步|验证)/i.test(text);
+    if (!explicitSubmit && !semanticLogin) return null;
+    return control;
   }
 
   function onSubmit(event) {
     if (!captureEnabled) return;
+    if (event && event.isTrusted === false) return;
     const form = event && event.target && typeof event.target.querySelectorAll === "function"
       ? event.target
       : root.document;
-    scheduleCandidate(form);
+    scheduleCandidate(form, 0);
   }
 
   function onClick(event) {
     if (!captureEnabled) return;
-    const target = event && event.target;
-    if (!target || typeof target.closest !== "function") return;
-    const submit = target.closest('button[type="submit"], input[type="submit"], button[role="button"]');
+    if (event && event.isTrusted === false) return;
+    const submit = likelyLoginAction(event && event.target);
     if (!submit) return;
     const form = submit.form || (typeof submit.closest === "function" ? submit.closest("form") : null);
-    scheduleCandidate(form || root.document);
+    scheduleCandidate(form || root.document, 0);
+  }
+
+  function onKeyDown(event) {
+    if (!captureEnabled || String(event && event.key || "") !== "Enter") return;
+    if (event && event.isTrusted === false) return;
+    const target = event && event.target;
+    if (!target) return;
+    const form = target.form || (typeof target.closest === "function" ? target.closest("form") : null);
+    // Enter is the common path for JS login forms that never dispatch submit
+    // and do not expose a semantic button in the event target.
+    scheduleCandidate(form || root.document, 0);
   }
 
   function startCapture(payload = {}) {
     let origin;
+    let topLevelOrigin;
     try {
       origin = currentOrigin();
+      topLevelOrigin = templates.exactOrigin(payload.topLevelOrigin || origin);
     } catch (_error) {
       return false;
     }
+    if (!templates.frameOriginAllowed(topLevelOrigin, origin)) return false;
     if (origin.startsWith("http://") && !captureAllowedHttpOrigins.has(origin)) return false;
     captureEnabled = true;
     if (!captureListenerInstalled) {
       root.document.addEventListener("submit", onSubmit, true);
       root.document.addEventListener("click", onClick, true);
+      root.document.addEventListener("keydown", onKeyDown, true);
       captureListenerInstalled = true;
     }
     return true;
@@ -785,11 +924,19 @@
 
   function stopCapture() {
     captureEnabled = false;
+    candidateScheduleGeneration += 1;
+    if (candidateScheduleTimer != null) clearTimeout(candidateScheduleTimer);
+    candidateScheduleTimer = null;
+    if (lastCandidateClearTimer != null) clearTimeout(lastCandidateClearTimer);
+    lastCandidateClearTimer = null;
+    lastCandidateFingerprint = "";
+    lastCandidateAt = 0;
     activeCapturePrompt = null;
     for (const candidateId of candidateTimers.keys()) clearCandidate(candidateId);
     if (captureListenerInstalled) {
       root.document.removeEventListener("submit", onSubmit, true);
       root.document.removeEventListener("click", onClick, true);
+      root.document.removeEventListener("keydown", onKeyDown, true);
       captureListenerInstalled = false;
     }
     if (overlay && overlay.id === OVERLAY_ID) removeOverlay();
@@ -851,6 +998,11 @@
             accountChoices: [],
             savePending: false,
           };
+        }
+        if (payload.origin) {
+          // The background derives the top-level origin from the tab/frame
+          // binding. This also corrects the iframe fallback on Firefox <148.
+          activeCapturePrompt.origin = templates.exactOrigin(payload.origin);
         }
         activeCapturePrompt.suggestedAction = payload.action === "select"
           ? "select"
@@ -928,11 +1080,15 @@
     activeCapturePrompt = null;
     for (const candidateId of candidateTimers.keys()) clearCandidate(candidateId);
     stopTemplateRecording();
+    if (fieldObserver && typeof fieldObserver.disconnect === "function") fieldObserver.disconnect();
+    fieldObserver = null;
+    if (fieldStateTimer != null) clearTimeout(fieldStateTimer);
+    fieldStateTimer = null;
     removeOverlay();
   });
 
   // Every frame announces itself: the top frame drives the tab bookkeeping,
-  // and same-site iframes learn the capture state for login detection.
+  // and explicitly trusted login frames learn the capture state too.
   let readyOrigin = "";
   try {
     readyOrigin = currentOrigin();
@@ -940,14 +1096,29 @@
     readyOrigin = "";
   }
   if (readyOrigin) {
+    const readyFields = loginFieldState();
     void sendBackground({
       type: READY_MESSAGE,
       origin: readyOrigin,
+      ...readyFields,
     }).then((response) => {
       if (response && response.captureEnabled) {
         captureAllowedHttpOrigins = new Set(response.insecureOrigins || []);
         startCapture(response);
       }
     }).catch(() => {});
+  }
+
+  // Login forms are frequently inserted after document_idle (163 is one
+  // example). Keep a secret-free frame capability record current so the
+  // background can target the frame that actually owns the fields.
+  if (typeof MutationObserver === "function" && root.document.documentElement) {
+    fieldObserver = new MutationObserver(() => scheduleFrameStateAnnouncement(100));
+    fieldObserver.observe(root.document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["autocomplete", "name", "type", "id", "style", "hidden", "class"],
+    });
   }
 })(typeof globalThis !== "undefined" ? globalThis : this);

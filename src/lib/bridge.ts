@@ -94,6 +94,7 @@ export interface AssetRef {
 export interface AppInfo {
   workspacePath: string;
   version: string;
+  buildTimestamp?: number;
   defaultEditorMode: EditorMode;
   trayShortcutSettings: TrayShortcutSettings;
   protectSensitiveWindows: boolean;
@@ -474,7 +475,7 @@ export const notesApi = {
     if (isTauriRuntime()) return command<AppInfo>("get_app_info");
     return {
       workspacePath: "浏览器演示数据",
-      version: "0.7.3",
+      version: "0.7.4",
       defaultEditorMode: readBrowserDefaultEditorMode(),
       trayShortcutSettings: readBrowserTrayShortcutSettings(),
       protectSensitiveWindows: readBrowserProtectSensitiveWindows(),

@@ -146,6 +146,9 @@ pub fn get_app_info(store: State<'_, WorkspaceStore>) -> AppInfo {
     AppInfo {
         name: "飞花 - PetalDesk".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        build_timestamp: env!("PETALDESK_BUILD_TIMESTAMP")
+            .parse()
+            .expect("PETALDESK_BUILD_TIMESTAMP must be a Unix timestamp"),
         workspace_path: store.workspace_path().to_string_lossy().into_owned(),
         default_editor_mode: store.default_editor_mode(),
         tray_shortcut_settings: store.tray_shortcut_settings(),

@@ -205,6 +205,7 @@ pub struct DataStorageChangeResult {
 pub struct AppInfo {
     pub name: String,
     pub version: String,
+    pub build_timestamp: u64,
     pub workspace_path: String,
     pub default_editor_mode: String,
     pub tray_shortcut_settings: TrayShortcutSettings,

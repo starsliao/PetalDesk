@@ -102,6 +102,27 @@
         'input[type="password"]',
       ]),
     }),
+    Object.freeze({
+      // NetEase renders a hidden password mirror next to the real field in
+      // the dl.reg.163.com login frame.  Naming the real fields keeps the
+      // hidden mirror from making generic matching ambiguous.
+      id: "netease-163-login",
+      label: "网易邮箱",
+      version: 1,
+      mode: "password",
+      origins: Object.freeze(["https://dl.reg.163.com"]),
+      topLevelOrigins: Object.freeze(["https://mail.163.com"]),
+      usernameSelectors: Object.freeze([
+        'input[name="email"]',
+        'input[type="email"]',
+        'input[autocomplete="username"]',
+      ]),
+      passwordSelectors: Object.freeze([
+        'input[name="password"]',
+        'input[autocomplete="current-password"]',
+        'input[autocomplete="new-password"]',
+      ]),
+    }),
   ]);
 
   function exactOrigin(value) {
@@ -117,63 +138,25 @@
     return url.origin;
   }
 
-  // Common multi-level public suffixes: hosts below these need one more label
-  // to reach the registrable domain (e.g. example.co.uk, mail.sina.com.cn).
-  const MULTI_LEVEL_PUBLIC_SUFFIXES = new Set([
-    "ac.cn",
-    "ac.uk",
-    "co.in",
-    "co.jp",
-    "co.kr",
-    "co.nz",
-    "co.uk",
-    "com.au",
-    "com.br",
-    "com.cn",
-    "com.hk",
-    "com.mx",
-    "com.my",
-    "com.sg",
-    "com.tr",
-    "com.tw",
-    "edu.cn",
-    "firm.in",
-    "gov.cn",
-    "net.au",
-    "net.cn",
-    "or.jp",
-    "org.au",
-    "org.cn",
-    "org.uk",
-  ]);
-
-  function isIpAddressHost(host) {
-    return host.includes(":") || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host);
-  }
-
-  function registrableDomain(host) {
-    const parts = host.split(".");
-    const suffix = parts.slice(-2).join(".");
-    if (parts.length >= 3 && MULTI_LEVEL_PUBLIC_SUFFIXES.has(suffix)) {
-      return parts.slice(-3).join(".");
-    }
-    return suffix;
-  }
-
-  function sameSite(originA, originB) {
-    if (originA === originB) return true;
-    let hostA;
-    let hostB;
+  function frameOriginAllowed(topLevelValue, frameValue) {
+    let topLevelOrigin;
+    let frameOrigin;
     try {
-      hostA = new URL(String(originA || "")).hostname;
-      hostB = new URL(String(originB || "")).hostname;
+      topLevelOrigin = exactOrigin(topLevelValue);
+      frameOrigin = exactOrigin(frameValue);
     } catch (_error) {
       return false;
     }
-    if (!hostA || !hostB || isIpAddressHost(hostA) || isIpAddressHost(hostB)) {
-      return false;
-    }
-    return registrableDomain(hostA) === registrableDomain(hostB);
+    if (topLevelOrigin === frameOrigin) return true;
+    // Cross-origin frames receive credentials only when a built-in template
+    // explicitly names both sides. Guessing an eTLD+1 from a partial public
+    // suffix list can merge unrelated tenants such as victim.github.io and
+    // attacker.github.io.
+    return BUILT_IN_TEMPLATES.some((template) => (
+      template.origins.includes(frameOrigin)
+      && Array.isArray(template.topLevelOrigins)
+      && template.topLevelOrigins.includes(topLevelOrigin)
+    ));
   }
 
   function templateForOrigin(value) {
@@ -204,6 +187,24 @@
     const type = String(input.type || stringAttribute(input, "type") || "text").toLowerCase();
     if (["hidden", "button", "submit", "reset", "checkbox", "radio", "file"].includes(type)) {
       return false;
+    }
+    if (input.hidden || typeof input.hasAttribute === "function" && input.hasAttribute("hidden")) {
+      return false;
+    }
+    // Some pages leave a hidden password mirror with a non-empty client rect
+    // while its CSS is being toggled.  Ignore it when the browser exposes
+    // computed style information, while retaining the rect check for small
+    // test/fallback DOM implementations.
+    try {
+      const view = input.ownerDocument && input.ownerDocument.defaultView;
+      if (view && typeof view.getComputedStyle === "function") {
+        const style = view.getComputedStyle(input);
+        if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") {
+          return false;
+        }
+      }
+    } catch (_error) {
+      // A detached or restricted document is handled by the remaining checks.
     }
     if (typeof input.getClientRects === "function") {
       const rects = input.getClientRects();
@@ -439,11 +440,11 @@
     BUILT_IN_TEMPLATES,
     classifyCredential,
     exactOrigin,
+    frameOriginAllowed,
     identifyLoginFields,
     normalizeRecordedSelector,
     normalizeUserTemplate,
     recordedSelectorForInput,
-    sameSite,
     templateForOrigin,
   });
 })(typeof globalThis !== "undefined" ? globalThis : this);

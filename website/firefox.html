@@ -85,7 +85,7 @@
     <div class="intro">
       <div class="inner">
         <h1>飞花 Firefox 浏览器增强</h1>
-        <p class="lead">同一个扩展提供网页长截图、站点账户数角标、连接诊断与账户弹窗，以及经用户确认的密码填充和登录信息保存提示。密码能力支持 Windows 与 Firefox Desktop 140 或更高版本。</p>
+        <p class="lead">同一个扩展提供网页长截图、站点账户数角标、连接诊断与账户弹窗，以及由用户点选账户触发的密码填充和登录信息保存提示。密码能力支持 Windows 与 Firefox Desktop 140 或更高版本。</p>
         <div class="actions">
           <a class="primary" href="https://addons.mozilla.org/firefox/search/?q=PetalDesk">在 Firefox Add-ons 查找 PetalDesk</a>
           <a class="secondary" href="https://github.com/starsliao/PetalDesk/releases/latest">下载飞花桌面端</a>
@@ -103,7 +103,7 @@
       <section>
         <h2>安装条件</h2>
         <ul>
-          <li>Windows 10/11 x64 上已安装飞花 - PetalDesk 0.6.0 或更高版本；密码角标、弹窗与登录检测需要 0.7.0 或更高版本。</li>
+          <li>Windows 10/11 x64 上已安装飞花 - PetalDesk 0.7.4 或更高版本，以使用当前的直接填充、登录保存提示和 163 邮箱登录 frame 支持。</li>
           <li>Firefox Desktop 140 或更高版本；Android、Chrome 与 Edge 暂不提供密码能力。</li>
           <li>安装扩展时由 Firefox 显示权限，并由用户本人确认。</li>
         </ul>
@@ -120,7 +120,7 @@
 
       <section>
         <h2>安全边界</h2>
-        <p>填充前页面会再次显示目标 origin 与账户名；扩展只填写字段，不会自动提交。登录候选仅在内存中短时保留，凭据不会写入 Firefox storage 或截图文件通信目录，也不会上传到飞花服务器。</p>
+        <p>用户在飞花或工具栏弹窗中点选账户后，扩展会校验目标标签页、顶层 origin、文档和登录 frame，再把一次性凭据交给目标字段；无需页面二次确认，也不会自动提交。跨源 frame 默认拒绝，当前只允许 <code>mail.163.com</code> 到 <code>dl.reg.163.com</code> 的单向登录委派。登录候选仅在内存中短时保留，凭据不会写入 Firefox storage 或截图文件通信目录，也不会上传到飞花服务器。</p>
       </section>
     </main>
 

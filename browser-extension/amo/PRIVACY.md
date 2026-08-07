@@ -1,6 +1,6 @@
 # PetalDesk Browser Companion privacy notice (draft)
 
-Last updated: 2026-08-05
+Last updated: 2026-08-07
 
 This draft must be reviewed by the product owner and published at a stable HTTPS URL before the extension is submitted to AMO.
 
@@ -21,8 +21,8 @@ The extension does not intentionally collect page text, browsing history, paymen
 ## How information is used
 
 - Long-screenshot measurements are sent through Firefox Native Messaging to the local PetalDesk process to coordinate a screenshot requested by the user.
-- A fill offer is shown on the intended page without a password. Only after the user confirms the page overlay does PetalDesk provide one-time credentials for field filling.
-- When login detection is enabled, a submitted login candidate is held briefly in memory and sent to the local PetalDesk process so the encrypted vault can decide whether it is unchanged, new, or an update. The prompt offers saving as a new account or updating an existing one, and reports when the vault is manually locked.
+- After the user chooses an account in PetalDesk or the toolbar popup, a password-free offer is sent to the intended page. The bound content frame confirms its identity and field availability before PetalDesk provides one-time credentials for field filling; no second page confirmation is required.
+- A login candidate submitted by the user is held briefly in memory and sent to the local PetalDesk process so the encrypted vault can decide whether it is unchanged, new, or an update. The prompt offers saving as a new account or updating an existing one, and reports when the vault is manually locked.
 - The toolbar badge shows the number of accounts saved for the exact current origin, and the toolbar popup lists those account labels on click. Both are read from the local vault through the local channel, refresh on tab or vault changes, and are cleared when the vault is manually locked. After the extension connects, capture, fill, and badge keep working while the PetalDesk password window is closed; a manual lock stops them immediately.
 
 The extension fills fields but never submits a login form. It does not bypass CAPTCHA, passkeys, SMS verification, security keys, or multi-factor authentication.
@@ -40,8 +40,8 @@ The extension does not sell, rent, share, or remotely transmit personal informat
 ## Security controls
 
 - Exact scheme, host, and port matching for password operations.
-- Binding to a single session, tab, top-level frame, document, and origin.
-- A visible confirmation before every fill and no automatic submission.
+- Binding to a single session, tab, document, top-level origin, and validated login frame. Cross-origin delegation is deny-by-default; the only current audited mapping is from `mail.163.com` to its `dl.reg.163.com` login frame.
+- An explicit account choice before every fill and no automatic submission.
 - HTTPS by default; HTTP requires a separate per-site warning and opt-in.
 - Short in-memory expiration for pending requests and login candidates.
 
@@ -49,7 +49,7 @@ No security control can make an already compromised device or website safe. User
 
 ## User choices
 
-The `authenticationInfo` permission is granted at installation; users who do not want it can decline the installation or remove the extension from Firefox at any time. They can disable login detection, lock the vault, or delete saved accounts in PetalDesk.
+The `authenticationInfo` permission is granted at installation; users who do not want it can decline the installation or remove the extension from Firefox at any time. They can lock the vault or delete saved accounts in PetalDesk.
 
 ## Contact
 
