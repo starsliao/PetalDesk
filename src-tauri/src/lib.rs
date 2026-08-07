@@ -871,6 +871,7 @@ pub fn run() {
             mfa::lock_mfa_vault,
             passwords::get_password_status,
             passwords::list_password_entries,
+            passwords::list_password_mfa_candidates,
             passwords::create_password_entry,
             passwords::update_password_entry,
             passwords::delete_password_entry,

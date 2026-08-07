@@ -1,8 +1,12 @@
 # 密码填充与保存功能交接文档（2026-08-07）
 
+> 历史说明：本文记录 `0.7.x` 填充/保存故障的现场状态与排查证据，
+> 不代表 `0.8.0` 当前行为。当前扩展协议、安全边界和发布说明以
+> `browser-extension/README.md`、`browser-extension/amo/` 与
+> `docs/publishing.md` 为准；本文提到但已移除的旧文档仍可在 Git 历史中查看。
+>
 > 读者：接手修复的开发者（codex）。
 > 范围：飞花密码管理器的**浏览器填充**（fill）与**登录保存提示**（capture）两条功能链。
-> 前置文档：`docs/PASSWORD_FIREFOX_HANDOFF.md`、`docs/PASSWORD_FIREFOX_V0.7.0.md`、`docs/PASSWORD_CHANNEL_DEBUG_HANDOFF.md`（通道死锁修复全过程）。
 
 ## 0. 当前状态速览
 
@@ -39,7 +43,7 @@
 
 ## 3. 已修复（有证据，勿再怀疑）
 
-1. **双端同步管道死锁**（0.6.3 以来"请求必超时"的根因）：Windows 同步管道句柄挂起阻塞读时，另一方向的写永久阻塞。两端已改 `FILE_FLAG_OVERLAPPED` 重叠 I/O（commit `b6595d3`，含"挂起读时写必须 2s 内完成"的真实管道回归测试）。详见 `PASSWORD_CHANNEL_DEBUG_HANDOFF.md`。
+1. **双端同步管道死锁**（0.6.3 以来"请求必超时"的根因）：Windows 同步管道句柄挂起阻塞读时，另一方向的写永久阻塞。两端已改 `FILE_FLAG_OVERLAPPED` 重叠 I/O（commit `b6595d3`，含"挂起读时写必须 2s 内完成"的真实管道回归测试）；旧调试交接已移除，需要时可从 Git 历史查看。
 2. **扩展上报过期 origin**：标签页激活改用实时 URL（不再用加载时缓存）；非网页标签通知桌面清跟踪。
 
 ## 4. 现存问题与嫌疑点

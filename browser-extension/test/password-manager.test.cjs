@@ -4,7 +4,13 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-function loadManager({ ambiguous = false, fieldScenario = "login", templateMultiple = false, frame = null } = {}) {
+function loadManager({
+  ambiguous = false,
+  fieldScenario = "login",
+  templateMultiple = false,
+  frame = null,
+  otpScenario = null,
+} = {}) {
   const runtimeMessages = [];
   const backgroundMessages = [];
   const documentListeners = new Map();
@@ -92,7 +98,7 @@ function loadManager({ ambiguous = false, fieldScenario = "login", templateMulti
     }
   }
 
-  const generic = fieldScenario !== "login" && fieldScenario !== "netease";
+  const generic = Boolean(otpScenario) || fieldScenario !== "login" && fieldScenario !== "netease";
   const netease = fieldScenario === "netease";
   const username = new FakeInput(netease
     ? { name: "email", type: "email" }
@@ -112,7 +118,63 @@ function loadManager({ ambiguous = false, fieldScenario = "login", templateMulti
       type: "password",
     });
   const newPassword = new FakeInput({ autocomplete: "new-password", name: "newPassword", type: "password" });
-  const inputs = fieldScenario === "empty"
+  const otpInputs = (() => {
+    const otp = (attributes) => new FakeInput({ type: "text", ...attributes });
+    if (otpScenario === "single") {
+      return [otp({ autocomplete: "one-time-code", inputmode: "numeric", maxLength: 6, name: "totp" })];
+    }
+    if (otpScenario === "authenticator-security-code") {
+      return [otp({
+        "aria-label": "Enter the 6-digit security code from your authenticator app",
+        inputmode: "numeric",
+        maxLength: 6,
+        name: "security-code",
+      })];
+    }
+    if (otpScenario === "authenticator-security-code-zh") {
+      return [otp({
+        "aria-label": "请输入身份验证器安全码",
+        inputmode: "numeric",
+        maxLength: 6,
+        name: "security-code",
+      })];
+    }
+    if (otpScenario === "seven" || otpScenario === "eight") {
+      const digits = otpScenario === "seven" ? 7 : 8;
+      return [otp({ autocomplete: "one-time-code", inputmode: "numeric", maxLength: digits, name: "mfa-code" })];
+    }
+    if (otpScenario === "segmented") {
+      return Array.from({ length: 6 }, (_value, index) => otp({
+        "aria-label": `OTP digit ${index + 1}`,
+        inputmode: "numeric",
+        maxLength: 1,
+        name: `totp-${index + 1}`,
+        type: "tel",
+      }));
+    }
+    if (otpScenario === "ambiguous") {
+      return [
+        otp({ inputmode: "numeric", maxLength: 6, name: "verification-code" }),
+        otp({ inputmode: "numeric", maxLength: 6, name: "auth-code" }),
+      ];
+    }
+    if (otpScenario === "excluded") {
+      return [
+        otp({ autocomplete: "one-time-code", maxLength: 6, name: "sms-code" }),
+        otp({ maxLength: 8, name: "recovery-code" }),
+        otp({ maxLength: 6, name: "captcha-code" }),
+        otp({ maxLength: 6, name: "card-cvv-code" }),
+        otp({ "aria-label": "Card security code", inputmode: "numeric", maxLength: 6, name: "security-code" }),
+        otp({ maxLength: 6, name: "postcode" }),
+        otp({ maxLength: 6, name: "coupon-code" }),
+        otp({ autocomplete: "one-time-code", hidden: true, maxLength: 6, name: "totp" }),
+      ];
+    }
+    return [];
+  })();
+  const inputs = otpScenario
+    ? otpInputs
+    : fieldScenario === "empty"
     ? []
     : netease
       ? [username, password, duplicatePassword]
@@ -226,6 +288,12 @@ function loadManager({ ambiguous = false, fieldScenario = "login", templateMulti
     documentListeners,
     windowListeners,
     inputs: { duplicatePassword, newPassword, password, username },
+    otpInputs,
+    replaceOtpInputs(attributesList) {
+      const replacements = attributesList.map((attributes) => new FakeInput({ type: "text", ...attributes }));
+      inputs.splice(0, inputs.length, ...replacements);
+      return replacements;
+    },
     submitted: () => submitted,
     markSubmitted() {
       submitted = true;
@@ -723,6 +791,297 @@ test("pagehide notifies the background bridge before local candidate cleanup", (
   const harness = loadManager();
   harness.windowListeners.get("pagehide")({ type: "pagehide" });
   assert.equal(harness.backgroundMessages.at(-1).type, "petaldesk.password.page-closed");
+});
+
+test("a unique trusted TOTP field reports metadata only and fills without submitting", async () => {
+  const harness = loadManager({ otpScenario: "single" });
+  const armed = await harness.command("armSecondFactor", {
+    expiresAt: Date.now() + 60_000,
+    flowId: "flow-single",
+  });
+  assert.equal(armed.ok, true);
+  const candidates = harness.backgroundMessages.find(
+    (message) => message.type === "petaldesk.password.second-factor-candidates",
+  );
+  assert.deepEqual(Object.keys(candidates).sort(), ["confidence", "count", "digits", "type"]);
+  assert.deepEqual(
+    {
+      confidence: candidates.confidence,
+      count: candidates.count,
+      digits: candidates.digits,
+    },
+    { confidence: "high", count: 1, digits: 6 },
+  );
+  assert.equal(JSON.stringify(candidates).includes("entry"), false);
+  assert.equal(JSON.stringify(candidates).includes("123456"), false);
+  await harness.command("bindSecondFactor", {
+    challengeId: "challenge-single",
+    expiresAt: Date.now() + 30_000,
+    flowId: "flow-single",
+  });
+
+  const secret = { challengeId: "challenge-single", code: "123456", flowId: "flow-single" };
+  const filled = await harness.command("provideSecondFactor", secret);
+  assert.equal(filled.ok, true);
+  assert.equal(filled.result.filled, true);
+  assert.equal(filled.result.submitted, false);
+  assert.equal(harness.otpInputs[0].value, "123456");
+  assert.deepEqual(harness.otpInputs[0].events, ["input", "change"]);
+  assert.equal(secret.code, "");
+  assert.equal(harness.submitted(), false);
+});
+
+for (const scenario of ["authenticator-security-code", "authenticator-security-code-zh"]) {
+  test(`${scenario} remains a trusted TOTP candidate`, async () => {
+    const harness = loadManager({ otpScenario: scenario });
+    await harness.command("armSecondFactor", {
+      expiresAt: Date.now() + 60_000,
+      flowId: `flow-${scenario}`,
+    });
+    const report = harness.backgroundMessages.find(
+      (message) => message.type === "petaldesk.password.second-factor-candidates",
+    );
+    assert.deepEqual(
+      { confidence: report.confidence, count: report.count, digits: report.digits },
+      { confidence: "high", count: 1, digits: 6 },
+    );
+  });
+}
+
+test("a challenge never follows a same-shape replacement OTP element", async () => {
+  const harness = loadManager({ otpScenario: "single" });
+  await harness.command("armSecondFactor", {
+    expiresAt: Date.now() + 60_000,
+    flowId: "flow-replaced-field",
+  });
+  await harness.command("bindSecondFactor", {
+    challengeId: "challenge-replaced-field",
+    expiresAt: Date.now() + 30_000,
+    flowId: "flow-replaced-field",
+  });
+  const replacements = harness.replaceOtpInputs([
+    { autocomplete: "one-time-code", inputmode: "numeric", maxLength: 6, name: "totp" },
+  ]);
+  const secret = {
+    challengeId: "challenge-replaced-field",
+    code: "123456",
+    flowId: "flow-replaced-field",
+  };
+  const rejected = await harness.command("provideSecondFactor", secret);
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.error.message, /changed/i);
+  assert.equal(replacements[0].value, "");
+  assert.equal(secret.code, "");
+});
+
+test("six segmented TOTP fields receive one digit each and never synthesize submit events", async () => {
+  const harness = loadManager({ otpScenario: "segmented" });
+  await harness.command("armSecondFactor", {
+    expiresAt: Date.now() + 60_000,
+    flowId: "flow-segmented",
+  });
+  const report = harness.backgroundMessages.find(
+    (message) => message.type === "petaldesk.password.second-factor-candidates",
+  );
+  assert.deepEqual(
+    { confidence: report.confidence, count: report.count, digits: report.digits },
+    { confidence: "high", count: 1, digits: 6 },
+  );
+  await harness.command("bindSecondFactor", {
+    challengeId: "challenge-segmented",
+    expiresAt: Date.now() + 30_000,
+    flowId: "flow-segmented",
+  });
+  const filled = await harness.command("provideSecondFactor", {
+    challengeId: "challenge-segmented",
+    code: "654321",
+    flowId: "flow-segmented",
+  });
+  assert.equal(filled.result.segmented, true);
+  assert.equal(filled.result.fields, 6);
+  assert.deepEqual(harness.otpInputs.map((input) => input.value), ["6", "5", "4", "3", "2", "1"]);
+  assert.equal(harness.submitted(), false);
+});
+
+for (const [scenario, digits, code] of [["seven", 7, "1234567"], ["eight", 8, "12345678"]]) {
+  test(`a ${digits}-digit TOTP field preserves its declared length`, async () => {
+    const harness = loadManager({ otpScenario: scenario });
+    await harness.command("armSecondFactor", {
+      expiresAt: Date.now() + 60_000,
+      flowId: `flow-${digits}`,
+    });
+    const report = harness.backgroundMessages.find(
+      (message) => message.type === "petaldesk.password.second-factor-candidates",
+    );
+    assert.equal(report.digits, digits);
+    await harness.command("bindSecondFactor", {
+      challengeId: `challenge-${digits}`,
+      expiresAt: Date.now() + 30_000,
+      flowId: `flow-${digits}`,
+    });
+    const filled = await harness.command("provideSecondFactor", {
+      challengeId: `challenge-${digits}`,
+      code,
+      flowId: `flow-${digits}`,
+    });
+    assert.equal(filled.result.digits, digits);
+    assert.equal(harness.otpInputs[0].value, code);
+  });
+}
+
+test("mixed candidate lengths prefer the strongest semantic TOTP field", async () => {
+  const harness = loadManager({ otpScenario: "ambiguous" });
+  harness.replaceOtpInputs([
+    {
+      autocomplete: "one-time-code",
+      inputmode: "numeric",
+      maxLength: 6,
+      name: "verification-code",
+    },
+    {
+      inputmode: "numeric",
+      maxLength: 8,
+      name: "authenticator-code",
+    },
+  ]);
+  await harness.command("armSecondFactor", {
+    expiresAt: Date.now() + 60_000,
+    flowId: "flow-mixed-candidate-lengths",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const report = harness.backgroundMessages.find(
+    (message) => message.type === "petaldesk.password.second-factor-candidates",
+  );
+  assert.deepEqual(
+    {
+      confidence: report.confidence,
+      count: report.count,
+      digits: report.digits,
+    },
+    { confidence: "low", count: 2, digits: 8 },
+  );
+});
+
+test("ambiguous MFA fields require the one-click prompt before a bound provide", async () => {
+  const harness = loadManager({ otpScenario: "ambiguous" });
+  await harness.command("armSecondFactor", {
+    expiresAt: Date.now() + 60_000,
+    flowId: "flow-ambiguous",
+  });
+  const report = harness.backgroundMessages.find(
+    (message) => message.type === "petaldesk.password.second-factor-candidates",
+  );
+  assert.deepEqual(
+    { confidence: report.confidence, count: report.count, digits: report.digits },
+    { confidence: "low", count: 2, digits: 6 },
+  );
+  await harness.command("bindSecondFactor", {
+    challengeId: "challenge-ambiguous",
+    expiresAt: Date.now() + 30_000,
+    flowId: "flow-ambiguous",
+  });
+  const offered = await harness.command("offerSecondFactor", {
+    challengeId: "challenge-ambiguous",
+    expiresAt: Date.now() + 30_000,
+    flowId: "flow-ambiguous",
+    requiresOriginConfirmation: false,
+    topOrigin: "https://example.test",
+  });
+  assert.equal(offered.ok, true);
+  assert.deepEqual(harness.overlayButtons(), ["一键填充", "取消"]);
+  harness.clickButton("一键填充");
+  await new Promise((resolve) => setImmediate(resolve));
+  const confirmation = harness.backgroundMessages.at(-1);
+  assert.deepEqual(
+    {
+      challengeId: confirmation.challengeId,
+      flowId: confirmation.flowId,
+      originConfirmed: confirmation.originConfirmed,
+      type: confirmation.type,
+    },
+    {
+      challengeId: "challenge-ambiguous",
+      flowId: "flow-ambiguous",
+      originConfirmed: false,
+      type: "petaldesk.password.second-factor-confirm",
+    },
+  );
+  const filled = await harness.command("provideSecondFactor", {
+    challengeId: "challenge-ambiguous",
+    code: "112233",
+    flowId: "flow-ambiguous",
+  });
+  assert.equal(filled.result.filled, true);
+  assert.equal(harness.otpInputs.filter((input) => input.value === "112233").length, 1);
+});
+
+test("first-time cross-origin MFA prompt names the exact HTTPS origin", async () => {
+  const harness = loadManager({ otpScenario: "single" });
+  await harness.command("armSecondFactor", {
+    expiresAt: Date.now() + 60_000,
+    flowId: "flow-cross-origin",
+  });
+  await harness.command("bindSecondFactor", {
+    challengeId: "challenge-cross-origin",
+    expiresAt: Date.now() + 30_000,
+    flowId: "flow-cross-origin",
+  });
+  await harness.command("offerSecondFactor", {
+    challengeId: "challenge-cross-origin",
+    flowId: "flow-cross-origin",
+    requiresOriginConfirmation: true,
+    topOrigin: "https://login.partner.example",
+  });
+  assert.match(harness.overlayMessage(), /https:\/\/login\.partner\.example/);
+  harness.clickButton("一键填充");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.backgroundMessages.at(-1).originConfirmed, true);
+});
+
+test("cancelling the MFA prompt retires its challenge and reports no secret", async () => {
+  const harness = loadManager({ otpScenario: "ambiguous" });
+  await harness.command("armSecondFactor", {
+    expiresAt: Date.now() + 60_000,
+    flowId: "flow-cancel",
+  });
+  await harness.command("bindSecondFactor", {
+    challengeId: "challenge-cancel",
+    expiresAt: Date.now() + 30_000,
+    flowId: "flow-cancel",
+  });
+  await harness.command("offerSecondFactor", {
+    challengeId: "challenge-cancel",
+    flowId: "flow-cancel",
+    requiresOriginConfirmation: false,
+    topOrigin: "https://example.test",
+  });
+  harness.clickButton("取消");
+  await new Promise((resolve) => setImmediate(resolve));
+  const cancelled = harness.backgroundMessages.at(-1);
+  assert.deepEqual(cancelled, {
+    type: "petaldesk.password.second-factor-cancel",
+    flowId: "flow-cancel",
+    challengeId: "challenge-cancel",
+  });
+  const secret = { challengeId: "challenge-cancel", code: "123456", flowId: "flow-cancel" };
+  const rejected = await harness.command("provideSecondFactor", secret);
+  assert.equal(rejected.ok, false);
+  assert.equal(secret.code, "");
+});
+
+test("SMS, recovery, CAPTCHA, card, postcode, coupon, and hidden fields are excluded", async () => {
+  const harness = loadManager({ otpScenario: "excluded" });
+  await harness.command("armSecondFactor", {
+    expiresAt: Date.now() + 60_000,
+    flowId: "flow-excluded",
+  });
+  const report = harness.backgroundMessages.find(
+    (message) => message.type === "petaldesk.password.second-factor-candidates",
+  );
+  assert.deepEqual(
+    { confidence: report.confidence, count: report.count, digits: report.digits },
+    { confidence: "low", count: 0, digits: 0 },
+  );
 });
 
 test("a new capture match with accounts offers save-as-new plus per-account updates", async () => {

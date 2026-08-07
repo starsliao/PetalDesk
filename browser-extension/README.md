@@ -1,10 +1,11 @@
 # 飞花 - PetalDesk 浏览器增强扩展
 
 This directory contains the shared WebExtension implementation used by the
-飞花 - PetalDesk browser enhancement. Firefox v1 adds the password-manager
-companion to the existing long-capture feature. The extension has no runtime
-npm dependencies. Release packaging downloads the pinned `web-ext@10.5.0` tool via
-`npx` for AMO validation, archives, and optional signing.
+飞花 - PetalDesk browser enhancement. The Firefox build combines the existing
+long-capture feature with the password-manager companion and linked local TOTP
+flow. The extension has no runtime npm dependencies. Release packaging downloads
+the pinned `web-ext@10.5.0` tool via `npx` for AMO validation, archives, and
+optional signing.
 
 ## Build and test
 
@@ -41,12 +42,12 @@ never requires AMO credentials or performs an external submission. Chrome/Edge
 password publication remains a later release step.
 
 The Firefox manifest declares required `websiteActivity` for scroll geometry
-and required `authenticationInfo` for usernames/passwords; both are granted at
-installation time. The toolbar action opens a popup with connection
-diagnostics and the accounts PetalDesk offers for the active tab. The Native
-Messaging host is on the same machine; the extension does not send data to a
-remote service. AMO listing, privacy, permission, and reviewer drafts are in
-`amo/`.
+and required `authenticationInfo` for usernames, passwords, and short-lived
+linked TOTP filling; both are granted at installation time. The toolbar action
+opens a popup with connection diagnostics and fixed account cards for the active
+tab. The Native Messaging host is on the same machine; the extension does not
+send data to a remote service. AMO listing, privacy, permission, and reviewer
+drafts are in `amo/`.
 
 ## Capture protocol
 
@@ -94,7 +95,8 @@ Native host templates and Windows registration instructions are under
 
 ## Password protocol
 
-Firefox advertises `password-fill` and `password-capture` plus these commands:
+Firefox advertises `password-fill`, `password-capture`, and
+`second-factor-fill-v1` plus these commands:
 
 - `password.open`
 - `password.offerFill`
@@ -110,22 +112,35 @@ Firefox advertises `password-fill` and `password-capture` plus these commands:
 - `password.cancelTemplateRecording`
 - `password.getStatus`
 - `password.updateBadge`
+- `password.armSecondFactor`
+- `password.offerSecondFactor`
+- `password.provideSecondFactor`
+- `password.cancelSecondFactor`
+- `password.copyMfaResult`
+- `password.deleteResult`
 
 `password.requestConsent` is a no-op compatibility probe: authentication
 access is a required install-time permission, so it always reports a granted
 state. `password.updateBadge` caches up to 16 account summaries
-(`entryId`/`username`/`siteName`, never secrets) for one tab, mirrors the
-count into the toolbar badge, and backs the action popup. The popup talks to
+(`entryId`/`username`/`siteName`/`hasMfa`, never an MFA ID or secret) for one
+tab, mirrors the count into the toolbar badge, and backs the action popup. The
+popup talks to
 the background over `petaldesk.popup.*` runtime messages (`getState`, `fill`,
 `openManager`, `copySecret`, `deleteEntry`) that only accept the extension's
-own popup sender; `copySecret` and `deleteEntry` are forwarded to the desktop
-as bare events so credentials never pass through the extension.
+own popup sender. Username and password copies are written by the desktop.
+An MFA copy carries only the selected password entry, tab, and exact origin;
+the desktop revalidates the association and writes the code directly to the
+system clipboard, so the MFA ID and code never return to extension JavaScript.
+Deletion carries a random request ID and resolves only after the desktop sends
+`password.deleteResult`; timeout, tab closure, and disconnect reject it.
 
 Password events use
 `{ "type": "extension.event", "event": "...", "payload": { ... } }`.
 The event names are `tabReady`, `fillConfirm`, `fillResult`,
 `captureCandidate`, `saveDecision`, `originActive`, `fillRequest`,
-`openPasswordManager`, `copySecret`, `deleteEntry`, `templateRecordingReady`,
+`openPasswordManager`, `copySecret`, `copyMfaCode`, `deleteEntry`,
+`secondFactorOffer`, `secondFactorConfirm`, `secondFactorResult`,
+`cancelSecondFactor`, `templateRecordingReady`,
 `templateRecordingProgress`, `templateRecordingResult`, and
 `templateRecordingCancelled`.
 `password.captureMatch` can return `new`, `update`, `same`, `select`,
@@ -167,3 +182,19 @@ the same tab and exact origin. Neither value is written to extension storage.
 `password.offerFill.userTemplate` is either `null` or a complete constrained
 template object; legacy string template IDs are rejected instead of silently
 falling back to generic field detection.
+
+Linked TOTP filling starts with `password.armSecondFactor`, which binds a
+five-minute journey to one flow, tab, login origin, and up to eight previously
+confirmed exact HTTPS MFA origins. A content frame reports only candidate
+count, digit length, and confidence; the background derives connection, tab,
+origin, frame, and document identities from trusted browser metadata. One
+high-confidence candidate may proceed automatically. Multiple or low-confidence
+candidates require the page's one-click confirmation, and a first-use
+cross-origin MFA page also requires confirmation of that exact HTTPS origin.
+Each field challenge expires after 30 seconds and is single-use. Navigation
+clears page field references without ending the journey, while tab closure,
+disconnect, user cancellation, or successful filling ends it. The content
+script accepts one 6/7/8-digit field or 6/7/8 one-character segments, clears
+the code immediately after use, and never clicks, submits, or synthesizes
+Enter. Recovery, SMS/email, CAPTCHA, passkey, security-key, payment, postal,
+coupon, hidden, HTTP, and cross-origin iframe candidates are rejected.

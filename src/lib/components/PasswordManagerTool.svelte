@@ -36,6 +36,8 @@
     type PasswordEntrySummary,
     type PasswordEntryUpdateRequest,
     type PasswordGeneratorOptions,
+    type PasswordMfaCandidate,
+    type PasswordMfaLink,
     type PasswordRecoveryState,
     type PasswordRevealResult,
     type PasswordStatus,
@@ -100,6 +102,13 @@
   let notes = $state("");
   let allowInsecureHttp = $state(false);
   let templateId = $state<string | null>(null);
+  let mfaLink = $state<PasswordMfaLink | null>(null);
+  let mfaLinkDirty = $state(false);
+  let mfaCandidates = $state<PasswordMfaCandidate[]>([]);
+  let mfaCandidatesLoading = $state(false);
+  let mfaCandidatesError = $state("");
+  let mfaSearch = $state("");
+  let mfaSelectorOpen = $state(false);
   let editingId = $state<string | null>(null);
   let editorError = $state("");
   let editorBusy = $state(false);
@@ -134,6 +143,13 @@
   });
   let isHttpOrigin = $derived.by(() => {
     return isInsecurePasswordUrl(loginUrl);
+  });
+  let selectedMfaCandidate = $derived(mfaCandidates.find((candidate) => candidate.id === mfaLink?.entryId) ?? null);
+  let filteredMfaCandidates = $derived.by(() => {
+    const query = mfaSearch.trim().toLocaleLowerCase();
+    if (!query) return mfaCandidates;
+    return mfaCandidates.filter((candidate) => [candidate.name, candidate.issuer, candidate.accountName]
+      .some((value) => value.toLocaleLowerCase().includes(query)));
   });
   function reasonMessage(reason: unknown, fallback: string): string {
     return reason instanceof Error && reason.message ? reason.message : fallback;
@@ -178,6 +194,13 @@
     notes = "";
     allowInsecureHttp = false;
     templateId = null;
+    mfaLink = null;
+    mfaLinkDirty = false;
+    mfaCandidates = [];
+    mfaCandidatesLoading = false;
+    mfaCandidatesError = "";
+    mfaSearch = "";
+    mfaSelectorOpen = false;
     generatorOpen = false;
     passwordVisible = false;
   }
@@ -197,6 +220,7 @@
     loginUrl = "https://";
     editorError = "";
     editorReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    void loadMfaCandidates();
     void tick().then(() => editorFirstInput?.focus());
   }
 
@@ -210,10 +234,43 @@
     notes = entry.notes;
     allowInsecureHttp = entry.allowInsecureHttp;
     templateId = entry.templateId ?? null;
+    mfaLink = entry.mfaLink
+      ? { entryId: entry.mfaLink.entryId, allowedOrigins: [...entry.mfaLink.allowedOrigins] }
+      : null;
+    mfaLinkDirty = false;
     editorError = "";
     passwordVisible = false;
     editorReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    void loadMfaCandidates();
     void tick().then(() => editorFirstInput?.focus());
+  }
+
+  async function loadMfaCandidates(): Promise<void> {
+    mfaCandidatesLoading = true;
+    mfaCandidatesError = "";
+    try {
+      mfaCandidates = await api.listMfaCandidates();
+    } catch (reason) {
+      mfaCandidates = [];
+      mfaCandidatesError = reasonMessage(reason, "暂时无法读取 MFA 账户。");
+    } finally {
+      mfaCandidatesLoading = false;
+    }
+  }
+
+  function selectMfaCandidate(candidate: PasswordMfaCandidate): void {
+    const allowedOrigins = mfaLink?.entryId === candidate.id ? mfaLink.allowedOrigins : [];
+    mfaLink = { entryId: candidate.id, allowedOrigins: [...allowedOrigins] };
+    mfaLinkDirty = true;
+    mfaSearch = "";
+    mfaSelectorOpen = false;
+  }
+
+  function unlinkMfa(): void {
+    mfaLink = null;
+    mfaLinkDirty = true;
+    mfaSearch = "";
+    mfaSelectorOpen = false;
   }
 
   function revealFor(entry: PasswordEntrySummary): PasswordRevealResult | null {
@@ -490,11 +547,16 @@
     };
     try {
       if (editingId) {
-        const request: PasswordEntryUpdateRequest = { ...base, id: editingId, ...(password ? { password } : {}) };
+        const request: PasswordEntryUpdateRequest = {
+          ...base,
+          id: editingId,
+          ...(password ? { password } : {}),
+          ...(mfaLinkDirty ? { mfaLink } : {}),
+        };
         await api.update(request);
         showToast("密码账户已更新");
       } else {
-        const request: PasswordEntryInput = { ...base, password };
+        const request: PasswordEntryInput = { ...base, password, mfaLink };
         await api.create(request);
         showToast("密码账户已保存");
       }
@@ -1030,7 +1092,7 @@
           <article class="entry-row" data-testid={`password-entry-${entry.id}`}>
             <div class="entry-site-mark" aria-hidden="true">{shortSiteName(entry).slice(0, 1).toUpperCase()}</div>
             <div class="entry-main">
-              <div class="entry-heading"><strong>{shortSiteName(entry)}</strong>{#if entry.templateId}<span class="template-badge">模板</span>{/if}{#if isHttpUrl(entry.loginUrl)}<span class="http-badge" title="该账户通过未加密的 HTTP 连接填充">HTTP 不安全</span>{/if}</div>
+              <div class="entry-heading"><strong>{shortSiteName(entry)}</strong>{#if entry.templateId}<span class="template-badge">模板</span>{/if}{#if entry.mfaLink}<span class="mfa-badge"><ShieldCheck size={10} aria-hidden="true" />MFA</span>{/if}{#if isHttpUrl(entry.loginUrl)}<span class="http-badge" title="该账户通过未加密的 HTTP 连接填充">HTTP 不安全</span>{/if}</div>
               <span class="entry-origin">{displayOrigin(entry)}</span>
               <span class="entry-username">{entry.username || "未填写用户名"}</span>
               {#if entry.notes}<span class="entry-notes">{entry.notes}</span>{/if}
@@ -1081,6 +1143,58 @@
         {/if}
         <label><span>用户名</span><input bind:value={username} maxlength="512" autocomplete="username" placeholder="账号或邮箱" /></label>
         <label><span>密码{#if editorMode === "edit"}<small>留空表示保持原密码</small>{/if}</span><div class="password-input"><input type={passwordVisible ? "text" : "password"} bind:value={password} maxlength="4096" autocomplete={editorMode === "add" ? "new-password" : "current-password"} /><button type="button" class="icon-button" aria-label={passwordVisible ? "隐藏密码" : "显示密码"} onclick={() => (passwordVisible = !passwordVisible)}>{#if passwordVisible}<EyeOff size={15} aria-hidden="true" />{:else}<Eye size={15} aria-hidden="true" />{/if}</button></div></label>
+        <div class="mfa-field">
+          <div class="mfa-field-label"><span>MFA 账户</span><small>可选</small></div>
+          {#if mfaLink}
+            <div class="mfa-selection" data-testid="selected-mfa-link">
+              <ShieldCheck size={16} aria-hidden="true" />
+              <div>
+                {#if selectedMfaCandidate}
+                  <strong>{selectedMfaCandidate.name}</strong>
+                  <span>{selectedMfaCandidate.issuer}{selectedMfaCandidate.issuer && selectedMfaCandidate.accountName ? " · " : ""}{selectedMfaCandidate.accountName}</span>
+                {:else if mfaCandidatesLoading}
+                  <strong>正在读取 MFA 账户</strong>
+                  <span>关联保持不变</span>
+                {:else}
+                  <strong>已关联的 MFA 当前不可用</strong>
+                  <span>可能已移入回收站、被删除或保险库尚未解锁</span>
+                {/if}
+              </div>
+              <button type="button" class="icon-button" aria-label="解除 MFA 关联" disabled={editorBusy} onclick={unlinkMfa}><X size={14} aria-hidden="true" /></button>
+            </div>
+          {/if}
+          <div class="mfa-search-box">
+            <Search size={14} aria-hidden="true" />
+            <input
+              type="search"
+              aria-label="搜索 MFA 账户"
+              placeholder={mfaLink ? "搜索并更换 MFA 账户" : "按名称、发行方或账户搜索"}
+              bind:value={mfaSearch}
+              disabled={mfaCandidatesLoading || editorBusy}
+              onfocus={() => (mfaSelectorOpen = true)}
+              oninput={() => (mfaSelectorOpen = true)}
+            />
+            {#if mfaCandidatesLoading}<span class="spin"><RefreshCw size={13} aria-hidden="true" /></span>{/if}
+          </div>
+          {#if mfaSelectorOpen && !mfaCandidatesLoading}
+            <div class="mfa-options" role="listbox" aria-label="可关联的 MFA 账户">
+              {#each filteredMfaCandidates as candidate (candidate.id)}
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={candidate.id === mfaLink?.entryId}
+                  onclick={() => selectMfaCandidate(candidate)}
+                >
+                  <strong>{candidate.name}</strong>
+                  <span>{candidate.issuer}{candidate.issuer && candidate.accountName ? " · " : ""}{candidate.accountName}</span>
+                </button>
+              {:else}
+                <div class="mfa-empty">{mfaCandidates.length ? "没有匹配的 MFA 账户" : "还没有可关联的 MFA 账户"}</div>
+              {/each}
+            </div>
+          {/if}
+          {#if mfaCandidatesError}<div class="mfa-load-error" role="status">{mfaCandidatesError}</div>{/if}
+        </div>
         <div class="generator-row"><button type="button" class="secondary-button" onclick={() => (generatorOpen = !generatorOpen)}><Sparkles size={14} aria-hidden="true" />密码生成器</button>{#if password}<span class="generated-note"><Check size={13} aria-hidden="true" />已填写密码</span>{/if}</div>
         {#if generatorOpen}
           <div class="generator-panel">
@@ -1200,7 +1314,8 @@
   .entry-origin, .entry-username, .entry-notes { max-width: 100%; overflow: hidden; color: var(--app-muted); font-size: 11px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
   .entry-username { color: #3e3e3e; }
   .entry-notes { color: #7d7d7d; }
-  .template-badge, .http-badge { flex: 0 0 auto; padding: 1px 4px; color: #226d51; font-size: 9px; border: 1px solid #b7d9c8; border-radius: 3px; }
+  .template-badge, .mfa-badge, .http-badge { flex: 0 0 auto; padding: 1px 4px; color: #226d51; font-size: 9px; border: 1px solid #b7d9c8; border-radius: 3px; }
+  .mfa-badge { display: inline-flex; align-items: center; gap: 2px; color: #1d638d; border-color: #b8d6e8; background: #f2f9fd; }
   .http-badge { color: #a1491c; border-color: #ebc1a5; background: #fff7f1; }
   .entry-secret { display: flex; min-width: 0; flex-direction: column; gap: 2px; color: #737373; font-family: Consolas, monospace; font-size: 12px; }
   .entry-secret span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1237,6 +1352,26 @@
   .password-input { display: flex; min-width: 0; align-items: center; gap: 3px; }
   .password-input input { min-width: 0; flex: 1; }
   .password-input .icon-button { flex: 0 0 30px; }
+  .mfa-field { position: relative; display: flex; min-width: 0; flex-direction: column; gap: 5px; color: #464646; font-size: 11px; }
+  .mfa-field-label { display: flex; align-items: baseline; gap: 5px; }
+  .mfa-selection { display: grid; min-width: 0; padding: 7px 8px; grid-template-columns: 18px minmax(0, 1fr) 28px; align-items: center; gap: 7px; color: #245f80; background: #f2f9fd; border: 1px solid #b8d6e8; border-radius: 4px; }
+  .mfa-selection > div { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
+  .mfa-selection strong, .mfa-selection span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mfa-selection strong { color: var(--app-fg); font-size: 11px; }
+  .mfa-selection span { color: var(--app-muted); font-size: 10px; }
+  .mfa-selection .icon-button { width: 26px; height: 26px; }
+  .mfa-search-box { display: flex; min-width: 0; height: 32px; padding: 0 8px; align-items: center; gap: 7px; color: var(--app-muted); background: #ffffff; border: 1px solid var(--app-border); border-radius: 4px; }
+  .mfa-search-box:focus-within { border-color: var(--app-focus); box-shadow: 0 0 0 1px var(--app-focus); }
+  .mfa-search-box input[type="search"] { min-width: 0; height: 100%; flex: 1; padding: 0; background: transparent; border: 0; box-shadow: none; }
+  .mfa-options { display: flex; max-height: 154px; padding: 3px; flex-direction: column; gap: 2px; overflow-y: auto; background: #ffffff; border: 1px solid var(--app-border); border-radius: 4px; box-shadow: 0 4px 12px rgb(0 0 0 / 10%); }
+  .mfa-options button { display: flex; min-width: 0; padding: 7px 8px; align-items: flex-start; flex-direction: column; gap: 1px; color: var(--app-fg); text-align: left; background: transparent; border: 0; border-radius: 3px; cursor: pointer; }
+  .mfa-options button:hover, .mfa-options button:focus-visible, .mfa-options button[aria-selected="true"] { background: var(--app-surface-hover); outline: 0; }
+  .mfa-options button:focus-visible { box-shadow: inset 0 0 0 2px var(--app-focus); }
+  .mfa-options strong, .mfa-options span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mfa-options strong { font-size: 11px; }
+  .mfa-options span, .mfa-empty, .mfa-load-error { color: var(--app-muted); font-size: 10px; }
+  .mfa-empty { padding: 9px 8px; text-align: center; }
+  .mfa-load-error { color: #a4231a; line-height: 1.4; }
   .generator-row { min-height: 30px; gap: 8px; }
   .generated-note { display: inline-flex; align-items: center; gap: 4px; color: #27794a; font-size: 11px; }
   .generator-panel { display: flex; padding: 10px; flex-direction: column; gap: 9px; background: #f7f9fa; border: 1px solid var(--app-border); border-radius: 5px; }

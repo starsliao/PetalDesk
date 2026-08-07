@@ -83,6 +83,54 @@ describe("PasswordManagerTool", () => {
     expect(view.getByText("HTTP 不安全")).toBeInTheDocument();
   });
 
+  it("searches public MFA metadata and associates one MFA account", async () => {
+    const api = createBrowserPasswordApi();
+    const update = vi.spyOn(api, "update");
+    const view = render(PasswordManagerTool, { api });
+    await view.findByText("demo@contoso.example");
+
+    await fireEvent.click(view.getByRole("button", { name: "编辑 Microsoft 工作账户" }));
+    const dialog = view.getByRole("dialog", { name: "编辑密码账户" });
+    const search = within(dialog).getByRole("searchbox", { name: "搜索 MFA 账户" });
+    await fireEvent.focus(search);
+    await fireEvent.input(search, { target: { value: "demo@example.com" } });
+    const option = await within(dialog).findByRole("option", { name: /Google Workspace.*Google.*demo@example.com/ });
+    expect(option).not.toHaveTextContent(/secret|code|验证码/i);
+    await fireEvent.click(option);
+    expect(within(dialog).getByTestId("selected-mfa-link")).toHaveTextContent("Google Workspace");
+    expect(within(dialog).getByTestId("selected-mfa-link")).toHaveTextContent("Google · demo@example.com");
+
+    await fireEvent.click(within(dialog).getByRole("button", { name: "保存账户" }));
+    await waitFor(() => expect(update).toHaveBeenCalledWith(expect.objectContaining({
+      id: "browser-demo-microsoft",
+      mfaLink: { entryId: "browser-demo-mfa-work", allowedOrigins: [] },
+    })));
+  });
+
+  it("preserves an untouched MFA link and sends null only after explicit unlink", async () => {
+    const api = createBrowserPasswordApi();
+    const update = vi.spyOn(api, "update");
+    const view = render(PasswordManagerTool, { api });
+    await view.findByText("demo@example.com");
+
+    await fireEvent.click(view.getAllByRole("button", { name: "编辑 Google Workspace" })[0]);
+    let dialog = view.getByRole("dialog", { name: "编辑密码账户" });
+    await within(dialog).findByTestId("selected-mfa-link");
+    await fireEvent.click(within(dialog).getByRole("button", { name: "保存账户" }));
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(1));
+    expect(update.mock.calls[0][0]).not.toHaveProperty("mfaLink");
+
+    await fireEvent.click(view.getAllByRole("button", { name: "编辑 Google Workspace" })[0]);
+    dialog = view.getByRole("dialog", { name: "编辑密码账户" });
+    await fireEvent.click(within(dialog).getByRole("button", { name: "解除 MFA 关联" }));
+    await fireEvent.click(within(dialog).getByRole("button", { name: "保存账户" }));
+    await waitFor(() => expect(update).toHaveBeenCalledTimes(2));
+    expect(update.mock.calls[1][0]).toMatchObject({
+      id: "browser-demo-google-work",
+      mfaLink: null,
+    });
+  });
+
   it("reveals a saved password only through the short-lived API response", async () => {
     const api = createBrowserPasswordApi();
     const reveal = vi.spyOn(api, "reveal");

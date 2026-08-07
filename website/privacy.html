@@ -63,7 +63,7 @@
 
       <section>
         <h2>适用范围</h2>
-        <p>本政策适用于 Firefox 上的“飞花 - PetalDesk 浏览器增强”。它为飞花桌面应用提供长截图、由用户点选账户触发的密码填充，以及用户提交登录时的保存或更新提示。</p>
+        <p>本政策适用于 Firefox 上的“飞花 - PetalDesk 浏览器增强”。它为飞花桌面应用提供长截图、由用户点选账户触发的密码填充、用户提交登录时的保存或更新提示，以及与本地 TOTP 的受控联动。</p>
       </section>
 
       <section>
@@ -71,7 +71,7 @@
         <ul>
           <li>长截图所需的网站活动数据，例如滚动位置、视口尺寸和页面稳定状态。</li>
           <li>用于把密码请求绑定到正确页面的精确网址 origin、标签页、文档和 frame 标识。</li>
-          <li>用户主动选择账户填充或提交登录时所需的用户名和密码（所需数据权限已在扩展安装时作为必要权限确认）。</li>
+          <li>用户主动选择账户填充或提交登录时所需的用户名和密码，以及已关联账户在受信任登录流程中短暂使用的当前 TOTP（所需数据权限已在扩展安装时作为必要权限确认）。</li>
         </ul>
         <p>扩展不会为广告、分析或画像收集页面正文、完整浏览历史、付款信息、健康信息、位置或广告标识符。</p>
       </section>
@@ -82,13 +82,15 @@
           <li>长截图数据通过 Firefox Native Messaging 发送给本机飞花进程，用于完成用户主动发起的截图。</li>
           <li>用户在飞花或工具栏弹窗中选择账户后，扩展先向目标页面发送不含密码的填充请求；目标 frame 的身份和字段可用性校验通过后，桌面应用才提供一次性凭据。扩展只填写字段，绝不自动提交表单。</li>
           <li>连接的密码保险库可用时，登录检测始终开启。用户提交登录后，扩展把短时登录候选交给本机加密保险库判断是否完全相同、需要新增或需要更新。</li>
+          <li>飞花填入已关联账户的密码，或手动登录与唯一已保存账户完全一致时，会为该标签页建立最长 5 分钟的二次验证 journey。唯一可信的 TOTP 字段可自动填入；模糊字段先询问用户，跨 origin 页面首次确认精确 HTTPS origin。飞花不点击按钮、不发送 Enter，也不主动提交表单。</li>
+          <li>工具栏弹窗只知道账户是否关联 MFA。用户点击复制 MFA 后，由桌面应用重新校验当前标签页和账户关联，直接写入系统剪贴板并在验证码失效时清除；MFA ID、密钥和验证码不会返回弹窗。</li>
         </ul>
-        <p>扩展不会绕过验证码、Passkey、短信验证、安全密钥或多因素认证。</p>
+        <p>扩展不会绕过多因素认证，只会在上述受信任流程中填入明确关联的本地 TOTP。恢复码、CAPTCHA、Passkey、短信或邮件验证码、安全密钥、CVV、邮编和优惠码完全排除。</p>
       </section>
 
       <section>
         <h2>存储与保留</h2>
-        <p>扩展不会把密码或登录候选写入 Firefox storage、磁盘或旧的截图文件通信目录。包含密码的登录候选最多在扩展内存中保留 30 秒；两步登录中的纯用户名阶段最多保留 2 分钟，只用于同一标签页和精确 origin 的下一步。它们都会在超时、页面关闭或连接断开时清除。填充完成或取消后，扩展立即丢弃相关消息引用。</p>
+        <p>扩展不会把密码、MFA ID、TOTP 或登录候选写入 Firefox storage、磁盘、日志、诊断或旧的截图文件通信目录。包含密码的登录候选最多在扩展内存中保留 30 秒；两步登录中的纯用户名阶段最多保留 2 分钟，只用于同一标签页和精确 origin 的下一步。二次验证 journey 最长 5 分钟，每个字段 challenge 最长 30 秒且只能消费一次。它们都会在超时、页面关闭或连接断开时清除；填充完成或取消后立即丢弃秘密引用。</p>
         <p>用户选择保存的凭据由飞花桌面应用写入本地 XChaCha20-Poly1305 加密保险库，保留与删除由用户在飞花中控制。</p>
       </section>
 
@@ -98,6 +100,7 @@
         <ul>
           <li>密码操作绑定单次会话、标签页、文档、顶层 origin 和经过校验的目标 frame。跨源委派默认拒绝；当前唯一明确允许的是 <code>mail.163.com</code> 到其 <code>dl.reg.163.com</code> 登录 frame 的单向委派。</li>
           <li>每次填充都需要用户先明确选择账户，且扩展不会自动提交。</li>
+          <li>TOTP challenge 绑定连接、flow、标签页、顶层 HTTPS origin、frame 和文档；跨 origin 首次需确认精确站点，跨 origin OTP iframe 一律拒绝。</li>
           <li>HTTPS 为默认要求；HTTP 必须在飞花中逐 origin 明确允许并持续显示风险提示。</li>
         </ul>
       </section>
@@ -117,19 +120,19 @@
 
         <section>
           <h2>Information handled and purpose</h2>
-          <p>The extension handles website activity needed for user-initiated long screenshots; exact origins and tab, document, and frame identifiers needed to bind a password request; and usernames and passwords when the user chooses an account to fill or submits a login. The authentication-information permission is required and granted once at install time.</p>
-          <p>A fill offer contains no password. After the user chooses an account in PetalDesk or the toolbar popup, the target frame confirms its identity and field availability before the desktop application provides one-time credentials. No second in-page confirmation is required. The extension fills fields but never submits a form. While the connected password vault is available, login detection remains active and sends a short-lived candidate to the local encrypted vault after a user submission so it can decide whether the credentials are unchanged, new, or an update.</p>
+          <p>The extension handles website activity needed for user-initiated long screenshots; exact origins and tab, document, and frame identifiers needed to bind a password request; and usernames, passwords, and a short-lived current TOTP when the user has linked local MFA. The authentication-information permission is required and granted once at install time.</p>
+          <p>A fill offer contains no password. After the user chooses an account in PetalDesk or the toolbar popup, the target frame confirms its identity and field availability before the desktop application provides one-time credentials. The extension fills fields but never submits a form. A linked password fill, or a manual login that exactly matches one unique saved account, can start a five-minute second-factor journey. One high-confidence TOTP field can be filled automatically; ambiguous candidates require a user click, and a different exact HTTPS origin requires first-use confirmation. The popup receives only a <code>hasMfa</code> flag; MFA copy is written directly by PetalDesk and cleared when it expires.</p>
         </section>
 
         <section>
           <h2>Storage, sharing, and retention</h2>
-          <p>Credentials and login candidates are not written to Firefox storage, disk, or the legacy screenshot file bridge. Candidates containing a password remain in extension memory for no more than 30 seconds and are cleared on timeout, pagehide, tab close, disconnect, or a user decision. A username-only stage for a two-step login may remain for up to two minutes and is bound to the same tab and exact origin; it is cleared on timeout, tab close, disconnect, or a new origin. Saved credentials remain in the encrypted local PetalDesk vault.</p>
+          <p>Credentials, MFA identifiers, TOTP codes, and login candidates are not written to Firefox storage, disk, logs, diagnostics, or the legacy screenshot file bridge. Candidates containing a password remain in extension memory for no more than 30 seconds. A username-only stage may remain for up to two minutes. A second-factor journey lasts at most five minutes and each bound field challenge lasts at most 30 seconds and is single-use. Values are cleared on timeout, pagehide, tab close, disconnect, a user decision, or immediately after filling. Saved credentials and MFA secrets remain in encrypted local PetalDesk vaults.</p>
           <p>The extension does not sell, rent, or remotely transmit personal information. Native Messaging transfers data only to the registered PetalDesk executable under the same Windows user account.</p>
         </section>
 
         <section>
           <h2>Controls and contact</h2>
-          <p>Password operations are bound to one session, tab, document, top-level origin, and validated target frame. Cross-origin delegation is denied by default; the only current explicit mapping is from <code>mail.163.com</code> to its <code>dl.reg.163.com</code> login frame. Every fill requires an explicit account choice, and the extension never submits a form. HTTPS is required by default; HTTP requires a separate per-origin opt-in. The extension never bypasses CAPTCHA, passkeys, SMS verification, security keys, or MFA.</p>
+          <p>Password operations are bound to one session, tab, document, top-level origin, and validated target frame. Cross-origin password delegation is denied by default; the only current explicit mapping is from <code>mail.163.com</code> to its <code>dl.reg.163.com</code> login frame. TOTP is bound to a separate single-use challenge and exact HTTPS origin; cross-origin OTP frames are rejected. The extension never submits a form or bypasses MFA. Recovery codes, CAPTCHA, passkeys, SMS or email codes, security keys, CVV, postal codes, and coupons are excluded.</p>
           <p>The authentication-information permission is required at install time. Users may decline it during installation (the extension cannot run without it), lock the password vault, delete accounts, or uninstall the extension. Questions can be filed through <a href="https://github.com/starsliao/PetalDesk/issues">PetalDesk GitHub Issues</a>.</p>
         </section>
       </div>

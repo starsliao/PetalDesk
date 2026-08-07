@@ -26,6 +26,24 @@ $desktopShortcutName = "飞花"
 $updaterPrivateKey = [Environment]::GetEnvironmentVariable("TAURI_SIGNING_PRIVATE_KEY")
 $updaterPrivateKeyPassword = [Environment]::GetEnvironmentVariable("TAURI_SIGNING_PRIVATE_KEY_PASSWORD")
 
+# Cargo embeds this value in get_app_info, which the About dialog renders as
+# the package time. Set it once for the whole installer build so the several
+# Tauri/Cargo invocations (app, Native Messaging host, and final EXE) all carry
+# the same timestamp. SOURCE_DATE_EPOCH remains an explicit reproducible-build
+# override; otherwise use the actual UTC start time of this packaging run.
+$buildTimestamp = [Environment]::GetEnvironmentVariable("PETALDESK_BUILD_TIMESTAMP", "Process")
+if ([string]::IsNullOrWhiteSpace($buildTimestamp)) {
+    $buildTimestamp = [Environment]::GetEnvironmentVariable("SOURCE_DATE_EPOCH", "Process")
+}
+if ([string]::IsNullOrWhiteSpace($buildTimestamp)) {
+    $buildTimestamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds().ToString()
+}
+if ($buildTimestamp -notmatch '^[1-9][0-9]*$') {
+    throw "PETALDESK_BUILD_TIMESTAMP/SOURCE_DATE_EPOCH 必须是正数 Unix 秒级时间戳：$buildTimestamp"
+}
+$env:PETALDESK_BUILD_TIMESTAMP = $buildTimestamp
+Write-Host "About 打包时间（UTC Unix timestamp）：$buildTimestamp"
+
 if ([string]::IsNullOrWhiteSpace($updaterPrivateKey)) {
     if (-not [string]::IsNullOrEmpty($updaterPrivateKeyPassword)) {
         throw "已设置 TAURI_SIGNING_PRIVATE_KEY_PASSWORD，但缺少 TAURI_SIGNING_PRIVATE_KEY。"

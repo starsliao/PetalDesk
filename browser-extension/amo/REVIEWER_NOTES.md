@@ -2,7 +2,7 @@
 
 ## Dependency
 
-The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.7.4/PetalDesk_0.7.4_x64-setup.exe.
+The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.8.0/PetalDesk_0.8.0_x64-setup.exe.
 
 The extension ID is fixed as `petaldesk-capture@petaldesk.app`, and the Native Messaging host name is `com.petaldesk.capture`.
 
@@ -42,8 +42,19 @@ The project has no runtime npm dependencies, bundler, minifier, generated JavaSc
 ## Toolbar popup and badge test
 
 1. With accounts saved for a site, open that site: the toolbar badge shows the saved-account count for the exact origin and refreshes on tab switch, navigation, and vault changes. Lock the vault manually in PetalDesk: the badge clears.
-2. Click the toolbar button: the popup shows layered diagnostics (install-time data permission, Native Host stdio, desktop password channel, recent request outcome, extension version), the current site's account list, and an **Open PetalDesk password manager** button.
-3. Choose an account in the popup: the current page is filled directly, a short result notice appears, and the form is not submitted.
+2. Click the toolbar button: the popup shows layered diagnostics, the current site's fixed account cards, and an **Open PetalDesk password manager** button. Each card has icon actions to copy username, password, and linked MFA, plus a separate top-right delete icon; there is no three-dot or expanded text menu.
+3. Choose the body of an account card: the current page is filled directly, a short result notice appears, and the form is not submitted. Icon clicks do not trigger a fill.
+4. Click delete once and cancel the anchored confirmation: no request is sent. Open it again and confirm **Delete**: the popup waits for the desktop result, then refreshes the badge and list.
+
+## Linked TOTP test
+
+Use a reviewer-controlled HTTPS login page with an ordinary username/password step followed by one visible 6-, 7-, or 8-digit TOTP input. The local HTTP fixture below intentionally cannot exercise MFA filling because second-factor pages require HTTPS.
+
+1. Import or create a standard TOTP entry in PetalDesk, create a password entry for the exact HTTPS login origin, and link the two in the password editor. The selector lists only the MFA name, issuer, and account name; it never reveals the secret or current code.
+2. Fill the linked password account from PetalDesk or the toolbar popup, then advance the website normally to its TOTP step. A single high-confidence field is filled without PetalDesk submitting the form. Multiple or low-confidence candidates display a one-click confirmation instead.
+3. For a TOTP page on a different origin, confirm that the exact HTTPS origin requires first-use confirmation. HTTP pages and cross-origin OTP iframes fail closed.
+4. In the toolbar popup, click the linked MFA icon. PetalDesk writes the code directly to the system clipboard; the popup shows only a success message, and the clipboard value is cleared when that TOTP expires. An unlinked account keeps the same disabled icon position.
+5. Lock the MFA vault manually and repeat either path. TOTP filling/copying is refused without affecting ordinary username/password filling.
 
 ## Login-detection test
 
@@ -76,4 +87,4 @@ Additional deterministic pages are available on the same origin:
 - Navigate after the content frame is bound but before credentials arrive: the new document cannot consume the old offer.
 - Try an arbitrary cross-origin iframe: it is rejected. The only current audited delegation is the `dl.reg.163.com` login frame embedded by `mail.163.com`.
 - Inspect extension storage: no credential or candidate is stored.
-- Search the package: there is no automatic form submission code.
+- Search the package: no password, MFA entry ID, TOTP secret, or current code is persisted or logged, and there is no automatic form submission code.

@@ -13,8 +13,17 @@
   const RECORDING_TTL_MS = 5 * 60 * 1_000;
   const CANDIDATE_TTL_MS = 30_000;
   const USERNAME_STAGE_TTL_MS = 2 * 60 * 1_000;
+  const SECOND_FACTOR_TTL_MS = 5 * 60 * 1_000;
+  const SECOND_FACTOR_CHALLENGE_TTL_MS = 30_000;
+  const SECOND_FACTOR_SCAN_SETTLE_MS = 50;
+  const MFA_COPY_RESULT_TTL_MS = 20_000;
+  const DELETE_RESULT_TTL_MS = 8_000;
   const BADGE_ACCOUNT_LIMIT = 16;
-  const CAPABILITY_GROUPS = Object.freeze(["password-fill", "password-capture"]);
+  const CAPABILITY_GROUPS = Object.freeze([
+    "password-fill",
+    "password-capture",
+    "second-factor-fill-v1",
+  ]);
   const COMMANDS = new Set([
     "password.open",
     "password.offerFill",
@@ -30,6 +39,13 @@
     "password.cancelTemplateRecording",
     "password.getStatus",
     "password.updateBadge",
+    "password.armSecondFactor",
+    "password.offerSecondFactor",
+    "password.provideSecondFactor",
+    "password.cancelSecondFactor",
+    "password.confirmMfaCopy",
+    "password.copyMfaResult",
+    "password.deleteResult",
   ]);
   const SAVE_ACTIONS = new Set(["new", "update", "replace", "ignore"]);
 
@@ -94,6 +110,10 @@
     const tabContexts = new Map();
     const tabFrames = new Map();
     const tabAccounts = new Map();
+    const secondFactors = new Map();
+    const secondFactorByTab = new Map();
+    const pendingMfaCopies = new Map();
+    const pendingDeletes = new Map();
     const diagnostics = {
       lastCommandAt: null,
       lastCommandErrorCode: null,
@@ -227,6 +247,212 @@
       if (session.timer && typeof session.timer.unref === "function") session.timer.unref();
     }
 
+    function clearSecondFactorChallenge(journey) {
+      if (!journey) return;
+      if (journey.reportTimer != null) clearTimeout(journey.reportTimer);
+      journey.reportTimer = null;
+      if (journey.challenge && journey.challenge.timer != null) {
+        clearTimeout(journey.challenge.timer);
+      }
+      journey.challenge = null;
+      journey.reports.clear();
+    }
+
+    function removeSecondFactorJourney(journey, { notify = false, reason = "cancelled" } = {}) {
+      if (!journey || secondFactors.get(journey.flowId) !== journey) return;
+      if (journey.timer != null) clearTimeout(journey.timer);
+      clearSecondFactorChallenge(journey);
+      secondFactors.delete(journey.flowId);
+      if (secondFactorByTab.get(journey.tabId) === journey.flowId) {
+        secondFactorByTab.delete(journey.tabId);
+      }
+      void api.sendTabMessage(
+        journey.tabId,
+        {
+          type: CONTENT_MESSAGE_TYPE,
+          command: "cancelSecondFactor",
+          payload: { flowId: journey.flowId },
+        },
+      ).catch(() => {});
+      if (notify) {
+        postEvent("cancelSecondFactor", {
+          flowId: journey.flowId,
+          reason: String(reason || "cancelled").slice(0, 80),
+          tabId: journey.tabId,
+        });
+      }
+    }
+
+    async function rearmSecondFactorDocument(journey, challenge) {
+      try {
+        await api.sendTabMessage(
+          journey.tabId,
+          {
+            type: CONTENT_MESSAGE_TYPE,
+            command: "cancelSecondFactor",
+            payload: { flowId: journey.flowId },
+          },
+          { documentId: challenge.documentId, frameId: challenge.frameId },
+        );
+      } catch (_error) {
+        // Navigation may already have destroyed the challenged document. The
+        // current document still gets a fresh arm below when the journey lives.
+      }
+      if (
+        secondFactors.get(journey.flowId) !== journey
+        || journey.expiresAt <= Date.now()
+      ) return;
+      await api.sendTabMessage(
+        journey.tabId,
+        {
+          type: CONTENT_MESSAGE_TYPE,
+          command: "armSecondFactor",
+          payload: { expiresAt: journey.expiresAt, flowId: journey.flowId },
+        },
+        { frameId: challenge.frameId },
+      ).catch(() => {});
+    }
+
+    function expireSecondFactorChallenge(journey, challenge) {
+      if (!journey || journey.challenge !== challenge) return;
+      clearSecondFactorChallenge(journey);
+      // A 30-second field challenge is disposable; the five-minute login
+      // journey is not. Reset the page-side references and let a still-visible
+      // field produce a freshly bound, single-use challenge.
+      void rearmSecondFactorDocument(journey, challenge);
+    }
+
+    async function settleSecondFactorReports(journey) {
+      if (!journey || secondFactors.get(journey.flowId) !== journey) return;
+      journey.reportTimer = null;
+      if (journey.expiresAt <= Date.now()) {
+        removeSecondFactorJourney(journey, { notify: true, reason: "expired" });
+        return;
+      }
+      const reports = Array.from(journey.reports.values()).filter((report) => report.count > 0);
+      if (reports.length === 0) return;
+      const totalCount = reports.reduce((sum, report) => sum + report.count, 0);
+      const preferred = reports.find((report) => report.confidence === "high") || reports[0];
+      const challenge = {
+        challengeId: secureRandomId("mfa-challenge"),
+        confidence: totalCount === 1 && preferred.confidence === "high" ? "high" : "low",
+        confirmed: false,
+        consumed: false,
+        count: totalCount,
+        digits: preferred.digits,
+        documentId: preferred.documentId,
+        expiresAt: Math.min(
+          journey.expiresAt,
+          Date.now() + SECOND_FACTOR_CHALLENGE_TTL_MS,
+        ),
+        frameId: preferred.frameId,
+        frameOrigin: preferred.frameOrigin,
+        offered: false,
+        originConfirmed: preferred.originPreauthorized,
+        originPreauthorized: preferred.originPreauthorized,
+        requiresOriginConfirmation: false,
+        timer: null,
+        topOrigin: preferred.topOrigin,
+      };
+      if (journey.challenge && journey.challenge.timer != null) {
+        clearTimeout(journey.challenge.timer);
+      }
+      journey.challenge = challenge;
+      challenge.timer = setTimeout(
+        () => expireSecondFactorChallenge(journey, challenge),
+        Math.max(0, challenge.expiresAt - Date.now()),
+      );
+      if (challenge.timer && typeof challenge.timer.unref === "function") challenge.timer.unref();
+      let response;
+      try {
+        response = await api.sendTabMessage(
+          journey.tabId,
+          {
+            type: CONTENT_MESSAGE_TYPE,
+            command: "bindSecondFactor",
+            payload: {
+              challengeId: challenge.challengeId,
+              expiresAt: challenge.expiresAt,
+              flowId: journey.flowId,
+            },
+          },
+          {
+            documentId: challenge.documentId,
+            frameId: challenge.frameId,
+          },
+        );
+      } catch (_error) {
+        response = null;
+      }
+      if (journey.challenge !== challenge) return;
+      if (!response || response.ok !== true || !response.result || response.result.bound !== true) {
+        clearSecondFactorChallenge(journey);
+        void api.sendTabMessage(
+          journey.tabId,
+          {
+            type: CONTENT_MESSAGE_TYPE,
+            command: "armSecondFactor",
+            payload: { expiresAt: journey.expiresAt, flowId: journey.flowId },
+          },
+          { frameId: challenge.frameId },
+        ).catch(() => {});
+        return;
+      }
+      postEvent("secondFactorOffer", {
+        challengeId: challenge.challengeId,
+        confidence: challenge.confidence,
+        count: challenge.count,
+        digits: challenge.digits,
+        documentId: challenge.documentId,
+        flowId: journey.flowId,
+        frameId: challenge.frameId,
+        frameOrigin: challenge.frameOrigin,
+        tabId: journey.tabId,
+        topOrigin: challenge.topOrigin,
+      });
+    }
+
+    function scheduleSecondFactorReportSettle(journey) {
+      if (journey.reportTimer != null) clearTimeout(journey.reportTimer);
+      journey.reportTimer = setTimeout(
+        () => { void settleSecondFactorReports(journey); },
+        SECOND_FACTOR_SCAN_SETTLE_MS,
+      );
+      if (journey.reportTimer && typeof journey.reportTimer.unref === "function") {
+        journey.reportTimer.unref();
+      }
+    }
+
+    function rejectPendingMfaCopy(requestId, error) {
+      const pending = pendingMfaCopies.get(requestId);
+      if (!pending) return false;
+      if (pending.timer != null) clearTimeout(pending.timer);
+      pendingMfaCopies.delete(requestId);
+      pending.reject(error);
+      return true;
+    }
+
+    function clearPendingMfaCopies(code, message) {
+      for (const requestId of Array.from(pendingMfaCopies.keys())) {
+        rejectPendingMfaCopy(requestId, bridgeError(code, message));
+      }
+    }
+
+    function rejectPendingDelete(requestId, error) {
+      const pending = pendingDeletes.get(requestId);
+      if (!pending) return false;
+      if (pending.timer != null) clearTimeout(pending.timer);
+      pendingDeletes.delete(requestId);
+      pending.reject(error);
+      return true;
+    }
+
+    function clearPendingDeletes(code, message) {
+      for (const requestId of Array.from(pendingDeletes.keys())) {
+        rejectPendingDelete(requestId, bridgeError(code, message));
+      }
+    }
+
     function clearCandidate(candidateId) {
       const record = candidates.get(candidateId);
       if (!record) return;
@@ -299,13 +525,56 @@
     function onPageClosed(sender) {
       const tabId = optionalRoutingId(sender && sender.tab && sender.tab.id, "tabId");
       const documentId = sender && sender.documentId ? String(sender.documentId) : null;
-      clearTabState(tabId, documentId, { preserveUsernameStage: true });
+      const frameId = optionalRoutingId(sender && sender.frameId, "frameId") ?? 0;
+      // A top-level navigation invalidates every document in the tab. Child
+      // frame notifications remain document-scoped so an unrelated frame does
+      // not retire another frame's pending secret.
+      clearTabState(tabId, frameId === 0 ? null : documentId, { preserveUsernameStage: true });
       if (tabId != null) {
-        const frameId = optionalRoutingId(sender && sender.frameId, "frameId") ?? 0;
         clearFrameContext(tabId, frameId === 0 ? null : frameId, documentId);
+        if (frameId === 0) {
+          clearTabAccounts(tabId);
+          for (const [requestId, pending] of pendingMfaCopies.entries()) {
+            if (pending.tabId === tabId) {
+              rejectPendingMfaCopy(
+                requestId,
+                bridgeError("PASSWORD_TARGET_MISMATCH", "The MFA copy page changed"),
+              );
+            }
+          }
+          for (const [requestId, pending] of pendingDeletes.entries()) {
+            if (pending.tabId === tabId) {
+              rejectPendingDelete(
+                requestId,
+                bridgeError("PASSWORD_TARGET_MISMATCH", "The delete request page changed"),
+              );
+            }
+          }
+          postEvent("originActive", { origin: "", tabId });
+        }
+        const journey = secondFactors.get(secondFactorByTab.get(tabId));
+        if (journey) {
+          for (const [key, report] of journey.reports.entries()) {
+            if (frameId === 0 || report.frameId === frameId) {
+              if (!documentId || !report.documentId || report.documentId === documentId) {
+                journey.reports.delete(key);
+              }
+            }
+          }
+          const challenge = journey.challenge;
+          if (
+            challenge
+            && (frameId === 0 || challenge.frameId === frameId)
+            && (frameId !== 0
+              ? (!documentId || !challenge.documentId || challenge.documentId === documentId)
+              : true)
+          ) {
+            clearSecondFactorChallenge(journey);
+          }
+        }
       }
-      postEvent("pageClosed", { documentId, tabId });
-      return { cleared: true, tabId, documentId };
+      postEvent("pageClosed", { documentId, frameId, tabId });
+      return { cleared: true, tabId, documentId, frameId };
     }
 
     function recordingResult(recording, status, extra = {}) {
@@ -805,6 +1074,393 @@
       };
     }
 
+    function exactHttpsOrigin(value, name) {
+      const origin = templates.exactOrigin(value);
+      if (!origin.startsWith("https://")) {
+        throw bridgeError("PASSWORD_INSECURE_ORIGIN", `${name} must be an exact HTTPS origin`);
+      }
+      return origin;
+    }
+
+    async function armSecondFactor(payload) {
+      const flowId = requiredString(payload.flowId, "flowId", 160);
+      const tabId = optionalRoutingId(payload.tabId, "tabId");
+      if (tabId == null) {
+        throw bridgeError("PASSWORD_TARGET_INVALID", "A second-factor target tab is required");
+      }
+      if (secondFactors.has(flowId)) {
+        throw bridgeError("PASSWORD_SESSION_EXISTS", "The second-factor journey already exists");
+      }
+      const topOrigin = exactHttpsOrigin(payload.topOrigin, "topOrigin");
+      const tab = await api.getTab(tabId).catch(() => null);
+      let liveOrigin = "";
+      try {
+        liveOrigin = templates.exactOrigin(tab && tab.url);
+      } catch (_error) {
+        liveOrigin = "";
+      }
+      if (!liveOrigin.startsWith("https://")) {
+        throw bridgeError("PASSWORD_INSECURE_ORIGIN", "The second-factor tab is not on HTTPS");
+      }
+      const allowedOrigins = new Set([topOrigin]);
+      if (payload.allowedOrigins != null && !Array.isArray(payload.allowedOrigins)) {
+        throw bridgeError("PASSWORD_PROTOCOL_INVALID", "allowedOrigins must be an array");
+      }
+      for (const value of payload.allowedOrigins || []) {
+        allowedOrigins.add(exactHttpsOrigin(value, "allowedOrigins"));
+      }
+      if (Array.from(allowedOrigins).filter((origin) => origin !== topOrigin).length > 8) {
+        throw bridgeError("PASSWORD_PROTOCOL_INVALID", "At most eight additional MFA origins are allowed");
+      }
+      const requestedExpiry = Number(payload.expiresAt);
+      if (!Number.isFinite(requestedExpiry) || requestedExpiry <= Date.now()) {
+        throw bridgeError("PASSWORD_PROTOCOL_INVALID", "The second-factor journey expiry is invalid");
+      }
+      const existingFlowId = secondFactorByTab.get(tabId);
+      if (existingFlowId) {
+        removeSecondFactorJourney(secondFactors.get(existingFlowId), {
+          notify: true,
+          reason: "replaced",
+        });
+      }
+      const journey = {
+        allowedOrigins,
+        challenge: null,
+        expiresAt: Math.min(requestedExpiry, Date.now() + SECOND_FACTOR_TTL_MS),
+        flowId,
+        loginOrigin: topOrigin,
+        reportTimer: null,
+        reports: new Map(),
+        tabId,
+        timer: null,
+      };
+      journey.timer = setTimeout(() => {
+        removeSecondFactorJourney(journey, { notify: true, reason: "expired" });
+      }, Math.max(0, journey.expiresAt - Date.now()));
+      if (journey.timer && typeof journey.timer.unref === "function") journey.timer.unref();
+      secondFactors.set(flowId, journey);
+      secondFactorByTab.set(tabId, flowId);
+      await api.sendTabMessage(
+        tabId,
+        {
+          type: CONTENT_MESSAGE_TYPE,
+          command: "armSecondFactor",
+          payload: { expiresAt: journey.expiresAt, flowId },
+        },
+      ).catch(() => {});
+      return {
+        armed: true,
+        expiresAt: journey.expiresAt,
+        flowId,
+        tabId,
+      };
+    }
+
+    function secondFactorJourney(payload) {
+      const flowId = requiredString(payload.flowId, "flowId", 160);
+      const journey = secondFactors.get(flowId);
+      if (!journey || journey.expiresAt <= Date.now()) {
+        if (journey) removeSecondFactorJourney(journey, { notify: true, reason: "expired" });
+        throw bridgeError("PASSWORD_SESSION_EXPIRED", "The second-factor journey has expired");
+      }
+      return journey;
+    }
+
+    async function liveSecondFactorOrigin(journey) {
+      const tab = await api.getTab(journey.tabId).catch(() => null);
+      let origin = "";
+      try {
+        origin = exactHttpsOrigin(tab && tab.url, "topOrigin");
+      } catch (_error) {
+        origin = "";
+      }
+      if (!origin) {
+        throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The second-factor tab is not on HTTPS");
+      }
+      return origin;
+    }
+
+    function secondFactorChallenge(payload) {
+      const journey = secondFactorJourney(payload);
+      const challengeId = requiredString(payload.challengeId, "challengeId", 160);
+      const challenge = journey.challenge;
+      if (
+        !challenge
+        || challenge.challengeId !== challengeId
+        || challenge.expiresAt <= Date.now()
+        || challenge.consumed
+      ) {
+        throw bridgeError("PASSWORD_CANDIDATE_EXPIRED", "The second-factor challenge has expired");
+      }
+      const tabId = optionalRoutingId(payload.tabId, "tabId");
+      const frameId = optionalRoutingId(payload.frameId, "frameId");
+      const documentId = requiredString(payload.documentId, "documentId", 256);
+      const topOrigin = exactHttpsOrigin(payload.topOrigin, "topOrigin");
+      if (
+        tabId !== journey.tabId
+        || frameId !== challenge.frameId
+        || documentId !== challenge.documentId
+        || topOrigin !== challenge.topOrigin
+      ) {
+        throw bridgeError("PASSWORD_TARGET_MISMATCH", "The second-factor target binding changed");
+      }
+      return { challenge, journey };
+    }
+
+    async function offerSecondFactor(payload) {
+      const { challenge, journey } = secondFactorChallenge(payload);
+      const liveOrigin = await liveSecondFactorOrigin(journey);
+      if (liveOrigin !== challenge.topOrigin) {
+        throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The second-factor tab origin changed");
+      }
+      const requiresOriginConfirmation = payload.requiresOriginConfirmation === true;
+      if (!challenge.originPreauthorized && !requiresOriginConfirmation) {
+        throw bridgeError(
+          "PASSWORD_ORIGIN_CONFIRMATION_REQUIRED",
+          "The exact cross-origin MFA site requires confirmation",
+        );
+      }
+      const response = await api.sendTabMessage(
+        journey.tabId,
+        {
+          type: CONTENT_MESSAGE_TYPE,
+          command: "offerSecondFactor",
+          payload: {
+            challengeId: challenge.challengeId,
+            expiresAt: challenge.expiresAt,
+            flowId: journey.flowId,
+            requiresOriginConfirmation,
+            topOrigin: challenge.topOrigin,
+          },
+        },
+        {
+          documentId: challenge.documentId,
+          frameId: challenge.frameId,
+        },
+      );
+      if (!response || response.ok !== true) {
+        throw bridgeError(
+          "PASSWORD_CONTENT_FAILED",
+          response && response.error
+            ? response.error.message || String(response.error)
+            : "The second-factor page did not respond",
+        );
+      }
+      challenge.offered = true;
+      challenge.requiresOriginConfirmation = requiresOriginConfirmation;
+      return {
+        challengeId: challenge.challengeId,
+        flowId: journey.flowId,
+        offered: true,
+      };
+    }
+
+    async function provideSecondFactor(payload) {
+      let code = String(payload.code == null ? "" : payload.code);
+      try {
+        const { challenge, journey } = secondFactorChallenge(payload);
+        if (challenge.confidence !== "high" && !challenge.confirmed) {
+          throw bridgeError("PASSWORD_CONFIRMATION_REQUIRED", "The MFA field requires user confirmation");
+        }
+        if (!challenge.originPreauthorized && !challenge.originConfirmed) {
+          throw bridgeError(
+            "PASSWORD_ORIGIN_CONFIRMATION_REQUIRED",
+            "The exact cross-origin MFA site was not confirmed",
+          );
+        }
+        const liveOrigin = await liveSecondFactorOrigin(journey);
+        if (liveOrigin !== challenge.topOrigin) {
+          throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The second-factor tab origin changed");
+        }
+        if (!/^\d{6,8}$/.test(code) || challenge.digits && code.length !== challenge.digits) {
+          throw bridgeError("PASSWORD_PROTOCOL_INVALID", "The MFA verification code is invalid");
+        }
+        challenge.consumed = true;
+        try {
+          const response = await api.sendTabMessage(
+            journey.tabId,
+            {
+              type: CONTENT_MESSAGE_TYPE,
+              command: "provideSecondFactor",
+              payload: {
+                challengeId: challenge.challengeId,
+                code,
+                flowId: journey.flowId,
+              },
+            },
+            {
+              documentId: challenge.documentId,
+              frameId: challenge.frameId,
+            },
+          );
+          if (!response || response.ok !== true) {
+            throw bridgeError(
+              "PASSWORD_CONTENT_FAILED",
+              response && response.error
+                ? response.error.message || String(response.error)
+                : "The second-factor page did not respond",
+            );
+          }
+          const result = response.result || {};
+          if (result.filled !== true || result.submitted !== false) {
+            throw bridgeError("PASSWORD_CONTENT_FAILED", "The second-factor page did not confirm a safe fill");
+          }
+          postEvent("secondFactorResult", {
+            challengeId: challenge.challengeId,
+            digits: Number(result.digits || code.length),
+            documentId: challenge.documentId,
+            fields: Number(result.fields || 1),
+            flowId: journey.flowId,
+            frameId: challenge.frameId,
+            frameOrigin: challenge.frameOrigin,
+            segmented: result.segmented === true,
+            status: "filled",
+            submitted: false,
+            tabId: journey.tabId,
+            topOrigin: challenge.topOrigin,
+          });
+          removeSecondFactorJourney(journey);
+          return {
+            ...result,
+            challengeId: challenge.challengeId,
+            flowId: journey.flowId,
+            frameId: challenge.frameId,
+            tabId: journey.tabId,
+          };
+        } catch (error) {
+          postEvent("secondFactorResult", {
+            challengeId: challenge.challengeId,
+            documentId: challenge.documentId,
+            flowId: journey.flowId,
+            frameId: challenge.frameId,
+            frameOrigin: challenge.frameOrigin,
+            status: "failed",
+            submitted: false,
+            tabId: journey.tabId,
+            topOrigin: challenge.topOrigin,
+          });
+          clearSecondFactorChallenge(journey);
+          void rearmSecondFactorDocument(journey, challenge);
+          throw error;
+        }
+      } finally {
+        code = "";
+        if (Object.prototype.hasOwnProperty.call(payload, "code")) payload.code = "";
+      }
+    }
+
+    async function cancelSecondFactor(payload) {
+      let journey = null;
+      if (payload.flowId != null && String(payload.flowId).trim() !== "") {
+        journey = secondFactors.get(requiredString(payload.flowId, "flowId", 160)) || null;
+      } else {
+        const tabId = optionalRoutingId(payload.tabId, "tabId");
+        if (tabId != null) journey = secondFactors.get(secondFactorByTab.get(tabId)) || null;
+      }
+      if (!journey) return { cancelled: false };
+      const requestedTabId = optionalRoutingId(payload.tabId, "tabId");
+      if (requestedTabId != null && requestedTabId !== journey.tabId) {
+        throw bridgeError("PASSWORD_TARGET_MISMATCH", "The second-factor cancel target changed");
+      }
+      if (payload.preserveJourney === true) {
+        const challengeId = requiredString(payload.challengeId, "challengeId", 160);
+        const challenge = journey.challenge;
+        if (
+          !challenge
+          || challenge.challengeId !== challengeId
+          || challenge.expiresAt <= Date.now()
+          || challenge.consumed
+        ) {
+          throw bridgeError(
+            "PASSWORD_CANDIDATE_EXPIRED",
+            "The second-factor challenge is no longer current",
+          );
+        }
+        clearSecondFactorChallenge(journey);
+        await rearmSecondFactorDocument(journey, challenge);
+        return {
+          cancelled: true,
+          challengeId,
+          flowId: journey.flowId,
+          preserved: true,
+          tabId: journey.tabId,
+        };
+      }
+      removeSecondFactorJourney(journey, {
+        notify: true,
+        reason: String(payload.reason || "cancelled"),
+      });
+      return { cancelled: true, flowId: journey.flowId, tabId: journey.tabId };
+    }
+
+    function copyMfaResult(payload) {
+      const requestId = requiredString(payload.requestId, "requestId", 160);
+      const pending = pendingMfaCopies.get(requestId);
+      if (!pending) {
+        throw bridgeError("PASSWORD_REQUEST_EXPIRED", "The MFA copy request is no longer pending");
+      }
+      if (pending.timer != null) clearTimeout(pending.timer);
+      pendingMfaCopies.delete(requestId);
+      if (payload.success === true) {
+        pending.resolve({ accepted: true });
+      } else {
+        const errorValue = payload.error && typeof payload.error === "object" ? payload.error : {};
+        pending.reject(bridgeError(
+          String(errorValue.code || "PASSWORD_MFA_COPY_FAILED").slice(0, 80),
+          String(errorValue.message || "MFA 验证码复制失败").slice(0, 512),
+        ));
+      }
+      return { requestId, resolved: true };
+    }
+
+    async function confirmMfaCopy(payload) {
+      const requestId = requiredString(payload.requestId, "requestId", 160);
+      const pending = pendingMfaCopies.get(requestId);
+      if (!pending) {
+        throw bridgeError("PASSWORD_REQUEST_EXPIRED", "The MFA copy request is no longer pending");
+      }
+      const tabId = optionalRoutingId(payload.tabId, "tabId");
+      const origin = exactHttpsOrigin(payload.origin, "origin");
+      if (tabId !== pending.tabId || origin !== pending.origin) {
+        throw bridgeError("PASSWORD_TARGET_MISMATCH", "The MFA copy target changed");
+      }
+      const active = await activeTabContext();
+      const cached = tabAccounts.get(pending.tabId);
+      const account = cached && cached.accounts.find((item) => item.entryId === pending.entryId);
+      if (
+        active.tabId !== pending.tabId
+        || active.origin !== pending.origin
+        || !cached
+        || cached.locked
+        || cached.origin !== pending.origin
+        || !account
+        || account.hasMfa !== true
+      ) {
+        throw bridgeError("PASSWORD_TARGET_MISMATCH", "The MFA copy page or account changed");
+      }
+      return { confirmed: true, requestId, tabId: pending.tabId };
+    }
+
+    function deleteResult(payload) {
+      const requestId = requiredString(payload.requestId, "requestId", 160);
+      const pending = pendingDeletes.get(requestId);
+      if (!pending) {
+        throw bridgeError("PASSWORD_REQUEST_EXPIRED", "The delete request is no longer pending");
+      }
+      if (pending.timer != null) clearTimeout(pending.timer);
+      pendingDeletes.delete(requestId);
+      if (payload.success === true) {
+        pending.resolve({ accepted: true });
+      } else {
+        const errorValue = payload.error && typeof payload.error === "object" ? payload.error : {};
+        pending.reject(bridgeError(
+          String(errorValue.code || "PASSWORD_DELETE_FAILED").slice(0, 80),
+          String(errorValue.message || "删除账户失败").slice(0, 512),
+        ));
+      }
+      return { requestId, resolved: true };
+    }
+
     async function requestConsent() {
       // Authentication access is now a required install-time permission, so the
       // desktop's legacy consent probe always reports an already granted state.
@@ -876,7 +1532,7 @@
         if (!entryId || entryId.length > 160 || username.length > 1_024 || siteName.length > 512) {
           return [];
         }
-        return [{ entryId, username, siteName }];
+        return [{ entryId, hasMfa: item.hasMfa === true, username, siteName }];
       });
     }
 
@@ -896,6 +1552,7 @@
         pendingCandidates: candidates.size,
         pendingUsernameStages: captureUsernames.size,
         pendingFillSessions: sessions.size,
+        pendingSecondFactorSessions: secondFactors.size,
         pendingTemplateRecordings: recordings.size,
       };
     }
@@ -918,6 +1575,13 @@
         case "password.cancelTemplateRecording": return cancelTemplateRecording(payload);
         case "password.getStatus": return getStatus();
         case "password.updateBadge": return updateBadge(payload);
+        case "password.armSecondFactor": return armSecondFactor(payload);
+        case "password.offerSecondFactor": return offerSecondFactor(payload);
+        case "password.provideSecondFactor": return provideSecondFactor(payload);
+        case "password.cancelSecondFactor": return cancelSecondFactor(payload);
+        case "password.confirmMfaCopy": return confirmMfaCopy(payload);
+        case "password.copyMfaResult": return copyMfaResult(payload);
+        case "password.deleteResult": return deleteResult(payload);
         default:
           throw bridgeError("PASSWORD_COMMAND_UNSUPPORTED", `Unsupported password command: ${command || "<empty>"}`);
       }
@@ -1125,9 +1789,11 @@
           binding.origin.startsWith("https://")
           || captureInsecureOrigins.has(binding.origin)
         );
+        const secondFactorArm = await secondFactorArmForBinding(binding, sender);
         return {
           captureEnabled: Boolean(captureEnabled && frameCaptureAllowed),
           insecureOrigins: Array.from(captureInsecureOrigins),
+          secondFactorArm,
           topLevelOrigin: frameTopOrigin,
         };
       }
@@ -1150,6 +1816,8 @@
       // map only when an established top document actually changes.
       if (previousContext && previousContext.documentId !== binding.documentId) {
         clearFrameContext(binding.tabId);
+        const journey = secondFactors.get(secondFactorByTab.get(binding.tabId));
+        if (journey) clearSecondFactorChallenge(journey);
       }
       setFrameContext(binding, message);
       tabContexts.set(binding.tabId, { documentId: binding.documentId, origin: binding.origin });
@@ -1264,9 +1932,11 @@
       }
       const originCaptureAllowed = binding.origin.startsWith("https://")
         || captureInsecureOrigins.has(binding.origin);
+      const secondFactorArm = await secondFactorArmForBinding(binding, sender);
       return {
         captureEnabled: Boolean(captureEnabled && originCaptureAllowed),
         insecureOrigins: Array.from(captureInsecureOrigins),
+        secondFactorArm,
         topLevelOrigin: binding.origin,
       };
     }
@@ -1279,6 +1949,169 @@
       }
       setFrameContext(binding, message);
       return { accepted: true, frameId: binding.frameId };
+    }
+
+    async function secondFactorArmForBinding(binding, sender) {
+      const journey = secondFactors.get(secondFactorByTab.get(binding.tabId));
+      if (!journey) return null;
+      if (journey.expiresAt <= Date.now()) {
+        removeSecondFactorJourney(journey, { notify: true, reason: "expired" });
+        return null;
+      }
+      const topOrigin = await topLevelOrigin(binding, sender);
+      if (!topOrigin || !topOrigin.startsWith("https://")) return null;
+      // Same-origin iframes may own segmented OTP controls. Cross-origin OTP
+      // iframes are rejected even when their parent page is allowed.
+      if (binding.frameId > 0 && binding.origin !== topOrigin) return null;
+      return { expiresAt: journey.expiresAt, flowId: journey.flowId };
+    }
+
+    async function onSecondFactorCandidates(message, sender) {
+      const allowedKeys = new Set(["type", "count", "digits", "confidence"]);
+      if (Object.keys(message).some((key) => !allowedKeys.has(key))) {
+        throw bridgeError(
+          "PASSWORD_PROTOCOL_INVALID",
+          "Second-factor candidates may contain only field-shape metadata",
+        );
+      }
+      const binding = senderBinding(sender);
+      const journey = secondFactors.get(secondFactorByTab.get(binding.tabId));
+      if (!journey || journey.expiresAt <= Date.now()) {
+        if (journey) removeSecondFactorJourney(journey, { notify: true, reason: "expired" });
+        throw bridgeError("PASSWORD_SESSION_EXPIRED", "No second-factor journey is active for this tab");
+      }
+      if (!binding.documentId) {
+        throw bridgeError("PASSWORD_TARGET_INVALID", "The second-factor document identity is unavailable");
+      }
+      if (binding.tabId !== journey.tabId) {
+        throw bridgeError("PASSWORD_TARGET_MISMATCH", "The second-factor candidate came from another tab");
+      }
+      const topOrigin = await topLevelOrigin(binding, sender);
+      if (!topOrigin || !topOrigin.startsWith("https://")) {
+        throw bridgeError("PASSWORD_INSECURE_ORIGIN", "MFA filling is available only on HTTPS");
+      }
+      if (binding.frameId === 0) {
+        if (binding.origin !== topOrigin) {
+          throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The second-factor top origin is invalid");
+        }
+      } else if (binding.origin !== topOrigin) {
+        throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "Cross-origin MFA iframes are not allowed");
+      }
+      const count = Number(message.count);
+      const digits = Number(message.digits);
+      if (!Number.isInteger(count) || count < 0 || count > 8) {
+        throw bridgeError("PASSWORD_PROTOCOL_INVALID", "The MFA candidate count is invalid");
+      }
+      if (![0, 6, 7, 8].includes(digits) || count > 0 && digits === 0) {
+        throw bridgeError("PASSWORD_PROTOCOL_INVALID", "The MFA candidate digit count is invalid");
+      }
+      const confidence = message.confidence === "high" && count === 1 ? "high" : "low";
+      const reportKey = `${binding.frameId}:${binding.documentId}`;
+      if (count === 0) {
+        journey.reports.delete(reportKey);
+        const challenge = journey.challenge;
+        if (
+          challenge
+          && challenge.frameId === binding.frameId
+          && challenge.documentId === binding.documentId
+        ) {
+          clearSecondFactorChallenge(journey);
+        }
+        return { accepted: true, count: 0 };
+      }
+      if (journey.challenge) {
+        clearSecondFactorChallenge(journey);
+      }
+      journey.reports.set(reportKey, {
+        confidence,
+        count,
+        digits,
+        documentId: binding.documentId,
+        frameId: binding.frameId,
+        frameOrigin: binding.origin,
+        originPreauthorized: journey.allowedOrigins.has(topOrigin),
+        topOrigin,
+      });
+      scheduleSecondFactorReportSettle(journey);
+      return { accepted: true, count };
+    }
+
+    async function onSecondFactorConfirm(message, sender) {
+      const allowedKeys = new Set(["type", "flowId", "challengeId", "originConfirmed"]);
+      if (Object.keys(message).some((key) => !allowedKeys.has(key))) {
+        throw bridgeError("PASSWORD_PROTOCOL_INVALID", "The second-factor confirmation is invalid");
+      }
+      const journey = secondFactorJourney(message);
+      const challengeId = requiredString(message.challengeId, "challengeId", 160);
+      const challenge = journey.challenge;
+      if (
+        !challenge
+        || challenge.challengeId !== challengeId
+        || challenge.expiresAt <= Date.now()
+        || challenge.consumed
+      ) {
+        throw bridgeError("PASSWORD_CANDIDATE_EXPIRED", "The second-factor challenge has expired");
+      }
+      const binding = senderBinding(sender);
+      if (
+        binding.tabId !== journey.tabId
+        || binding.frameId !== challenge.frameId
+        || binding.documentId !== challenge.documentId
+        || binding.origin !== challenge.frameOrigin
+      ) {
+        throw bridgeError("PASSWORD_TARGET_MISMATCH", "The MFA confirmation came from another page");
+      }
+      const liveOrigin = await liveSecondFactorOrigin(journey);
+      if (liveOrigin !== challenge.topOrigin || !challenge.offered) {
+        throw bridgeError("PASSWORD_TARGET_MISMATCH", "The MFA confirmation target changed");
+      }
+      const originConfirmed = message.originConfirmed === true;
+      if (challenge.requiresOriginConfirmation && !originConfirmed) {
+        throw bridgeError(
+          "PASSWORD_ORIGIN_CONFIRMATION_REQUIRED",
+          "The exact cross-origin MFA site was not confirmed",
+        );
+      }
+      challenge.confirmed = true;
+      challenge.originConfirmed = challenge.originPreauthorized || originConfirmed;
+      postEvent("secondFactorConfirm", {
+        challengeId: challenge.challengeId,
+        documentId: challenge.documentId,
+        flowId: journey.flowId,
+        frameId: challenge.frameId,
+        frameOrigin: challenge.frameOrigin,
+        originConfirmed,
+        tabId: journey.tabId,
+        topOrigin: challenge.topOrigin,
+      });
+      return { confirmed: true };
+    }
+
+    async function onSecondFactorCancel(message, sender) {
+      const allowedKeys = new Set(["type", "flowId", "challengeId"]);
+      if (Object.keys(message).some((key) => !allowedKeys.has(key))) {
+        throw bridgeError("PASSWORD_PROTOCOL_INVALID", "The second-factor cancellation is invalid");
+      }
+      const journey = secondFactorJourney(message);
+      const challengeId = requiredString(message.challengeId, "challengeId", 160);
+      const challenge = journey.challenge;
+      const binding = senderBinding(sender);
+      if (
+        !challenge
+        || challenge.challengeId !== challengeId
+        || binding.tabId !== journey.tabId
+        || binding.frameId !== challenge.frameId
+        || binding.documentId !== challenge.documentId
+        || binding.origin !== challenge.frameOrigin
+      ) {
+        throw bridgeError("PASSWORD_TARGET_MISMATCH", "The MFA cancellation came from another page");
+      }
+      const liveOrigin = await liveSecondFactorOrigin(journey);
+      if (liveOrigin !== challenge.topOrigin) {
+        throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The second-factor tab origin changed");
+      }
+      removeSecondFactorJourney(journey, { notify: true, reason: "user-cancelled" });
+      return { cancelled: true };
     }
 
     function sessionForContent(message, sender) {
@@ -1706,19 +2539,63 @@
         throw bridgeError("PASSWORD_TARGET_INVALID", "No active browser tab is available");
       }
       const cached = tabAccounts.get(active.tabId);
-      if (!cached || cached.locked || !cached.accounts.some((account) => account.entryId === entryId)) {
+      const account = cached && cached.accounts.find((item) => item.entryId === entryId);
+      if (
+        !cached
+        || cached.locked
+        || !account
+        || !active.origin
+        || cached.origin !== active.origin
+      ) {
         throw bridgeError("PASSWORD_TARGET_MISMATCH", "The requested account is not available on this tab");
       }
-      return active;
+      return { ...active, account };
     }
 
     async function popupCopySecret(message) {
       const entryId = requiredString(message.entryId, "entryId", 160);
       const field = String(message.field || "");
-      if (field !== "username" && field !== "password") {
+      if (field !== "username" && field !== "password" && field !== "mfa") {
         throw bridgeError("PASSWORD_PROTOCOL_INVALID", "The copy field is invalid");
       }
-      await cachedPopupAccount(entryId);
+      const active = await cachedPopupAccount(entryId);
+      if (field === "mfa") {
+        if (active.account.hasMfa !== true) {
+          throw bridgeError("PASSWORD_TARGET_MISMATCH", "The requested account has no linked MFA entry");
+        }
+        const requestId = secureRandomId("mfa-copy");
+        const result = new Promise((resolve, reject) => {
+          const pending = {
+            entryId,
+            origin: active.origin,
+            reject,
+            resolve,
+            tabId: active.tabId,
+            timer: null,
+          };
+          pending.timer = setTimeout(() => {
+            rejectPendingMfaCopy(
+              requestId,
+              bridgeError("PASSWORD_REQUEST_EXPIRED", "MFA 验证码复制请求超时"),
+            );
+          }, MFA_COPY_RESULT_TTL_MS);
+          if (pending.timer && typeof pending.timer.unref === "function") pending.timer.unref();
+          pendingMfaCopies.set(requestId, pending);
+        });
+        const posted = postEvent("copyMfaCode", {
+          entryId,
+          origin: active.origin,
+          requestId,
+          tabId: active.tabId,
+        });
+        if (!posted) {
+          rejectPendingMfaCopy(
+            requestId,
+            bridgeError("PASSWORD_NATIVE_DISCONNECTED", "PetalDesk native host is disconnected"),
+          );
+        }
+        return result;
+      }
       // The desktop writes the clipboard; credentials never pass the extension.
       const posted = postEvent("copySecret", { entryId, field });
       if (!posted) {
@@ -1729,19 +2606,67 @@
 
     async function popupDeleteEntry(message) {
       const entryId = requiredString(message.entryId, "entryId", 160);
-      await cachedPopupAccount(entryId);
-      // The desktop deletes the entry and pushes a badge refresh afterwards.
-      const posted = postEvent("deleteEntry", { entryId });
+      const active = await cachedPopupAccount(entryId);
+      const requestId = secureRandomId("delete");
+      const result = new Promise((resolve, reject) => {
+        const pending = {
+          entryId,
+          origin: active.origin,
+          reject,
+          resolve,
+          tabId: active.tabId,
+          timer: null,
+        };
+        pending.timer = setTimeout(() => {
+          rejectPendingDelete(
+            requestId,
+            bridgeError("PASSWORD_REQUEST_EXPIRED", "删除账户请求超时"),
+          );
+        }, DELETE_RESULT_TTL_MS);
+        if (pending.timer && typeof pending.timer.unref === "function") pending.timer.unref();
+        pendingDeletes.set(requestId, pending);
+      });
+      // The desktop replies only after the vault mutation and badge refresh
+      // complete, so the popup cannot mistake event delivery for deletion.
+      const posted = postEvent("deleteEntry", {
+        entryId,
+        origin: active.origin,
+        requestId,
+        tabId: active.tabId,
+      });
       if (!posted) {
-        throw bridgeError("PASSWORD_NATIVE_DISCONNECTED", "PetalDesk native host is disconnected");
+        rejectPendingDelete(
+          requestId,
+          bridgeError("PASSWORD_NATIVE_DISCONNECTED", "PetalDesk native host is disconnected"),
+        );
       }
-      return { accepted: true };
+      return result;
     }
 
     function onPopupMessage(message, sender) {
       // The action popup is an extension page without a tab; content scripts
       // and other extensions must never reach these handlers.
-      if (!sender || sender.id !== api.runtime.id || sender.tab) {
+      let expectedPopupUrl = "";
+      try {
+        expectedPopupUrl = api.runtime && typeof api.runtime.getURL === "function"
+          ? new URL(api.runtime.getURL("popup/popup.html")).href
+          : "";
+      } catch (_error) {
+        expectedPopupUrl = "";
+      }
+      let senderUrl = "";
+      try {
+        senderUrl = sender && sender.url ? new URL(sender.url).href : "";
+      } catch (_error) {
+        senderUrl = "";
+      }
+      if (
+        !sender
+        || sender.id !== api.runtime.id
+        || sender.tab
+        || !expectedPopupUrl
+        || senderUrl !== expectedPopupUrl
+      ) {
         throw bridgeError("PASSWORD_TARGET_INVALID", "The popup message sender is not trusted");
       }
       switch (message.type) {
@@ -1767,6 +2692,9 @@
         case "petaldesk.password.save-decision": return onSaveDecision(message, sender);
         case "petaldesk.password.template-recording-progress": return onTemplateRecordingProgress(message, sender);
         case "petaldesk.password.template-recording-cancelled": return onTemplateRecordingCancelled(message, sender);
+        case "petaldesk.password.second-factor-candidates": return onSecondFactorCandidates(message, sender);
+        case "petaldesk.password.second-factor-confirm": return onSecondFactorConfirm(message, sender);
+        case "petaldesk.password.second-factor-cancel": return onSecondFactorCancel(message, sender);
         default: return null;
       }
     }
@@ -1798,6 +2726,24 @@
         tabFrames.delete(tabId);
         tabAccounts.delete(tabId);
         clearTabState(tabId);
+        const journey = secondFactors.get(secondFactorByTab.get(tabId));
+        if (journey) removeSecondFactorJourney(journey, { notify: true, reason: "tab-closed" });
+        for (const [requestId, pending] of pendingMfaCopies.entries()) {
+          if (pending.tabId === tabId) {
+            rejectPendingMfaCopy(
+              requestId,
+              bridgeError("PASSWORD_TARGET_MISMATCH", "The MFA copy tab was closed"),
+            );
+          }
+        }
+        for (const [requestId, pending] of pendingDeletes.entries()) {
+          if (pending.tabId === tabId) {
+            rejectPendingDelete(
+              requestId,
+              bridgeError("PASSWORD_TARGET_MISMATCH", "The delete request tab was closed"),
+            );
+          }
+        }
         postEvent("pageClosed", { documentId: null, tabId });
       });
     }
@@ -1856,6 +2802,17 @@
       captureEnabled = false;
       void broadcastCaptureState().catch(() => {});
       for (const sessionId of Array.from(sessions.keys())) clearSession(sessionId);
+      for (const journey of Array.from(secondFactors.values())) {
+        removeSecondFactorJourney(journey, { notify: true, reason: "native-disconnected" });
+      }
+      clearPendingMfaCopies(
+        "PASSWORD_NATIVE_DISCONNECTED",
+        "PetalDesk native host is disconnected",
+      );
+      clearPendingDeletes(
+        "PASSWORD_NATIVE_DISCONNECTED",
+        "PetalDesk native host is disconnected",
+      );
       tabFrames.clear();
       clearCaptureState();
     }

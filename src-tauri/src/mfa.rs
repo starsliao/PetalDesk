@@ -124,6 +124,13 @@ fn mfa_session_closed_error() -> AppError {
     )
 }
 
+fn mfa_manually_locked_error() -> AppError {
+    AppError::new(
+        "mfa_vault_locked",
+        "MFA 保险库已显式锁定，请先在 MFA 验证器中使用恢复密码解锁。",
+    )
+}
+
 /// A deserialisable but non-debuggable string used for URI/manual import
 /// inputs.  Its contents are wiped when the value leaves scope.
 #[derive(Deserialize)]
@@ -228,6 +235,15 @@ pub struct MfaRevealResult {
     pub id: String,
     pub code: String,
     pub valid_until: u64,
+}
+
+/// A one-shot TOTP result for the native browser bridge. This type is never
+/// serialized through Tauri; the value is sent only through the memory-only
+/// password channel and is wiped when the request finishes.
+pub(crate) struct BrowserMfaCode {
+    pub(crate) code: Zeroizing<String>,
+    pub(crate) valid_until: u64,
+    pub(crate) digits: u32,
 }
 
 #[derive(Serialize)]
@@ -475,6 +491,8 @@ struct RuntimeState {
     vault: Option<UnlockedVault>,
     recovery_state: MfaRecoveryState,
     recovered_from_backup: bool,
+    manually_locked: bool,
+    locked_entry_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -593,6 +611,8 @@ impl MfaStore {
                 vault: None,
                 recovery_state,
                 recovered_from_backup: false,
+                manually_locked: false,
+                locked_entry_count: 0,
             }),
             imports,
             session_epoch: AtomicU64::new(0),
@@ -649,6 +669,9 @@ impl MfaStore {
 
     fn ensure_unlocked_at(&self, runtime: &mut RuntimeState, epoch: u64) -> AppResult<()> {
         self.validate_epoch(epoch)?;
+        if runtime.manually_locked {
+            return Err(mfa_manually_locked_error());
+        }
         let result = self.ensure_unlocked(runtime);
         if let Err(error) = self.validate_epoch(epoch) {
             runtime.vault = None;
@@ -665,38 +688,52 @@ impl MfaStore {
 
     fn status_at(&self, epoch: u64) -> AppResult<MfaStatus> {
         let mut runtime = lock_unpoisoned(&self.runtime);
-        let available = self.ensure_unlocked_at(&mut runtime, epoch).is_ok();
-        let (locked, entry_count) = runtime
-            .vault
-            .as_ref()
-            .map(|vault| (false, vault.payload.entries.len()))
-            .unwrap_or((self.vault_path.exists(), 0));
+        self.validate_epoch(epoch)?;
+        let manually_locked = runtime.manually_locked;
+        let available = manually_locked || self.ensure_unlocked_at(&mut runtime, epoch).is_ok();
+        let (locked, entry_count) = if manually_locked {
+            (true, runtime.locked_entry_count)
+        } else {
+            runtime
+                .vault
+                .as_ref()
+                .map(|vault| (false, vault.payload.entries.len()))
+                .unwrap_or((self.vault_path.exists(), 0))
+        };
         Ok(MfaStatus {
             available,
             locked,
             entry_count,
             protection: local_protection_label(runtime.recovery_state).to_string(),
-            recovery_state: runtime.recovery_state,
+            recovery_state: if manually_locked {
+                MfaRecoveryState::PasswordRequired
+            } else {
+                runtime.recovery_state
+            },
             capture_excluded: match self.capture_excluded.load(Ordering::Acquire) {
                 1 => Some(false),
                 2 => Some(true),
                 _ => None,
             },
             recovered_from_backup: runtime.recovered_from_backup,
-            message: match runtime.recovery_state {
-                MfaRecoveryState::SetupRequired => {
-                    Some("请先设置恢复密码，之后即可添加 MFA 账户。".to_string())
+            message: if manually_locked {
+                Some("MFA 保险库已锁定，请输入恢复密码解锁。".to_string())
+            } else {
+                match runtime.recovery_state {
+                    MfaRecoveryState::SetupRequired => {
+                        Some("请先设置恢复密码，之后即可添加 MFA 账户。".to_string())
+                    }
+                    MfaRecoveryState::Ready if runtime.recovered_from_backup => {
+                        Some("MFA 主保险库缺失或损坏，已从最近的有效备份恢复。".to_string())
+                    }
+                    MfaRecoveryState::PasswordRequired => Some(
+                        "此保险库缺少当前系统可用的本机密钥，请输入恢复密码完成迁移。".to_string(),
+                    ),
+                    MfaRecoveryState::Unavailable => {
+                        Some("MFA 数据当前无法读取；不会创建空白保险库。".to_string())
+                    }
+                    MfaRecoveryState::Ready => None,
                 }
-                MfaRecoveryState::Ready if runtime.recovered_from_backup => {
-                    Some("MFA 主保险库缺失或损坏，已从最近的有效备份恢复。".to_string())
-                }
-                MfaRecoveryState::PasswordRequired => {
-                    Some("此保险库缺少当前系统可用的本机密钥，请输入恢复密码完成迁移。".to_string())
-                }
-                MfaRecoveryState::Unavailable => {
-                    Some("MFA 数据当前无法读取；不会创建空白保险库。".to_string())
-                }
-                MfaRecoveryState::Ready => None,
             },
         })
     }
@@ -1080,6 +1117,7 @@ impl MfaStore {
         }
         runtime.recovery_state = MfaRecoveryState::Ready;
         runtime.recovered_from_backup = false;
+        runtime.manually_locked = false;
         drop(runtime);
         drop(_lifecycle);
         self.status_at(epoch)
@@ -1113,6 +1151,7 @@ impl MfaStore {
                 return Err(invalid_recovery_password_error());
             }
             runtime.recovery_state = MfaRecoveryState::Ready;
+            runtime.manually_locked = false;
             drop(runtime);
             drop(_lifecycle);
             return self.status_at(epoch);
@@ -1198,6 +1237,8 @@ impl MfaStore {
         runtime.vault = Some(vault);
         runtime.recovery_state = MfaRecoveryState::Ready;
         runtime.recovered_from_backup = recovered_from_backup;
+        runtime.manually_locked = false;
+        runtime.locked_entry_count = 0;
         drop(runtime);
         drop(_lifecycle);
         self.status_at(epoch)
@@ -1763,6 +1804,132 @@ impl MfaStore {
         })
     }
 
+    /// Returns public MFA metadata for the password editor without requiring
+    /// the MFA window to remain open. The encrypted vault is opened with the
+    /// local OS key for this operation only and is dropped before returning.
+    pub(crate) fn browser_link_summaries(&self) -> AppResult<Vec<MfaEntrySummary>> {
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        let runtime = lock_unpoisoned(&self.runtime);
+        if runtime.manually_locked {
+            return Err(mfa_manually_locked_error());
+        }
+        if let Some(vault) = runtime.vault.as_ref() {
+            return Ok(vault.payload.entries.iter().map(summary).collect());
+        }
+        drop(runtime);
+
+        let bytes =
+            read_bounded_vault_bytes(&self.vault_path).map_err(|_| generic_vault_error())?;
+        let vault = decrypt_envelope_local(&bytes).map_err(|error| match error {
+            LocalUnlockError::LocalKeyUnavailable => recovery_password_required_error(),
+            LocalUnlockError::InvalidEnvelope | LocalUnlockError::InvalidPayload => {
+                generic_vault_error()
+            }
+        })?;
+        Ok(vault.payload.entries.iter().map(summary).collect())
+    }
+
+    /// Generates a current code for an already-authorized browser journey.
+    /// Browser connectivity is deliberately not checked here: the password
+    /// browser service must validate the full tab/document challenge before
+    /// and after this potentially waiting operation. No decrypted vault is
+    /// installed into RuntimeState when the MFA window is closed.
+    pub(crate) fn browser_code_at(
+        &self,
+        entry_id: &str,
+        minimum_validity_seconds: u64,
+    ) -> AppResult<BrowserMfaCode> {
+        if entry_id.is_empty() || entry_id.len() > 128 {
+            return Err(AppError::invalid("MFA 账户标识无效。"));
+        }
+        loop {
+            let result = self.browser_code_now(entry_id)?;
+            let remaining = result.valid_until.saturating_sub(unix_seconds());
+            if remaining > minimum_validity_seconds {
+                return Ok(result);
+            }
+            drop(result);
+            std::thread::sleep(Duration::from_secs(remaining.saturating_add(1)));
+        }
+    }
+
+    /// Revalidates a generated browser code after any wait. This rejects a
+    /// manual lock, trash/delete/update of the linked entry, and a TOTP period
+    /// rollover without exposing the entry id or code outside the desktop.
+    pub(crate) fn browser_code_is_current(
+        &self,
+        entry_id: &str,
+        result: &BrowserMfaCode,
+    ) -> AppResult<bool> {
+        if result.valid_until <= unix_seconds() {
+            return Ok(false);
+        }
+        let current = self.browser_code_now(entry_id)?;
+        Ok(current.valid_until == result.valid_until
+            && current.digits == result.digits
+            && constant_time_eq(current.code.as_bytes(), result.code.as_bytes()))
+    }
+
+    pub(crate) fn write_browser_code_to_clipboard(&self, result: &BrowserMfaCode) -> AppResult<()> {
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        let runtime = lock_unpoisoned(&self.runtime);
+        if runtime.manually_locked {
+            return Err(mfa_manually_locked_error());
+        }
+        drop(runtime);
+        if result.valid_until <= unix_seconds() {
+            return Err(AppError::new(
+                "mfa_code_expired",
+                "MFA 验证码已过期，请重试。",
+            ));
+        }
+        write_code_to_clipboard(&result.code, result.valid_until, &self.clipboard)
+    }
+
+    fn browser_code_now(&self, entry_id: &str) -> AppResult<BrowserMfaCode> {
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        let runtime = lock_unpoisoned(&self.runtime);
+        if runtime.manually_locked {
+            return Err(mfa_manually_locked_error());
+        }
+        if let Some(vault) = runtime.vault.as_ref() {
+            let entry = vault
+                .payload
+                .entries
+                .iter()
+                .find(|entry| entry.id == entry_id)
+                .ok_or_else(|| AppError::not_found("关联的 MFA 账户不可用或已在回收站。"))?;
+            let (code, valid_until) = generate_code(entry, unix_seconds());
+            return Ok(BrowserMfaCode {
+                code: Zeroizing::new(code),
+                valid_until,
+                digits: entry.digits,
+            });
+        }
+        drop(runtime);
+
+        let bytes =
+            read_bounded_vault_bytes(&self.vault_path).map_err(|_| generic_vault_error())?;
+        let vault = decrypt_envelope_local(&bytes).map_err(|error| match error {
+            LocalUnlockError::LocalKeyUnavailable => recovery_password_required_error(),
+            LocalUnlockError::InvalidEnvelope | LocalUnlockError::InvalidPayload => {
+                generic_vault_error()
+            }
+        })?;
+        let entry = vault
+            .payload
+            .entries
+            .iter()
+            .find(|entry| entry.id == entry_id)
+            .ok_or_else(|| AppError::not_found("关联的 MFA 账户不可用或已在回收站。"))?;
+        let (code, valid_until) = generate_code(entry, unix_seconds());
+        Ok(BrowserMfaCode {
+            code: Zeroizing::new(code),
+            valid_until,
+            digits: entry.digits,
+        })
+    }
+
     #[cfg(test)]
     fn export_entry(&self, entry_id: &str, password: &str) -> AppResult<MfaEntryExport> {
         let epoch = self.require_active_epoch()?;
@@ -1845,8 +2012,46 @@ impl MfaStore {
     /// clipboard value.  This is safe to call repeatedly from window destroy
     /// and application exit handlers.
     pub fn lock(&self) {
+        {
+            let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+            let mut runtime = lock_unpoisoned(&self.runtime);
+            runtime.locked_entry_count = runtime
+                .vault
+                .as_ref()
+                .map_or(runtime.locked_entry_count, |vault| {
+                    vault.payload.entries.len()
+                });
+            runtime.manually_locked = false;
+        }
         let epoch = self.deactivate();
         self.clear_deactivated_state(epoch);
+    }
+
+    /// Explicitly locks the MFA vault while keeping the window session alive
+    /// so the recovery-password dialog can authenticate a new epoch. Unlike a
+    /// normal window close, this also blocks one-shot browser unlocks.
+    pub(crate) fn lock_current_session(&self) -> AppResult<()> {
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        if !self.session_active.load(Ordering::Acquire) {
+            return Err(mfa_session_closed_error());
+        }
+        self.session_epoch.fetch_add(1, Ordering::AcqRel);
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        runtime.locked_entry_count = runtime
+            .vault
+            .as_ref()
+            .map_or(runtime.locked_entry_count, |vault| {
+                vault.payload.entries.len()
+            });
+        runtime.vault = None;
+        runtime.manually_locked = self.vault_path.exists();
+        runtime.recovered_from_backup = false;
+        drop(runtime);
+        force_expire_clipboard(&self.clipboard);
+        if !clear_clipboard_now(&self.clipboard) {
+            schedule_clipboard_cleanup(self.clipboard.clone(), Instant::now());
+        }
+        Ok(())
     }
 
     pub fn clear_deactivated_state(&self, epoch: u64) {
@@ -1857,7 +2062,9 @@ impl MfaStore {
             return;
         }
         let mut runtime = lock_unpoisoned(&self.runtime);
-        runtime.vault = None;
+        if let Some(vault) = runtime.vault.take() {
+            runtime.locked_entry_count = vault.payload.entries.len();
+        }
         let mut imports = lock_unpoisoned(&self.imports);
         imports.clear();
         force_expire_clipboard(&self.clipboard);
@@ -4349,10 +4556,9 @@ pub async fn copy_mfa_code(
 #[tauri::command]
 pub async fn lock_mfa_vault(app: AppHandle, window: WebviewWindow) -> AppResult<()> {
     ensure_mfa_window(&window)?;
-    let epoch = app.state::<MfaStore>().deactivate();
     tauri::async_runtime::spawn_blocking(move || {
-        app.state::<MfaStore>().clear_deactivated_state(epoch);
-        Ok(())
+        app.state::<crate::password_browser::PasswordBrowserService>()
+            .lock_mfa_vault_and_cancel_second_factors(&app.state::<MfaStore>())
     })
     .await
     .map_err(|_| AppError::new("mfa_task_error", "锁定 MFA 保险库任务异常结束。"))?
@@ -5807,5 +6013,82 @@ mod tests {
         // a freshly reopened MFA session.
         store.clear_deactivated_state(closing_epoch);
         assert_eq!(store.list_entries_at(new_epoch).unwrap().len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn browser_code_uses_a_one_shot_unlock_after_the_mfa_window_closes() {
+        let (_root, store) = test_store();
+        let entry = import_public_rfc_entry(&store, "browser-one-shot");
+        let closing_epoch = store.deactivate();
+        store.clear_deactivated_state(closing_epoch);
+        assert!(lock_unpoisoned(&store.runtime).vault.is_none());
+
+        let result = store.browser_code_at(&entry.id, 0).unwrap();
+
+        assert_eq!(result.digits, 6);
+        assert_eq!(result.code.len(), 6);
+        assert!(result.code.bytes().all(|byte| byte.is_ascii_digit()));
+        assert!(result.valid_until > unix_seconds());
+        assert!(lock_unpoisoned(&store.runtime).vault.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_mfa_lock_blocks_browser_unlock_until_reauthenticated() {
+        let (_root, store) = test_store();
+        let entry = import_public_rfc_entry(&store, "browser-manual-lock");
+        let generated = store.browser_code_at(&entry.id, 0).unwrap();
+
+        store.lock_current_session().unwrap();
+        let status = store.status().unwrap();
+        assert!(status.locked);
+        assert_eq!(status.recovery_state, MfaRecoveryState::PasswordRequired);
+        assert_eq!(
+            store.browser_code_at(&entry.id, 0).err().unwrap().code,
+            "mfa_vault_locked"
+        );
+        assert_eq!(
+            store
+                .browser_code_is_current(&entry.id, &generated)
+                .err()
+                .unwrap()
+                .code,
+            "mfa_vault_locked"
+        );
+
+        store
+            .unlock_with_recovery_password(RECOVERY_PASSWORD)
+            .unwrap();
+        assert_eq!(store.browser_code_at(&entry.id, 0).unwrap().digits, 6);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn browser_link_pauses_in_trash_and_recovers_with_the_same_mfa_id() {
+        let (_root, store) = test_store();
+        let entry = import_public_rfc_entry(&store, "browser-trash-restore");
+        let generated = store.browser_code_at(&entry.id, 0).unwrap();
+        assert!(store
+            .browser_code_is_current(&entry.id, &generated)
+            .unwrap());
+
+        store.delete_entry(&entry.id).unwrap();
+        assert_eq!(
+            store.browser_code_at(&entry.id, 0).err().unwrap().code,
+            "not_found"
+        );
+        assert_eq!(
+            store
+                .browser_code_is_current(&entry.id, &generated)
+                .err()
+                .unwrap()
+                .code,
+            "not_found"
+        );
+
+        let restored = store.restore_entry(&entry.id).unwrap();
+        assert_eq!(restored.id, entry.id);
+        assert!(store.browser_code_at(&entry.id, 0).is_ok());
     }
 }

@@ -86,9 +86,61 @@ describe("browser password preview", () => {
     expect((await api.list()).find((item) => item.id === entry.id)?.username).toBe("renamed@example.com");
     expect((await api.reveal(entry.id)).password).toBe("Demo-Google-2026!");
   });
+
+  it("preserves, sets, and clears MFA links without exposing MFA secrets", async () => {
+    const api = createBrowserPasswordApi();
+    const entry = (await api.list())[0];
+    expect(entry.mfaLink).toEqual({ entryId: "browser-demo-mfa-work", allowedOrigins: [] });
+    const candidates = await api.listMfaCandidates();
+    expect(candidates[0]).toEqual({
+      id: "browser-demo-mfa-work",
+      name: "Google Workspace",
+      issuer: "Google",
+      accountName: "demo@example.com",
+    });
+    expect(candidates[0]).not.toHaveProperty("secret");
+    expect(candidates[0]).not.toHaveProperty("code");
+
+    await api.update({
+      id: entry.id,
+      siteName: entry.siteName,
+      loginUrl: entry.loginUrl,
+      username: entry.username,
+    });
+    expect((await api.list()).find((item) => item.id === entry.id)?.mfaLink).toEqual(entry.mfaLink);
+
+    await api.update({
+      id: entry.id,
+      siteName: entry.siteName,
+      loginUrl: entry.loginUrl,
+      username: entry.username,
+      mfaLink: null,
+    });
+    expect((await api.list()).find((item) => item.id === entry.id)?.mfaLink).toBeNull();
+  });
 });
 
 describe("desktop password command contract", () => {
+  it("lists only normalized public MFA association metadata", async () => {
+    (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
+    backendInvoke.mockResolvedValueOnce([{
+      id: "legacy-id",
+      name: "Work",
+      issuer: "Example",
+      account_name: "alice@example.com",
+      secret: "must-not-pass-through",
+      code: "123456",
+    }]);
+
+    await expect(passwordApi.listMfaCandidates()).resolves.toEqual([{
+      id: "legacy-id",
+      name: "Work",
+      issuer: "Example",
+      accountName: "alice@example.com",
+    }]);
+    expect(backendInvoke).toHaveBeenCalledWith("list_password_mfa_candidates", undefined);
+  });
+
   it("normalizes the shared recovery flag from desktop status payloads", async () => {
     (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
     backendInvoke.mockResolvedValueOnce({

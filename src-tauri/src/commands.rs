@@ -786,9 +786,7 @@ pub fn open_password_window_inner(app: &AppHandle, store: &WorkspaceStore) -> Ap
 }
 
 fn ensure_sensitive_tool_local(app: &AppHandle, label: &str) -> AppResult<()> {
-    let protect_enabled = app
-        .state::<WorkspaceStore>()
-        .protect_sensitive_windows();
+    let protect_enabled = app.state::<WorkspaceStore>().protect_sensitive_windows();
     let access = sensitive_tool_access(is_remote_desktop_session(), protect_enabled);
     if access.is_err() {
         close_sensitive_window_for_remote_session(app, label);
@@ -805,6 +803,8 @@ fn close_sensitive_window_for_remote_session(app: &AppHandle, label: &str) {
     match label {
         MFA_WINDOW_LABEL => {
             app.state::<crate::mfa::MfaStore>().lock();
+            app.state::<crate::password_browser::PasswordBrowserService>()
+                .cancel_all_second_factors();
         }
         PASSWORD_WINDOW_LABEL => {
             app.state::<crate::passwords::PasswordStore>().lock();

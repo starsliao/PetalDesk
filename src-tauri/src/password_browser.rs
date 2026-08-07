@@ -1,6 +1,7 @@
 use crate::browser_bridge::BrowserFamily;
 use crate::browser_secret_bridge::{BrowserSecretBridge, BrowserSecretEvent, DiagEntry};
 use crate::error::{AppError, AppResult};
+use crate::mfa::MfaStore;
 use crate::passwords::{
     PasswordCaptureAccount, PasswordCaptureAction, PasswordCaptureCandidate, PasswordEntryInput,
     PasswordEntrySummary, PasswordEntryUpdateInput, PasswordStore, PasswordTemplateDefinition,
@@ -22,6 +23,9 @@ const FILL_TTL: Duration = Duration::from_secs(5 * 60);
 const CAPTURE_TTL: Duration = Duration::from_secs(30);
 const TEMPLATE_RECORDING_TTL: Duration = Duration::from_secs(5 * 60);
 const TEMPLATE_RECORDING_TIMEOUT: Duration = Duration::from_secs(15);
+const SECOND_FACTOR_TTL: Duration = Duration::from_secs(5 * 60);
+const SECOND_FACTOR_CHALLENGE_TTL: Duration = Duration::from_secs(30);
+const SECOND_FACTOR_MIN_VALIDITY_SECONDS: u64 = 5;
 const BADGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_BADGE_ACCOUNTS: usize = 16;
 const STATUS_DIAGNOSTIC_LIMIT: usize = 20;
@@ -41,6 +45,29 @@ struct FillSession {
     tab_id: Option<i64>,
     frame_id: Option<i64>,
     document_id: Option<String>,
+    expires_at: Instant,
+}
+
+#[derive(Clone)]
+struct SecondFactorChallenge {
+    challenge_id: String,
+    top_origin: String,
+    frame_origin: String,
+    frame_id: i64,
+    document_id: String,
+    digits: u32,
+    requires_origin_confirmation: bool,
+    generating: bool,
+    expires_at: Instant,
+}
+
+#[derive(Clone)]
+struct SecondFactorSession {
+    connection_id: String,
+    entry_id: String,
+    login_origin: String,
+    tab_id: i64,
+    challenge: Option<SecondFactorChallenge>,
     expires_at: Instant,
 }
 
@@ -95,6 +122,10 @@ pub struct PasswordBrowserService {
     fills: Mutex<HashMap<String, FillSession>>,
     captures: Mutex<HashMap<String, PendingCapture>>,
     recordings: Mutex<HashMap<String, TemplateRecordingSession>>,
+    second_factors: Mutex<HashMap<String, SecondFactorSession>>,
+    // Serializes final TOTP publication with explicit lock/disconnect
+    // revocation. Code generation happens outside this guard.
+    second_factor_publish: Mutex<()>,
     // Last setCaptureEnabled payload sent per connection; suppresses duplicate
     // broadcasts triggered by password-status polling.
     synced_capture: Mutex<HashMap<String, (bool, Vec<String>)>>,
@@ -157,6 +188,8 @@ impl PasswordBrowserService {
             fills: Mutex::new(HashMap::new()),
             captures: Mutex::new(HashMap::new()),
             recordings: Mutex::new(HashMap::new()),
+            second_factors: Mutex::new(HashMap::new()),
+            second_factor_publish: Mutex::new(()),
             synced_capture: Mutex::new(HashMap::new()),
             badge_tabs: Mutex::new(HashMap::new()),
         }
@@ -298,11 +331,10 @@ impl PasswordBrowserService {
             }),
             REQUEST_TIMEOUT,
         );
-        result
-            .map_err(|error| {
-                lock_unpoisoned(&self.fills).remove(&session_id);
-                browser_error("password_fill_start_failed", error)
-            })?;
+        result.map_err(|error| {
+            lock_unpoisoned(&self.fills).remove(&session_id);
+            browser_error("password_fill_start_failed", error)
+        })?;
         Ok(PasswordFillTicket {
             session_id,
             entry_id: entry_id.to_string(),
@@ -461,6 +493,60 @@ impl PasswordBrowserService {
                 Duration::from_secs(2),
             );
         }
+        self.cancel_all_second_factors();
+    }
+
+    pub(crate) fn cancel_all_second_factors(&self) {
+        let sessions = {
+            let _publish = lock_unpoisoned(&self.second_factor_publish);
+            self.drain_second_factors()
+        };
+        self.notify_second_factor_revocations(sessions);
+    }
+
+    pub(crate) fn lock_password_vault_and_cancel_second_factors(
+        &self,
+        store: &PasswordStore,
+    ) -> AppResult<()> {
+        let publish = lock_unpoisoned(&self.second_factor_publish);
+        store.lock_current_session()?;
+        let sessions = self.drain_second_factors();
+        drop(publish);
+        self.notify_second_factor_revocations(sessions);
+        Ok(())
+    }
+
+    pub(crate) fn lock_mfa_vault_and_cancel_second_factors(
+        &self,
+        store: &MfaStore,
+    ) -> AppResult<()> {
+        let publish = lock_unpoisoned(&self.second_factor_publish);
+        store.lock_current_session()?;
+        let sessions = self.drain_second_factors();
+        drop(publish);
+        self.notify_second_factor_revocations(sessions);
+        Ok(())
+    }
+
+    fn drain_second_factors(&self) -> Vec<(String, SecondFactorSession)> {
+        lock_unpoisoned(&self.second_factors)
+            .drain()
+            .collect::<Vec<_>>()
+    }
+
+    fn notify_second_factor_revocations(&self, sessions: Vec<(String, SecondFactorSession)>) {
+        for (flow_id, session) in sessions {
+            let _ = self.bridge.request_connection(
+                &session.connection_id,
+                "password.cancelSecondFactor",
+                serde_json::json!({
+                    "flowId": flow_id,
+                    "tabId": session.tab_id,
+                    "reason": "desktop-revoked",
+                }),
+                Duration::from_secs(2),
+            );
+        }
     }
 
     fn single_firefox_connection(&self) -> AppResult<String> {
@@ -546,11 +632,19 @@ impl PasswordBrowserService {
             }
             "connectionClosed" => {
                 self.clear_connection_state(app, &event.connection_id);
+                if self
+                    .bridge
+                    .connection_ids(BrowserFamily::Firefox)
+                    .is_empty()
+                {
+                    app.state::<PasswordStore>().deactivate_browser_session();
+                }
                 self.sync_capture_from_store(&app.state());
             }
             "originActive" => self.handle_origin_active(&app.state(), &event),
             "fillRequest" => self.handle_fill_request(&app.state(), &event),
             "copySecret" => self.handle_copy_secret(&app.state(), &event),
+            "copyMfaCode" => self.handle_copy_mfa_code(app, &event),
             "deleteEntry" => self.handle_delete_entry(app, &event),
             "openPasswordManager" => {
                 if let Err(error) = crate::commands::open_password_window(app) {
@@ -559,8 +653,18 @@ impl PasswordBrowserService {
             }
             "tabReady" => self.handle_tab_ready(app, &event),
             "fillConfirm" => self.handle_fill_confirm(&app.state(), &event),
-            "fillResult" => self.handle_fill_result(&event),
-            "captureCandidate" => self.handle_capture_candidate(&app.state(), &event),
+            "fillResult" => {
+                self.maybe_arm_from_fill_result(app, &event);
+                self.handle_fill_result(&event);
+            }
+            "secondFactorOffer" => self.handle_second_factor_offer(app, &event),
+            "secondFactorConfirm" => self.handle_second_factor_confirm(app, &event),
+            "secondFactorResult" => self.handle_second_factor_result(&event),
+            "cancelSecondFactor" => self.handle_second_factor_cancel(&event),
+            "captureCandidate" => {
+                self.handle_capture_candidate(&app.state(), &event);
+                self.maybe_arm_from_manual_capture(app, &event);
+            }
             "pageClosed" => self.handle_page_closed(&event),
             "saveDecision" => self.handle_save_decision(app, &event),
             "templateRecordingReady" => self.handle_template_recording_ready(app, &event),
@@ -599,6 +703,9 @@ impl PasswordBrowserService {
         // password. Do this before rebroadcasting capture settings so a stale
         // page cannot submit a candidate after its native connection closed.
         lock_unpoisoned(&self.fills).retain(|_, session| session.connection_id != connection_id);
+        let _publish = lock_unpoisoned(&self.second_factor_publish);
+        lock_unpoisoned(&self.second_factors)
+            .retain(|_, session| session.connection_id != connection_id);
         lock_unpoisoned(&self.captures).retain(|_, capture| capture.connection_id != connection_id);
         lock_unpoisoned(&self.badge_tabs).remove(connection_id);
         lock_unpoisoned(&self.synced_capture).remove(connection_id);
@@ -626,6 +733,12 @@ impl PasswordBrowserService {
         let Some(tab_id) = event.payload.get("tabId").and_then(Value::as_i64) else {
             return;
         };
+        let frame_id = event
+            .payload
+            .get("frameId")
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0)
+            .unwrap_or(0);
         let document_id = match event.payload.get("documentId") {
             None | Some(Value::Null) => None,
             Some(Value::String(value)) if !value.is_empty() && value.len() <= 256 => {
@@ -638,19 +751,56 @@ impl PasswordBrowserService {
         // event removes the native copy that already crossed the bridge. Drop
         // matching values under the connection/tab/document binding so
         // PendingCapture's Drop implementation zeroizes username and password.
+        // A top-level pagehide invalidates every frame in the tab.  Child
+        // frame notifications are narrower and only remove the matching
+        // frame/document binding.  Keeping the distinction here prevents a
+        // stale iframe secret from surviving a top-level navigation while
+        // still allowing an unrelated iframe to continue its journey.
         lock_unpoisoned(&self.fills).retain(|_, session| {
             !(session.connection_id == event.connection_id
                 && session.tab_id == Some(tab_id)
-                && document_id.map_or(true, |value| session.document_id.as_deref() == Some(value)))
+                && (frame_id == 0
+                    || (session.frame_id == Some(frame_id)
+                        && document_id
+                            .map_or(true, |value| session.document_id.as_deref() == Some(value)))))
         });
         lock_unpoisoned(&self.captures).retain(|_, capture| {
             !(capture.connection_id == event.connection_id
                 && capture.tab_id == tab_id
-                && document_id.map_or(true, |value| capture.document_id == value))
+                && (frame_id == 0
+                    || (capture.frame_id == frame_id
+                        && document_id.map_or(true, |value| capture.document_id == value))))
         });
         lock_unpoisoned(&self.recordings).retain(|_, recording| {
-            !(recording.connection_id == event.connection_id && recording.tab_id == Some(tab_id))
+            !(recording.connection_id == event.connection_id
+                && recording.tab_id == Some(tab_id)
+                && (frame_id == 0
+                    || (recording.frame_id == Some(frame_id)
+                        && document_id.map_or(true, |value| {
+                            recording.document_id.as_deref() == Some(value)
+                        }))))
         });
+        if frame_id == 0 {
+            if let Some(tabs) = lock_unpoisoned(&self.badge_tabs).get_mut(&event.connection_id) {
+                tabs.remove(&tab_id);
+            }
+        }
+        let _publish = lock_unpoisoned(&self.second_factor_publish);
+        for session in lock_unpoisoned(&self.second_factors).values_mut() {
+            if session.connection_id != event.connection_id || session.tab_id != tab_id {
+                continue;
+            }
+            let matches = session.challenge.as_ref().is_some_and(|challenge| {
+                frame_id == 0
+                    || (challenge.frame_id == frame_id
+                        && document_id
+                            .map(|value| challenge.document_id == value)
+                            .unwrap_or(true))
+            });
+            if matches {
+                session.challenge = None;
+            }
+        }
     }
 
     fn handle_tab_ready(&self, app: &AppHandle, event: &BrowserSecretEvent) {
@@ -817,6 +967,24 @@ impl PasswordBrowserService {
         }
     }
 
+    fn maybe_arm_from_fill_result(&self, app: &AppHandle, event: &BrowserSecretEvent) {
+        if event.payload.get("filledPassword").and_then(Value::as_bool) != Some(true) {
+            return;
+        }
+        let Some(session_id) = event.payload.get("sessionId").and_then(Value::as_str) else {
+            return;
+        };
+        let session = lock_unpoisoned(&self.fills).get(session_id).cloned();
+        let Some(session) = session else { return };
+        let Some(tab_id) = session.tab_id else { return };
+        if session.connection_id != event.connection_id
+            || !fill_target_matches(&session, &event.payload)
+        {
+            return;
+        }
+        self.arm_second_factor(app, &session.connection_id, &session.entry_id, tab_id);
+    }
+
     fn handle_fill_result(&self, event: &BrowserSecretEvent) {
         if let Some(session_id) = event.payload.get("sessionId").and_then(Value::as_str) {
             let mut fills = lock_unpoisoned(&self.fills);
@@ -837,6 +1005,587 @@ impl PasswordBrowserService {
                 fills.remove(session_id);
             }
         }
+    }
+
+    fn arm_second_factor(&self, app: &AppHandle, connection_id: &str, entry_id: &str, tab_id: i64) {
+        let store = app.state::<PasswordStore>();
+        let data = store
+            .require_any_epoch()
+            .and_then(|epoch| store.browser_fill_data_at(entry_id, epoch));
+        let Ok(data) = data else { return };
+        let Some(link) = data.mfa_link.as_ref() else {
+            return;
+        };
+        // Automatic OTP delivery is HTTPS-only. The MFA id is deliberately
+        // checked here but never included in the extension command.
+        if !data.origin.starts_with("https://") || link.entry_id.is_empty() {
+            return;
+        }
+        let flow_id = Uuid::new_v4().to_string();
+        let replaced = {
+            let _publish = lock_unpoisoned(&self.second_factor_publish);
+            // A password entry can remain readable while the MFA vault is
+            // explicitly locked. Do not arm a journey in that state, and
+            // perform this check under the publication guard so an MFA lock
+            // cannot race with insertion of a new journey.
+            let mfa_available = app
+                .state::<MfaStore>()
+                .browser_link_summaries()
+                .ok()
+                .is_some_and(|entries| entries.iter().any(|entry| entry.id == link.entry_id));
+            if !mfa_available {
+                return;
+            }
+            let mut sessions = lock_unpoisoned(&self.second_factors);
+            let replaced = sessions
+                .iter()
+                .find(|(_, session)| {
+                    session.connection_id == connection_id && session.tab_id == tab_id
+                })
+                .map(|(flow_id, _)| flow_id.clone());
+            if let Some(previous) = replaced.as_ref() {
+                sessions.remove(previous);
+            }
+            sessions.insert(
+                flow_id.clone(),
+                SecondFactorSession {
+                    connection_id: connection_id.to_string(),
+                    entry_id: data.entry_id.clone(),
+                    login_origin: data.origin.clone(),
+                    tab_id,
+                    challenge: None,
+                    expires_at: Instant::now() + SECOND_FACTOR_TTL,
+                },
+            );
+            replaced
+        };
+        if let Some(previous) = replaced {
+            let _ = self.bridge.request_connection(
+                connection_id,
+                "password.cancelSecondFactor",
+                serde_json::json!({ "flowId": previous, "tabId": tab_id, "reason": "replaced" }),
+                Duration::from_secs(2),
+            );
+        }
+        let mut allowed_origins = Vec::with_capacity(link.allowed_origins.len() + 1);
+        allowed_origins.push(data.origin.clone());
+        allowed_origins.extend(link.allowed_origins.iter().cloned());
+        let result = self.bridge.request_connection(
+            connection_id,
+            "password.armSecondFactor",
+            serde_json::json!({
+                "flowId": flow_id,
+                "tabId": tab_id,
+                "topOrigin": data.origin,
+                "allowedOrigins": allowed_origins,
+                "expiresAt": unix_time_ms().saturating_add(SECOND_FACTOR_TTL.as_millis()),
+            }),
+            REQUEST_TIMEOUT,
+        );
+        // The explicit vault lock can drain this flow while the extension is
+        // still answering the arm request. Re-check under the same publish
+        // guard and compensate with a cancellation if the desktop no longer
+        // owns the journey, so the extension cannot retain an orphaned flow.
+        let should_cancel = {
+            let _publish = lock_unpoisoned(&self.second_factor_publish);
+            let still_owned = lock_unpoisoned(&self.second_factors).contains_key(&flow_id);
+            if result.is_err() {
+                lock_unpoisoned(&self.second_factors).remove(&flow_id);
+            }
+            result.is_err() || !still_owned
+        };
+        if should_cancel {
+            let _ = self.bridge.request_connection(
+                connection_id,
+                "password.cancelSecondFactor",
+                serde_json::json!({
+                    "flowId": flow_id,
+                    "tabId": tab_id,
+                    "reason": "desktop-revoked",
+                }),
+                Duration::from_secs(2),
+            );
+        }
+    }
+
+    fn handle_second_factor_offer(&self, app: &AppHandle, event: &BrowserSecretEvent) {
+        let Some(binding) = second_factor_binding(&event.payload) else {
+            return;
+        };
+        let count = event
+            .payload
+            .get("count")
+            .or_else(|| event.payload.get("candidateCount"))
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0 && *value <= 8)
+            .unwrap_or(0);
+        let digits = event
+            .payload
+            .get("digits")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| (6..=8).contains(value));
+        let confidence = event
+            .payload
+            .get("confidence")
+            .and_then(Value::as_str)
+            .unwrap_or("low");
+        let Some(digits) = digits else { return };
+
+        let session = lock_unpoisoned(&self.second_factors)
+            .get(&binding.flow_id)
+            .cloned();
+        let Some(session) = session else { return };
+        if session.connection_id != event.connection_id
+            || session.tab_id != binding.tab_id
+            || session.expires_at <= Instant::now()
+            || binding.frame_origin != binding.top_origin
+        {
+            return;
+        }
+
+        let store = app.state::<PasswordStore>();
+        let data = store
+            .require_any_epoch()
+            .and_then(|epoch| store.browser_fill_data_at(&session.entry_id, epoch));
+        let Ok(data) = data else {
+            self.cancel_second_factor(&binding.flow_id, "password-vault-unavailable");
+            return;
+        };
+        let Some(link) = data.mfa_link.as_ref() else {
+            self.cancel_second_factor(&binding.flow_id, "mfa-link-removed");
+            return;
+        };
+        if link.entry_id.is_empty() || data.origin != session.login_origin {
+            self.cancel_second_factor(&binding.flow_id, "mfa-link-changed");
+            return;
+        }
+        let origin_allowed = binding.top_origin == data.origin
+            || link
+                .allowed_origins
+                .iter()
+                .any(|origin| origin == &binding.top_origin);
+        let requires_origin_confirmation = !origin_allowed;
+        // A new cross-origin permission is only ever offered on a top-level
+        // HTTPS document. Cross-origin OTP iframes are not delegatable.
+        if requires_origin_confirmation && binding.frame_id != 0 {
+            self.cancel_second_factor(&binding.flow_id, "cross-origin-frame-denied");
+            return;
+        }
+        let prompt_required = count != 1 || confidence != "high" || requires_origin_confirmation;
+        let challenge = SecondFactorChallenge {
+            challenge_id: binding.challenge_id.clone(),
+            top_origin: binding.top_origin.clone(),
+            frame_origin: binding.frame_origin.clone(),
+            frame_id: binding.frame_id,
+            document_id: binding.document_id.clone(),
+            digits,
+            requires_origin_confirmation,
+            generating: false,
+            expires_at: Instant::now() + SECOND_FACTOR_CHALLENGE_TTL,
+        };
+        {
+            let _publish = lock_unpoisoned(&self.second_factor_publish);
+            let mut sessions = lock_unpoisoned(&self.second_factors);
+            let Some(current) = sessions.get_mut(&binding.flow_id) else {
+                return;
+            };
+            if current.connection_id != event.connection_id
+                || current.tab_id != binding.tab_id
+                || current.expires_at <= Instant::now()
+            {
+                return;
+            }
+            current.challenge = Some(challenge);
+        }
+
+        if prompt_required {
+            let response = self.bridge.request_connection(
+                &event.connection_id,
+                "password.offerSecondFactor",
+                serde_json::json!({
+                    "flowId": binding.flow_id,
+                    "challengeId": binding.challenge_id,
+                    "tabId": binding.tab_id,
+                    "topOrigin": binding.top_origin,
+                    "frameId": binding.frame_id,
+                    "documentId": binding.document_id,
+                    "requiresOriginConfirmation": requires_origin_confirmation,
+                }),
+                REQUEST_TIMEOUT,
+            );
+            if response.is_err() {
+                self.cancel_second_factor(&binding.flow_id, "offer-failed");
+            }
+        } else {
+            self.provide_second_factor(app, &binding.flow_id, &binding.challenge_id);
+        }
+    }
+
+    fn handle_second_factor_confirm(&self, app: &AppHandle, event: &BrowserSecretEvent) {
+        let Some(binding) = second_factor_binding(&event.payload) else {
+            return;
+        };
+        let session = lock_unpoisoned(&self.second_factors)
+            .get(&binding.flow_id)
+            .cloned();
+        let Some(session) = session else { return };
+        let Some(challenge) = session.challenge.as_ref() else {
+            return;
+        };
+        if session.connection_id != event.connection_id
+            || session.tab_id != binding.tab_id
+            || !second_factor_challenge_matches(challenge, &binding)
+            || challenge.expires_at <= Instant::now()
+            || challenge.generating
+        {
+            return;
+        }
+        if challenge.requires_origin_confirmation {
+            if event
+                .payload
+                .get("originConfirmed")
+                .and_then(Value::as_bool)
+                != Some(true)
+            {
+                return;
+            }
+            let store = app.state::<PasswordStore>();
+            let update = store.require_any_epoch().and_then(|epoch| {
+                store.add_mfa_allowed_origin_at(&session.entry_id, &challenge.top_origin, epoch)
+            });
+            if update.is_err() {
+                self.cancel_second_factor(&binding.flow_id, "origin-confirmation-failed");
+                return;
+            }
+            self.refresh_badges(&store);
+        }
+        self.provide_second_factor(app, &binding.flow_id, &binding.challenge_id);
+    }
+
+    fn provide_second_factor(&self, app: &AppHandle, flow_id: &str, challenge_id: &str) {
+        let (session, challenge) = {
+            let mut sessions = lock_unpoisoned(&self.second_factors);
+            let Some(session) = sessions.get_mut(flow_id) else {
+                return;
+            };
+            let challenge = {
+                let Some(challenge) = session.challenge.as_mut() else {
+                    return;
+                };
+                if challenge.challenge_id != challenge_id
+                    || challenge.generating
+                    || challenge.expires_at <= Instant::now()
+                    || session.expires_at <= Instant::now()
+                {
+                    return;
+                }
+                challenge.generating = true;
+                challenge.clone()
+            };
+            (session.clone(), challenge)
+        };
+
+        let worker_app = app.clone();
+        let flow_id = flow_id.to_string();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            worker_app
+                .state::<PasswordBrowserService>()
+                .provide_second_factor_worker(&worker_app, &flow_id, session, challenge);
+        });
+    }
+
+    fn provide_second_factor_worker(
+        &self,
+        app: &AppHandle,
+        flow_id: &str,
+        session: SecondFactorSession,
+        challenge: SecondFactorChallenge,
+    ) {
+        let store = app.state::<PasswordStore>();
+        let before = store
+            .require_any_epoch()
+            .and_then(|epoch| store.browser_fill_data_at(&session.entry_id, epoch));
+        let Ok(before) = before else {
+            self.cancel_second_factor(flow_id, "password-vault-unavailable");
+            return;
+        };
+        let Some(before_link) = before.mfa_link.as_ref() else {
+            self.cancel_second_factor(flow_id, "mfa-link-removed");
+            return;
+        };
+        let link_id = before_link.entry_id.clone();
+        let origin_allowed = challenge.top_origin == before.origin
+            || before_link
+                .allowed_origins
+                .iter()
+                .any(|origin| origin == &challenge.top_origin);
+        if !origin_allowed || challenge.frame_origin != challenge.top_origin {
+            self.cancel_second_factor_challenge(
+                flow_id,
+                &challenge.challenge_id,
+                "origin-not-authorized",
+            );
+            return;
+        }
+
+        let result = app
+            .state::<MfaStore>()
+            .browser_code_at(&link_id, SECOND_FACTOR_MIN_VALIDITY_SECONDS);
+        let Ok(result) = result else {
+            self.cancel_second_factor_challenge(
+                flow_id,
+                &challenge.challenge_id,
+                "mfa-unavailable",
+            );
+            return;
+        };
+
+        // Code generation may wait for the next TOTP period. Serialize the
+        // final checks and publication with explicit lock/disconnect
+        // revocation, then re-read both vaults and the one-time challenge.
+        let publish = lock_unpoisoned(&self.second_factor_publish);
+        let current_matches = lock_unpoisoned(&self.second_factors)
+            .get(flow_id)
+            .is_some_and(|current| {
+                current.connection_id == session.connection_id
+                    && current.tab_id == session.tab_id
+                    && current.entry_id == session.entry_id
+                    && current.expires_at > Instant::now()
+                    && current.challenge.as_ref().is_some_and(|current_challenge| {
+                        second_factor_challenges_match(current_challenge, &challenge)
+                            && current_challenge.generating
+                            && current_challenge.expires_at > Instant::now()
+                    })
+            });
+        if !current_matches {
+            return;
+        }
+
+        let after = store
+            .require_any_epoch()
+            .and_then(|epoch| store.browser_fill_data_at(&session.entry_id, epoch));
+        let Some(after_link) = after.as_ref().ok().and_then(|data| data.mfa_link.as_ref()) else {
+            drop(publish);
+            self.cancel_second_factor(flow_id, "mfa-link-removed");
+            return;
+        };
+        if after_link.entry_id != link_id
+            || after
+                .as_ref()
+                .is_ok_and(|data| data.origin != session.login_origin)
+        {
+            drop(publish);
+            self.cancel_second_factor(flow_id, "mfa-binding-changed");
+            return;
+        }
+        let origin_still_allowed = after.as_ref().is_ok_and(|data| {
+            challenge.top_origin == data.origin
+                || after_link
+                    .allowed_origins
+                    .iter()
+                    .any(|origin| origin == &challenge.top_origin)
+        });
+        let mfa_still_current = app
+            .state::<MfaStore>()
+            .browser_code_is_current(&link_id, &result)
+            .unwrap_or(false);
+        if result.digits != challenge.digits || !origin_still_allowed || !mfa_still_current {
+            drop(publish);
+            self.cancel_second_factor_challenge(
+                flow_id,
+                &challenge.challenge_id,
+                "mfa-binding-changed",
+            );
+            return;
+        }
+
+        let current_connection = {
+            let sessions = lock_unpoisoned(&self.second_factors);
+            sessions.get(flow_id).and_then(|current| {
+                (current.connection_id == session.connection_id
+                    && current.tab_id == session.tab_id
+                    && current.entry_id == session.entry_id
+                    && current.expires_at > Instant::now()
+                    && current.challenge.as_ref().is_some_and(|current_challenge| {
+                        second_factor_challenges_match(current_challenge, &challenge)
+                            && current_challenge.generating
+                            && current_challenge.expires_at > Instant::now()
+                    }))
+                .then(|| current.connection_id.clone())
+            })
+        };
+        let Some(current_connection) = current_connection else {
+            return;
+        };
+
+        let mut payload = serde_json::json!({
+            "flowId": flow_id,
+            "challengeId": challenge.challenge_id,
+            "tabId": session.tab_id,
+            "topOrigin": challenge.top_origin,
+            "frameId": challenge.frame_id,
+            "documentId": challenge.document_id,
+            "code": result.code.as_str(),
+        });
+        let response = self.bridge.request_connection(
+            &current_connection,
+            "password.provideSecondFactor",
+            payload.clone(),
+            REQUEST_TIMEOUT,
+        );
+        if let Some(value) = payload.get_mut("code") {
+            if let Value::String(secret) = value {
+                secret.zeroize();
+            }
+            *value = Value::Null;
+        }
+        let success = response.is_ok();
+        let challenge_cleared = {
+            let mut sessions = lock_unpoisoned(&self.second_factors);
+            if !sessions.get(flow_id).is_some_and(|current| {
+                current.connection_id == session.connection_id
+                    && current.tab_id == session.tab_id
+                    && current.challenge.as_ref().is_some_and(|current_challenge| {
+                        second_factor_challenges_match(current_challenge, &challenge)
+                    })
+            }) {
+                false
+            } else if success {
+                sessions.remove(flow_id);
+                false
+            } else {
+                if let Some(current) = sessions.get_mut(flow_id) {
+                    current.challenge = None;
+                }
+                true
+            }
+        };
+        drop(publish);
+        if challenge_cleared {
+            self.notify_second_factor_challenge_cancel(
+                &current_connection,
+                flow_id,
+                &challenge.challenge_id,
+                session.tab_id,
+                "provide-failed",
+            );
+        }
+    }
+
+    fn handle_second_factor_result(&self, event: &BrowserSecretEvent) {
+        let Some(flow_id) = event.payload.get("flowId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(tab_id) = event.payload.get("tabId").and_then(Value::as_i64) else {
+            return;
+        };
+        let status = event
+            .payload
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let _publish = lock_unpoisoned(&self.second_factor_publish);
+        let mut sessions = lock_unpoisoned(&self.second_factors);
+        let Some(session) = sessions.get_mut(flow_id) else {
+            return;
+        };
+        if session.connection_id != event.connection_id || session.tab_id != tab_id {
+            return;
+        }
+        match status {
+            "filled" => {
+                // A successful fill consumes the complete five-minute journey.
+                sessions.remove(flow_id);
+            }
+            "failed" => {
+                // Failed delivery is retryable. The extension re-arms the
+                // document, so discard only the one-shot native challenge.
+                session.challenge = None;
+            }
+            // Explicit cancellation/expiry is reported by the separate
+            // cancelSecondFactor event and must not be inferred here.
+            _ => {}
+        }
+    }
+
+    fn handle_second_factor_cancel(&self, event: &BrowserSecretEvent) {
+        let Some(flow_id) = event.payload.get("flowId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(tab_id) = event.payload.get("tabId").and_then(Value::as_i64) else {
+            return;
+        };
+        let _publish = lock_unpoisoned(&self.second_factor_publish);
+        let mut sessions = lock_unpoisoned(&self.second_factors);
+        if sessions.get(flow_id).is_some_and(|session| {
+            session.connection_id == event.connection_id && session.tab_id == tab_id
+        }) {
+            sessions.remove(flow_id);
+        }
+    }
+
+    fn cancel_second_factor(&self, flow_id: &str, reason: &str) {
+        let _publish = lock_unpoisoned(&self.second_factor_publish);
+        let session = lock_unpoisoned(&self.second_factors).remove(flow_id);
+        let Some(session) = session else { return };
+        let _ = self.bridge.request_connection(
+            &session.connection_id,
+            "password.cancelSecondFactor",
+            serde_json::json!({ "flowId": flow_id, "tabId": session.tab_id, "reason": reason }),
+            Duration::from_secs(2),
+        );
+    }
+
+    fn cancel_second_factor_challenge(&self, flow_id: &str, challenge_id: &str, reason: &str) {
+        let publish = lock_unpoisoned(&self.second_factor_publish);
+        let target = {
+            let mut sessions = lock_unpoisoned(&self.second_factors);
+            let Some(session) = sessions.get_mut(flow_id) else {
+                return;
+            };
+            if session
+                .challenge
+                .as_ref()
+                .is_none_or(|challenge| challenge.challenge_id != challenge_id)
+            {
+                return;
+            }
+            session.challenge = None;
+            Some((session.connection_id.clone(), session.tab_id))
+        };
+        drop(publish);
+        if let Some((connection_id, tab_id)) = target {
+            self.notify_second_factor_challenge_cancel(
+                &connection_id,
+                flow_id,
+                challenge_id,
+                tab_id,
+                reason,
+            );
+        }
+    }
+
+    fn notify_second_factor_challenge_cancel(
+        &self,
+        connection_id: &str,
+        flow_id: &str,
+        challenge_id: &str,
+        tab_id: i64,
+        reason: &str,
+    ) {
+        let _ = self.bridge.request_connection(
+            connection_id,
+            "password.cancelSecondFactor",
+            serde_json::json!({
+                "flowId": flow_id,
+                "challengeId": challenge_id,
+                "tabId": tab_id,
+                "reason": reason,
+                "preserveJourney": true,
+            }),
+            Duration::from_secs(2),
+        );
     }
 
     /// The popup asks to fill one entry into the current tab. Unlike
@@ -994,18 +1743,201 @@ impl PasswordBrowserService {
         }
     }
 
+    fn handle_copy_mfa_code(&self, app: &AppHandle, event: &BrowserSecretEvent) {
+        let worker_app = app.clone();
+        let event = event.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            worker_app
+                .state::<PasswordBrowserService>()
+                .handle_copy_mfa_code_worker(&worker_app, &event);
+        });
+    }
+
+    fn handle_copy_mfa_code_worker(&self, app: &AppHandle, event: &BrowserSecretEvent) {
+        let Some(request_id) = event
+            .payload
+            .get("requestId")
+            .and_then(Value::as_str)
+            .filter(|value| is_safe_protocol_id(value, 160))
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let result = (|| -> AppResult<u64> {
+            let entry_id = event
+                .payload
+                .get("entryId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 128)
+                .ok_or_else(|| browser_error("password_entry_invalid", "站点账户标识无效。"))?;
+            let tab_id = event
+                .payload
+                .get("tabId")
+                .and_then(Value::as_i64)
+                .filter(|value| *value >= 0)
+                .ok_or_else(|| browser_error("password_target_invalid", "当前标签页无效。"))?;
+            let origin = event
+                .payload
+                .get("origin")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 2_048)
+                .ok_or_else(|| browser_error("password_target_invalid", "当前站点无效。"))?;
+            let tracked = lock_unpoisoned(&self.badge_tabs)
+                .get(&event.connection_id)
+                .and_then(|tabs| tabs.get(&tab_id))
+                .is_some_and(|tracked| tracked == origin);
+            if !tracked {
+                return Err(browser_error(
+                    "password_target_mismatch",
+                    "当前标签页的站点账户已变化，请重新打开扩展。",
+                ));
+            }
+            let store = app.state::<PasswordStore>();
+            let before = store
+                .require_any_epoch()
+                .and_then(|epoch| store.browser_fill_data_at(entry_id, epoch))?;
+            if before.origin != origin {
+                return Err(browser_error(
+                    "password_origin_mismatch",
+                    "此账户不属于当前站点。",
+                ));
+            }
+            let link_id = before
+                .mfa_link
+                .as_ref()
+                .map(|link| link.entry_id.clone())
+                .ok_or_else(|| browser_error("password_mfa_unlinked", "此账户未关联 MFA。"))?;
+
+            let code = app
+                .state::<MfaStore>()
+                .browser_code_at(&link_id, SECOND_FACTOR_MIN_VALIDITY_SECONDS)?;
+
+            // Ask the extension to re-read the live active tab after any TOTP
+            // wait. This confirmation contains no MFA id or code and closes
+            // the gap before a newly navigated page reports originActive.
+            let live_confirmation = self.bridge.request_connection(
+                &event.connection_id,
+                "password.confirmMfaCopy",
+                serde_json::json!({
+                    "requestId": request_id.as_str(),
+                    "tabId": tab_id,
+                    "origin": origin,
+                }),
+                Duration::from_secs(3),
+            );
+            if !mfa_copy_confirmation_matches(live_confirmation.as_ref().ok(), &request_id, tab_id)
+            {
+                return Err(browser_error(
+                    "password_target_mismatch",
+                    "当前标签页已变化，请重新打开扩展后重试。",
+                ));
+            }
+
+            // Generation can wait for a fresh period. Recheck the active tab,
+            // exact account origin, both vault bindings and manual-lock state
+            // before touching the clipboard. The event dispatcher remains
+            // free to apply originActive/pageClosed events while we wait.
+            let _publish = lock_unpoisoned(&self.second_factor_publish);
+            let still_tracked = lock_unpoisoned(&self.badge_tabs)
+                .get(&event.connection_id)
+                .and_then(|tabs| tabs.get(&tab_id))
+                .is_some_and(|tracked| tracked == origin);
+            let after = store
+                .require_any_epoch()
+                .and_then(|epoch| store.browser_fill_data_at(entry_id, epoch))?;
+            if !still_tracked
+                || after.origin != origin
+                || after
+                    .mfa_link
+                    .as_ref()
+                    .is_none_or(|link| link.entry_id != link_id)
+            {
+                return Err(browser_error(
+                    "password_target_mismatch",
+                    "账户或标签页已变化，请重试。",
+                ));
+            }
+            if !app
+                .state::<MfaStore>()
+                .browser_code_is_current(&link_id, &code)?
+            {
+                return Err(browser_error(
+                    "password_mfa_changed",
+                    "关联的 MFA 账户已变化，请重试。",
+                ));
+            }
+            app.state::<MfaStore>()
+                .write_browser_code_to_clipboard(&code)?;
+            Ok(code.valid_until.saturating_mul(1_000))
+        })();
+
+        let payload = match result {
+            Ok(expires_at) => serde_json::json!({
+                "requestId": request_id,
+                "success": true,
+                "expiresAt": expires_at,
+            }),
+            Err(error) => serde_json::json!({
+                "requestId": request_id,
+                "success": false,
+                "error": { "code": error.code, "message": error.message },
+            }),
+        };
+        let _ = self.bridge.request_connection(
+            &event.connection_id,
+            "password.copyMfaResult",
+            payload,
+            REQUEST_TIMEOUT,
+        );
+    }
+
     /// The popup's account menu asks to delete one vault entry. On success
     /// the password window is notified and badges are recomputed, mirroring
     /// the save-decision flow.
     fn handle_delete_entry(&self, app: &AppHandle, event: &BrowserSecretEvent) {
+        let request_id = event
+            .payload
+            .get("requestId")
+            .and_then(Value::as_str)
+            .filter(|value| is_safe_protocol_id(value, 160))
+            .map(str::to_string);
         let store = app.state::<PasswordStore>();
-        if let Some(entry_id) = self.delete_entry_from_event(&store, event) {
+        let deleted = self.delete_entry_from_event(&store, event);
+        if let Some(entry_id) = deleted.as_ref() {
             let _ = app.emit_to(
                 "passwords",
                 "password_entries_changed",
                 serde_json::json!({ "entryId": entry_id, "action": "delete" }),
             );
             self.refresh_badges(&store);
+            let flows = lock_unpoisoned(&self.second_factors)
+                .iter()
+                .filter(|(_, session)| session.entry_id == entry_id.as_str())
+                .map(|(flow_id, _)| flow_id.clone())
+                .collect::<Vec<_>>();
+            for flow_id in flows {
+                self.cancel_second_factor(&flow_id, "password-entry-deleted");
+            }
+        }
+        if let Some(request_id) = request_id {
+            let payload = if deleted.is_some() {
+                serde_json::json!({ "requestId": request_id, "success": true })
+            } else {
+                serde_json::json!({
+                    "requestId": request_id,
+                    "success": false,
+                    "error": {
+                        "code": "password_delete_failed",
+                        "message": "删除账户失败，请刷新后重试。",
+                    },
+                })
+            };
+            let _ = self.bridge.request_connection(
+                &event.connection_id,
+                "password.deleteResult",
+                payload,
+                REQUEST_TIMEOUT,
+            );
         }
     }
 
@@ -1064,8 +1996,7 @@ impl PasswordBrowserService {
             }
             return;
         }
-        if origin.len() > 2048
-            || !(origin.starts_with("https://") || origin.starts_with("http://"))
+        if origin.len() > 2048 || !(origin.starts_with("https://") || origin.starts_with("http://"))
         {
             return;
         }
@@ -1339,6 +2270,108 @@ impl PasswordBrowserService {
         );
     }
 
+    fn maybe_arm_from_manual_capture(&self, app: &AppHandle, event: &BrowserSecretEvent) {
+        let Some(candidate_id) = event
+            .payload
+            .get("candidateId")
+            .and_then(Value::as_str)
+            .filter(|value| is_safe_protocol_id(value, 160))
+        else {
+            return;
+        };
+        let _ = candidate_id;
+        let Some(tab_id) = event
+            .payload
+            .get("tabId")
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0)
+        else {
+            return;
+        };
+        let Some(frame_id) = event
+            .payload
+            .get("frameId")
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0)
+        else {
+            return;
+        };
+        let Some(origin) = event
+            .payload
+            .get("origin")
+            .and_then(Value::as_str)
+            .and_then(exact_https_origin)
+        else {
+            return;
+        };
+        let frame_origin = event
+            .payload
+            .get("frameOrigin")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 2_048)
+            .unwrap_or(if frame_id == 0 { origin.as_str() } else { "" });
+        if frame_origin.is_empty()
+            || (frame_id == 0 && frame_origin != origin.as_str())
+            || (frame_id > 0 && !frame_origin_allowed(&origin, frame_origin))
+        {
+            return;
+        }
+        let prompt_origin = event
+            .payload
+            .get("promptOrigin")
+            .and_then(Value::as_str)
+            .unwrap_or(if frame_id > 0 {
+                frame_origin
+            } else {
+                origin.as_str()
+            });
+        if (prompt_origin != origin.as_str()
+            && !(frame_id > 0
+                && prompt_origin == frame_origin
+                && frame_origin_allowed(&origin, prompt_origin)))
+            || event
+                .payload
+                .get("documentId")
+                .and_then(Value::as_str)
+                .is_none_or(|value| value.is_empty() || value.len() > 256)
+        {
+            return;
+        }
+        let username = event
+            .payload
+            .get("username")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let password = event
+            .payload
+            .get("password")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if username.is_empty() || password.is_empty() {
+            return;
+        }
+        let store = app.state::<PasswordStore>();
+        let decision = store.require_any_epoch().and_then(|epoch| {
+            store.capture_decision_at(
+                PasswordCaptureCandidate {
+                    origin,
+                    username: SensitiveText::new(username.to_string()),
+                    password: SensitiveText::new(password.to_string()),
+                    allow_insecure_http: false,
+                },
+                epoch,
+            )
+        });
+        let Some(entry_id) = decision.ok().and_then(|decision| {
+            (decision.action == PasswordCaptureAction::NoPrompt)
+                .then_some(decision.entry_id)
+                .flatten()
+        }) else {
+            return;
+        };
+        self.arm_second_factor(app, &event.connection_id, &entry_id, tab_id);
+    }
+
     fn handle_save_decision(&self, app: &AppHandle, event: &BrowserSecretEvent) {
         let store = app.state::<PasswordStore>();
         if let Some((entry_id, action)) = self.save_decision_from_event(&store, event) {
@@ -1477,6 +2510,7 @@ impl PasswordBrowserService {
                                             )),
                                             notes: entry.notes,
                                             template_id: entry.template_id,
+                                            mfa_link: None,
                                             allow_insecure_http: entry.allow_insecure_http,
                                         },
                                         epoch,
@@ -1513,6 +2547,7 @@ impl PasswordBrowserService {
                         password: SensitiveText::new(pending.password.clone()),
                         notes: String::new(),
                         template_id: None,
+                        mfa_link: None,
                         allow_insecure_http: pending.allow_insecure_http,
                     },
                     epoch,
@@ -1736,6 +2771,66 @@ impl PasswordBrowserService {
                 TemplateRecordingState::Failed,
             );
         }
+        let (expired_second_factors, expired_challenges) = self.prune_second_factor_state(now);
+        for (flow_id, session) in expired_second_factors {
+            let _ = self.bridge.request_connection(
+                &session.connection_id,
+                "password.cancelSecondFactor",
+                serde_json::json!({
+                    "flowId": flow_id,
+                    "tabId": session.tab_id,
+                    "reason": "expired",
+                }),
+                Duration::from_secs(2),
+            );
+        }
+        for (flow_id, challenge_id, connection_id, tab_id) in expired_challenges {
+            self.notify_second_factor_challenge_cancel(
+                &connection_id,
+                &flow_id,
+                &challenge_id,
+                tab_id,
+                "challenge-expired",
+            );
+        }
+    }
+
+    fn prune_second_factor_state(
+        &self,
+        now: Instant,
+    ) -> (
+        Vec<(String, SecondFactorSession)>,
+        Vec<(String, String, String, i64)>,
+    ) {
+        let _publish = lock_unpoisoned(&self.second_factor_publish);
+        let mut sessions = lock_unpoisoned(&self.second_factors);
+        let expired_ids = sessions
+            .iter()
+            .filter(|(_, session)| session.expires_at <= now)
+            .map(|(flow_id, _)| flow_id.clone())
+            .collect::<Vec<_>>();
+        let expired_sessions = expired_ids
+            .into_iter()
+            .filter_map(|flow_id| sessions.remove(&flow_id).map(|session| (flow_id, session)))
+            .collect::<Vec<_>>();
+        let mut expired_challenges = Vec::new();
+        for (flow_id, session) in sessions.iter_mut() {
+            let expired = session
+                .challenge
+                .as_ref()
+                .is_some_and(|challenge| challenge.expires_at <= now);
+            if expired {
+                if let Some(challenge) = session.challenge.take() {
+                    expired_challenges.push((
+                        flow_id.clone(),
+                        challenge.challenge_id,
+                        session.connection_id.clone(),
+                        session.tab_id,
+                    ));
+                }
+            }
+        }
+        (expired_sessions, expired_challenges)
     }
 }
 
@@ -1788,6 +2883,7 @@ fn badge_accounts(store: &PasswordStore, origin: &str) -> (bool, Vec<PasswordCap
                     entry_id: entry.id,
                     site_name: entry.site_name,
                     username: entry.username,
+                    has_mfa: entry.mfa_link.is_some(),
                 })
                 .collect(),
         ),
@@ -1864,6 +2960,130 @@ fn unix_time_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+struct SecondFactorBinding {
+    flow_id: String,
+    challenge_id: String,
+    tab_id: i64,
+    top_origin: String,
+    frame_origin: String,
+    frame_id: i64,
+    document_id: String,
+}
+
+fn second_factor_binding(payload: &Value) -> Option<SecondFactorBinding> {
+    let flow_id = payload
+        .get("flowId")
+        .and_then(Value::as_str)
+        .filter(|value| is_safe_protocol_id(value, 160))?
+        .to_string();
+    let challenge_id = payload
+        .get("challengeId")
+        .and_then(Value::as_str)
+        .filter(|value| is_safe_protocol_id(value, 160))?
+        .to_string();
+    let tab_id = payload
+        .get("tabId")
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)?;
+    let frame_id = payload
+        .get("frameId")
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)?;
+    let top_origin = exact_https_origin(
+        payload
+            .get("topOrigin")
+            .or_else(|| payload.get("origin"))
+            .and_then(Value::as_str)?,
+    )?;
+    let frame_origin = exact_https_origin(
+        payload
+            .get("frameOrigin")
+            .and_then(Value::as_str)
+            .unwrap_or(&top_origin),
+    )?;
+    let document_id = payload
+        .get("documentId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 256)?
+        .to_string();
+    Some(SecondFactorBinding {
+        flow_id,
+        challenge_id,
+        tab_id,
+        top_origin,
+        frame_origin,
+        frame_id,
+        document_id,
+    })
+}
+
+fn second_factor_challenge_matches(
+    challenge: &SecondFactorChallenge,
+    binding: &SecondFactorBinding,
+) -> bool {
+    challenge.challenge_id == binding.challenge_id
+        && challenge.top_origin == binding.top_origin
+        && challenge.frame_origin == binding.frame_origin
+        && challenge.frame_id == binding.frame_id
+        && challenge.document_id == binding.document_id
+}
+
+fn second_factor_challenges_match(
+    current: &SecondFactorChallenge,
+    expected: &SecondFactorChallenge,
+) -> bool {
+    current.challenge_id == expected.challenge_id
+        && current.top_origin == expected.top_origin
+        && current.frame_origin == expected.frame_origin
+        && current.frame_id == expected.frame_id
+        && current.document_id == expected.document_id
+        && current.digits == expected.digits
+}
+
+/// The confirmation response is part of the copy authorization boundary. A
+/// bare `confirmed: true` is not sufficient: accepting a response for a
+/// different request or tab could let a delayed popup response authorize a
+/// newly navigated tab. The extension echoes both routing fields after it
+/// re-reads the live active tab and cached account summary.
+fn mfa_copy_confirmation_matches(response: Option<&Value>, request_id: &str, tab_id: i64) -> bool {
+    response
+        .and_then(|value| value.get("confirmed"))
+        .and_then(Value::as_bool)
+        == Some(true)
+        && response
+            .and_then(|value| value.get("requestId"))
+            .and_then(Value::as_str)
+            == Some(request_id)
+        && response
+            .and_then(|value| value.get("tabId"))
+            .and_then(Value::as_i64)
+            == Some(tab_id)
+}
+
+fn exact_https_origin(value: &str) -> Option<String> {
+    if value.is_empty() || value.len() > 2_048 {
+        return None;
+    }
+    let url = Url::parse(value).ok()?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.cannot_be_a_base()
+    {
+        return None;
+    }
+    let origin = url.origin().ascii_serialization();
+    (value == origin).then_some(origin)
+}
+
+fn is_safe_protocol_id(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 /// Returns whether a top-level origin may delegate password handling to a
@@ -2159,6 +3379,8 @@ mod tests {
             fills: Mutex::new(HashMap::new()),
             captures: Mutex::new(HashMap::new()),
             recordings: Mutex::new(HashMap::new()),
+            second_factors: Mutex::new(HashMap::new()),
+            second_factor_publish: Mutex::new(()),
             synced_capture: Mutex::new(HashMap::new()),
             badge_tabs: Mutex::new(HashMap::new()),
         }
@@ -2175,6 +3397,209 @@ mod tests {
             document_id: None,
             expires_at: Instant::now() + FILL_TTL,
         }
+    }
+
+    fn second_factor_session() -> SecondFactorSession {
+        SecondFactorSession {
+            connection_id: "connection-a".to_string(),
+            entry_id: "password-entry-a".to_string(),
+            login_origin: "https://login.example.com".to_string(),
+            tab_id: 42,
+            challenge: None,
+            expires_at: Instant::now() + SECOND_FACTOR_TTL,
+        }
+    }
+
+    fn second_factor_challenge(expires_at: Instant) -> SecondFactorChallenge {
+        SecondFactorChallenge {
+            challenge_id: "challenge-a".to_string(),
+            top_origin: "https://mfa.example.com".to_string(),
+            frame_origin: "https://mfa.example.com".to_string(),
+            frame_id: 0,
+            document_id: "document-a".to_string(),
+            digits: 6,
+            requires_origin_confirmation: false,
+            generating: false,
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn second_factor_binding_requires_exact_https_and_all_page_ids() {
+        let valid = serde_json::json!({
+            "flowId": "flow-a",
+            "challengeId": "challenge-a",
+            "tabId": 42,
+            "topOrigin": "https://mfa.example.com",
+            "frameOrigin": "https://mfa.example.com",
+            "frameId": 0,
+            "documentId": "document-a",
+        });
+        let parsed = second_factor_binding(&valid).unwrap();
+        assert_eq!(parsed.top_origin, "https://mfa.example.com");
+        assert_eq!(parsed.document_id, "document-a");
+
+        let mut http = valid.clone();
+        http["topOrigin"] = serde_json::json!("http://mfa.example.com");
+        let mut path = valid.clone();
+        path["topOrigin"] = serde_json::json!("https://mfa.example.com/path");
+        let mut missing_document = valid.clone();
+        missing_document["documentId"] = Value::Null;
+        let mut negative_frame = valid.clone();
+        negative_frame["frameId"] = serde_json::json!(-1);
+        for invalid in [http, path, missing_document, negative_frame] {
+            assert!(second_factor_binding(&invalid).is_none());
+        }
+    }
+
+    #[test]
+    fn mfa_copy_confirmation_requires_the_exact_request_and_tab() {
+        let valid = serde_json::json!({
+            "confirmed": true,
+            "requestId": "copy-request",
+            "tabId": 42,
+        });
+        assert!(mfa_copy_confirmation_matches(
+            Some(&valid),
+            "copy-request",
+            42
+        ));
+
+        let mut wrong_request = valid.clone();
+        wrong_request["requestId"] = serde_json::json!("other-request");
+        let mut wrong_tab = valid.clone();
+        wrong_tab["tabId"] = serde_json::json!(43);
+        let mut bare_confirmation = valid.clone();
+        bare_confirmation
+            .as_object_mut()
+            .unwrap()
+            .remove("requestId");
+        for response in [wrong_request, wrong_tab, bare_confirmation] {
+            assert!(!mfa_copy_confirmation_matches(
+                Some(&response),
+                "copy-request",
+                42
+            ));
+        }
+        assert!(!mfa_copy_confirmation_matches(None, "copy-request", 42));
+    }
+
+    #[test]
+    fn page_close_clears_field_sessions_but_preserves_second_factor_journey() {
+        let service = service();
+        lock_unpoisoned(&service.second_factors)
+            .insert("flow-a".to_string(), second_factor_session());
+
+        service.handle_page_closed(&secret_event(
+            "connection-a",
+            "pageClosed",
+            serde_json::json!({ "tabId": 42, "documentId": "old-document" }),
+        ));
+
+        assert!(lock_unpoisoned(&service.second_factors).contains_key("flow-a"));
+    }
+
+    #[test]
+    fn top_level_page_close_clears_badge_and_child_challenge_but_keeps_journey() {
+        let service = service();
+        let mut session = second_factor_session();
+        session.challenge = Some(SecondFactorChallenge {
+            challenge_id: "child-challenge".to_string(),
+            top_origin: "https://login.example.com".to_string(),
+            frame_origin: "https://login.example.com".to_string(),
+            frame_id: 9,
+            document_id: "child-document".to_string(),
+            digits: 6,
+            requires_origin_confirmation: false,
+            generating: false,
+            expires_at: Instant::now() + SECOND_FACTOR_CHALLENGE_TTL,
+        });
+        lock_unpoisoned(&service.second_factors).insert("flow-a".to_string(), session);
+        lock_unpoisoned(&service.badge_tabs)
+            .entry("connection-a".to_string())
+            .or_default()
+            .insert(42, "https://login.example.com".to_string());
+
+        service.handle_page_closed(&secret_event(
+            "connection-a",
+            "pageClosed",
+            serde_json::json!({
+                "tabId": 42,
+                "frameId": 0,
+                "documentId": "top-document",
+            }),
+        ));
+
+        let sessions = lock_unpoisoned(&service.second_factors);
+        assert!(sessions.contains_key("flow-a"));
+        assert!(sessions["flow-a"].challenge.is_none());
+        drop(sessions);
+        assert!(!lock_unpoisoned(&service.badge_tabs)
+            .get("connection-a")
+            .is_some_and(|tabs| tabs.contains_key(&42)));
+    }
+
+    #[test]
+    fn challenge_expiry_clears_only_the_challenge_and_keeps_the_journey() {
+        let service = service();
+        let now = Instant::now();
+        let mut session = second_factor_session();
+        session.challenge = Some(second_factor_challenge(now - Duration::from_secs(1)));
+        lock_unpoisoned(&service.second_factors).insert("flow-a".to_string(), session);
+
+        let (expired_sessions, expired_challenges) = service.prune_second_factor_state(now);
+
+        assert!(expired_sessions.is_empty());
+        assert_eq!(expired_challenges.len(), 1);
+        let sessions = lock_unpoisoned(&service.second_factors);
+        assert!(sessions.contains_key("flow-a"));
+        assert!(sessions["flow-a"].challenge.is_none());
+    }
+
+    #[test]
+    fn journey_expiry_removes_the_whole_second_factor_session() {
+        let service = service();
+        let now = Instant::now();
+        let mut session = second_factor_session();
+        session.expires_at = now - Duration::from_secs(1);
+        session.challenge = Some(second_factor_challenge(now - Duration::from_secs(1)));
+        lock_unpoisoned(&service.second_factors).insert("flow-a".to_string(), session);
+
+        let (expired_sessions, expired_challenges) = service.prune_second_factor_state(now);
+
+        assert_eq!(expired_sessions.len(), 1);
+        assert!(expired_challenges.is_empty());
+        assert!(lock_unpoisoned(&service.second_factors).is_empty());
+    }
+
+    #[test]
+    fn stale_second_factor_document_and_frame_cannot_match_a_challenge() {
+        let challenge = SecondFactorChallenge {
+            challenge_id: "challenge-a".to_string(),
+            top_origin: "https://mfa.example.com".to_string(),
+            frame_origin: "https://mfa.example.com".to_string(),
+            frame_id: 3,
+            document_id: "document-a".to_string(),
+            digits: 6,
+            requires_origin_confirmation: false,
+            generating: false,
+            expires_at: Instant::now() + SECOND_FACTOR_CHALLENGE_TTL,
+        };
+        let mut binding = SecondFactorBinding {
+            flow_id: "flow-a".to_string(),
+            challenge_id: "challenge-a".to_string(),
+            tab_id: 42,
+            top_origin: "https://mfa.example.com".to_string(),
+            frame_origin: "https://mfa.example.com".to_string(),
+            frame_id: 3,
+            document_id: "document-a".to_string(),
+        };
+        assert!(second_factor_challenge_matches(&challenge, &binding));
+        binding.document_id = "stale-document".to_string();
+        assert!(!second_factor_challenge_matches(&challenge, &binding));
+        binding.document_id = "document-a".to_string();
+        binding.frame_id = 0;
+        assert!(!second_factor_challenge_matches(&challenge, &binding));
     }
 
     #[test]
@@ -2395,7 +3820,7 @@ mod tests {
     #[test]
     fn page_closed_drops_only_the_matching_native_capture() {
         let service = service();
-        let capture = |connection_id: &str, document_id: &str| PendingCapture {
+        let capture = |connection_id: &str, document_id: &str, frame_id: i64| PendingCapture {
             connection_id: connection_id.to_string(),
             entry_id: None,
             account_choices: Vec::new(),
@@ -2405,7 +3830,7 @@ mod tests {
             password: "secret".to_string(),
             allow_insecure_http: false,
             tab_id: 7,
-            frame_id: 0,
+            frame_id,
             document_id: document_id.to_string(),
             prompt_origin: "https://example.com".to_string(),
             created_at: Instant::now(),
@@ -2413,22 +3838,26 @@ mod tests {
         };
         lock_unpoisoned(&service.captures).insert(
             "matching".to_string(),
-            capture("connection-a", "document-a"),
+            capture("connection-a", "document-a", 1),
         );
         lock_unpoisoned(&service.captures).insert(
             "other-document".to_string(),
-            capture("connection-a", "document-b"),
+            capture("connection-a", "document-b", 1),
         );
         lock_unpoisoned(&service.captures).insert(
             "other-connection".to_string(),
-            capture("connection-b", "document-a"),
+            capture("connection-b", "document-a", 1),
         );
 
         service.handle_page_closed(&BrowserSecretEvent {
             connection_id: "connection-a".to_string(),
             browser: BrowserFamily::Firefox,
             event: "pageClosed".to_string(),
-            payload: serde_json::json!({ "tabId": 7, "documentId": "document-a" }),
+            payload: serde_json::json!({
+                "tabId": 7,
+                "frameId": 1,
+                "documentId": "document-a"
+            }),
         });
 
         let captures = lock_unpoisoned(&service.captures);
@@ -2530,6 +3959,8 @@ mod tests {
                 fills: Mutex::new(HashMap::new()),
                 captures: Mutex::new(HashMap::new()),
                 recordings: Mutex::new(HashMap::new()),
+                second_factors: Mutex::new(HashMap::new()),
+                second_factor_publish: Mutex::new(()),
                 synced_capture: Mutex::new(HashMap::new()),
                 badge_tabs: Mutex::new(HashMap::new()),
             },
@@ -2548,6 +3979,97 @@ mod tests {
         (root, store)
     }
 
+    #[test]
+    fn explicit_password_lock_waits_for_and_serializes_second_factor_publish() {
+        let (_root, store) = test_store();
+        let entry = create_entry(&store, "https://example.com/login", "alice", "secret");
+        let store = std::sync::Arc::new(store);
+        let service = std::sync::Arc::new(service());
+        lock_unpoisoned(&service.second_factors)
+            .insert("flow-a".to_string(), second_factor_session());
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_service = service.clone();
+        let worker = std::thread::spawn(move || {
+            let _publish = lock_unpoisoned(&worker_service.second_factor_publish);
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let lock_service = service.clone();
+        let lock_store = store.clone();
+        let locker = std::thread::spawn(move || {
+            done_tx.send(lock_service.lock_password_vault_and_cancel_second_factors(&lock_store))
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_ok());
+        assert!(locker.join().unwrap().is_ok());
+        assert!(lock_unpoisoned(&service.second_factors).is_empty());
+        let epoch = store.require_any_epoch().unwrap();
+        let error = match store.browser_fill_data_at(&entry.id, epoch) {
+            Ok(_) => panic!("a manually locked password vault must reject browser reads"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "password_vault_locked",);
+    }
+
+    #[test]
+    fn explicit_mfa_lock_waits_for_and_serializes_second_factor_publish() {
+        let root = tempfile::tempdir().unwrap();
+        let mfa = MfaStore::load(root.path()).unwrap();
+        let passwords = PasswordStore::load(root.path()).unwrap();
+        mfa.activate();
+        crate::recovery::configure_shared_recovery_password(
+            &mfa,
+            &passwords,
+            TEST_RECOVERY_PASSWORD,
+            None,
+        )
+        .unwrap();
+        let mfa = std::sync::Arc::new(mfa);
+        let service = std::sync::Arc::new(service());
+        lock_unpoisoned(&service.second_factors)
+            .insert("flow-a".to_string(), second_factor_session());
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_service = service.clone();
+        let worker = std::thread::spawn(move || {
+            let _publish = lock_unpoisoned(&worker_service.second_factor_publish);
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let lock_service = service.clone();
+        let lock_store = mfa.clone();
+        let locker = std::thread::spawn(move || {
+            done_tx.send(lock_service.lock_mfa_vault_and_cancel_second_factors(&lock_store))
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_ok());
+        assert!(locker.join().unwrap().is_ok());
+        assert!(lock_unpoisoned(&service.second_factors).is_empty());
+        assert_eq!(
+            mfa.browser_link_summaries().unwrap_err().code,
+            "mfa_vault_locked"
+        );
+    }
+
     fn create_entry(
         store: &PasswordStore,
         login_url: &str,
@@ -2564,6 +4086,7 @@ mod tests {
                     password: SensitiveText::new(password.to_string()),
                     notes: String::new(),
                     template_id: None,
+                    mfa_link: None,
                     allow_insecure_http: false,
                 },
                 epoch,
@@ -2576,6 +4099,7 @@ mod tests {
             entry_id: entry.id.clone(),
             site_name: entry.site_name.clone(),
             username: entry.username.clone(),
+            has_mfa: entry.mfa_link.is_some(),
         }
     }
 
@@ -2586,6 +4110,28 @@ mod tests {
             event: event.to_string(),
             payload,
         }
+    }
+
+    #[test]
+    fn challenge_failure_preserves_journey_and_notifies_extension_scope() {
+        let (service, recorded) = connected_service("connection-a");
+        let mut session = second_factor_session();
+        session.challenge = Some(second_factor_challenge(
+            Instant::now() + SECOND_FACTOR_CHALLENGE_TTL,
+        ));
+        lock_unpoisoned(&service.second_factors).insert("flow-a".to_string(), session);
+
+        service.cancel_second_factor_challenge("flow-a", "challenge-a", "mfa-unavailable");
+
+        let sessions = lock_unpoisoned(&service.second_factors);
+        assert!(sessions.contains_key("flow-a"));
+        assert!(sessions["flow-a"].challenge.is_none());
+        drop(sessions);
+        let requests = recorded.requests_for("password.cancelSecondFactor");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["payload"]["flowId"], "flow-a");
+        assert_eq!(requests[0]["payload"]["challengeId"], "challenge-a");
+        assert_eq!(requests[0]["payload"]["preserveJourney"], true);
     }
 
     fn pending_capture(account_choices: Vec<PasswordCaptureAccount>) -> PendingCapture {
@@ -2629,7 +4175,7 @@ mod tests {
         let (_root, store) = test_store();
         let first = create_entry(&store, "https://example.com/login", "alice", "one");
         let second = create_entry(&store, "https://example.com/signin", "bob", "two");
-        create_entry(&store,  "https://other.example.com/login", "carol", "three");
+        create_entry(&store, "https://other.example.com/login", "carol", "three");
         let (service, recorded) = connected_service("connection-a");
 
         service.handle_origin_active(
@@ -2660,7 +4206,7 @@ mod tests {
     #[test]
     fn origin_active_pushes_empty_and_locked_badges() {
         let (_root, store) = test_store();
-        create_entry(&store,  "https://example.com/login", "alice", "one");
+        create_entry(&store, "https://example.com/login", "alice", "one");
         let (service, recorded) = connected_service("connection-a");
 
         service.handle_origin_active(
@@ -2724,7 +4270,7 @@ mod tests {
         );
         assert_eq!(recorded.requests_for("password.updateBadge").len(), 1);
 
-        create_entry(&store,  "https://example.com/signin", "bob", "two");
+        create_entry(&store, "https://example.com/signin", "bob", "two");
         service.refresh_badges(&store);
         let badges = recorded.requests_for("password.updateBadge");
         assert_eq!(badges.len(), 2);
@@ -3032,7 +4578,9 @@ mod tests {
             );
             assert!(!lock_unpoisoned(&service.fills).contains_key(&session_id));
         }
-        assert!(recorded.requests_for("password.provideCredentials").is_empty());
+        assert!(recorded
+            .requests_for("password.provideCredentials")
+            .is_empty());
     }
 
     #[test]
@@ -3230,10 +4778,8 @@ mod tests {
             pending_capture(vec![capture_account(&alice), capture_account(&bob)]),
         );
 
-        let saved = service.save_decision_from_event(
-            &store,
-            &save_decision_event("candidate-1", Some(&bob.id)),
-        );
+        let saved = service
+            .save_decision_from_event(&store, &save_decision_event("candidate-1", Some(&bob.id)));
         assert_eq!(saved, Some((bob.id.clone(), "replace".to_string())));
 
         let results = recorded.requests_for("password.saveResult");
@@ -3245,10 +4791,7 @@ mod tests {
         assert_eq!(updated.username, "carol");
         assert_eq!(updated.password, "three");
         let entries = store.list_entries_at(epoch).unwrap();
-        let untouched = entries
-            .iter()
-            .find(|entry| entry.id == alice.id)
-            .unwrap();
+        let untouched = entries.iter().find(|entry| entry.id == alice.id).unwrap();
         assert_eq!(untouched.username, "alice");
     }
 
@@ -3263,10 +4806,8 @@ mod tests {
             pending_capture(vec![capture_account(&alice)]),
         );
 
-        let saved = service.save_decision_from_event(
-            &store,
-            &save_decision_event("candidate-2", Some(&bob.id)),
-        );
+        let saved = service
+            .save_decision_from_event(&store, &save_decision_event("candidate-2", Some(&bob.id)));
         assert_eq!(saved, None);
 
         let results = recorded.requests_for("password.saveResult");
@@ -3394,7 +4935,8 @@ mod tests {
             serde_json::json!({ "entryId": Uuid::new_v4(), "field": "password" }),
             serde_json::json!({ "entryId": "not-a-uuid", "field": "password" }),
         ] {
-            service.handle_copy_secret(&store, &secret_event("connection-a", "copySecret", payload));
+            service
+                .handle_copy_secret(&store, &secret_event("connection-a", "copySecret", payload));
         }
         store.lock_current_session().unwrap();
         service.handle_copy_secret(

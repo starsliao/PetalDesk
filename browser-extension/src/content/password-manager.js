@@ -19,6 +19,9 @@
   const SAVE_DECISION_MESSAGE = "petaldesk.password.save-decision";
   const TEMPLATE_PROGRESS_MESSAGE = "petaldesk.password.template-recording-progress";
   const TEMPLATE_CANCEL_MESSAGE = "petaldesk.password.template-recording-cancelled";
+  const SECOND_FACTOR_CANDIDATES_MESSAGE = "petaldesk.password.second-factor-candidates";
+  const SECOND_FACTOR_CONFIRM_MESSAGE = "petaldesk.password.second-factor-confirm";
+  const SECOND_FACTOR_CANCEL_MESSAGE = "petaldesk.password.second-factor-cancel";
   const CANDIDATE_TTL_MS = 30_000;
   const CANDIDATE_DEDUP_MS = 1_500;
   const OVERLAY_ID = "petaldesk-password-overlay";
@@ -39,6 +42,8 @@
   let lastCandidateClearTimer = null;
   let fieldObserver = null;
   let fieldStateTimer = null;
+  let activeSecondFactor = null;
+  let secondFactorScanTimer = null;
 
   function errorMessage(error) {
     return error instanceof Error ? error.message : String(error || "Unknown error");
@@ -392,6 +397,389 @@
       const EventConstructor = root.Event || Event;
       input.dispatchEvent(new EventConstructor("input", { bubbles: true, composed: true }));
       input.dispatchEvent(new EventConstructor("change", { bubbles: true, composed: true }));
+    }
+  }
+
+  function inputAttribute(input, name) {
+    try {
+      const value = input && typeof input.getAttribute === "function"
+        ? input.getAttribute(name)
+        : null;
+      return value == null ? "" : String(value);
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function secondFactorMetadata(input) {
+    const labels = input && input.labels
+      ? Array.from(input.labels, (label) => String(label && label.textContent || ""))
+      : [];
+    return [
+      inputAttribute(input, "autocomplete"),
+      inputAttribute(input, "aria-label"),
+      inputAttribute(input, "id"),
+      inputAttribute(input, "inputmode"),
+      inputAttribute(input, "name"),
+      inputAttribute(input, "placeholder"),
+      inputAttribute(input, "type"),
+      ...labels,
+    ].join(" ").toLowerCase();
+  }
+
+  function secondFactorFieldVisible(input) {
+    if (!input || input.disabled === true || input.readOnly === true || input.hidden === true) return false;
+    const type = inputAttribute(input, "type").toLowerCase();
+    if (type === "hidden" || type === "submit" || type === "button") return false;
+    if (inputAttribute(input, "aria-hidden").toLowerCase() === "true") return false;
+    try {
+      if (typeof input.getClientRects === "function" && input.getClientRects().length === 0) return false;
+      if (typeof root.getComputedStyle === "function") {
+        const style = root.getComputedStyle(input);
+        if (
+          style
+          && (style.display === "none"
+            || style.visibility === "hidden"
+            || style.visibility === "collapse"
+            || Number(style.opacity) === 0)
+        ) return false;
+      }
+    } catch (_error) {
+      return false;
+    }
+    return true;
+  }
+
+  function secondFactorFieldDescriptor(input) {
+    if (!secondFactorFieldVisible(input)) return null;
+    const metadata = secondFactorMetadata(input);
+    const excluded = /\b(?:sms|text message|mobile|phone|email|e-mail|mail|recovery|backup|captcha|passkey|webauthn|security[ -]?key|cvv|cvc|card|postal|postcode|zip|coupon|promo|discount)\b|短信|手机|邮箱|邮件|恢复码|备用码|图形验证码|安全密钥|银行卡|邮编|优惠码/.test(metadata);
+    if (excluded) return null;
+    const autocomplete = inputAttribute(input, "autocomplete").toLowerCase();
+    // `autocomplete=one-time-code` and plain "OTP" are also widely used for
+    // SMS/email challenges. They are candidates, but only explicit TOTP/MFA
+    // semantics are trusted enough for automatic filling.
+    const strong = /\b(?:totp|mfa|2fa|authenticator|two[ -]?factor)\b|动态口令|身份验证器|二次验证|两步验证/.test(metadata);
+    const weak = autocomplete === "one-time-code"
+      || /\b(?:otp|one[ -]?time(?:[ -]?(?:code|password))?|verification|verify|code|token|pin|digit)\b|验证码|校验码|验证代码|数字/.test(metadata);
+    if (!strong && !weak) return null;
+    const rawMaxLength = Number(input.maxLength || inputAttribute(input, "maxlength"));
+    const maxLength = Number.isInteger(rawMaxLength) && rawMaxLength > 0 ? rawMaxLength : 0;
+    const type = inputAttribute(input, "type").toLowerCase();
+    const inputMode = inputAttribute(input, "inputmode").toLowerCase();
+    const numeric = ["", "text", "tel", "number", "password"].includes(type)
+      && (strong || inputMode === "numeric" || inputMode === "decimal" || type === "number");
+    if (!numeric) return null;
+    if (maxLength === 1) {
+      return { confidence: strong ? "high" : "low", field: input, segment: true };
+    }
+    const digits = [6, 7, 8].includes(maxLength)
+      ? maxLength
+      : autocomplete === "one-time-code" || strong ? 6 : 0;
+    if (![6, 7, 8].includes(digits)) return null;
+    return { confidence: strong ? "high" : "low", digits, field: input, segment: false };
+  }
+
+  function detectSecondFactorCandidates() {
+    const inputs = Array.from(root.document.querySelectorAll("input"));
+    const candidates = [];
+    let segmentRun = [];
+    function flushSegments() {
+      if ([6, 7, 8].includes(segmentRun.length)) {
+        candidates.push({
+          confidence: segmentRun.some((item) => item.confidence === "high") ? "high" : "low",
+          digits: segmentRun.length,
+          fields: segmentRun.map((item) => item.field),
+          segmented: true,
+        });
+      }
+      segmentRun = [];
+    }
+    for (const input of inputs) {
+      const descriptor = secondFactorFieldDescriptor(input);
+      if (descriptor && descriptor.segment) {
+        segmentRun.push(descriptor);
+        continue;
+      }
+      flushSegments();
+      if (descriptor) {
+        candidates.push({
+          confidence: descriptor.confidence,
+          digits: descriptor.digits,
+          fields: [descriptor.field],
+          segmented: false,
+        });
+      }
+    }
+    flushSegments();
+    return candidates;
+  }
+
+  function secondFactorSummary(candidates) {
+    // Keep the digit length of the strongest semantic match when a page has
+    // multiple candidates. A blanket preference for six digits can conflict
+    // with a linked eight-digit TOTP when a weak six-digit field is nearby.
+    const preferred = candidates.find((candidate) => candidate.confidence === "high")
+      || candidates[0];
+    const preferredDigits = preferred ? preferred.digits : 0;
+    return {
+      confidence: candidates.length === 1 && candidates[0].confidence === "high" ? "high" : "low",
+      count: candidates.length,
+      digits: preferredDigits,
+    };
+  }
+
+  function snapshotSecondFactorCandidates(candidates) {
+    return candidates.map((candidate) => ({
+      confidence: candidate.confidence,
+      digits: candidate.digits,
+      fields: Array.from(candidate.fields),
+      segmented: candidate.segmented,
+    }));
+  }
+
+  function sameSecondFactorCandidates(left, right) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+    return left.every((candidate, index) => {
+      const other = right[index];
+      return Boolean(other)
+        && candidate.confidence === other.confidence
+        && candidate.digits === other.digits
+        && candidate.segmented === other.segmented
+        && candidate.fields.length === other.fields.length
+        && candidate.fields.every((field, fieldIndex) => field === other.fields[fieldIndex]);
+    });
+  }
+
+  function boundSecondFactorCandidates(session) {
+    const current = detectSecondFactorCandidates();
+    if (
+      !session.boundCandidates
+      || !sameSecondFactorCandidates(current, session.boundCandidates)
+    ) return null;
+    const summary = secondFactorSummary(current);
+    if (
+      !session.boundSummary
+      || summary.count !== session.boundSummary.count
+      || summary.digits !== session.boundSummary.digits
+      || summary.confidence !== session.boundSummary.confidence
+    ) return null;
+    return current;
+  }
+
+  function reportSecondFactorCandidates(force = false) {
+    const session = activeSecondFactor;
+    if (!session || session.expiresAt <= Date.now()) {
+      clearSecondFactorLocal();
+      return;
+    }
+    const candidates = root.document.visibilityState === "hidden"
+      ? []
+      : detectSecondFactorCandidates();
+    session.candidates = candidates;
+    const summary = secondFactorSummary(candidates);
+    const fingerprint = `${summary.count}:${summary.digits}:${summary.confidence}`;
+    if (
+      !force
+      && fingerprint === session.lastFingerprint
+      && sameSecondFactorCandidates(candidates, session.reportedCandidates)
+    ) return;
+    session.lastFingerprint = fingerprint;
+    session.reportedCandidates = snapshotSecondFactorCandidates(candidates);
+    // Only field shape metadata crosses the content-script boundary. The
+    // background derives every browser identity from MessageSender.
+    void sendBackground({
+      type: SECOND_FACTOR_CANDIDATES_MESSAGE,
+      count: summary.count,
+      digits: summary.digits,
+      confidence: summary.confidence,
+    }).catch(() => {});
+  }
+
+  function scheduleSecondFactorScan(delayMs = 0) {
+    if (!activeSecondFactor) return;
+    if (secondFactorScanTimer != null) clearTimeout(secondFactorScanTimer);
+    secondFactorScanTimer = setTimeout(() => {
+      secondFactorScanTimer = null;
+      reportSecondFactorCandidates();
+    }, Math.max(0, delayMs));
+  }
+
+  function clearSecondFactorLocal() {
+    if (secondFactorScanTimer != null) clearTimeout(secondFactorScanTimer);
+    secondFactorScanTimer = null;
+    if (!activeSecondFactor) return;
+    activeSecondFactor.candidates = [];
+    activeSecondFactor.boundCandidates = null;
+    activeSecondFactor.boundSummary = null;
+    activeSecondFactor.challengeId = null;
+    activeSecondFactor.confirmed = false;
+    activeSecondFactor.lastFingerprint = "";
+    activeSecondFactor.reportedCandidates = [];
+    activeSecondFactor = null;
+  }
+
+  function armSecondFactor(payload) {
+    const flowId = safeString(payload.flowId, 160);
+    const expiresAt = Number(payload.expiresAt);
+    if (!flowId || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+      throw new Error("The second-factor journey is invalid or expired");
+    }
+    clearSecondFactorLocal();
+    activeSecondFactor = {
+      boundCandidates: null,
+      boundSummary: null,
+      candidates: [],
+      challengeId: null,
+      confirmed: false,
+      expiresAt,
+      flowId,
+      lastFingerprint: "",
+      reportedCandidates: [],
+    };
+    reportSecondFactorCandidates(true);
+    return { armed: true, flowId };
+  }
+
+  function bindSecondFactor(payload) {
+    const session = activeSecondFactor;
+    const flowId = safeString(payload.flowId, 160);
+    const challengeId = safeString(payload.challengeId, 160);
+    const expiresAt = Number(payload.expiresAt);
+    if (
+      !session
+      || session.flowId !== flowId
+      || !challengeId
+      || !Number.isFinite(expiresAt)
+      || expiresAt <= Date.now()
+      || session.expiresAt <= Date.now()
+    ) throw new Error("The second-factor challenge cannot be bound to this page");
+    const current = detectSecondFactorCandidates();
+    if (
+      current.length === 0
+      || !sameSecondFactorCandidates(current, session.reportedCandidates)
+    ) throw new Error("The MFA verification fields changed before challenge binding");
+    session.boundCandidates = snapshotSecondFactorCandidates(current);
+    session.boundSummary = secondFactorSummary(current);
+    session.challengeId = challengeId;
+    session.confirmed = false;
+    return { bound: true, challengeId, flowId };
+  }
+
+  function offerSecondFactor(payload) {
+    const session = activeSecondFactor;
+    const flowId = safeString(payload.flowId, 160);
+    const challengeId = safeString(payload.challengeId, 160);
+    const expiresAt = Number(payload.expiresAt);
+    if (!session || session.flowId !== flowId || !challengeId || session.expiresAt <= Date.now()) {
+      throw new Error("The second-factor challenge is no longer available");
+    }
+    if (session.challengeId !== challengeId || !boundSecondFactorCandidates(session)) {
+      throw new Error("The MFA verification fields changed before confirmation");
+    }
+    session.confirmed = false;
+    const requiresOriginConfirmation = payload.requiresOriginConfirmation === true;
+    const challengeExpiresAt = Number.isFinite(expiresAt)
+      ? Math.min(expiresAt, session.expiresAt)
+      : session.expiresAt;
+    createOverlay(
+      requiresOriginConfirmation ? "确认 MFA 填充站点" : "填充 MFA 验证码",
+      requiresOriginConfirmation
+        ? `飞花准备在 ${safeString(payload.topOrigin, 512)} 填充 MFA 验证码。确认后会记住这个精确 HTTPS 站点，不会自动提交表单。`
+        : "检测到多个或不确定的验证码输入框。是否使用飞花一键填充？不会自动提交表单。",
+      [
+        {
+          label: "一键填充",
+          primary: true,
+          onClick: () => {
+            if (
+              !activeSecondFactor
+              || activeSecondFactor.flowId !== flowId
+              || activeSecondFactor.challengeId !== challengeId
+              || challengeExpiresAt <= Date.now()
+            ) return;
+            activeSecondFactor.confirmed = true;
+            removeOverlay();
+            void sendBackground({
+              type: SECOND_FACTOR_CONFIRM_MESSAGE,
+              flowId,
+              challengeId,
+              originConfirmed: requiresOriginConfirmation,
+            }).catch(() => {});
+          },
+        },
+        {
+          label: "取消",
+          onClick: () => {
+            void sendBackground({
+              type: SECOND_FACTOR_CANCEL_MESSAGE,
+              flowId,
+              challengeId,
+            }).catch(() => {});
+            clearSecondFactorLocal();
+            removeOverlay();
+          },
+        },
+      ],
+    );
+    return { offered: true, flowId, challengeId };
+  }
+
+  function chooseSecondFactorCandidate(candidates, codeLength) {
+    const matching = candidates.filter((candidate) => candidate.digits === codeLength);
+    if (matching.length === 0) return null;
+    const activeElement = root.document.activeElement;
+    if (activeElement) {
+      const focused = matching.find((candidate) => candidate.fields.includes(activeElement));
+      if (focused) return focused;
+    }
+    return matching.find((candidate) => candidate.confidence === "high") || matching[0];
+  }
+
+  function provideSecondFactor(payload) {
+    const session = activeSecondFactor;
+    const flowId = safeString(payload.flowId, 160);
+    const challengeId = safeString(payload.challengeId, 160);
+    let code = String(payload.code == null ? "" : payload.code);
+    try {
+      if (!session || session.flowId !== flowId || !challengeId || session.expiresAt <= Date.now()) {
+        throw new Error("The second-factor journey is no longer active");
+      }
+      if (root.document.visibilityState === "hidden") {
+        throw new Error("The second-factor page is not visible");
+      }
+      if (session.challengeId !== challengeId) {
+        throw new Error("The second-factor challenge does not match this page");
+      }
+      if (!/^\d{6,8}$/.test(code)) throw new Error("The MFA verification code is invalid");
+      const candidates = boundSecondFactorCandidates(session);
+      if (!candidates) throw new Error("The MFA verification fields changed after challenge binding");
+      if (
+        !session.confirmed
+        && (candidates.length !== 1 || candidates[0].confidence !== "high")
+      ) {
+        throw new Error("The MFA verification fields changed and now require confirmation");
+      }
+      const candidate = chooseSecondFactorCandidate(candidates, code.length);
+      if (!candidate) throw new Error("No matching MFA verification field is available");
+      if (candidate.segmented) {
+        candidate.fields.forEach((field, index) => fillInputValue(field, code[index]));
+      } else {
+        fillInputValue(candidate.fields[0], code);
+      }
+      const result = {
+        digits: code.length,
+        filled: true,
+        fields: candidate.fields.length,
+        segmented: candidate.segmented,
+        submitted: false,
+      };
+      clearSecondFactorLocal();
+      removeOverlay();
+      return result;
+    } finally {
+      code = "";
+      if (payload && Object.prototype.hasOwnProperty.call(payload, "code")) payload.code = "";
     }
   }
 
@@ -1049,6 +1437,18 @@
           stopTemplateRecording();
         }
         return { cancelled: true };
+      case "armSecondFactor":
+        return armSecondFactor(payload);
+      case "bindSecondFactor":
+        return bindSecondFactor(payload);
+      case "offerSecondFactor":
+        return offerSecondFactor(payload);
+      case "provideSecondFactor":
+        return provideSecondFactor(payload);
+      case "cancelSecondFactor":
+        clearSecondFactorLocal();
+        removeOverlay();
+        return { cancelled: true };
       default:
         throw new Error(`Unsupported password command: ${String(command)}`);
     }
@@ -1067,11 +1467,19 @@
 
   root.document.addEventListener("visibilitychange", () => {
     if (root.document.visibilityState === "hidden") {
+      if (activeSecondFactor) {
+        activeSecondFactor.candidates = [];
+        activeSecondFactor.challengeId = null;
+        activeSecondFactor.confirmed = false;
+        reportSecondFactorCandidates(true);
+      }
       notifyDocumentClosed();
       for (const candidateId of candidateTimers.keys()) clearCandidate(candidateId);
       activeCapturePrompt = null;
       if (!activeRecording) removeOverlay();
       clearActiveOffer();
+    } else {
+      scheduleSecondFactorScan(0);
     }
   });
   root.addEventListener("pagehide", () => {
@@ -1084,6 +1492,7 @@
     fieldObserver = null;
     if (fieldStateTimer != null) clearTimeout(fieldStateTimer);
     fieldStateTimer = null;
+    clearSecondFactorLocal();
     removeOverlay();
   });
 
@@ -1106,6 +1515,9 @@
         captureAllowedHttpOrigins = new Set(response.insecureOrigins || []);
         startCapture(response);
       }
+      if (response && response.secondFactorArm) {
+        armSecondFactor(response.secondFactorArm);
+      }
     }).catch(() => {});
   }
 
@@ -1113,12 +1525,18 @@
   // example). Keep a secret-free frame capability record current so the
   // background can target the frame that actually owns the fields.
   if (typeof MutationObserver === "function" && root.document.documentElement) {
-    fieldObserver = new MutationObserver(() => scheduleFrameStateAnnouncement(100));
+    fieldObserver = new MutationObserver(() => {
+      scheduleFrameStateAnnouncement(100);
+      scheduleSecondFactorScan(100);
+    });
     fieldObserver.observe(root.document.documentElement, {
       childList: true,
       subtree: true,
       attributes: true,
-      attributeFilter: ["autocomplete", "name", "type", "id", "style", "hidden", "class"],
+      attributeFilter: [
+        "aria-hidden", "aria-label", "autocomplete", "class", "disabled", "hidden", "id",
+        "inputmode", "maxlength", "name", "placeholder", "readonly", "style", "type",
+      ],
     });
   }
 })(typeof globalThis !== "undefined" ? globalThis : this);

@@ -35,6 +35,12 @@ const variants = [
       ["../assets/icons/petaldesk-48.png", "assets/icons/petaldesk-48.png"],
       ["../assets/icons/petaldesk-96.png", "assets/icons/petaldesk-96.png"],
       ["../assets/icons/petaldesk-128.png", "assets/icons/petaldesk-128.png"],
+      ["../assets/icons/lucide/LICENSE", "assets/icons/lucide/LICENSE"],
+      ["../assets/icons/lucide/README.md", "assets/icons/lucide/README.md"],
+      ["../assets/icons/lucide/user-round.svg", "assets/icons/lucide/user-round.svg"],
+      ["../assets/icons/lucide/key-round.svg", "assets/icons/lucide/key-round.svg"],
+      ["../assets/icons/lucide/shield-check.svg", "assets/icons/lucide/shield-check.svg"],
+      ["../assets/icons/lucide/trash-2.svg", "assets/icons/lucide/trash-2.svg"],
     ],
   },
 ];

@@ -392,8 +392,7 @@ fn trim_host_diag_log(path: &Path) -> Result<(), String> {
     if metadata.len() <= HOST_DIAG_MAX_BYTES {
         return Ok(());
     }
-    let bytes =
-        fs::read(path).map_err(|error| format!("读取浏览器宿主诊断日志失败: {error}"))?;
+    let bytes = fs::read(path).map_err(|error| format!("读取浏览器宿主诊断日志失败: {error}"))?;
     let tail = &bytes[bytes
         .len()
         .saturating_sub((HOST_DIAG_MAX_BYTES / 2) as usize)..];
@@ -402,8 +401,7 @@ fn trim_host_diag_log(path: &Path) -> Result<(), String> {
         .position(|byte| *byte == b'\n')
         .map(|index| index + 1)
         .unwrap_or(0);
-    fs::write(path, &tail[start..])
-        .map_err(|error| format!("截断浏览器宿主诊断日志失败: {error}"))
+    fs::write(path, &tail[start..]).map_err(|error| format!("截断浏览器宿主诊断日志失败: {error}"))
 }
 
 #[derive(Clone)]
@@ -656,9 +654,9 @@ fn run_secret_reader(
             }
             SecretFrameIo::Frame(_) => {}
             SecretFrameIo::Stopped => return SecretReaderExit::Stopped,
-            SecretFrameIo::Written
-            | SecretFrameIo::Closed
-            | SecretFrameIo::TimedOut => return SecretReaderExit::PipeClosed,
+            SecretFrameIo::Written | SecretFrameIo::Closed | SecretFrameIo::TimedOut => {
+                return SecretReaderExit::PipeClosed
+            }
         }
     }
 }
@@ -705,9 +703,9 @@ fn run_secret_writer(
         match write_secret_frame_overlapped(raw, &op_event, Some(stop_event), None, &message) {
             SecretFrameIo::Written => {}
             SecretFrameIo::Stopped => return SecretWriterExit::Stopped,
-            SecretFrameIo::Frame(_)
-            | SecretFrameIo::Closed
-            | SecretFrameIo::TimedOut => return SecretWriterExit::PipeClosed,
+            SecretFrameIo::Frame(_) | SecretFrameIo::Closed | SecretFrameIo::TimedOut => {
+                return SecretWriterExit::PipeClosed
+            }
         }
     }
 }
@@ -873,8 +871,8 @@ fn wait_secret_pipe_io(
     timeout: Option<Duration>,
 ) -> SecretPipeIo {
     use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult};
     use windows_sys::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult};
 
     let timeout_ms = timeout.map_or(INFINITE, |timeout| {
         u32::try_from(timeout.as_millis()).unwrap_or(INFINITE - 1)
@@ -1065,11 +1063,7 @@ fn join_finished_secret_worker(thread: &mut Option<JoinHandle<()>>) {
 }
 
 #[cfg(windows)]
-fn join_secret_workers(
-    reader: JoinHandle<()>,
-    writer: JoinHandle<()>,
-    deadline: Instant,
-) -> bool {
+fn join_secret_workers(reader: JoinHandle<()>, writer: JoinHandle<()>, deadline: Instant) -> bool {
     let mut reader = Some(reader);
     let mut writer = Some(writer);
     loop {
@@ -1201,10 +1195,7 @@ fn note_secret_outbound_failure(
         Err(mpsc::TrySendError::Full(_)) => "full",
         Err(mpsc::TrySendError::Disconnected(_)) => "disconnected",
     };
-    log_host_diag(
-        "outbound-send-failed",
-        &format!("{detail} queue={queue}"),
-    );
+    log_host_diag("outbound-send-failed", &format!("{detail} queue={queue}"));
     reconnect_requested.store(true, Ordering::Release);
 }
 
@@ -1697,8 +1688,8 @@ mod tests {
                 FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
             };
             use windows_sys::Win32::System::Pipes::{
-                ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE,
-                PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+                ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_TYPE_BYTE, PIPE_WAIT,
             };
 
             let name = format!(r"\\.\pipe\PetalDesk-password-test-{}", Uuid::new_v4());
@@ -1722,7 +1713,8 @@ mod tests {
             let server_handle = server_handle as usize;
             let connect_thread = std::thread::spawn(move || {
                 let server_handle = server_handle as *mut core::ffi::c_void;
-                let connected = unsafe { ConnectNamedPipe(server_handle, std::ptr::null_mut()) } != 0
+                let connected = unsafe { ConnectNamedPipe(server_handle, std::ptr::null_mut()) }
+                    != 0
                     || unsafe { GetLastError() } == ERROR_PIPE_CONNECTED;
                 assert!(connected, "ConnectNamedPipe failed in test pipe");
                 server_handle as usize
@@ -1786,7 +1778,12 @@ mod tests {
         let reader_stop = stop.clone();
         let reader_stop_event = stop_event.clone();
         let reader_thread = std::thread::spawn(move || {
-            run_secret_reader(&reader_client, &command_tx, &reader_stop, &reader_stop_event)
+            run_secret_reader(
+                &reader_client,
+                &command_tx,
+                &reader_stop,
+                &reader_stop_event,
+            )
         });
         // 让 reader 先挂起在读上（桌面侧保持静默）。
         std::thread::sleep(Duration::from_millis(100));
@@ -1817,8 +1814,12 @@ mod tests {
         let reader_stop_event = stop_event.clone();
         let reader_client = pair.client;
         let reader_thread = std::thread::spawn(move || {
-            let _ =
-                run_secret_reader(&reader_client, &command_tx, &reader_stop, &reader_stop_event);
+            let _ = run_secret_reader(
+                &reader_client,
+                &command_tx,
+                &reader_stop,
+                &reader_stop_event,
+            );
         });
         let other_worker = std::thread::spawn(|| {});
         let stopped = join_secret_workers(
@@ -1885,8 +1886,12 @@ mod tests {
         let reader_stop = stop.clone();
         let reader_stop_event = stop_event.clone();
         let reader_thread = std::thread::spawn(move || {
-            let _ =
-                run_secret_reader(&reader_client, &command_tx, &reader_stop, &reader_stop_event);
+            let _ = run_secret_reader(
+                &reader_client,
+                &command_tx,
+                &reader_stop,
+                &reader_stop_event,
+            );
         });
         let (outbound_tx, outbound_rx) = mpsc::channel::<Value>();
         let writer_stop = stop.clone();
@@ -1942,7 +1947,10 @@ mod tests {
             Instant::now() + SECRET_IO_STOP_TIMEOUT,
         );
         server_thread.join().unwrap();
-        assert!(workers_stopped, "secret workers did not stop after the test");
+        assert!(
+            workers_stopped,
+            "secret workers did not stop after the test"
+        );
     }
 
     #[cfg(windows)]
@@ -1974,8 +1982,7 @@ mod tests {
     #[cfg(windows)]
     impl TestTempDir {
         fn new() -> Self {
-            let path =
-                std::env::temp_dir().join(format!("petaldesk-host-test-{}", Uuid::new_v4()));
+            let path = std::env::temp_dir().join(format!("petaldesk-host-test-{}", Uuid::new_v4()));
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }

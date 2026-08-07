@@ -11,9 +11,24 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    outputs:
+      build_timestamp: ${{ steps.release_metadata.outputs.build_timestamp }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+
+      - name: Record release package timestamp
+        id: release_metadata
+        shell: bash
+        run: echo "build_timestamp=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Node.js for release metadata tests
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Test release package timestamp selection
+        run: node --test scripts/build-macos.test.mjs
 
       - name: Validate release versions
         shell: pwsh
@@ -82,6 +97,7 @@ jobs:
       - name: Build signed Windows installer
         shell: pwsh
         env:
+          PETALDESK_BUILD_TIMESTAMP: ${{ needs.validate.outputs.build_timestamp }}
           PETALDESK_CHROME_EXTENSION_ID: ${{ secrets.PETALDESK_CHROME_EXTENSION_ID }}
           PETALDESK_EDGE_EXTENSION_ID: ${{ secrets.PETALDESK_EDGE_EXTENSION_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -179,6 +195,7 @@ jobs:
       - name: Build Universal macOS DMG
         shell: bash
         env:
+          PETALDESK_BUILD_TIMESTAMP: ${{ needs.validate.outputs.build_timestamp }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}

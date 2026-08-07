@@ -98,6 +98,18 @@
     document.getElementById("site-status").textContent = text;
   }
 
+  async function runBusy(button, action) {
+    const wasDisabled = button.disabled === true;
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    try {
+      return await action();
+    } finally {
+      button.disabled = wasDisabled;
+      button.removeAttribute("aria-busy");
+    }
+  }
+
   async function fillAccount(entryId) {
     try {
       const response = await sendMessage({ type: "petaldesk.popup.fill", entryId });
@@ -105,8 +117,10 @@
         throw new Error(response.error && response.error.message || "填充请求失败");
       }
       setStatus("填充请求已发送，请查看页面。");
+      return true;
     } catch (error) {
       setStatus(errorMessage(error));
+      return false;
     }
   }
 
@@ -116,9 +130,16 @@
       if (response && response.ok === false) {
         throw new Error(response.error && response.error.message || "复制请求失败");
       }
-      setStatus(field === "password" ? "已复制密码。" : "已复制用户名。");
+      const successMessages = {
+        username: "已复制用户名",
+        password: "已复制密码",
+        mfa: "MFA 验证码已复制，过期后自动清除",
+      };
+      setStatus(successMessages[field] || "复制成功");
+      return true;
     } catch (error) {
       setStatus(errorMessage(error));
+      return false;
     }
   }
 
@@ -128,120 +149,182 @@
       if (response && response.ok === false) {
         throw new Error(response.error && response.error.message || "删除请求失败");
       }
+      return true;
     } catch (error) {
       setStatus(errorMessage(error));
+      return false;
+    }
+  }
+
+  let confirmDeleteEntryId = null;
+  let deleteButtons = new Map();
+  let deleteConfirmations = new Map();
+
+  function closeDeleteConfirmation(returnFocus = true) {
+    if (!confirmDeleteEntryId) {
       return;
     }
-    await refresh();
-  }
-
-  let lastTab = {};
-  let menuEntryId = null;
-  let confirmDeleteEntryId = null;
-
-  function rerenderAccounts() {
-    renderSite(lastTab);
-  }
-
-  function renderAccountMenu(account) {
-    const menu = document.createElement("div");
-    menu.className = "account-menu";
-    for (const action of [
-      { field: "username", label: "复制账号" },
-      { field: "password", label: "复制密码" },
-    ]) {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.textContent = action.label;
-      button.addEventListener("click", () => {
-        menuEntryId = null;
-        rerenderAccounts();
-        void copySecret(account.entryId, action.field);
-      });
-      menu.appendChild(button);
+    const entryId = confirmDeleteEntryId;
+    const confirmation = deleteConfirmations.get(entryId);
+    if (confirmation && confirmation.parentElement) {
+      confirmation.parentElement.removeChild(confirmation);
     }
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.className = "danger";
-    remove.textContent = "删除账号";
-    remove.addEventListener("click", () => {
-      menuEntryId = null;
-      confirmDeleteEntryId = account.entryId;
-      rerenderAccounts();
-    });
-    menu.appendChild(remove);
-    return menu;
+    deleteConfirmations.delete(entryId);
+    confirmDeleteEntryId = null;
+    const trigger = deleteButtons.get(entryId);
+    if (trigger) {
+      trigger.setAttribute("aria-expanded", "false");
+      if (returnFocus && typeof trigger.focus === "function") {
+        trigger.focus();
+      }
+    }
+  }
+
+  function icon(name) {
+    const glyph = document.createElement("span");
+    glyph.className = `lucide-icon lucide-${name}`;
+    glyph.setAttribute("aria-hidden", "true");
+    return glyph;
+  }
+
+  function iconButton({ label, iconName, className = "", disabled = false }) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `icon-button ${className}`.trim();
+    button.disabled = disabled;
+    button.setAttribute("aria-label", label);
+    button.setAttribute("title", label);
+    button.appendChild(icon(iconName));
+    return button;
   }
 
   function renderDeleteConfirm(account) {
     const confirm = document.createElement("div");
-    confirm.className = "account-menu confirm";
+    confirm.className = "delete-confirm";
+    confirm.setAttribute("role", "dialog");
+    confirm.setAttribute("aria-label", "确认删除账户");
     const label = document.createElement("span");
     label.className = "confirm-label";
-    label.textContent = "确认删除？";
-    const yes = document.createElement("button");
-    yes.type = "button";
-    yes.className = "danger";
-    yes.textContent = "删除";
-    yes.addEventListener("click", () => {
-      confirmDeleteEntryId = null;
-      rerenderAccounts();
-      void deleteAccount(account.entryId);
+    label.textContent = "确认删除此账户？";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "confirm-cancel";
+    cancel.textContent = "取消";
+    cancel.addEventListener("click", () => {
+      closeDeleteConfirmation(true);
     });
-    const no = document.createElement("button");
-    no.type = "button";
-    no.textContent = "取消";
-    no.addEventListener("click", () => {
-      confirmDeleteEntryId = null;
-      rerenderAccounts();
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "confirm-delete";
+    remove.textContent = "删除";
+    remove.addEventListener("click", () => {
+      void runBusy(remove, async () => {
+        const trigger = deleteButtons.get(account.entryId);
+        cancel.disabled = true;
+        if (trigger) {
+          trigger.disabled = true;
+          trigger.setAttribute("aria-busy", "true");
+        }
+        try {
+          const deleted = await deleteAccount(account.entryId);
+          if (!deleted) return;
+          confirmDeleteEntryId = null;
+          await refresh();
+        } finally {
+          cancel.disabled = false;
+          if (trigger) {
+            trigger.disabled = false;
+            trigger.removeAttribute("aria-busy");
+          }
+        }
+      });
     });
-    confirm.append(label, yes, no);
+    confirm.append(label, cancel, remove);
     return confirm;
   }
 
   function renderAccountItem(account, origin) {
     const item = document.createElement("li");
-    const row = document.createElement("div");
-    row.className = "account-row";
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "account";
+    item.className = "account-card";
+    item.setAttribute("data-entry-id", account.entryId);
+    const fill = document.createElement("button");
+    fill.type = "button";
+    fill.className = "account-main";
+    fill.setAttribute("aria-label", `填充 ${account.siteName || origin} 的账户`);
+    const text = document.createElement("span");
+    text.className = "account-text";
     const site = document.createElement("span");
     site.className = "site";
     site.textContent = account.siteName || origin;
     const username = document.createElement("span");
     username.className = "username";
     username.textContent = account.username || "（未保存用户名）";
-    button.append(site, username);
-    button.addEventListener("click", () => {
-      void fillAccount(account.entryId);
+    text.append(site, username);
+    fill.appendChild(text);
+    fill.addEventListener("click", () => {
+      if (confirmDeleteEntryId) closeDeleteConfirmation(false);
+      void runBusy(fill, () => fillAccount(account.entryId));
     });
-    const trigger = document.createElement("button");
-    trigger.type = "button";
-    trigger.className = "menu-trigger";
-    trigger.textContent = "⋯";
-    trigger.setAttribute("aria-label", "账户操作");
-    trigger.setAttribute("title", "账户操作");
-    trigger.addEventListener("click", () => {
-      menuEntryId = menuEntryId === account.entryId ? null : account.entryId;
-      confirmDeleteEntryId = null;
-      rerenderAccounts();
+
+    const actions = document.createElement("div");
+    actions.className = "account-actions";
+    const usernameCopy = iconButton({ label: "复制用户名", iconName: "user-round" });
+    usernameCopy.addEventListener("click", () => {
+      if (confirmDeleteEntryId) closeDeleteConfirmation(false);
+      void runBusy(usernameCopy, () => copySecret(account.entryId, "username"));
     });
-    row.append(button, trigger);
-    item.appendChild(row);
-    if (confirmDeleteEntryId === account.entryId) {
-      item.appendChild(renderDeleteConfirm(account));
-    } else if (menuEntryId === account.entryId) {
-      item.appendChild(renderAccountMenu(account));
+    const passwordCopy = iconButton({ label: "复制密码", iconName: "key-round" });
+    passwordCopy.addEventListener("click", () => {
+      if (confirmDeleteEntryId) closeDeleteConfirmation(false);
+      void runBusy(passwordCopy, () => copySecret(account.entryId, "password"));
+    });
+    const hasMfa = account.hasMfa === true;
+    const mfaCopy = iconButton({
+      label: hasMfa ? "复制 MFA 验证码" : "未关联 MFA",
+      iconName: "shield-check",
+      disabled: !hasMfa,
+    });
+    if (hasMfa) {
+      mfaCopy.addEventListener("click", () => {
+        if (confirmDeleteEntryId) closeDeleteConfirmation(false);
+        void runBusy(mfaCopy, () => copySecret(account.entryId, "mfa"));
+      });
     }
+    actions.append(usernameCopy, passwordCopy, mfaCopy);
+
+    const remove = iconButton({
+      label: "删除账户",
+      iconName: "trash-2",
+      className: "delete-trigger",
+    });
+    remove.setAttribute("aria-haspopup", "dialog");
+    remove.setAttribute("aria-expanded", "false");
+    remove.addEventListener("click", () => {
+      if (confirmDeleteEntryId === account.entryId) {
+        closeDeleteConfirmation(true);
+        return;
+      }
+      if (confirmDeleteEntryId) closeDeleteConfirmation(false);
+      confirmDeleteEntryId = account.entryId;
+      remove.setAttribute("aria-expanded", "true");
+      const confirmation = renderDeleteConfirm(account);
+      deleteConfirmations.set(account.entryId, confirmation);
+      item.appendChild(confirmation);
+    });
+    deleteButtons.set(account.entryId, remove);
+
+    item.append(fill, actions, remove);
     return item;
   }
 
   function renderSite(tab) {
-    lastTab = tab && typeof tab === "object" ? tab : {};
+    tab = tab && typeof tab === "object" ? tab : {};
     const originElement = document.getElementById("site-origin");
     const accountList = document.getElementById("account-list");
     clearChildren(accountList);
+    confirmDeleteEntryId = null;
+    deleteButtons = new Map();
+    deleteConfirmations = new Map();
     const origin = typeof tab.origin === "string" ? tab.origin : "";
     originElement.textContent = origin || "当前页面不是可填充的网站";
     const accounts = Array.isArray(tab.accounts) ? tab.accounts : [];
@@ -280,6 +363,12 @@
 
   document.getElementById("open-manager").addEventListener("click", () => {
     void sendMessage({ type: "petaldesk.popup.openManager" }).catch(() => {});
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !confirmDeleteEntryId) return;
+    if (typeof event.preventDefault === "function") event.preventDefault();
+    closeDeleteConfirmation(true);
   });
 
   void refresh();

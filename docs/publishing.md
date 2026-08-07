@@ -6,20 +6,20 @@
 
 <https://starsliao.github.io/PetalDesk/>
 
-## 0.6.3 平台范围
+## 0.8.0 平台范围
 
-Windows 10/11 x64 与 macOS 12+ 共享便签、甘特图、计时器、提醒、系统通知、MFA 和普通截图能力。`0.6.0` 在 Windows 新增本地密码保险库，并把经确认的自动填充和登录信息检测整合进 Firefox 长截图扩展；`0.6.1` 修复密码管理器首次启用时对 MFA 全局恢复密码的复用与修改体验；`0.6.2` 修复密码管理器提示层、窗口关闭和锁定交互，取消闲置自动锁定，并在远程桌面会话中阻止打开会被系统隐藏的 MFA 与密码管理器窗口；`0.6.3` 修复 Firefox 原生消息通道断开后造成的飞花卡顿、密码权限误报和扩展按钮无反馈，并为通道握手与重连增加超时保护。Chrome/Edge 的密码能力延期。Windows 继续提供长截图、自动滚动和 Native Messaging Host。macOS 使用 Keychain 提供 MFA 本机免密解锁，并支持普通区域截图，但当前不提供密码管理器、长截图、浏览器联动、Native Messaging 注册或自动更新。
+Windows 10/11 x64 与 macOS 12+ 共享便签、甘特图、计时器、提醒、系统通知、MFA 和普通截图能力。Windows `0.8.0` 的 Firefox 扩展把密码账户与本地 TOTP 关联：密码填入或唯一账户完全匹配后，可自动或经用户确认填入受信任的 6/7/8 位 TOTP 字段，且绝不主动提交表单；工具栏账户卡片可分别复制用户名、密码和 MFA。Chrome/Edge 的密码能力延期。Windows 继续提供密码管理器、长截图、自动滚动和 Native Messaging Host。macOS 使用 Keychain 提供 MFA 本机免密解锁，并支持普通区域截图，但当前不提供密码管理器、长截图、浏览器联动、Native Messaging 注册或自动更新。
 
 macOS Release 是一个 Universal DMG，内部同时包含 `x86_64-apple-darwin` 与 `aarch64-apple-darwin`，所以 Intel 和 Apple Silicon 不需要两个安装包。当前发布资产为：
 
-- `PetalDesk_0.6.3_x64-setup.exe`
-- `PetalDesk_0.6.3_x64-setup.exe.sig`
+- `PetalDesk_0.8.0_x64-setup.exe`
+- `PetalDesk_0.8.0_x64-setup.exe.sig`
 - `latest.json`
-- `PetalDesk_0.6.3_universal.dmg`
-- `PetalDesk_Firefox_AMO-upload_0.6.3.zip`
-- `PetalDesk_Firefox_AMO-source_0.6.3.zip`
+- `PetalDesk_0.8.0_universal.dmg`
+- `PetalDesk_Firefox_AMO-upload_0.8.0.zip`
+- `PetalDesk_Firefox_AMO-source_0.8.0.zip`
 
-Windows `0.5.2` 及后续版本可以通过客户端自动更新到 `0.6.3`，无需先在本机手工打包或安装。macOS 的 `0.5.0` 是首个公开版本，`0.6.3` 可以直接覆盖升级。MFA 保险库继续兼容已有 DPAPI/Keychain 包装；Windows 密码保险库使用独立数据密钥，并与 MFA 协调同一个全局恢复密码。
+Windows `0.5.2` 及后续版本可以通过客户端自动更新到 `0.8.0`，无需先在本机手工打包或安装。macOS 的 `0.5.0` 是首个公开版本，`0.8.0` 可以直接覆盖升级。MFA 保险库继续兼容已有 DPAPI/Keychain 包装；Windows 密码保险库 v1 会透明迁移到保留旧 AAD 的 v2，并在首次成功写入前创建备份。
 
 ## 本地构建
 
@@ -29,7 +29,11 @@ Windows `0.5.2` 及后续版本可以通过客户端自动更新到 `0.6.3`，�
 pnpm package:windows
 ```
 
-安装包输出到 `src-tauri/target/release/bundle/nsis/`。
+安装器脚本会在整个 Tauri/Cargo 构建链开始时设置一次
+`PETALDESK_BUILD_TIMESTAMP`，About 页显示的“打包时间”就是该次打包的 UTC
+时间（前端按本地时区显示）。需要可复现构建时可以预先设置
+`SOURCE_DATE_EPOCH`；脚本会沿用它而不是当前时间。安装包输出到
+`src-tauri/target/release/bundle/nsis/`。
 
 在 macOS 上生成 Universal 应用和 DMG：
 
@@ -39,7 +43,10 @@ pnpm install --frozen-lockfile
 pnpm package:macos
 ```
 
-DMG 输出到 `src-tauri/target/universal-apple-darwin/release/bundle/dmg/`。Universal 目标必须在 macOS 上构建；Windows 主机不能直接产出可发布的 DMG。
+`package:macos` 入口同样会为本次构建注入 `PETALDESK_BUILD_TIMESTAMP`（可用
+`SOURCE_DATE_EPOCH` 覆盖）。DMG 输出到
+`src-tauri/target/universal-apple-darwin/release/bundle/dmg/`。Universal 目标必须在
+macOS 上构建；Windows 主机不能直接产出可发布的 DMG。
 
 ## 没有 Mac 时使用 GitHub Actions
 
@@ -83,7 +90,7 @@ Windows 包始终包含并注册 Firefox Native Messaging Host。构建 Chromium
 - Firefox 扩展安装页：<https://starsliao.github.io/PetalDesk/firefox.html>
 - 浏览器增强隐私政策：<https://starsliao.github.io/PetalDesk/privacy.html>
 
-AMO 公开提交前应先把包含这两个页面的 `main` 分支推送并等待 Pages 部署成功，再创建 `v0.6.3` 标签和提交 AMO，避免审核材料引用尚未上线的页面。
+AMO 公开提交前应先把包含这两个页面的 `main` 分支推送并等待 Pages 部署成功，再创建 `v0.8.0` 标签和提交 AMO，避免审核材料引用尚未上线的页面。
 
 本地生成带版本号的 AMO 上传包：
 
@@ -95,4 +102,4 @@ npm --prefix browser-extension run package:firefox
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.6.3>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.8.0>

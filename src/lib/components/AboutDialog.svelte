@@ -223,7 +223,6 @@
     <div class="version-line">
       <span>当前版本</span>
       <strong>v{displayedVersion}</strong>
-      <span class="platform-badge">Windows</span>
       {#if displayedBuild}
         <time class="build-time" datetime={displayedBuild.iso}>打包时间 {displayedBuild.label}</time>
       {/if}
@@ -466,16 +465,6 @@
   .version-line strong {
     color: var(--app-fg);
     font-size: 13px;
-  }
-
-  .platform-badge {
-    padding: 2px 7px;
-    color: #075a96;
-    font-size: 10.5px;
-    font-weight: 700;
-    background: #e6f3ff;
-    border: 1px solid #bfddf5;
-    border-radius: 999px;
   }
 
   .build-time {

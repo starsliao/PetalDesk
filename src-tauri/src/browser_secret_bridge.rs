@@ -23,6 +23,7 @@ use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+use zeroize::{Zeroize, Zeroizing};
 
 const SECRET_PROTOCOL_VERSION: u32 = 1;
 const MAX_SECRET_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -51,7 +52,10 @@ enum SecretSendError {
     /// 扩展返回了错误应答；连接本身是健康的。
     Answered(String),
     /// 请求发不出去或应答通道断开；按 reason 退休该 generation。
-    Retire { reason: &'static str, message: String },
+    Retire {
+        reason: &'static str,
+        message: String,
+    },
     /// 超时未收到应答；退休前先用 ping 探测连接死活。
     TimedOut(String),
 }
@@ -283,7 +287,12 @@ fn secret_pipe_read(
             &std::io::Error::from_raw_os_error(error as i32),
         );
     }
-    wait_secret_pipe_io(pipe, &overlapped, stop_event, "failed to read browser secret frame")
+    wait_secret_pipe_io(
+        pipe,
+        &overlapped,
+        stop_event,
+        "failed to read browser secret frame",
+    )
 }
 
 /// `secret_pipe_read` 的写方向对应物。
@@ -320,7 +329,12 @@ fn secret_pipe_write(
             &std::io::Error::from_raw_os_error(error as i32),
         );
     }
-    wait_secret_pipe_io(pipe, &overlapped, stop_event, "failed to write browser secret frame")
+    wait_secret_pipe_io(
+        pipe,
+        &overlapped,
+        stop_event,
+        "failed to write browser secret frame",
+    )
 }
 
 /// 同步完成（ReadFile/WriteFile 直接返回 TRUE）或等待完成后取实际字节数。
@@ -350,8 +364,8 @@ fn wait_secret_pipe_io(
     context: &str,
 ) -> SecretPipeIo {
     use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult};
     use windows_sys::Win32::System::Threading::{WaitForMultipleObjects, INFINITE};
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult};
 
     let waited = if let Some(stop_event) = stop_event {
         let handles = [overlapped.hEvent, stop_event.handle()];
@@ -442,11 +456,9 @@ fn read_frame_overlapped(
     }
     let length = u32::from_le_bytes(length) as usize;
     if length == 0 || length > MAX_SECRET_MESSAGE_BYTES {
-        return SecretFrameIo::Failed(format!(
-            "browser secret frame length is invalid: {length}"
-        ));
+        return SecretFrameIo::Failed(format!("browser secret frame length is invalid: {length}"));
     }
-    let mut bytes = vec![0_u8; length];
+    let mut bytes = Zeroizing::new(vec![0_u8; length]);
     match secret_pipe_read_exact(pipe, op_event, stop_event, &mut bytes) {
         SecretPipeIo::Completed(_) => {}
         SecretPipeIo::Ended => return SecretFrameIo::Ended,
@@ -468,7 +480,7 @@ fn write_frame_overlapped(
     value: &Value,
 ) -> SecretFrameIo {
     let bytes = match encode_frame(value) {
-        Ok(bytes) => bytes,
+        Ok(bytes) => Zeroizing::new(bytes),
         Err(error) => return SecretFrameIo::Failed(error),
     };
     match secret_pipe_write_all(pipe, op_event, stop_event, &bytes) {
@@ -749,15 +761,19 @@ impl BrowserSecretBridge {
         }
         if let Err(error) = connection.sender.try_send(request) {
             lock_unpoisoned(&self.inner.pending).remove(request_id);
-            let (reason, message) = match error {
-                mpsc::TrySendError::Full(_) => {
-                    ("request-queue-full", "password browser connection is busy")
-                }
-                mpsc::TrySendError::Disconnected(_) => (
+            let (reason, message, mut rejected) = match error {
+                mpsc::TrySendError::Full(value) => (
+                    "request-queue-full",
+                    "password browser connection is busy",
+                    value,
+                ),
+                mpsc::TrySendError::Disconnected(value) => (
                     "request-queue-disconnected",
                     "password browser connection closed",
+                    value,
                 ),
             };
+            zeroize_json_value(&mut rejected);
             record_diag(
                 &self.inner,
                 "request",
@@ -814,7 +830,12 @@ impl BrowserSecretBridge {
     }
 
     /// 给编排层（password_browser）记录业务事件到诊断环。禁止写入秘密。
-    pub(crate) fn record_event(&self, layer: &'static str, event: &'static str, detail: impl Into<String>) {
+    pub(crate) fn record_event(
+        &self,
+        layer: &'static str,
+        event: &'static str,
+        detail: impl Into<String>,
+    ) {
         record_diag(&self.inner, layer, event, detail);
     }
 
@@ -917,7 +938,12 @@ fn request_detail(command: &str, request_id: &str) -> String {
     format!("command={command} requestId={short_id}")
 }
 
-fn record_diag(inner: &SecretInner, layer: &'static str, event: &'static str, detail: impl Into<String>) {
+fn record_diag(
+    inner: &SecretInner,
+    layer: &'static str,
+    event: &'static str,
+    detail: impl Into<String>,
+) {
     let mut diag = lock_unpoisoned(&inner.diag);
     while diag.len() >= DIAG_CAPACITY {
         diag.pop_front();
@@ -980,7 +1006,7 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Value>, String> {
     if length == 0 || length > MAX_SECRET_MESSAGE_BYTES {
         return Err(format!("browser secret frame length is invalid: {length}"));
     }
-    let mut bytes = vec![0_u8; length];
+    let mut bytes = Zeroizing::new(vec![0_u8; length]);
     reader
         .read_exact(&mut bytes)
         .map_err(|error| format!("failed to read browser secret frame: {error}"))?;
@@ -1004,11 +1030,20 @@ fn encode_frame(value: &Value) -> Result<Vec<u8>, String> {
     Ok(frame)
 }
 
+fn zeroize_json_value(value: &mut Value) {
+    match value {
+        Value::String(text) => text.zeroize(),
+        Value::Array(values) => values.iter_mut().for_each(zeroize_json_value),
+        Value::Object(values) => values.values_mut().for_each(zeroize_json_value),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
 /// 同步帧写入（含 flush），语义不变；保留给非 Windows 路径与测试使用。
 /// Windows 生产写入路径是 `write_frame_overlapped`（管道写完即可见，无 flush）。
 #[cfg(any(not(windows), test))]
 fn write_frame<W: Write>(writer: &mut W, value: &Value) -> Result<(), String> {
-    let frame = encode_frame(value)?;
+    let frame = Zeroizing::new(encode_frame(value)?);
     writer
         .write_all(&frame)
         .and_then(|_| writer.flush())
@@ -1020,7 +1055,15 @@ fn write_frame<W: Write>(writer: &mut W, value: &Value) -> Result<(), String> {
 fn establish_secret_connection(
     pipe: &mut std::fs::File,
     inner: &SecretInner,
-) -> Result<(String, BrowserFamily, std::fs::File, Arc<SecretConnectionControl>), String> {
+) -> Result<
+    (
+        String,
+        BrowserFamily,
+        std::fs::File,
+        Arc<SecretConnectionControl>,
+    ),
+    String,
+> {
     // Windows 的管道句柄带 FILE_FLAG_OVERLAPPED，握手读写也必须走重叠结构；
     // 握手阶段尚无 stop 事件，等待语义与原先的同步阻塞一致（对端静默则一直等，
     // 对端断开则报错退出）。
@@ -1288,15 +1331,18 @@ fn run_connection_writer<W: SecretFrameWriter>(
     control: Arc<SecretConnectionControl>,
 ) {
     while !control.is_retired() {
-        let message = match outbound_rx.recv_timeout(CONNECTION_STOP_POLL_INTERVAL) {
+        let mut message = match outbound_rx.recv_timeout(CONNECTION_STOP_POLL_INTERVAL) {
             Ok(message) => message,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if control.is_retired() {
+            zeroize_json_value(&mut message);
             break;
         }
-        if writer.write_frame(&message).is_err() {
+        let write_failed = writer.write_frame(&message).is_err();
+        zeroize_json_value(&mut message);
+        if write_failed {
             close_connection_generation(
                 &inner,
                 &connection_id,
@@ -1307,6 +1353,9 @@ fn run_connection_writer<W: SecretFrameWriter>(
             );
             break;
         }
+    }
+    while let Ok(mut queued) = outbound_rx.try_recv() {
+        zeroize_json_value(&mut queued);
     }
 }
 
@@ -1505,12 +1554,12 @@ fn create_and_connect_pipe(pipe_name: &str) -> Result<std::fs::File, String> {
         GetLastError, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
-    use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
         PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
     use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
     let name = std::ffi::OsStr::new(pipe_name)
         .encode_wide()
@@ -1693,6 +1742,24 @@ impl Drop for CurrentUserSecurity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_json_cleanup_recursively_wipes_strings() {
+        let mut value = serde_json::json!({
+            "command": "password.provideSecondFactor",
+            "payload": {
+                "code": "123456",
+                "nested": ["username", { "password": "secret" }],
+            },
+        });
+
+        zeroize_json_value(&mut value);
+
+        assert_eq!(value["command"], "");
+        assert_eq!(value["payload"]["code"], "");
+        assert_eq!(value["payload"]["nested"][0], "");
+        assert_eq!(value["payload"]["nested"][1]["password"], "");
+    }
 
     fn test_inner() -> Arc<SecretInner> {
         Arc::new(SecretInner {
@@ -1911,10 +1978,9 @@ mod tests {
         let diag = bridge.diag_snapshot(DIAG_CAPACITY);
         assert!(diag.iter().any(|entry| entry.event == "timeout"));
         assert!(diag.iter().any(|entry| entry.event == "probe-failed"));
-        assert!(diag
-            .iter()
-            .any(|entry| entry.event == "retired"
-                && entry.detail.contains("reason=request-timeout")));
+        assert!(diag.iter().any(
+            |entry| entry.event == "retired" && entry.detail.contains("reason=request-timeout")
+        ));
     }
 
     #[test]
@@ -1953,10 +2019,7 @@ mod tests {
             )
             .unwrap_err();
 
-        assert_eq!(
-            error,
-            "password browser request timed out after 50 ms"
-        );
+        assert_eq!(error, "password browser request timed out after 50 ms");
         // ping 应答正常：连接保留，不退休 generation，也不产生关闭事件。
         assert!(!control.is_retired());
         assert!(lock_unpoisoned(&inner.connections).contains_key("probe-alive"));
@@ -2000,9 +2063,9 @@ mod tests {
         assert_eq!(limited.len(), 5);
         assert_eq!(limited[0].detail, format!("entry-{}", DIAG_CAPACITY + 20));
         assert_eq!(limited[4].detail, format!("entry-{}", DIAG_CAPACITY + 24));
-        assert!(limited.iter().all(|entry| entry.layer == "test"
-            && entry.event == "fill"
-            && entry.at_unix_ms > 0));
+        assert!(limited
+            .iter()
+            .all(|entry| entry.layer == "test" && entry.event == "fill" && entry.at_unix_ms > 0));
     }
 
     #[test]

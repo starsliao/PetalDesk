@@ -1,6 +1,6 @@
 {
   "name": "petaldesk",
-  "version": "0.7.4",
+  "version": "0.8.0",
   "description": "飞花 - PetalDesk: local Markdown notes and desktop tools",
   "type": "module",
   "scripts": {
@@ -10,9 +10,10 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "test": "vitest run",
+    "test:build-metadata": "node --test scripts/build-macos.test.mjs",
     "test:watch": "vitest",
     "package:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\build-windows-installer.ps1",
-    "package:macos": "tauri build --target universal-apple-darwin --bundles app,dmg",
+    "package:macos": "node scripts/build-macos.mjs",
     "tauri": "tauri"
   },
   "license": "MIT",

@@ -4,11 +4,18 @@
 
 body {
   margin: 0;
-  min-width: 300px;
-  max-width: 340px;
+  width: 360px;
+  min-width: 360px;
+  max-width: 360px;
   font: 13px/1.5 system-ui, sans-serif;
   color: #17202a;
   background: #f7f9fb;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
 }
 
 .popup {
@@ -67,10 +74,12 @@ h2 {
 .status {
   color: #566573;
   margin: 0 0 8px;
+  overflow-wrap: anywhere;
 }
 
-.accounts li {
-  margin-bottom: 6px;
+.accounts {
+  display: grid;
+  gap: 8px;
 }
 
 button {
@@ -83,6 +92,16 @@ button {
   padding: 7px 10px;
 }
 
+button:focus-visible {
+  outline: 2px solid #1769aa;
+  outline-offset: 2px;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.42;
+}
+
 button.primary {
   background: #1769aa;
   border-color: #1769aa;
@@ -91,67 +110,187 @@ button.primary {
   margin-top: 12px;
 }
 
-button.account {
+.account-card {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 106px;
+  grid-template-rows: 34px 40px;
+  min-height: 74px;
+  width: 100%;
+  border: 1px solid #c6d0d9;
+  border-radius: 6px;
+  background: #fff;
+}
+
+button.account-main {
+  grid-column: 1;
+  grid-row: 1 / 3;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 2px;
+  justify-content: center;
+  min-width: 0;
   width: 100%;
+  height: 100%;
+  border: 0;
+  border-radius: 5px 0 0 5px;
+  background: transparent;
+  padding: 10px;
   text-align: left;
 }
 
-button.account:hover,
+button.account-main:hover {
+  background: #edf4fa;
+}
+
 button.primary:hover {
   filter: brightness(0.96);
 }
 
-button.account .site {
-  font-weight: 600;
-  overflow-wrap: anywhere;
+.account-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  max-width: 100%;
 }
 
-button.account .username {
+button.account-main .site,
+button.account-main .username {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+button.account-main .site {
+  font-weight: 600;
+}
+
+button.account-main .username {
   color: #566573;
   font-weight: 400;
-  overflow-wrap: anywhere;
 }
 
-.account-row {
-  display: flex;
-  align-items: stretch;
+.account-actions {
+  grid-column: 2;
+  grid-row: 2;
+  display: grid;
+  grid-template-columns: repeat(3, 30px);
+  gap: 4px;
+  align-self: end;
+  justify-self: end;
+  padding: 0 7px 7px 0;
+}
+
+button.icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  min-width: 30px;
+  padding: 0;
+  color: #465765;
+  background: #fff;
+  border-color: #b7c2cc;
+}
+
+button.icon-button:hover:not(:disabled) {
+  color: #1769aa;
+  background: #edf4fa;
+  border-color: #7f9eb8;
+}
+
+.lucide-icon {
+  display: block;
+  width: 17px;
+  height: 17px;
+  background: currentColor;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+}
+
+.lucide-user-round {
+  -webkit-mask-image: url("../assets/icons/lucide/user-round.svg");
+  mask-image: url("../assets/icons/lucide/user-round.svg");
+}
+
+.lucide-key-round {
+  -webkit-mask-image: url("../assets/icons/lucide/key-round.svg");
+  mask-image: url("../assets/icons/lucide/key-round.svg");
+}
+
+.lucide-shield-check {
+  -webkit-mask-image: url("../assets/icons/lucide/shield-check.svg");
+  mask-image: url("../assets/icons/lucide/shield-check.svg");
+}
+
+.lucide-trash-2 {
+  -webkit-mask-image: url("../assets/icons/lucide/trash-2.svg");
+  mask-image: url("../assets/icons/lucide/trash-2.svg");
+}
+
+button.delete-trigger {
+  grid-column: 2;
+  grid-row: 1;
+  align-self: start;
+  justify-self: end;
+  margin: 4px 7px 0 0;
+  color: #657481;
+  background: transparent;
+  border-color: transparent;
+}
+
+button.delete-trigger:hover:not(:disabled),
+button.delete-trigger:focus-visible {
+  color: #b00020;
+  background: #fff0f2;
+  border-color: #e4a4af;
+}
+
+.delete-confirm {
+  position: absolute;
+  z-index: 10;
+  top: 36px;
+  right: 7px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
   gap: 6px;
+  width: 166px;
+  padding: 8px;
+  border: 1px solid #c6d0d9;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 5px 14px rgb(23 32 42 / 18%);
 }
 
-.account-row button.account {
-  flex: 1 1 auto;
+.delete-confirm .confirm-label {
+  grid-column: 1 / 3;
+  color: #465765;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.delete-confirm button {
   min-width: 0;
-  width: auto;
-}
-
-button.menu-trigger {
-  flex: none;
-  padding: 7px 8px;
-}
-
-.account-menu {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 6px;
-}
-
-.account-menu button {
   padding: 5px 8px;
 }
 
-.account-menu .confirm-label {
-  color: #566573;
+.delete-confirm button.confirm-delete {
+  color: #b00020;
+  border-color: #b00020;
 }
 
-button.danger {
-  border-color: #b00020;
-  color: #b00020;
+.delete-confirm button.confirm-delete:hover:not(:disabled) {
+  color: #fff;
+  background: #b00020;
 }
 
 .version {

@@ -14,7 +14,7 @@ function eventTarget() {
   };
 }
 
-function loadBridge() {
+function loadBridge({ longTimerDelayMs = null } = {}) {
   const events = [];
   const runtimeMessages = eventTarget();
   const tabActivations = eventTarget();
@@ -26,9 +26,24 @@ function loadBridge() {
   const actionUpdates = {
     badgeTexts: [],
   };
+  const timeoutDelays = [];
+  const nativeSetTimeout = setTimeout;
+  function bridgeSetTimeout(callback, delay, ...args) {
+    timeoutDelays.push(delay);
+    const effectiveDelay = longTimerDelayMs != null && delay >= 8_000
+      ? longTimerDelayMs
+      : delay;
+    const handle = nativeSetTimeout(callback, effectiveDelay, ...args);
+    // Production deliberately unrefs long request timers. Keep shortened
+    // timers referenced in this harness so an expiry test can await them.
+    if (effectiveDelay !== delay && handle && typeof handle.unref === "function") {
+      handle.unref = () => handle;
+    }
+    return handle;
+  }
   const api = {
     browserFamily: "firefox",
-    extensionVersion: "0.7.4",
+    extensionVersion: "0.8.0",
     action: {
       async setBadgeText(value) {
         actionUpdates.badgeTexts.push(JSON.parse(JSON.stringify(value)));
@@ -56,7 +71,13 @@ function loadBridge() {
     async queryAllTabs() {
       return Array.from(tabs.values());
     },
-    runtime: { id: "petaldesk-capture@petaldesk.app", onMessage: runtimeMessages },
+    runtime: {
+      id: "petaldesk-capture@petaldesk.app",
+      getURL(relativePath) {
+        return `moz-extension://petaldesk-test/${relativePath}`;
+      },
+      onMessage: runtimeMessages,
+    },
     async sendTabMessage(tabId, message, options) {
       tabMessages.push({ tabId, message: JSON.parse(JSON.stringify(message)), options });
       const tab = tabs.get(tabId);
@@ -72,11 +93,24 @@ function loadBridge() {
       if (message.command === "fillSecret") {
         assert.equal(message.payload.password, "secret-password");
       }
+      if (message.command === "provideSecondFactor") {
+        assert.match(message.payload.code, /^\d{6,8}$/);
+      }
       return {
         ok: true,
         result: message.command === "fillSecret"
           ? { filledUsername: true, filledPassword: true, needsNextStep: false, submitted: false }
-          : { state: message.command },
+          : message.command === "bindSecondFactor"
+            ? { bound: true }
+          : message.command === "provideSecondFactor"
+            ? {
+              digits: message.payload.code.length,
+              fields: 1,
+              filled: true,
+              segmented: false,
+              submitted: false,
+            }
+            : { state: message.command },
       };
     },
   };
@@ -85,7 +119,7 @@ function loadBridge() {
     clearTimeout,
     console,
     crypto: { randomUUID: () => "test-id" },
-    setTimeout,
+    setTimeout: bridgeSetTimeout,
   };
   context.globalThis = context;
   vm.createContext(context);
@@ -112,7 +146,10 @@ function loadBridge() {
     }
     return result;
   }
-  async function sendPopup(message, sender = { id: api.runtime.id }) {
+  async function sendPopup(message, sender = {
+    id: api.runtime.id,
+    url: api.runtime.getURL("popup/popup.html"),
+  }) {
     return new Promise((resolve) => {
       runtimeMessages.listeners[0](message, sender, resolve);
     });
@@ -131,6 +168,7 @@ function loadBridge() {
     tabMessages,
     tabRemovals,
     tabs,
+    timeoutDelays,
   };
 }
 
@@ -146,6 +184,729 @@ test("the consent probe is a no-op now that authentication access is granted at 
   assert.equal(status.consentArmed, false);
   assert.equal(status.consentActionRequired, null);
   assert.equal(status.captureEnabled, false);
+});
+
+test("second-factor capability arms a bound journey and auto-fills one trusted field", async () => {
+  const harness = loadBridge();
+  assert.equal(harness.bridge.capabilities.includes("second-factor-fill-v1"), true);
+  for (const command of [
+    "password.armSecondFactor",
+    "password.offerSecondFactor",
+    "password.provideSecondFactor",
+    "password.cancelSecondFactor",
+    "password.confirmMfaCopy",
+    "password.copyMfaResult",
+    "password.deleteResult",
+  ]) {
+    assert.equal(harness.bridge.supportsCommand(command), true, `${command} must be advertised`);
+  }
+  harness.tabs.set(120, { id: 120, url: "https://example.test/login" });
+  const expiry = Date.now() + 5 * 60_000;
+  const armed = await harness.bridge.route({
+    command: "password.armSecondFactor",
+    payload: {
+      allowedOrigins: ["https://example.test"],
+      expiresAt: expiry,
+      flowId: "flow-auto",
+      tabId: 120,
+      topOrigin: "https://example.test",
+    },
+  });
+  assert.equal(armed.armed, true);
+  assert.equal(harness.tabMessages.at(-1).message.command, "armSecondFactor");
+  assert.deepEqual(
+    Object.keys(harness.tabMessages.at(-1).message.payload).sort(),
+    ["expiresAt", "flowId"],
+  );
+
+  const sender = {
+    documentId: "otp-document-auto",
+    frameId: 0,
+    tab: { id: 120, url: "https://example.test/challenge" },
+    url: "https://example.test/challenge",
+  };
+  await harness.sendContent({
+    type: "petaldesk.password.second-factor-candidates",
+    confidence: "high",
+    count: 1,
+    digits: 6,
+  }, sender);
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  const offer = harness.events.find((event) => event.event === "secondFactorOffer");
+  assert.ok(offer);
+  assert.deepEqual(Object.keys(offer.payload).sort(), [
+    "challengeId", "confidence", "count", "digits", "documentId", "flowId",
+    "frameId", "frameOrigin", "tabId", "topOrigin",
+  ]);
+  assert.equal(offer.payload.topOrigin, "https://example.test");
+  assert.equal(offer.payload.frameOrigin, "https://example.test");
+
+  for (const forgedBinding of [
+    { documentId: "forged-document" },
+    { frameId: 9 },
+    { tabId: 999 },
+  ]) {
+    const forged = {
+      ...offer.payload,
+      code: "123456",
+      ...forgedBinding,
+    };
+    await assert.rejects(
+      harness.bridge.route({ command: "password.provideSecondFactor", payload: forged }),
+      /binding|target/i,
+    );
+    assert.equal(forged.code, "");
+  }
+
+  const secretPayload = {
+    challengeId: offer.payload.challengeId,
+    code: "123456",
+    documentId: "otp-document-auto",
+    flowId: "flow-auto",
+    frameId: 0,
+    tabId: 120,
+    topOrigin: "https://example.test",
+  };
+  const filled = await harness.bridge.route({
+    command: "password.provideSecondFactor",
+    payload: secretPayload,
+  });
+  assert.equal(filled.filled, true);
+  assert.equal(filled.submitted, false);
+  assert.equal(secretPayload.code, "");
+  const result = harness.events.find((event) => event.event === "secondFactorResult");
+  assert.equal(result.payload.status, "filled");
+  assert.equal(result.payload.submitted, false);
+  assert.equal(JSON.stringify(result).includes("123456"), false);
+  assert.equal(
+    (await harness.bridge.route({ command: "password.getStatus", payload: {} })).pendingSecondFactorSessions,
+    0,
+  );
+});
+
+test("ambiguous second-factor fields require the bound one-click confirmation", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(121, { id: 121, url: "https://example.test/login" });
+  await harness.bridge.route({
+    command: "password.armSecondFactor",
+    payload: {
+      allowedOrigins: [],
+      expiresAt: Date.now() + 60_000,
+      flowId: "flow-prompt",
+      tabId: 121,
+      topOrigin: "https://example.test",
+    },
+  });
+  const sender = {
+    documentId: "otp-document-prompt",
+    frameId: 0,
+    tab: { id: 121, url: "https://example.test/login" },
+    url: "https://example.test/login",
+  };
+  await harness.sendContent({
+    type: "petaldesk.password.second-factor-candidates",
+    confidence: "low",
+    count: 2,
+    digits: 6,
+  }, sender);
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  const binding = harness.events.find((event) => event.event === "secondFactorOffer").payload;
+  const provide = {
+    challengeId: binding.challengeId,
+    code: "234567",
+    documentId: binding.documentId,
+    flowId: binding.flowId,
+    frameId: binding.frameId,
+    tabId: binding.tabId,
+    topOrigin: binding.topOrigin,
+  };
+  await assert.rejects(
+    harness.bridge.route({ command: "password.provideSecondFactor", payload: provide }),
+    /confirmation/i,
+  );
+  assert.equal(provide.code, "");
+  const offered = await harness.bridge.route({
+    command: "password.offerSecondFactor",
+    payload: { ...binding, requiresOriginConfirmation: false },
+  });
+  assert.equal(offered.offered, true);
+  assert.equal(harness.tabMessages.at(-1).message.command, "offerSecondFactor");
+  await harness.sendContent({
+    type: "petaldesk.password.second-factor-confirm",
+    challengeId: binding.challengeId,
+    flowId: binding.flowId,
+    originConfirmed: false,
+  }, sender);
+  assert.equal(harness.events.at(-1).event, "secondFactorConfirm");
+  const confirmedSecret = { ...provide, code: "234567" };
+  const filled = await harness.bridge.route({
+    command: "password.provideSecondFactor",
+    payload: confirmedSecret,
+  });
+  assert.equal(filled.filled, true);
+  assert.equal(confirmedSecret.code, "");
+});
+
+test("a first-time cross-origin MFA page requires exact-origin confirmation", async () => {
+  const harness = loadBridge();
+  // The site may navigate before the desktop's arm command reaches Firefox.
+  // The original login origin remains the trust anchor, while the live HTTPS
+  // origin must enter the explicit first-time confirmation flow.
+  harness.tabs.set(122, { id: 122, url: "https://mfa.partner.test/challenge" });
+  await harness.bridge.route({
+    command: "password.armSecondFactor",
+    payload: {
+      allowedOrigins: [],
+      expiresAt: Date.now() + 60_000,
+      flowId: "flow-cross",
+      tabId: 122,
+      topOrigin: "https://example.test",
+    },
+  });
+  const sender = {
+    documentId: "otp-document-cross",
+    frameId: 0,
+    tab: { id: 122, url: "https://mfa.partner.test/challenge" },
+    url: "https://mfa.partner.test/challenge",
+  };
+  const ready = await harness.sendContent(
+    { type: "petaldesk.password.tab-ready", origin: "https://mfa.partner.test" },
+    sender,
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(ready.secondFactorArm)),
+    { expiresAt: ready.secondFactorArm.expiresAt, flowId: "flow-cross" },
+  );
+  await harness.sendContent({
+    type: "petaldesk.password.second-factor-candidates",
+    confidence: "high",
+    count: 1,
+    digits: 6,
+  }, sender);
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  const binding = harness.events.find((event) => event.event === "secondFactorOffer").payload;
+  await assert.rejects(
+    harness.bridge.route({
+      command: "password.offerSecondFactor",
+      payload: { ...binding, requiresOriginConfirmation: false },
+    }),
+    /exact cross-origin|confirmation/i,
+  );
+  await harness.bridge.route({
+    command: "password.offerSecondFactor",
+    payload: { ...binding, requiresOriginConfirmation: true },
+  });
+  const denied = await harness.sendContent({
+    type: "petaldesk.password.second-factor-confirm",
+    challengeId: binding.challengeId,
+    flowId: binding.flowId,
+    originConfirmed: false,
+  }, sender).then(() => null, (error) => error);
+  assert.match(String(denied && denied.message), /confirm/i);
+  await harness.sendContent({
+    type: "petaldesk.password.second-factor-confirm",
+    challengeId: binding.challengeId,
+    flowId: binding.flowId,
+    originConfirmed: true,
+  }, sender);
+  assert.equal(harness.events.at(-1).payload.originConfirmed, true);
+  assert.equal(harness.events.at(-1).payload.topOrigin, "https://mfa.partner.test");
+});
+
+test("cross-origin OTP iframes and forged candidate metadata are rejected", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(123, { id: 123, url: "https://example.test/login" });
+  await harness.bridge.route({
+    command: "password.armSecondFactor",
+    payload: {
+      allowedOrigins: [],
+      expiresAt: Date.now() + 60_000,
+      flowId: "flow-iframe",
+      tabId: 123,
+      topOrigin: "https://example.test",
+    },
+  });
+  const iframeSender = {
+    documentId: "evil-otp-document",
+    frameId: 4,
+    tab: { id: 123, url: "https://example.test/login" },
+    url: "https://evil.test/otp",
+  };
+  await assert.rejects(
+    harness.sendContent({
+      type: "petaldesk.password.second-factor-candidates",
+      confidence: "high",
+      count: 1,
+      digits: 6,
+    }, iframeSender),
+    /cross-origin/i,
+  );
+  const topSender = {
+    documentId: "otp-document-safe",
+    frameId: 0,
+    tab: { id: 123, url: "https://example.test/login" },
+    url: "https://example.test/login",
+  };
+  await assert.rejects(
+    harness.sendContent({
+      type: "petaldesk.password.second-factor-candidates",
+      confidence: "high",
+      count: 1,
+      digits: 6,
+      value: "must-not-cross",
+    }, topSender),
+    /field-shape metadata/i,
+  );
+  assert.equal(harness.events.some((event) => event.event === "secondFactorOffer"), false);
+});
+
+test("a same-origin OTP iframe remains bound to its frame and document", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(125, { id: 125, url: "https://example.test/login" });
+  await harness.bridge.route({
+    command: "password.armSecondFactor",
+    payload: {
+      allowedOrigins: [],
+      expiresAt: Date.now() + 60_000,
+      flowId: "flow-same-origin-frame",
+      tabId: 125,
+      topOrigin: "https://example.test",
+    },
+  });
+  const sender = {
+    documentId: "same-origin-frame-document",
+    frameId: 3,
+    tab: { id: 125, url: "https://example.test/login" },
+    url: "https://example.test/embedded-mfa",
+  };
+  await harness.sendContent({
+    type: "petaldesk.password.second-factor-candidates",
+    confidence: "high",
+    count: 1,
+    digits: 6,
+  }, sender);
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  const binding = harness.events.find((event) => event.event === "secondFactorOffer").payload;
+  assert.equal(binding.frameId, 3);
+  assert.equal(binding.documentId, "same-origin-frame-document");
+  const filled = await harness.bridge.route({
+    command: "password.provideSecondFactor",
+    payload: { ...binding, code: "456789" },
+  });
+  assert.equal(filled.filled, true);
+  const delivery = harness.tabMessages.find(
+    ({ message }) => message.command === "provideSecondFactor",
+  );
+  assert.equal(delivery.options.frameId, 3);
+  assert.equal(delivery.options.documentId, "same-origin-frame-document");
+});
+
+test("mixed-length same-origin frame reports bind digits to the selected frame", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(128, { id: 128, url: "https://example.test/login" });
+  await harness.bridge.route({
+    command: "password.armSecondFactor",
+    payload: {
+      allowedOrigins: [],
+      expiresAt: Date.now() + 60_000,
+      flowId: "flow-mixed-frame-digits",
+      tabId: 128,
+      topOrigin: "https://example.test",
+    },
+  });
+  const topSender = {
+    documentId: "mixed-top-document",
+    frameId: 0,
+    tab: { id: 128, url: "https://example.test/login" },
+    url: "https://example.test/login",
+  };
+  const iframeSender = {
+    documentId: "mixed-iframe-document",
+    frameId: 3,
+    tab: { id: 128, url: "https://example.test/login" },
+    url: "https://example.test/embedded-mfa",
+  };
+  await harness.sendContent({
+    type: "petaldesk.password.second-factor-candidates",
+    confidence: "low",
+    count: 1,
+    digits: 6,
+  }, topSender);
+  await harness.sendContent({
+    type: "petaldesk.password.second-factor-candidates",
+    confidence: "high",
+    count: 1,
+    digits: 8,
+  }, iframeSender);
+  await new Promise((resolve) => setTimeout(resolve, 70));
+
+  const binding = harness.events.find((event) => event.event === "secondFactorOffer").payload;
+  assert.deepEqual(
+    {
+      confidence: binding.confidence,
+      count: binding.count,
+      digits: binding.digits,
+      documentId: binding.documentId,
+      frameId: binding.frameId,
+    },
+    {
+      confidence: "low",
+      count: 2,
+      digits: 8,
+      documentId: "mixed-iframe-document",
+      frameId: 3,
+    },
+  );
+  const bound = harness.tabMessages.find(({ message }) => message.command === "bindSecondFactor");
+  assert.equal(bound.options.documentId, "mixed-iframe-document");
+  assert.equal(bound.options.frameId, 3);
+
+  await harness.bridge.route({
+    command: "password.offerSecondFactor",
+    payload: { ...binding, requiresOriginConfirmation: false },
+  });
+  await harness.sendContent({
+    type: "petaldesk.password.second-factor-confirm",
+    challengeId: binding.challengeId,
+    flowId: binding.flowId,
+    originConfirmed: false,
+  }, iframeSender);
+  const filled = await harness.bridge.route({
+    command: "password.provideSecondFactor",
+    payload: { ...binding, code: "12345678" },
+  });
+  assert.equal(filled.filled, true);
+  const delivery = harness.tabMessages.find(
+    ({ message }) => message.command === "provideSecondFactor",
+  );
+  assert.equal(delivery.options.documentId, "mixed-iframe-document");
+  assert.equal(delivery.options.frameId, 3);
+});
+
+test("a failed second-factor delivery re-arms the document without ending the journey", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(129, { id: 129, url: "https://example.test/login" });
+  const sendTabMessage = harness.api.sendTabMessage.bind(harness.api);
+  let failNextDelivery = true;
+  harness.api.sendTabMessage = async (...args) => {
+    const response = await sendTabMessage(...args);
+    if (args[1] && args[1].command === "provideSecondFactor" && failNextDelivery) {
+      failNextDelivery = false;
+      return { ok: false, error: { message: "The OTP field changed" } };
+    }
+    return response;
+  };
+  await harness.bridge.route({
+    command: "password.armSecondFactor",
+    payload: {
+      allowedOrigins: [],
+      expiresAt: Date.now() + 60_000,
+      flowId: "flow-delivery-retry",
+      tabId: 129,
+      topOrigin: "https://example.test",
+    },
+  });
+  const sender = {
+    documentId: "retry-document",
+    frameId: 0,
+    tab: { id: 129, url: "https://example.test/login" },
+    url: "https://example.test/login",
+  };
+  const report = () => harness.sendContent({
+    type: "petaldesk.password.second-factor-candidates",
+    confidence: "high",
+    count: 1,
+    digits: 6,
+  }, sender);
+  await report();
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  const firstBinding = harness.events.find(
+    (event) => event.event === "secondFactorOffer",
+  ).payload;
+  const firstSecret = { ...firstBinding, code: "123456" };
+  await assert.rejects(
+    harness.bridge.route({ command: "password.provideSecondFactor", payload: firstSecret }),
+    /field changed/i,
+  );
+  assert.equal(firstSecret.code, "");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    (await harness.bridge.route({ command: "password.getStatus", payload: {} })).pendingSecondFactorSessions,
+    1,
+  );
+  const recoveryCommands = harness.tabMessages
+    .slice(-2)
+    .map(({ message }) => message.command);
+  assert.deepEqual(recoveryCommands, ["cancelSecondFactor", "armSecondFactor"]);
+
+  await report();
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  const offers = harness.events.filter((event) => event.event === "secondFactorOffer");
+  assert.equal(offers.length, 2);
+  const secondBinding = offers.at(-1).payload;
+  const filled = await harness.bridge.route({
+    command: "password.provideSecondFactor",
+    payload: { ...secondBinding, code: "654321" },
+  });
+  assert.equal(filled.filled, true);
+  assert.equal(
+    (await harness.bridge.route({ command: "password.getStatus", payload: {} })).pendingSecondFactorSessions,
+    0,
+  );
+});
+
+test("desktop challenge cancellation preserves and re-arms the second-factor journey", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(130, { id: 130, url: "https://example.test/login" });
+  await harness.bridge.route({
+    command: "password.armSecondFactor",
+    payload: {
+      allowedOrigins: [],
+      expiresAt: Date.now() + 60_000,
+      flowId: "flow-generation-retry",
+      tabId: 130,
+      topOrigin: "https://example.test",
+    },
+  });
+  const sender = {
+    documentId: "generation-retry-document",
+    frameId: 0,
+    tab: { id: 130, url: "https://example.test/login" },
+    url: "https://example.test/login",
+  };
+  const report = () => harness.sendContent({
+    type: "petaldesk.password.second-factor-candidates",
+    confidence: "high",
+    count: 1,
+    digits: 6,
+  }, sender);
+  await report();
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  const firstBinding = harness.events.find(
+    (event) => event.event === "secondFactorOffer",
+  ).payload;
+
+  await assert.rejects(
+    harness.bridge.route({
+      command: "password.cancelSecondFactor",
+      payload: {
+        challengeId: "stale-challenge",
+        flowId: firstBinding.flowId,
+        preserveJourney: true,
+        tabId: firstBinding.tabId,
+      },
+    }),
+    /no longer current/i,
+  );
+  const cancelled = await harness.bridge.route({
+    command: "password.cancelSecondFactor",
+    payload: {
+      challengeId: firstBinding.challengeId,
+      flowId: firstBinding.flowId,
+      preserveJourney: true,
+      reason: "totp-unavailable",
+      tabId: firstBinding.tabId,
+    },
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(cancelled)), {
+    cancelled: true,
+    challengeId: firstBinding.challengeId,
+    flowId: "flow-generation-retry",
+    preserved: true,
+    tabId: 130,
+  });
+  assert.equal(
+    (await harness.bridge.route({ command: "password.getStatus", payload: {} })).pendingSecondFactorSessions,
+    1,
+  );
+  assert.deepEqual(
+    harness.tabMessages.slice(-2).map(({ message }) => message.command),
+    ["cancelSecondFactor", "armSecondFactor"],
+  );
+
+  await report();
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  const offers = harness.events.filter((event) => event.event === "secondFactorOffer");
+  assert.equal(offers.length, 2);
+  const secondBinding = offers.at(-1).payload;
+  const filled = await harness.bridge.route({
+    command: "password.provideSecondFactor",
+    payload: { ...secondBinding, code: "654321" },
+  });
+  assert.equal(filled.filled, true);
+  assert.equal(filled.submitted, false);
+});
+
+test("page navigation retires only the challenge while preserving its journey", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(124, { id: 124, url: "https://example.test/login" });
+  await harness.bridge.route({
+    command: "password.armSecondFactor",
+    payload: {
+      allowedOrigins: [],
+      expiresAt: Date.now() + 60_000,
+      flowId: "flow-navigation",
+      tabId: 124,
+      topOrigin: "https://example.test",
+    },
+  });
+  const sender = {
+    documentId: "otp-document-old",
+    frameId: 0,
+    tab: { id: 124, url: "https://example.test/login" },
+    url: "https://example.test/login",
+  };
+  await harness.sendContent({
+    type: "petaldesk.password.second-factor-candidates",
+    confidence: "high",
+    count: 1,
+    digits: 6,
+  }, sender);
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  const oldBinding = harness.events.find((event) => event.event === "secondFactorOffer").payload;
+  await harness.sendContent({ type: "petaldesk.password.page-closed" }, sender);
+  assert.equal(
+    (await harness.bridge.route({ command: "password.getStatus", payload: {} })).pendingSecondFactorSessions,
+    1,
+  );
+  const staleSecret = {
+    ...oldBinding,
+    code: "345678",
+  };
+  await assert.rejects(
+    harness.bridge.route({ command: "password.provideSecondFactor", payload: staleSecret }),
+    /challenge|expired/i,
+  );
+  assert.equal(staleSecret.code, "");
+  const freshSender = {
+    ...sender,
+    documentId: "otp-document-new",
+    tab: { id: 124, url: "https://example.test/challenge" },
+    url: "https://example.test/challenge",
+  };
+  const ready = await harness.sendContent(
+    { type: "petaldesk.password.tab-ready", origin: "https://example.test" },
+    freshSender,
+  );
+  assert.equal(ready.secondFactorArm.flowId, "flow-navigation");
+});
+
+test("top-level navigation retires a child-frame challenge while preserving its journey", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(125, { id: 125, url: "https://example.test/login" });
+  await harness.bridge.route({
+    command: "password.armSecondFactor",
+    payload: {
+      allowedOrigins: [],
+      expiresAt: Date.now() + 60_000,
+      flowId: "flow-child-navigation",
+      tabId: 125,
+      topOrigin: "https://example.test",
+    },
+  });
+  const childSender = {
+    documentId: "otp-child-old",
+    frameId: 7,
+    tab: { id: 125, url: "https://example.test/login" },
+    url: "https://example.test/login",
+  };
+  await harness.sendContent({
+    type: "petaldesk.password.second-factor-candidates",
+    confidence: "high",
+    count: 1,
+    digits: 6,
+  }, childSender);
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  const oldBinding = harness.events.find((event) => event.event === "secondFactorOffer").payload;
+  await harness.sendContent(
+    { type: "petaldesk.password.page-closed" },
+    {
+      documentId: "top-document-new",
+      frameId: 0,
+      tab: { id: 125, url: "https://example.test/challenge" },
+      url: "https://example.test/challenge",
+    },
+  );
+  assert.equal(
+    (await harness.bridge.route({ command: "password.getStatus", payload: {} })).pendingSecondFactorSessions,
+    1,
+  );
+  const staleSecret = { ...oldBinding, code: "456789" };
+  await assert.rejects(
+    harness.bridge.route({ command: "password.provideSecondFactor", payload: staleSecret }),
+    /challenge|expired/i,
+  );
+  assert.equal(staleSecret.code, "");
+});
+
+test("a bound page prompt cancellation terminates its second-factor journey", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(126, { id: 126, url: "https://example.test/login" });
+  await harness.bridge.route({
+    command: "password.armSecondFactor",
+    payload: {
+      allowedOrigins: [],
+      expiresAt: Date.now() + 60_000,
+      flowId: "flow-user-cancel",
+      tabId: 126,
+      topOrigin: "https://example.test",
+    },
+  });
+  const sender = {
+    documentId: "otp-document-cancel",
+    frameId: 0,
+    tab: { id: 126, url: "https://example.test/login" },
+    url: "https://example.test/login",
+  };
+  await harness.sendContent({
+    type: "petaldesk.password.second-factor-candidates",
+    confidence: "low",
+    count: 2,
+    digits: 6,
+  }, sender);
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  const binding = harness.events.find((event) => event.event === "secondFactorOffer").payload;
+  await harness.bridge.route({
+    command: "password.offerSecondFactor",
+    payload: { ...binding, requiresOriginConfirmation: false },
+  });
+  const cancelled = await harness.sendContent({
+    type: "petaldesk.password.second-factor-cancel",
+    challengeId: binding.challengeId,
+    flowId: binding.flowId,
+  }, sender);
+  assert.equal(cancelled.cancelled, true);
+  assert.equal(harness.events.at(-1).event, "cancelSecondFactor");
+  assert.equal(harness.events.at(-1).payload.reason, "user-cancelled");
+  assert.equal(
+    (await harness.bridge.route({ command: "password.getStatus", payload: {} })).pendingSecondFactorSessions,
+    0,
+  );
+});
+
+test("closing a tab cancels its journey instead of leaving a reusable flow", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(127, { id: 127, url: "https://example.test/login" });
+  await harness.bridge.route({
+    command: "password.armSecondFactor",
+    payload: {
+      allowedOrigins: [],
+      expiresAt: Date.now() + 60_000,
+      flowId: "flow-tab-close",
+      tabId: 127,
+      topOrigin: "https://example.test",
+    },
+  });
+  harness.tabRemovals.listeners[0](127);
+  const cancellation = harness.events.find(
+    (event) => event.event === "cancelSecondFactor" && event.payload.flowId === "flow-tab-close",
+  );
+  assert.ok(cancellation);
+  assert.equal(cancellation.payload.reason, "tab-closed");
+  assert.equal(
+    (await harness.bridge.route({ command: "password.getStatus", payload: {} })).pendingSecondFactorSessions,
+    0,
+  );
 });
 
 test("fill sessions bind the new tab, origin, frame, and confirmation before receiving secrets", async () => {
@@ -513,7 +1274,7 @@ test("popup state reports diagnostics recorded at the command boundary", async (
   await harness.bridge.route({ command: "password.getStatus", payload: {} });
   let state = await harness.sendPopup({ type: "petaldesk.popup.getState" });
   assert.equal(state.diagnostics.nativeConnected, true);
-  assert.equal(state.diagnostics.extensionVersion, "0.7.4");
+  assert.equal(state.diagnostics.extensionVersion, "0.8.0");
   assert.equal(state.diagnostics.lastCommandOk, true);
   assert.equal(state.diagnostics.lastCommandErrorCode, null);
   assert.equal(typeof state.diagnostics.lastCommandAt, "number");
@@ -543,6 +1304,15 @@ test("popup messages reject content-script and foreign senders", async () => {
   );
   assert.equal(forged.ok, false);
   assert.equal(forged.error.code, "PASSWORD_TARGET_INVALID");
+  const otherExtensionPage = await harness.sendPopup(
+    { type: "petaldesk.popup.getState" },
+    {
+      id: "petaldesk-capture@petaldesk.app",
+      url: "moz-extension://petaldesk-test/options.html",
+    },
+  );
+  assert.equal(otherExtensionPage.ok, false);
+  assert.equal(otherExtensionPage.error.code, "PASSWORD_TARGET_INVALID");
   const legitimate = await harness.sendPopup({ type: "petaldesk.popup.getState" });
   assert.equal(legitimate.diagnostics.nativeConnected, false);
   assert.deepEqual(JSON.parse(JSON.stringify(legitimate.tab)), { accounts: [], locked: false, origin: "" });
@@ -588,7 +1358,7 @@ test("popup fill validates the cached account and posts a fill request", async (
   assert.deepEqual(harness.events.at(-1).payload, {});
 });
 
-test("popup copy and delete validate the cached account and post bare events", async () => {
+test("popup copy and delete validate the cached account and wait for desktop deletion", async () => {
   const harness = loadBridge();
   harness.tabs.set(86, { id: 86, url: "https://example.test/login" });
   harness.setActiveTab(86);
@@ -616,11 +1386,35 @@ test("popup copy and delete validate the cached account and post bare events", a
   const copiedUsername = await harness.sendPopup({ type: "petaldesk.popup.copySecret", entryId: "entry-b", field: "username" });
   assert.equal(copiedUsername.accepted, true);
   assert.deepEqual(harness.events.at(-1).payload, { entryId: "entry-b", field: "username" });
-  const deleted = await harness.sendPopup({ type: "petaldesk.popup.deleteEntry", entryId: "entry-a" });
-  assert.equal(deleted.accepted, true);
-  assert.equal(harness.events.at(-1).event, "deleteEntry");
-  // The delete event carries only the entry ID: no site or account metadata.
-  assert.deepEqual(harness.events.at(-1).payload, { entryId: "entry-a" });
+  const pendingDelete = harness.sendPopup({ type: "petaldesk.popup.deleteEntry", entryId: "entry-a" });
+  let deleteSettled = false;
+  void pendingDelete.then(() => { deleteSettled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(deleteSettled, false, "the popup must wait for the desktop delete result");
+  const deleteRequest = harness.events.at(-1);
+  assert.equal(deleteRequest.event, "deleteEntry");
+  assert.deepEqual(Object.keys(deleteRequest.payload).sort(), ["entryId", "origin", "requestId", "tabId"]);
+  assert.deepEqual(
+    {
+      entryId: deleteRequest.payload.entryId,
+      origin: deleteRequest.payload.origin,
+      tabId: deleteRequest.payload.tabId,
+    },
+    { entryId: "entry-a", origin: "https://example.test", tabId: 86 },
+  );
+  await harness.bridge.route({
+    command: "password.updateBadge",
+    payload: {
+      accounts: [{ entryId: "entry-b", siteName: "Example", username: "bob" }],
+      origin: "https://example.test",
+      tabId: 86,
+    },
+  });
+  await harness.bridge.route({
+    command: "password.deleteResult",
+    payload: { requestId: deleteRequest.payload.requestId, success: true },
+  });
+  assert.equal((await pendingDelete).accepted, true);
   // A locked vault rejects copy and delete for cached accounts.
   await harness.bridge.route({
     command: "password.updateBadge",
@@ -637,6 +1431,273 @@ test("popup copy and delete validate the cached account and post bare events", a
   const lockedDelete = await harness.sendPopup({ type: "petaldesk.popup.deleteEntry", entryId: "entry-a" });
   assert.equal(lockedDelete.ok, false);
   assert.equal(lockedDelete.error.code, "PASSWORD_TARGET_MISMATCH");
+});
+
+test("desktop delete failures, tab closure, and disconnect reject pending popup deletes", async () => {
+  function prepareDeleteHarness(tabId, options) {
+    const harness = loadBridge(options);
+    harness.tabs.set(tabId, { id: tabId, url: "https://example.test/login" });
+    harness.setActiveTab(tabId);
+    return harness.bridge.route({
+      command: "password.updateBadge",
+      payload: {
+        accounts: [{ entryId: "entry-a", siteName: "Example", username: "alice" }],
+        origin: "https://example.test",
+        tabId,
+      },
+    }).then(() => harness);
+  }
+
+  const failedHarness = await prepareDeleteHarness(862);
+  const failedDelete = failedHarness.sendPopup({
+    type: "petaldesk.popup.deleteEntry",
+    entryId: "entry-a",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const failedRequest = failedHarness.events.at(-1);
+  await failedHarness.bridge.route({
+    command: "password.deleteResult",
+    payload: {
+      requestId: failedRequest.payload.requestId,
+      success: false,
+      error: { code: "PASSWORD_VAULT_LOCKED", message: "密码库已锁定" },
+    },
+  });
+  const failedResponse = await failedDelete;
+  assert.equal(failedResponse.ok, false);
+  assert.equal(failedResponse.error.code, "PASSWORD_VAULT_LOCKED");
+  assert.equal(failedResponse.error.message, "密码库已锁定");
+  await assert.rejects(
+    failedHarness.bridge.route({
+      command: "password.deleteResult",
+      payload: { requestId: failedRequest.payload.requestId, success: true },
+    }),
+    /no longer pending/i,
+  );
+
+  const closedHarness = await prepareDeleteHarness(863);
+  const closedDelete = closedHarness.sendPopup({
+    type: "petaldesk.popup.deleteEntry",
+    entryId: "entry-a",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  for (const listener of closedHarness.tabRemovals.listeners) listener(863);
+  const closedResponse = await closedDelete;
+  assert.equal(closedResponse.ok, false);
+  assert.equal(closedResponse.error.code, "PASSWORD_TARGET_MISMATCH");
+
+  const disconnectedHarness = await prepareDeleteHarness(864);
+  const disconnectedDelete = disconnectedHarness.sendPopup({
+    type: "petaldesk.popup.deleteEntry",
+    entryId: "entry-a",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  disconnectedHarness.bridge.disconnect();
+  const disconnectedResponse = await disconnectedDelete;
+  assert.equal(disconnectedResponse.ok, false);
+  assert.equal(disconnectedResponse.error.code, "PASSWORD_NATIVE_DISCONNECTED");
+
+  const timeoutHarness = await prepareDeleteHarness(865, { longTimerDelayMs: 5 });
+  const timedOutDelete = timeoutHarness.sendPopup({
+    type: "petaldesk.popup.deleteEntry",
+    entryId: "entry-a",
+  });
+  const timeoutResponse = await timedOutDelete;
+  assert.equal(timeoutResponse.ok, false);
+  assert.equal(timeoutResponse.error.code, "PASSWORD_REQUEST_EXPIRED");
+  assert.equal(timeoutHarness.timeoutDelays.includes(8_000), true);
+});
+
+test("popup MFA copy requires hasMfa and resolves only after the desktop result", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(861, { id: 861, url: "https://example.test/login" });
+  harness.setActiveTab(861);
+  await harness.bridge.route({
+    command: "password.updateBadge",
+    payload: {
+      accounts: [
+        { entryId: "entry-linked", hasMfa: true, siteName: "Example", username: "alice" },
+        { entryId: "entry-plain", hasMfa: false, siteName: "Example", username: "bob" },
+      ],
+      origin: "https://example.test",
+      tabId: 861,
+    },
+  });
+  const state = await harness.sendPopup({ type: "petaldesk.popup.getState" });
+  assert.deepEqual(
+    state.tab.accounts.map((account) => ({ entryId: account.entryId, hasMfa: account.hasMfa })),
+    [
+      { entryId: "entry-linked", hasMfa: true },
+      { entryId: "entry-plain", hasMfa: false },
+    ],
+  );
+  assert.equal(JSON.stringify(state).includes("mfaEntryId"), false);
+
+  const unavailable = await harness.sendPopup({
+    type: "petaldesk.popup.copySecret",
+    entryId: "entry-plain",
+    field: "mfa",
+  });
+  assert.equal(unavailable.ok, false);
+  assert.equal(unavailable.error.code, "PASSWORD_TARGET_MISMATCH");
+
+  const pendingCopy = harness.sendPopup({
+    type: "petaldesk.popup.copySecret",
+    entryId: "entry-linked",
+    field: "mfa",
+  });
+  let copySettled = false;
+  void pendingCopy.then(() => { copySettled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(copySettled, false, "the popup must wait for the desktop clipboard result");
+  assert.equal(
+    harness.timeoutDelays.includes(20_000),
+    true,
+    "MFA copy must allow enough time to wait for the next TOTP period",
+  );
+  const request = harness.events.at(-1);
+  assert.equal(request.event, "copyMfaCode");
+  assert.deepEqual(Object.keys(request.payload).sort(), ["entryId", "origin", "requestId", "tabId"]);
+  assert.deepEqual(
+    {
+      entryId: request.payload.entryId,
+      origin: request.payload.origin,
+      tabId: request.payload.tabId,
+    },
+    { entryId: "entry-linked", origin: "https://example.test", tabId: 861 },
+  );
+  assert.equal(JSON.stringify(request).includes("code"), false);
+  const confirmation = await harness.bridge.route({
+    command: "password.confirmMfaCopy",
+    payload: {
+      origin: request.payload.origin,
+      requestId: request.payload.requestId,
+      tabId: request.payload.tabId,
+    },
+  });
+  assert.equal(confirmation.confirmed, true);
+  assert.equal(confirmation.requestId, request.payload.requestId);
+  assert.equal(confirmation.tabId, 861);
+  await harness.bridge.route({
+    command: "password.copyMfaResult",
+    payload: { requestId: request.payload.requestId, success: true },
+  });
+  assert.equal((await pendingCopy).accepted, true);
+
+  const failedCopy = harness.sendPopup({
+    type: "petaldesk.popup.copySecret",
+    entryId: "entry-linked",
+    field: "mfa",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const failedRequest = harness.events.at(-1);
+  await harness.bridge.route({
+    command: "password.copyMfaResult",
+    payload: {
+      error: { code: "MFA_LOCKED", message: "MFA 已锁定" },
+      requestId: failedRequest.payload.requestId,
+      success: false,
+    },
+  });
+  const failed = await failedCopy;
+  assert.equal(failed.ok, false);
+  assert.equal(failed.error.code, "MFA_LOCKED");
+  assert.equal(failed.error.message, "MFA 已锁定");
+
+  const navigatedCopy = harness.sendPopup({
+    type: "petaldesk.popup.copySecret",
+    entryId: "entry-linked",
+    field: "mfa",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const navigatedRequest = harness.events.at(-1);
+  harness.tabs.set(861, { id: 861, url: "https://other.test/login" });
+  await assert.rejects(
+    harness.bridge.route({
+      command: "password.confirmMfaCopy",
+      payload: {
+        origin: navigatedRequest.payload.origin,
+        requestId: navigatedRequest.payload.requestId,
+        tabId: navigatedRequest.payload.tabId,
+      },
+    }),
+    /page or account changed/i,
+  );
+  await harness.bridge.route({
+    command: "password.copyMfaResult",
+    payload: {
+      error: { code: "PASSWORD_TARGET_MISMATCH", message: "页面已变化" },
+      requestId: navigatedRequest.payload.requestId,
+      success: false,
+    },
+  });
+  assert.equal((await navigatedCopy).ok, false);
+});
+
+test("top-frame pagehide cancels pending popup MFA copy and clears its badge cache", async () => {
+  const harness = loadBridge();
+  const sender = {
+    documentId: "copy-document",
+    frameId: 0,
+    tab: { id: 867, url: "https://example.test/login" },
+    url: "https://example.test/login",
+  };
+  harness.tabs.set(867, sender.tab);
+  harness.setActiveTab(867);
+  await harness.bridge.route({
+    command: "password.updateBadge",
+    payload: {
+      accounts: [{ entryId: "entry-linked", hasMfa: true, siteName: "Example", username: "alice" }],
+      origin: "https://example.test",
+      tabId: 867,
+    },
+  });
+  const pending = harness.sendPopup({
+    type: "petaldesk.popup.copySecret",
+    entryId: "entry-linked",
+    field: "mfa",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await harness.sendContent({ type: "petaldesk.password.page-closed" }, sender);
+  const response = await pending;
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "PASSWORD_TARGET_MISMATCH");
+  const state = await harness.sendPopup({ type: "petaldesk.popup.getState" });
+  assert.equal(state.tab.accounts.length, 0);
+  assert.equal(harness.events.some((event) => event.event === "originActive" && event.payload.origin === ""), true);
+  assert.equal(harness.events.at(-1).payload.frameId, 0);
+});
+
+test("popup MFA copy expires a pending desktop request without exposing a code", async () => {
+  const harness = loadBridge({ longTimerDelayMs: 5 });
+  harness.tabs.set(866, { id: 866, url: "https://example.test/login" });
+  harness.setActiveTab(866);
+  await harness.bridge.route({
+    command: "password.updateBadge",
+    payload: {
+      accounts: [{ entryId: "entry-linked", hasMfa: true, siteName: "Example", username: "alice" }],
+      origin: "https://example.test",
+      tabId: 866,
+    },
+  });
+  const pending = harness.sendPopup({
+    type: "petaldesk.popup.copySecret",
+    entryId: "entry-linked",
+    field: "mfa",
+  });
+  const response = await pending;
+  assert.equal(response.ok, false);
+  assert.equal(response.error.code, "PASSWORD_REQUEST_EXPIRED");
+  const request = harness.events.at(-1);
+  assert.equal(request.event, "copyMfaCode");
+  assert.equal(JSON.stringify(request).includes("code"), false);
+  await assert.rejects(
+    harness.bridge.route({
+      command: "password.copyMfaResult",
+      payload: { requestId: request.payload.requestId, success: true },
+    }),
+    /no longer pending/i,
+  );
 });
 
 test("popup copy and delete reject content-script and foreign senders", async () => {

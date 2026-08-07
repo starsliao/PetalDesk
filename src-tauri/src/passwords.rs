@@ -34,7 +34,8 @@ const VAULT_FILE: &str = "vault.json";
 const SETTINGS_FILE: &str = "settings.json";
 const BACKUP_DIR: &str = "backups";
 const CONFLICT_DIR: &str = "conflicts";
-const VAULT_SCHEMA_VERSION: u32 = 1;
+const LEGACY_VAULT_SCHEMA_VERSION: u32 = 1;
+const VAULT_SCHEMA_VERSION: u32 = 2;
 const SETTINGS_SCHEMA_VERSION: u32 = 1;
 const VAULT_AAD: &[u8] = b"PetalDesk password vault v1";
 const RECOVERY_KEY_AAD: &[u8] = b"PetalDesk password recovery key v1";
@@ -71,6 +72,8 @@ const MAX_TEMPLATE_ID_BYTES: usize = 256;
 const MAX_TEMPLATE_LABEL_BYTES: usize = 512;
 const MAX_TEMPLATE_SELECTOR_BYTES: usize = 512;
 const MAX_TEMPLATE_SELECTORS: usize = 16;
+const MAX_MFA_ENTRY_ID_BYTES: usize = 128;
+const MAX_MFA_ALLOWED_ORIGINS: usize = 8;
 const MAX_CAPTURE_ACCOUNT_CHOICES: usize = 16;
 const BACKUP_LIMIT: usize = 5;
 const CONFLICT_LIMIT: usize = 10;
@@ -217,9 +220,28 @@ pub struct PasswordEntrySummary {
     pub notes: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mfa_link: Option<PasswordMfaLink>,
     pub allow_insecure_http: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PasswordMfaLink {
+    pub entry_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_origins: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PasswordMfaCandidate {
+    pub id: String,
+    pub name: String,
+    pub issuer: String,
+    pub account_name: String,
 }
 
 #[derive(Deserialize)]
@@ -233,6 +255,8 @@ pub struct PasswordEntryInput {
     pub notes: String,
     #[serde(default)]
     pub template_id: Option<String>,
+    #[serde(default)]
+    pub mfa_link: Option<PasswordMfaLink>,
     #[serde(default)]
     pub allow_insecure_http: bool,
 }
@@ -250,8 +274,19 @@ pub struct PasswordEntryUpdateInput {
     pub notes: String,
     #[serde(default)]
     pub template_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_mfa_link_update")]
+    pub mfa_link: Option<Option<PasswordMfaLink>>,
     #[serde(default)]
     pub allow_insecure_http: bool,
+}
+
+fn deserialize_mfa_link_update<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<PasswordMfaLink>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<PasswordMfaLink>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -308,6 +343,7 @@ pub struct PasswordCaptureAccount {
     pub entry_id: String,
     pub site_name: String,
     pub username: String,
+    pub has_mfa: bool,
 }
 
 #[derive(Serialize)]
@@ -382,6 +418,7 @@ pub(crate) struct BrowserFillData {
     pub origin: String,
     pub username: String,
     pub password: String,
+    pub mfa_link: Option<PasswordMfaLink>,
     pub user_template: Option<PasswordTemplateDefinition>,
     pub allow_insecure_http: bool,
 }
@@ -448,6 +485,13 @@ struct VaultPayload {
     entries: Vec<StoredPasswordEntry>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentVaultPayload<'a> {
+    schema_version: u32,
+    entries: &'a [StoredPasswordEntry],
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredPasswordEntry {
@@ -462,6 +506,8 @@ struct StoredPasswordEntry {
     template_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     user_template: Option<PasswordTemplateDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mfa_link: Option<PasswordMfaLink>,
     allow_insecure_http: bool,
     created_at: String,
     updated_at: String,
@@ -658,6 +704,27 @@ impl PasswordStore {
     pub(crate) fn activate_browser_session(&self) {
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
         self.session.browser_active.store(true, Ordering::Release);
+    }
+
+    /// Revokes the background browser lease after the final Firefox
+    /// connection closes. A visible password window keeps its own UI lease;
+    /// otherwise decrypted entries and clipboard state are released now.
+    pub(crate) fn deactivate_browser_session(&self) {
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        self.session.browser_active.store(false, Ordering::Release);
+        if self.session.active.load(Ordering::Acquire) {
+            return;
+        }
+        self.session.epoch.fetch_add(1, Ordering::AcqRel);
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        if let Some(vault) = runtime.vault.take() {
+            runtime.locked_entry_count = vault.payload.entries.len();
+        }
+        drop(runtime);
+        force_expire_clipboard(&self.clipboard);
+        if !clear_clipboard_now(&self.clipboard) {
+            schedule_clipboard_cleanup(Arc::downgrade(&self.clipboard), Instant::now());
+        }
     }
 
     /// Invalidates queued work before clearing decrypted data.
@@ -894,9 +961,74 @@ impl PasswordStore {
             origin: entry.origin.clone(),
             username: entry.username.clone(),
             password: entry.password.clone(),
+            mfa_link: entry.mfa_link.clone(),
             user_template: entry.user_template.clone(),
             allow_insecure_http: entry.allow_insecure_http,
         })
+    }
+
+    pub(crate) fn add_mfa_allowed_origin_at(
+        &self,
+        entry_id: &str,
+        origin: &str,
+        epoch: u64,
+    ) -> AppResult<PasswordEntrySummary> {
+        validate_entry_id(entry_id)?;
+        let (origin, insecure) = validate_exact_origin(origin, false).map_err(|_| {
+            AppError::new(
+                "password_mfa_origin_invalid",
+                "MFA 页面必须使用精确 HTTPS origin。",
+            )
+        })?;
+        if insecure {
+            return Err(AppError::new(
+                "password_mfa_origin_invalid",
+                "MFA 页面必须使用精确 HTTPS origin。",
+            ));
+        }
+
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        self.validate_epoch(epoch)?;
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        self.ensure_unlocked(&mut runtime)?;
+        let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
+        let entry = vault
+            .payload
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == entry_id)
+            .ok_or_else(|| AppError::not_found("没有找到这个站点账户。"))?;
+        let link = entry.mfa_link.as_mut().ok_or_else(|| {
+            AppError::new("password_mfa_not_linked", "这个密码账户尚未关联 MFA。")
+        })?;
+        if origin == entry.origin || link.allowed_origins.iter().any(|item| item == &origin) {
+            return Ok(entry_summary(entry));
+        }
+        if link.allowed_origins.len() >= MAX_MFA_ALLOWED_ORIGINS {
+            return Err(AppError::new(
+                "password_mfa_origin_limit",
+                format!("MFA 额外允许的站点最多为 {MAX_MFA_ALLOWED_ORIGINS} 个。"),
+            ));
+        }
+
+        let previous_updated_at = entry.updated_at.clone();
+        link.allowed_origins.push(origin);
+        entry.updated_at = vault_timestamp();
+        let result = entry_summary(entry);
+        if let Err(error) = self.save_vault(vault) {
+            let entry = vault
+                .payload
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == entry_id)
+                .ok_or_else(generic_vault_error)?;
+            if let Some(link) = entry.mfa_link.as_mut() {
+                let _ = link.allowed_origins.pop();
+            }
+            entry.updated_at = previous_updated_at;
+            return Err(error);
+        }
+        Ok(result)
     }
 
     #[cfg(test)]
@@ -916,6 +1048,7 @@ impl PasswordStore {
         let notes = validate_notes(&input.notes)?;
         let template_id = validate_template_id(input.template_id.as_deref())?;
         let login = validate_login_url(&input.login_url, input.allow_insecure_http)?;
+        let mfa_link = validate_mfa_link(input.mfa_link.as_ref(), &login.origin)?;
         let now = vault_timestamp();
         let entry = StoredPasswordEntry {
             id: Uuid::new_v4().to_string(),
@@ -927,6 +1060,7 @@ impl PasswordStore {
             notes,
             template_id,
             user_template: None,
+            mfa_link,
             allow_insecure_http: login.allow_insecure_http,
             created_at: now.clone(),
             updated_at: now,
@@ -1002,6 +1136,10 @@ impl PasswordStore {
                 && login.origin == existing.origin)
                 .then(|| template.clone())
         });
+        let mfa_link = match input.mfa_link.as_ref() {
+            None => validate_mfa_link(existing.mfa_link.as_ref(), &login.origin)?,
+            Some(value) => validate_mfa_link(value.as_ref(), &login.origin)?,
+        };
         let replacement = StoredPasswordEntry {
             id: existing.id.clone(),
             site_name,
@@ -1012,6 +1150,7 @@ impl PasswordStore {
             notes,
             template_id,
             user_template,
+            mfa_link,
             allow_insecure_http: login.allow_insecure_http,
             created_at: existing.created_at.clone(),
             updated_at: vault_timestamp(),
@@ -1212,6 +1351,7 @@ impl PasswordStore {
                     entry_id: entry.id.clone(),
                     site_name: entry.site_name.clone(),
                     username: entry.username.clone(),
+                    has_mfa: entry.mfa_link.is_some(),
                 })
                 .collect::<Vec<_>>();
             return Ok(PasswordCaptureDecision {
@@ -1266,6 +1406,7 @@ impl PasswordStore {
                 entry_id: entry.id.clone(),
                 site_name: entry.site_name.clone(),
                 username: entry.username.clone(),
+                has_mfa: entry.mfa_link.is_some(),
             })
             .collect();
         Ok(PasswordCaptureDecision {
@@ -1454,6 +1595,7 @@ impl PasswordStore {
             };
         }
         vault.disk_hash = Some(bytes_hash(&replacement));
+        vault.payload.schema_version = VAULT_SCHEMA_VERSION;
         let mut runtime = lock_unpoisoned(&self.runtime);
         runtime.recovery_state = PasswordRecoveryState::Ready;
         runtime.recovered_from_backup = false;
@@ -1602,6 +1744,7 @@ impl PasswordStore {
         atomic_write(&self.vault_path, &rebound)?;
         self.reset_backups_to_current(&rebound)?;
         vault.disk_hash = Some(bytes_hash(&rebound));
+        vault.payload.schema_version = VAULT_SCHEMA_VERSION;
         runtime.vault = Some(vault);
         runtime.recovery_state = PasswordRecoveryState::Ready;
         runtime.recovered_from_backup = recovered_from_backup;
@@ -1758,6 +1901,7 @@ impl PasswordStore {
         }
         atomic_write(&self.vault_path, &bytes)?;
         vault.disk_hash = Some(bytes_hash(&bytes));
+        vault.payload.schema_version = VAULT_SCHEMA_VERSION;
         Ok(())
     }
 
@@ -1957,8 +2101,10 @@ fn parse_envelope(bytes: &[u8]) -> Result<VaultEnvelope, LocalUnlockError> {
     }
     let envelope: VaultEnvelope =
         serde_json::from_slice(bytes).map_err(|_| LocalUnlockError::InvalidEnvelope)?;
-    if envelope.schema_version != VAULT_SCHEMA_VERSION
-        || envelope.dpapi_wrapped_key.is_empty()
+    if !matches!(
+        envelope.schema_version,
+        LEGACY_VAULT_SCHEMA_VERSION | VAULT_SCHEMA_VERSION
+    ) || envelope.dpapi_wrapped_key.is_empty()
         || envelope.dpapi_wrapped_key.len() > 8192
     {
         return Err(LocalUnlockError::InvalidEnvelope);
@@ -2058,6 +2204,16 @@ fn decrypt_vault_payload(
 }
 
 fn serialize_vault(vault: &UnlockedVault) -> AppResult<Vec<u8>> {
+    serialize_vault_with_schema(vault, VAULT_SCHEMA_VERSION)
+}
+
+fn serialize_vault_with_schema(vault: &UnlockedVault, schema_version: u32) -> AppResult<Vec<u8>> {
+    if !matches!(
+        schema_version,
+        LEGACY_VAULT_SCHEMA_VERSION | VAULT_SCHEMA_VERSION
+    ) {
+        return Err(generic_vault_error());
+    }
     let recovery_wrapped_key = vault
         .recovery_wrapped_key
         .clone()
@@ -2066,8 +2222,12 @@ fn serialize_vault(vault: &UnlockedVault) -> AppResult<Vec<u8>> {
         return Err(generic_vault_error());
     }
     validate_payload(&vault.payload)?;
+    let payload = CurrentVaultPayload {
+        schema_version,
+        entries: &vault.payload.entries,
+    };
     let mut plaintext =
-        Zeroizing::new(serde_json::to_vec(&vault.payload).map_err(|_| generic_vault_error())?);
+        Zeroizing::new(serde_json::to_vec(&payload).map_err(|_| generic_vault_error())?);
     if plaintext.len() > MAX_VAULT_BYTES {
         return Err(AppError::new(
             "password_vault_too_large",
@@ -2090,7 +2250,7 @@ fn serialize_vault(vault: &UnlockedVault) -> AppResult<Vec<u8>> {
         .map_err(|_| generic_vault_error())?;
     plaintext.zeroize();
     let envelope = VaultEnvelope {
-        schema_version: VAULT_SCHEMA_VERSION,
+        schema_version,
         dpapi_wrapped_key: vault.dpapi_wrapped_key.clone(),
         recovery_wrapped_key,
         nonce: STANDARD_NO_PAD.encode(nonce_bytes),
@@ -2108,7 +2268,11 @@ fn serialize_vault(vault: &UnlockedVault) -> AppResult<Vec<u8>> {
 }
 
 fn validate_payload(payload: &VaultPayload) -> AppResult<()> {
-    if payload.schema_version != VAULT_SCHEMA_VERSION || payload.entries.len() > MAX_VAULT_ENTRIES {
+    if !matches!(
+        payload.schema_version,
+        LEGACY_VAULT_SCHEMA_VERSION | VAULT_SCHEMA_VERSION
+    ) || payload.entries.len() > MAX_VAULT_ENTRIES
+    {
         return Err(generic_vault_error());
     }
     let mut ids = HashSet::with_capacity(payload.entries.len());
@@ -2131,6 +2295,11 @@ fn validate_stored_entry(entry: &StoredPasswordEntry) -> AppResult<()> {
     validate_password(&entry.password).map_err(|_| generic_vault_error())?;
     validate_notes(&entry.notes).map_err(|_| generic_vault_error())?;
     validate_template_id(entry.template_id.as_deref()).map_err(|_| generic_vault_error())?;
+    let normalized_mfa_link = validate_mfa_link(entry.mfa_link.as_ref(), &entry.origin)
+        .map_err(|_| generic_vault_error())?;
+    if normalized_mfa_link != entry.mfa_link {
+        return Err(generic_vault_error());
+    }
     if let Some(template) = entry.user_template.as_ref() {
         validate_template_definition(template, &entry.origin, entry.allow_insecure_http)
             .map_err(|_| generic_vault_error())?;
@@ -2160,6 +2329,7 @@ fn entry_summary(entry: &StoredPasswordEntry) -> PasswordEntrySummary {
         username: entry.username.clone(),
         notes: entry.notes.clone(),
         template_id: entry.template_id.clone(),
+        mfa_link: entry.mfa_link.clone(),
         allow_insecure_http: entry.allow_insecure_http,
         created_at: entry.created_at.clone(),
         updated_at: entry.updated_at.clone(),
@@ -2227,6 +2397,45 @@ fn validate_template_id(value: Option<&str>) -> AppResult<Option<String>> {
         return Err(AppError::invalid("登录模板 ID 无效或过长。"));
     }
     Ok(value.map(str::to_string))
+}
+
+fn validate_mfa_link(
+    value: Option<&PasswordMfaLink>,
+    login_origin: &str,
+) -> AppResult<Option<PasswordMfaLink>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.entry_id.is_empty()
+        || value.entry_id.len() > MAX_MFA_ENTRY_ID_BYTES
+        || value.entry_id.contains('\0')
+    {
+        return Err(AppError::invalid("MFA 账户 ID 无效。"));
+    }
+    if value.allowed_origins.len() > MAX_MFA_ALLOWED_ORIGINS {
+        return Err(AppError::invalid(format!(
+            "MFA 额外允许的站点最多为 {MAX_MFA_ALLOWED_ORIGINS} 个。"
+        )));
+    }
+
+    let mut seen = HashSet::with_capacity(value.allowed_origins.len());
+    let mut allowed_origins = Vec::with_capacity(value.allowed_origins.len());
+    for candidate in &value.allowed_origins {
+        let (origin, insecure) = validate_exact_origin(candidate, false)
+            .map_err(|_| AppError::invalid("MFA 额外允许的站点必须是精确 HTTPS origin。"))?;
+        if insecure {
+            return Err(AppError::invalid(
+                "MFA 额外允许的站点必须是精确 HTTPS origin。",
+            ));
+        }
+        if origin != login_origin && seen.insert(origin.clone()) {
+            allowed_origins.push(origin);
+        }
+    }
+    Ok(Some(PasswordMfaLink {
+        entry_id: value.entry_id.clone(),
+        allowed_origins,
+    }))
 }
 
 fn validate_template_definition(
@@ -3085,6 +3294,33 @@ pub async fn list_password_entries(
 }
 
 #[tauri::command]
+pub async fn list_password_mfa_candidates(
+    app: AppHandle,
+    window: WebviewWindow,
+) -> AppResult<Vec<PasswordMfaCandidate>> {
+    ensure_password_window(&window)?;
+    let epoch = app.state::<PasswordStore>().require_active_epoch()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<PasswordStore>().validate_epoch(epoch)?;
+        app.state::<crate::mfa::MfaStore>()
+            .browser_link_summaries()
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| PasswordMfaCandidate {
+                        id: entry.id,
+                        name: entry.name,
+                        issuer: entry.issuer,
+                        account_name: entry.account_name,
+                    })
+                    .collect()
+            })
+    })
+    .await
+    .map_err(|_| AppError::new("password_task_error", "读取 MFA 关联候选任务异常结束。"))?
+}
+
+#[tauri::command]
 pub async fn create_password_entry(
     app: AppHandle,
     window: WebviewWindow,
@@ -3094,7 +3330,9 @@ pub async fn create_password_entry(
     let epoch = app.state::<PasswordStore>().require_active_epoch()?;
     let task_app = app.clone();
     let entry = tauri::async_runtime::spawn_blocking(move || {
-        task_app.state::<PasswordStore>().create_entry_at(input, epoch)
+        task_app
+            .state::<PasswordStore>()
+            .create_entry_at(input, epoch)
     })
     .await
     .map_err(|_| AppError::new("password_task_error", "保存密码账户任务异常结束。"))??;
@@ -3114,7 +3352,9 @@ pub async fn update_password_entry(
     let epoch = app.state::<PasswordStore>().require_active_epoch()?;
     let task_app = app.clone();
     let entry = tauri::async_runtime::spawn_blocking(move || {
-        task_app.state::<PasswordStore>().update_entry_at(input, epoch)
+        task_app
+            .state::<PasswordStore>()
+            .update_entry_at(input, epoch)
     })
     .await
     .map_err(|_| AppError::new("password_task_error", "更新密码账户任务异常结束。"))??;
@@ -3310,8 +3550,10 @@ pub fn generate_password(
 pub async fn lock_password_vault(app: AppHandle, window: WebviewWindow) -> AppResult<()> {
     ensure_password_window(&window)?;
     let task_app = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        task_app.state::<PasswordStore>().lock_current_session()
+    tauri::async_runtime::spawn_blocking(move || -> AppResult<()> {
+        task_app
+            .state::<crate::password_browser::PasswordBrowserService>()
+            .lock_password_vault_and_cancel_second_factors(&task_app.state::<PasswordStore>())
     })
     .await
     .map_err(|_| AppError::new("password_task_error", "锁定密码保险库任务异常结束。"))??;
@@ -3343,6 +3585,7 @@ mod tests {
             password: SensitiveText(password.to_string()),
             notes: "test note".to_string(),
             template_id: Some("generic".to_string()),
+            mfa_link: None,
             allow_insecure_http: false,
         }
     }
@@ -3412,6 +3655,229 @@ mod tests {
         assert_eq!(
             reopened.list_entries().unwrap_err().code,
             "password_session_closed"
+        );
+    }
+
+    #[test]
+    fn legacy_v1_vault_is_read_without_rewrite_and_migrates_with_a_backup() {
+        let (root, store) = test_store();
+        store
+            .create_entry(input(
+                "Legacy",
+                "https://legacy.example/login",
+                "legacy-user",
+                "legacy-password",
+            ))
+            .unwrap();
+        let password_root = root
+            .path()
+            .join(INTERNAL_DATA_DIR)
+            .join("tools")
+            .join(PASSWORDS_DIR);
+        let vault_path = password_root.join(VAULT_FILE);
+        let current = read_bounded_vault_bytes(&vault_path).unwrap();
+        let mut legacy_vault = decrypt_envelope_local(&current).unwrap();
+        legacy_vault.payload.schema_version = LEGACY_VAULT_SCHEMA_VERSION;
+        let legacy_bytes =
+            serialize_vault_with_schema(&legacy_vault, LEGACY_VAULT_SCHEMA_VERSION).unwrap();
+        atomic_write(&vault_path, &legacy_bytes).unwrap();
+        drop(store);
+
+        let reopened = PasswordStore::load(root.path()).unwrap();
+        reopened.activate();
+        assert_eq!(reopened.list_entries().unwrap().len(), 1);
+        assert_eq!(read_bounded_vault_bytes(&vault_path).unwrap(), legacy_bytes);
+
+        reopened
+            .create_entry(input(
+                "Current",
+                "https://current.example/login",
+                "current-user",
+                "current-password",
+            ))
+            .unwrap();
+        let migrated = read_bounded_vault_bytes(&vault_path).unwrap();
+        assert_eq!(
+            parse_envelope(&migrated).unwrap().schema_version,
+            VAULT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            decrypt_envelope_local(&migrated)
+                .unwrap()
+                .payload
+                .schema_version,
+            VAULT_SCHEMA_VERSION
+        );
+        assert!(backup_files_newest_first(&password_root.join(BACKUP_DIR))
+            .unwrap()
+            .into_iter()
+            .filter_map(|path| read_bounded_vault_bytes(&path).ok())
+            .filter_map(|bytes| parse_envelope(&bytes).ok())
+            .any(|envelope| envelope.schema_version == LEGACY_VAULT_SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn mfa_link_accepts_historical_ids_and_update_is_tri_state() {
+        let (_root, store) = test_store();
+        let mut linked_input = input("Example", "https://example.com/login", "alice", "secret");
+        linked_input.mfa_link = Some(PasswordMfaLink {
+            entry_id: "legacy:mfa/account-01".to_string(),
+            allowed_origins: vec![
+                "https://mfa.example.com/".to_string(),
+                "https://mfa.example.com".to_string(),
+                "https://example.com".to_string(),
+            ],
+        });
+        let saved = store.create_entry(linked_input).unwrap();
+        assert_eq!(
+            saved.mfa_link,
+            Some(PasswordMfaLink {
+                entry_id: "legacy:mfa/account-01".to_string(),
+                allowed_origins: vec!["https://mfa.example.com".to_string()],
+            })
+        );
+        let mut reused_input = input(
+            "Other",
+            "https://other.example/login",
+            "bob",
+            "other-secret",
+        );
+        reused_input.mfa_link = Some(PasswordMfaLink {
+            entry_id: "legacy:mfa/account-01".to_string(),
+            allowed_origins: Vec::new(),
+        });
+        assert_eq!(
+            store
+                .create_entry(reused_input)
+                .unwrap()
+                .mfa_link
+                .unwrap()
+                .entry_id,
+            "legacy:mfa/account-01"
+        );
+
+        let preserved = store
+            .update_entry(PasswordEntryUpdateInput {
+                id: saved.id.clone(),
+                site_name: "Example renamed".to_string(),
+                login_url: saved.login_url.clone(),
+                username: SensitiveText(saved.username.clone()),
+                password: None,
+                notes: saved.notes.clone(),
+                template_id: saved.template_id.clone(),
+                mfa_link: None,
+                allow_insecure_http: false,
+            })
+            .unwrap();
+        assert_eq!(preserved.mfa_link, saved.mfa_link);
+
+        let unlinked = store
+            .update_entry(PasswordEntryUpdateInput {
+                id: saved.id,
+                site_name: preserved.site_name,
+                login_url: preserved.login_url,
+                username: SensitiveText(preserved.username),
+                password: None,
+                notes: preserved.notes,
+                template_id: preserved.template_id,
+                mfa_link: Some(None),
+                allow_insecure_http: false,
+            })
+            .unwrap();
+        assert!(unlinked.mfa_link.is_none());
+    }
+
+    #[test]
+    fn mfa_link_update_deserialization_distinguishes_missing_null_and_object() {
+        let base = serde_json::json!({
+            "id": Uuid::new_v4().to_string(),
+            "siteName": "Example",
+            "loginUrl": "https://example.com/login",
+            "username": "alice"
+        });
+        let missing: PasswordEntryUpdateInput = serde_json::from_value(base.clone()).unwrap();
+        assert!(missing.mfa_link.is_none());
+
+        let mut null = base.clone();
+        null["mfaLink"] = serde_json::Value::Null;
+        let null: PasswordEntryUpdateInput = serde_json::from_value(null).unwrap();
+        assert!(matches!(null.mfa_link, Some(None)));
+
+        let mut linked = base;
+        linked["mfaLink"] = serde_json::json!({
+            "entryId": "historical-id",
+            "allowedOrigins": ["https://verify.example"]
+        });
+        let linked: PasswordEntryUpdateInput = serde_json::from_value(linked).unwrap();
+        assert_eq!(
+            linked
+                .mfa_link
+                .and_then(|value| value)
+                .map(|value| value.entry_id),
+            Some("historical-id".to_string())
+        );
+    }
+
+    #[test]
+    fn mfa_allowed_origins_are_https_deduplicated_and_capped() {
+        assert!(validate_mfa_link(
+            Some(&PasswordMfaLink {
+                entry_id: "x".repeat(MAX_MFA_ENTRY_ID_BYTES),
+                allowed_origins: Vec::new(),
+            }),
+            "https://example.com",
+        )
+        .is_ok());
+        assert!(validate_mfa_link(
+            Some(&PasswordMfaLink {
+                entry_id: "x".repeat(MAX_MFA_ENTRY_ID_BYTES + 1),
+                allowed_origins: Vec::new(),
+            }),
+            "https://example.com",
+        )
+        .is_err());
+        let (_root, store) = test_store();
+        let mut linked_input = input("Example", "https://example.com/login", "alice", "secret");
+        linked_input.mfa_link = Some(PasswordMfaLink {
+            entry_id: "shared-mfa".to_string(),
+            allowed_origins: Vec::new(),
+        });
+        let saved = store.create_entry(linked_input).unwrap();
+        let epoch = store.require_active_epoch().unwrap();
+
+        let unchanged = store
+            .add_mfa_allowed_origin_at(&saved.id, "https://example.com", epoch)
+            .unwrap();
+        assert!(unchanged.mfa_link.unwrap().allowed_origins.is_empty());
+        assert_eq!(
+            store
+                .add_mfa_allowed_origin_at(&saved.id, "http://verify.example", epoch)
+                .unwrap_err()
+                .code,
+            "password_mfa_origin_invalid"
+        );
+        for index in 0..MAX_MFA_ALLOWED_ORIGINS {
+            store
+                .add_mfa_allowed_origin_at(
+                    &saved.id,
+                    &format!("https://verify-{index}.example"),
+                    epoch,
+                )
+                .unwrap();
+        }
+        let duplicate = store
+            .add_mfa_allowed_origin_at(&saved.id, "https://verify-0.example/", epoch)
+            .unwrap();
+        assert_eq!(
+            duplicate.mfa_link.unwrap().allowed_origins.len(),
+            MAX_MFA_ALLOWED_ORIGINS
+        );
+        assert_eq!(
+            store
+                .add_mfa_allowed_origin_at(&saved.id, "https://one-too-many.example", epoch)
+                .unwrap_err()
+                .code,
+            "password_mfa_origin_limit"
         );
     }
 
@@ -3667,6 +4133,7 @@ mod tests {
             password: Some(SensitiveText("two".to_string())),
             notes: String::new(),
             template_id: None,
+            mfa_link: None,
             allow_insecure_http: false,
         };
         store.update_entry(update).unwrap();
@@ -3693,6 +4160,7 @@ mod tests {
             password: None,
             notes: String::new(),
             template_id: None,
+            mfa_link: None,
             allow_insecure_http: false,
         };
         recovered.update_entry(update).unwrap();
@@ -3892,6 +4360,33 @@ mod tests {
         let fill = store.browser_fill_data_at(&entry.id, epoch).unwrap();
         assert_eq!(fill.username, "alice");
         assert_eq!(fill.password, "stored secret");
+    }
+
+    #[test]
+    fn final_browser_disconnect_releases_background_vault_lease() {
+        let (_root, store) = test_store();
+        store
+            .create_entry(input(
+                "Example",
+                "https://example.com/login",
+                "alice",
+                "stored secret",
+            ))
+            .unwrap();
+        store.activate_browser_session();
+        let closed_epoch = store.deactivate();
+        store.clear_deactivated_state(closed_epoch);
+        assert!(lock_unpoisoned(&store.runtime).vault.is_some());
+        assert!(store.require_any_epoch().is_ok());
+
+        store.deactivate_browser_session();
+
+        assert!(!store.session.browser_active.load(Ordering::Acquire));
+        assert!(lock_unpoisoned(&store.runtime).vault.is_none());
+        assert_eq!(
+            store.require_any_epoch().unwrap_err().code,
+            "password_session_closed"
+        );
     }
 
     #[test]

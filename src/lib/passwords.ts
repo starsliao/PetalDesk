@@ -59,6 +59,20 @@ export interface PasswordStatus {
 }
 
 /** Listing data deliberately excludes the password. */
+export interface PasswordMfaLink {
+  entryId: string;
+  /** Extra exact HTTPS origins; the password account's own origin is implicit. */
+  allowedOrigins: string[];
+}
+
+/** MFA metadata exposed only to the password editor; never contains a code or secret. */
+export interface PasswordMfaCandidate {
+  id: string;
+  name: string;
+  issuer: string;
+  accountName: string;
+}
+
 export interface PasswordEntrySummary {
   id: string;
   siteName: string;
@@ -68,6 +82,7 @@ export interface PasswordEntrySummary {
   notes: string;
   allowInsecureHttp: boolean;
   templateId?: string | null;
+  mfaLink?: PasswordMfaLink | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -80,6 +95,7 @@ export interface PasswordEntryInput {
   notes?: string;
   allowInsecureHttp?: boolean;
   templateId?: string | null;
+  mfaLink?: PasswordMfaLink | null;
 }
 
 export interface PasswordEntryUpdateRequest extends Omit<PasswordEntryInput, "password"> {
@@ -122,6 +138,7 @@ export interface PasswordCaptureAccount {
   entryId: string;
   siteName: string;
   username: string;
+  hasMfa: boolean;
 }
 
 export type PasswordCaptureDecision =
@@ -149,6 +166,7 @@ export interface PasswordApi {
   getStatus(): Promise<PasswordStatus>;
   getBrowserStatus(): Promise<PasswordBrowserStatus>;
   list(): Promise<PasswordEntrySummary[]>;
+  listMfaCandidates(): Promise<PasswordMfaCandidate[]>;
   create(request: PasswordEntryInput): Promise<PasswordEntrySummary>;
   update(request: PasswordEntryUpdateRequest): Promise<PasswordEntrySummary>;
   delete(id: string): Promise<void>;
@@ -280,6 +298,18 @@ export function isInsecurePasswordUrl(url: string): boolean {
 
 function normalizedEntry(value: Partial<PasswordEntrySummary> & Record<string, unknown>): PasswordEntrySummary {
   const loginUrl = String(value.loginUrl ?? value.url ?? "");
+  const rawMfaLink = value.mfaLink ?? value.mfa_link;
+  const mfaLink = (() => {
+    if (typeof rawMfaLink !== "object" || !rawMfaLink) return null;
+    const record = rawMfaLink as Record<string, unknown>;
+    const entryId = String(record.entryId ?? record.entry_id ?? "");
+    if (!entryId) return null;
+    const origins = record.allowedOrigins ?? record.allowed_origins;
+    return {
+      entryId,
+      allowedOrigins: Array.isArray(origins) ? origins.map(String) : [],
+    } satisfies PasswordMfaLink;
+  })();
   return {
     id: String(value.id ?? crypto.randomUUID()),
     siteName: String(value.siteName ?? value.name ?? value.title ?? (passwordOrigin(loginUrl) || "未命名网站")),
@@ -289,8 +319,18 @@ function normalizedEntry(value: Partial<PasswordEntrySummary> & Record<string, u
     notes: String(value.notes ?? value.note ?? ""),
     allowInsecureHttp: Boolean(value.allowInsecureHttp ?? value.allowHttp ?? value.httpAllowed ?? false),
     templateId: value.templateId == null ? null : String(value.templateId),
+    mfaLink,
     createdAt: String(value.createdAt ?? nowIso()),
     updatedAt: String(value.updatedAt ?? nowIso()),
+  };
+}
+
+function normalizedMfaCandidate(value: Partial<PasswordMfaCandidate> & Record<string, unknown>): PasswordMfaCandidate {
+  return {
+    id: String(value.id ?? ""),
+    name: String(value.name ?? ""),
+    issuer: String(value.issuer ?? ""),
+    accountName: String(value.accountName ?? value.account_name ?? ""),
   };
 }
 
@@ -452,6 +492,7 @@ export function createBrowserPasswordApi(): PasswordApi {
       notes: "办公云服务示例账户",
       allowInsecureHttp: false,
       templateId: "google",
+      mfaLink: { entryId: "browser-demo-mfa-work", allowedOrigins: [] },
       createdAt: timestamp,
       updatedAt: timestamp,
     },
@@ -487,6 +528,10 @@ export function createBrowserPasswordApi(): PasswordApi {
   };
   let captureEnabled = false;
   let captureConfigured = false;
+  const mfaCandidates: PasswordMfaCandidate[] = [
+    { id: "browser-demo-mfa-work", name: "Google Workspace", issuer: "Google", accountName: "demo@example.com" },
+    { id: "legacy-mfa-id:personal", name: "个人账户", issuer: "Google", accountName: "personal@example.com" },
+  ];
 
   return {
     isDesktop: () => false,
@@ -509,6 +554,9 @@ export function createBrowserPasswordApi(): PasswordApi {
     },
     async list() {
       return structuredClone(entries);
+    },
+    async listMfaCandidates() {
+      return structuredClone(mfaCandidates);
     },
     async create(request) {
       const loginUrl = request.loginUrl.trim();
@@ -627,6 +675,13 @@ export const passwordApi: PasswordApi = {
     if (!isDesktopRuntime()) return browserApi.list();
     const entries = await command<Array<Partial<PasswordEntrySummary> & Record<string, unknown>>>("list_password_entries");
     return (entries ?? []).map(normalizedEntry);
+  },
+  async listMfaCandidates() {
+    if (!isDesktopRuntime()) return browserApi.listMfaCandidates();
+    const candidates = await command<Array<Partial<PasswordMfaCandidate> & Record<string, unknown>>>(
+      "list_password_mfa_candidates",
+    );
+    return (candidates ?? []).map(normalizedMfaCandidate).filter((candidate) => candidate.id);
   },
   async create(request) {
     if (!isDesktopRuntime()) return browserApi.create(request);

@@ -7,7 +7,7 @@ afterEach(cleanup);
 
 const idleState: UpdateState = {
   phase: "idle",
-  currentVersion: "0.6.0",
+  currentVersion: "0.8.0",
   availableVersion: null,
   releaseNotes: null,
   publishedAt: null,
@@ -38,19 +38,20 @@ describe("AboutDialog", () => {
   it("shows the package timestamp next to the current version", () => {
     const buildTimestamp = 1_704_067_200;
     const rendered = render(AboutDialog, {
-      currentVersion: "0.7.4",
+      currentVersion: "0.8.0",
       buildTimestamp,
       supported: false,
     });
 
     const packagedAt = rendered.getByText(/^打包时间 /);
     expect(packagedAt).toHaveAttribute("datetime", new Date(buildTimestamp * 1000).toISOString());
-    expect(rendered.getByText("v0.7.4")).toBeInTheDocument();
+    expect(rendered.getByText("v0.8.0")).toBeInTheDocument();
+    expect(rendered.queryByText("Windows")).not.toBeInTheDocument();
   });
 
   it("enables automatic updates by default and supports a manual check", async () => {
     const api = mockApi();
-    const rendered = render(AboutDialog, { currentVersion: "0.6.0", supported: true, api });
+    const rendered = render(AboutDialog, { currentVersion: "0.8.0", supported: true, api });
 
     const automatic = await rendered.findByRole("checkbox", { name: /自动检查并下载更新/ });
     expect(automatic).toBeChecked();
@@ -64,7 +65,7 @@ describe("AboutDialog", () => {
 
   it("persists a disabled automatic-update preference", async () => {
     const api = mockApi();
-    const rendered = render(AboutDialog, { currentVersion: "0.6.0", supported: true, api });
+    const rendered = render(AboutDialog, { currentVersion: "0.8.0", supported: true, api });
     const automatic = await rendered.findByRole("checkbox", { name: /自动检查并下载更新/ });
 
     await waitFor(() => expect(automatic).toBeEnabled());
@@ -77,7 +78,7 @@ describe("AboutDialog", () => {
 
   it("shows a failed manual check as an error instead of leaving a loading state", async () => {
     const api = mockApi({ check: vi.fn().mockRejectedValue(new Error("网络不可用")) });
-    const rendered = render(AboutDialog, { currentVersion: "0.6.0", supported: true, api });
+    const rendered = render(AboutDialog, { currentVersion: "0.8.0", supported: true, api });
     const check = rendered.getByRole("button", { name: "检查更新" });
 
     await waitFor(() => expect(check).toBeEnabled());
