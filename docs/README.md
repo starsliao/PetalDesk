@@ -9,4 +9,5 @@
 - [密码管理器与 Firefox 扩展交接文档](PASSWORD_FIREFOX_HANDOFF.md)
 - [密码管理器 Firefox 扩展 v0.7.0 改动说明](PASSWORD_FIREFOX_V0.7.0.md)
 - [密码通道调试交接文档（命名管道死锁根因与修复）](PASSWORD_CHANNEL_DEBUG_HANDOFF.md)
+- [密码填充与保存功能交接文档](PASSWORD_FILL_SAVE_HANDOFF.md)
 - [项目功能和本地开发](../README.md)
