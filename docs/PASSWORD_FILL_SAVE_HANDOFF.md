@@ -10,11 +10,11 @@
 | --- | --- | --- |
 | 通道（桌面↔host↔扩展） | ✅ 已修复并验证 | 连接稳定数小时；探针实测 ping/getStatus 50ms 应答 |
 | `openPasswordManager`、`setCaptureEnabled`、状态同步 | ✅ 真机验证 | 弹窗"打开飞花密码管理器"可用，检测开关显示已开启 |
-| 角标（badge） | ⚠️ 切换标签可用，刷新后偶发不显示 | 见 §4.3 |
+| 角标（badge） | ✅ 真机验证（切换标签与刷新均正常） | 2026-08-07 用户实测确认；修复见 §4.3 |
 | 弹窗点击填充 | ❌ 真机不工作（至少对 163 邮箱） | 见 §4.1 |
 | 登录提交→保存提示 | ❌ 真机从未观察到提示 | 见 §4.2 |
 
-**重要**：同站 iframe 支持（163 修复的关键）已实现并全部单测通过，**但从未在真实 Firefox 里验证过**——代码在 commit `fc933e4`（main 分支，未发版）。用户最后一次测试用的扩展可能还是旧 zip（不含 iframe 支持）。接手后第一件事是按 §5 用新构建实测，区分"还没测到新代码"还是"新代码有 bug"。
+**重要**：同站 iframe 支持（163 修复的关键）已实现并全部单测通过，代码在 commit `fc933e4`（main 分支，未发版）。2026-08-07 用户实测：角标在切换标签与刷新后均正常——证明新扩展 + 新桌面端已在本机运行且 badge 链路（含 `fc933e4` 的角标重放修复）真机有效；但填充与保存提示仍不工作。接手后按 §4.1/§4.2 的嫌疑顺序用 §5 工具实测定位。
 
 ## 1. 功能需求（用户明确要求，已逐条确认）
 
@@ -61,8 +61,8 @@
 3. 提交检测选择器：`scheduleCandidate` 靠 form submit + 类提交按钮 click。163 的登录按钮是 JS 异步登录（不真正 submit form），`onClick` 分支的选择器是否覆盖该按钮需要真实页面验证。
 4. 桌面端 `handle_capture_candidate`（password_browser.rs:1162 附近）：`frameOrigin`/`origin` same-site 校验、promptOrigin 校验，任何一步不过都静默 return——诊断点目前只覆盖 badge/fill，**建议给 capture 候选加同样的 record_event 记录点**（为什么丢弃）。
 
-### 4.3 角标刷新后不恢复
-`fc933e4` 已做：tab-ready 时用 tabAccounts 缓存立即重放角标 + 激活时读实时 URL。若仍偶发不显示，查 `onActivated`/`onTabReady`/`clearTabAccounts` 的竞态（pagehide→page-closed→clearTabState 与 updateBadge 重推的顺序）。
+### 4.3 角标（已修复并真机确认）
+~~刷新后不恢复~~。修复内容（`fc933e4`）：tab-ready 时用 tabAccounts 缓存立即重放角标 + 激活时读实时 URL + 非网页标签通知桌面清跟踪。2026-08-07 用户实测：切换标签与刷新均正常显示。
 
 ### 4.4 其他已知限制（桌面端 agent 标注）
 - iframe 绑定的填充会话遇顶层导航会被 `bind_fill_tab_ready`（仍要求 frameId==0）清掉——两步登录第二页可能受影响。
