@@ -4,7 +4,7 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-function loadManager({ ambiguous = false, fieldScenario = "login", templateMultiple = false } = {}) {
+function loadManager({ ambiguous = false, fieldScenario = "login", templateMultiple = false, frame = null } = {}) {
   const runtimeMessages = [];
   const backgroundMessages = [];
   const documentListeners = new Map();
@@ -145,6 +145,11 @@ function loadManager({ ambiguous = false, fieldScenario = "login", templateMulti
       return Promise.resolve(response);
     },
   };
+  const location = {
+    href: generic ? "https://example.test/login" : "https://accounts.google.com/signin",
+  };
+  if (frame && frame.href) location.href = frame.href;
+  if (frame && frame.ancestorOrigins) location.ancestorOrigins = frame.ancestorOrigins;
   const context = {
     URL,
     Event: class {
@@ -160,11 +165,11 @@ function loadManager({ ambiguous = false, fieldScenario = "login", templateMulti
     console,
     crypto: { randomUUID: () => "manager-test" },
     document,
-    location: { href: generic ? "https://example.test/login" : "https://accounts.google.com/signin" },
+    location,
     setTimeout,
     top: null,
   };
-  context.top = context;
+  context.top = frame && frame.top === false ? { iframe: true } : context;
   context.globalThis = context;
   vm.createContext(context);
   for (const source of ["src/shared/password-templates.js", "src/content/password-manager.js"]) {
@@ -406,11 +411,158 @@ test("template filling rejects multiple fields matched by the same password sele
   assert.equal(credentials.password, "");
 });
 
-test("filling fails when the page has no login fields", async () => {
-  const { credentials, result } = await attemptGenericFill("empty");
+test("fill offers are silently ignored when the page has no login fields", async () => {
+  const harness = loadManager({ fieldScenario: "empty" });
+  const offer = await harness.command("fillOffer", {
+    entryId: "entry-empty",
+    offerId: "offer-empty",
+    origin: "https://example.test",
+    sessionId: "session-empty",
+    username: "alice@example.com",
+  });
+  assert.equal(offer.ok, true);
+  assert.equal(offer.result.ignored, true);
+  assert.deepEqual(harness.overlayButtons(), []);
+  // Without an active offer the secret request still fails closed.
+  const credentials = {
+    offerId: "offer-empty",
+    origin: "https://example.test",
+    password: "secret-password",
+    sessionId: "session-empty",
+    username: "alice@example.com",
+  };
+  const result = await harness.command("fillSecret", credentials);
   assert.equal(result.ok, false);
-  assert.match(result.error.message, /no login fields/i);
   assert.equal(credentials.password, "");
+});
+
+test("a same-site iframe confirms a broadcast offer and receives the secret", async () => {
+  const harness = loadManager({
+    frame: {
+      ancestorOrigins: ["https://mail.163.com"],
+      href: "https://dl.reg.163.com/login",
+      top: false,
+    },
+  });
+  const offer = await harness.command("fillOffer", {
+    direct: true,
+    entryId: "entry-163",
+    offerId: "offer-163",
+    origin: "https://mail.163.com",
+    sessionId: "session-163",
+    username: "alice@163.com",
+  });
+  assert.equal(offer.ok, true);
+  assert.equal(offer.result.state, "confirmed");
+  const confirm = harness.backgroundMessages.at(-1);
+  assert.equal(confirm.type, "petaldesk.password.fill-confirm");
+  assert.equal(confirm.origin, "https://mail.163.com");
+  assert.equal(confirm.frameOrigin, "https://dl.reg.163.com");
+  const credentials = {
+    offerId: "offer-163",
+    origin: "https://mail.163.com",
+    password: "secret-password",
+    sessionId: "session-163",
+    username: "alice@163.com",
+  };
+  const result = await harness.command("fillSecret", credentials);
+  assert.equal(result.ok, true);
+  assert.equal(result.result.submitted, false);
+  assert.equal(harness.inputs.username.value, "alice@163.com");
+  assert.equal(harness.inputs.password.value, "secret-password");
+  assert.equal(credentials.password, "");
+});
+
+test("a cross-site iframe silently ignores a broadcast fill offer", async () => {
+  const harness = loadManager({
+    frame: { href: "https://ads.example.net/banner", top: false },
+  });
+  const offer = await harness.command("fillOffer", {
+    direct: true,
+    entryId: "entry-163",
+    offerId: "offer-xsite",
+    origin: "https://mail.163.com",
+    sessionId: "session-xsite",
+    username: "alice@163.com",
+  });
+  assert.equal(offer.ok, true);
+  assert.equal(offer.result.ignored, true);
+  assert.equal(
+    harness.backgroundMessages.some((message) => message.type === "petaldesk.password.fill-confirm"),
+    false,
+  );
+  assert.deepEqual(harness.overlayButtons(), []);
+  assert.equal(harness.inputs.password.value, "");
+});
+
+test("a same-site iframe without login fields silently ignores the offer", async () => {
+  const harness = loadManager({
+    fieldScenario: "empty",
+    frame: { href: "https://dl.reg.163.com/frame", top: false },
+  });
+  const offer = await harness.command("fillOffer", {
+    direct: true,
+    entryId: "entry-163",
+    offerId: "offer-no-fields",
+    origin: "https://mail.163.com",
+    sessionId: "session-no-fields",
+    username: "alice@163.com",
+  });
+  assert.equal(offer.ok, true);
+  assert.equal(offer.result.ignored, true);
+  assert.equal(
+    harness.backgroundMessages.some((message) => message.type === "petaldesk.password.fill-confirm"),
+    false,
+  );
+  assert.deepEqual(harness.overlayButtons(), []);
+});
+
+test("an iframe capture reports the top-level origin plus its frame origin", async () => {
+  const harness = loadManager({
+    frame: {
+      ancestorOrigins: ["https://mail.163.com"],
+      href: "https://dl.reg.163.com/login",
+      top: false,
+    },
+  });
+  const enabled = await harness.command("captureEnable", {});
+  assert.equal(enabled.result.enabled, true);
+  harness.inputs.username.value = "alice";
+  harness.inputs.password.value = "secret-password";
+  harness.documentListeners.get("submit")({ target: harness.document });
+  await new Promise((resolve) => setImmediate(resolve));
+  const submitted = harness.backgroundMessages.find(
+    (message) => message.type === "petaldesk.password.capture-submitted",
+  );
+  assert.ok(submitted, "the iframe should report its submitted candidate");
+  assert.equal(submitted.candidate.origin, "https://mail.163.com");
+  assert.equal(submitted.candidate.frameOrigin, "https://dl.reg.163.com");
+  assert.equal(submitted.candidate.password, "secret-password");
+  const success = harness.backgroundMessages.find(
+    (message) => message.type === "petaldesk.password.capture-success",
+  );
+  assert.ok(success);
+  assert.equal(success.origin, "https://mail.163.com");
+  assert.equal(success.candidateId, submitted.candidate.candidateId);
+  await harness.command("captureDisable", {});
+});
+
+test("an iframe capture falls back to its own origin without ancestorOrigins", async () => {
+  const harness = loadManager({
+    frame: { href: "https://dl.reg.163.com/login", top: false },
+  });
+  await harness.command("captureEnable", {});
+  harness.inputs.username.value = "alice";
+  harness.inputs.password.value = "secret-password";
+  harness.documentListeners.get("submit")({ target: harness.document });
+  await new Promise((resolve) => setImmediate(resolve));
+  const submitted = harness.backgroundMessages.find(
+    (message) => message.type === "petaldesk.password.capture-submitted",
+  );
+  assert.ok(submitted);
+  assert.equal(submitted.candidate.origin, "https://dl.reg.163.com");
+  assert.equal(submitted.candidate.frameOrigin, "https://dl.reg.163.com");
+  await harness.command("captureDisable", {});
 });
 
 test("fill offers reject legacy template IDs instead of silently using generic fields", async () => {

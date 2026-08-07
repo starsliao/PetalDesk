@@ -117,6 +117,65 @@
     return url.origin;
   }
 
+  // Common multi-level public suffixes: hosts below these need one more label
+  // to reach the registrable domain (e.g. example.co.uk, mail.sina.com.cn).
+  const MULTI_LEVEL_PUBLIC_SUFFIXES = new Set([
+    "ac.cn",
+    "ac.uk",
+    "co.in",
+    "co.jp",
+    "co.kr",
+    "co.nz",
+    "co.uk",
+    "com.au",
+    "com.br",
+    "com.cn",
+    "com.hk",
+    "com.mx",
+    "com.my",
+    "com.sg",
+    "com.tr",
+    "com.tw",
+    "edu.cn",
+    "firm.in",
+    "gov.cn",
+    "net.au",
+    "net.cn",
+    "or.jp",
+    "org.au",
+    "org.cn",
+    "org.uk",
+  ]);
+
+  function isIpAddressHost(host) {
+    return host.includes(":") || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host);
+  }
+
+  function registrableDomain(host) {
+    const parts = host.split(".");
+    const suffix = parts.slice(-2).join(".");
+    if (parts.length >= 3 && MULTI_LEVEL_PUBLIC_SUFFIXES.has(suffix)) {
+      return parts.slice(-3).join(".");
+    }
+    return suffix;
+  }
+
+  function sameSite(originA, originB) {
+    if (originA === originB) return true;
+    let hostA;
+    let hostB;
+    try {
+      hostA = new URL(String(originA || "")).hostname;
+      hostB = new URL(String(originB || "")).hostname;
+    } catch (_error) {
+      return false;
+    }
+    if (!hostA || !hostB || isIpAddressHost(hostA) || isIpAddressHost(hostB)) {
+      return false;
+    }
+    return registrableDomain(hostA) === registrableDomain(hostB);
+  }
+
   function templateForOrigin(value) {
     const origin = exactOrigin(value);
     return BUILT_IN_TEMPLATES.find((template) => template.origins.includes(origin)) || null;
@@ -384,6 +443,7 @@
     normalizeRecordedSelector,
     normalizeUserTemplate,
     recordedSelectorForInput,
+    sameSite,
     templateForOrigin,
   });
 })(typeof globalThis !== "undefined" ? globalThis : this);

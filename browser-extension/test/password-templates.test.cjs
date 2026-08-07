@@ -180,3 +180,37 @@ test("credential matching distinguishes same, update, and new accounts", () => {
     { action: "new", entryId: null },
   );
 });
+
+test("sameSite matches registrable domains and rejects strangers and IPs", () => {
+  const templates = loadTemplates();
+  const cases = [
+    // The 163 mail login iframe: top page and frames share 163.com.
+    ["https://163.com", "https://mail.163.com", true],
+    ["https://mail.163.com", "https://dl.reg.163.com", true],
+    ["https://163.com", "https://dl.reg.163.com", true],
+    ["https://mail.163.com", "https://mail.163.com", true],
+    // Multi-level public suffixes need one more label.
+    ["https://www.sina.com.cn", "https://mail.sina.com.cn", true],
+    ["https://a.com.cn", "https://b.com.cn", false],
+    ["https://www.example.co.uk", "https://api.example.co.uk", true],
+    ["https://example.co.uk", "https://other.co.uk", false],
+    ["https://co.uk", "https://example.co.uk", false],
+    // Different registrable domains never match.
+    ["https://example.com", "https://example.com.evil.test", false],
+    ["https://mail.163.com", "https://mail.126.com", false],
+    ["https://example.test", "https://other-example.test", false],
+    // Ports and schemes are not part of the registrable domain.
+    ["https://example.test:8443", "https://example.test", true],
+    ["http://mail.163.com", "https://mail.163.com", true],
+    // IP literals and unparseable input never match.
+    ["http://127.0.0.1:8080", "http://127.0.0.1:9000", false],
+    ["http://[::1]:8080", "http://[::1]:9000", false],
+    ["https://192.168.1.1", "https://192.168.1.1.evil.test", false],
+    ["not a url", "https://example.test", false],
+    ["https://example.test", "", false],
+  ];
+  for (const [originA, originB, expected] of cases) {
+    assert.equal(templates.sameSite(originA, originB), expected, `${originA} vs ${originB}`);
+    assert.equal(templates.sameSite(originB, originA), expected, `${originB} vs ${originA}`);
+  }
+});

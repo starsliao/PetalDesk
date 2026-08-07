@@ -141,10 +141,16 @@ password; after the page produces `fillConfirm`, the host sends one
 the content script confirms immediately without a page overlay and shows a
 short auto-dismissing notice once the fields are filled; the overlay is still
 used for template recording. `password.offerFillDirect` skips
-`password.open` by binding an existing tab, frame, and exact origin into a
+`password.open` by binding an existing tab and exact origin into a
 ready session, then follows the same offer and confirmation steps. The
-request is bound to one session,
-tab, top-level frame, document, and exact origin. Content scripts fill fields
+request is bound to one session, tab, document, and exact origin. Fill offers
+are broadcast to every frame of the tab: a frame answers only when it is the
+offer origin itself or same-site with it (e.g. the `dl.reg.163.com` login
+iframe inside `mail.163.com`) and contains login fields, so the confirming
+same-site frame becomes the sole `fillSecret` target. Login capture follows
+the same rule: a same-site iframe reports candidates with the top-level
+origin plus its own `frameOrigin`, and cross-site frames are discarded.
+Content scripts fill fields
 and dispatch `input`/`change` events but never submit the form. A submitted
 password form is reported as a high-confidence success immediately; the save
 prompt does not wait for a post-submit success signal. Login candidates

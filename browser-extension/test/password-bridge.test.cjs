@@ -61,7 +61,11 @@ function loadBridge() {
       tabMessages.push({ tabId, message: JSON.parse(JSON.stringify(message)), options });
       const tab = tabs.get(tabId);
       assert.ok(tab, `tab ${tabId} should exist`);
-      assert.equal(options.frameId, 0);
+      // Broadcast commands (fillOffer, fillCancel, captureEnable, ...) carry no
+      // frameId; targeted commands must name a concrete frame.
+      if (options != null) {
+        assert.ok(Number.isInteger(options.frameId) && options.frameId >= 0);
+      }
       if (message.command === "fillOffer") {
         assert.equal(Object.prototype.hasOwnProperty.call(message.payload, "password"), false);
       }
@@ -1153,4 +1157,382 @@ test("HTTP origins require an explicit allowlist for opening and capture", async
     },
   });
   assert.equal(opened.origin, "http://intranet.test");
+});
+
+test("a same-site iframe confirms the broadcast offer and receives the secret alone", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(88, { id: 88, url: "https://mail.163.com/" });
+  await harness.bridge.route({
+    command: "password.offerFillDirect",
+    payload: {
+      documentId: "document-88",
+      entryId: "entry-163",
+      offerId: "offer-163",
+      origin: "https://mail.163.com",
+      sessionId: "iframe-fill",
+      tabId: 88,
+      username: "alice@163.com",
+    },
+  });
+  const offer = harness.tabMessages.at(-1);
+  assert.equal(offer.message.command, "fillOffer");
+  // The offer is broadcast: no frameId, every frame decides for itself.
+  assert.equal(offer.options, undefined);
+  assert.equal(offer.message.payload.origin, "https://mail.163.com");
+  const iframeSender = {
+    documentId: "iframe-document-88",
+    frameId: 7,
+    tab: { id: 88, url: "https://mail.163.com/" },
+    url: "https://dl.reg.163.com/login",
+  };
+  const confirmed = await harness.sendContent(
+    {
+      type: "petaldesk.password.fill-confirm",
+      frameOrigin: "https://dl.reg.163.com",
+      offerId: "offer-163",
+      origin: "https://mail.163.com",
+      sessionId: "iframe-fill",
+    },
+    iframeSender,
+  );
+  assert.equal(confirmed.confirmed, true);
+  const fillConfirm = harness.events.at(-1);
+  assert.equal(fillConfirm.event, "fillConfirm");
+  assert.equal(fillConfirm.payload.frameId, 7);
+  assert.equal(fillConfirm.payload.frameOrigin, "https://dl.reg.163.com");
+  assert.equal(fillConfirm.payload.origin, "https://mail.163.com");
+  const credentials = {
+    offerId: "offer-163",
+    origin: "https://mail.163.com",
+    password: "secret-password",
+    sessionId: "iframe-fill",
+  };
+  const filled = await harness.bridge.route({ command: "password.provideCredentials", payload: credentials });
+  assert.equal(filled.filledPassword, true);
+  assert.equal(credentials.password, "");
+  const secret = harness.tabMessages.at(-1);
+  assert.equal(secret.message.command, "fillSecret");
+  // The password is delivered only to the confirmed same-site frame.
+  assert.equal(secret.options.frameId, 7);
+  assert.equal(harness.events.at(-1).event, "fillResult");
+});
+
+test("a same-site iframe stays bound across a two-step fill", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(76, { id: 76, url: "https://mail.163.com/" });
+  await harness.bridge.route({
+    command: "password.offerFillDirect",
+    payload: {
+      entryId: "entry-163",
+      offerId: "offer-step-1",
+      origin: "https://mail.163.com",
+      sessionId: "iframe-two-step",
+      tabId: 76,
+      username: "alice@163.com",
+    },
+  });
+  const iframeSender = {
+    documentId: "iframe-document-76",
+    frameId: 7,
+    tab: { id: 76, url: "https://mail.163.com/" },
+    url: "https://dl.reg.163.com/login",
+  };
+  await harness.sendContent(
+    {
+      type: "petaldesk.password.fill-confirm",
+      frameOrigin: "https://dl.reg.163.com",
+      offerId: "offer-step-1",
+      origin: "https://mail.163.com",
+      sessionId: "iframe-two-step",
+    },
+    iframeSender,
+  );
+  const originalSendTabMessage = harness.api.sendTabMessage;
+  let firstSecret = true;
+  harness.api.sendTabMessage = async (tabId, message, options) => {
+    const response = await originalSendTabMessage(tabId, message, options);
+    if (message.command === "fillSecret" && firstSecret) {
+      firstSecret = false;
+      return { ok: true, result: { ...response.result, filledPassword: false, needsNextStep: true } };
+    }
+    return response;
+  };
+  const first = await harness.bridge.route({
+    command: "password.provideCredentials",
+    payload: {
+      offerId: "offer-step-1",
+      origin: "https://mail.163.com",
+      password: "secret-password",
+      sessionId: "iframe-two-step",
+    },
+  });
+  assert.equal(first.needsNextStep, true);
+  // The second offer must still reach the iframe-bound session and confirm.
+  await harness.bridge.route({
+    command: "password.offerFill",
+    payload: {
+      offerId: "offer-step-2",
+      origin: "https://mail.163.com",
+      sessionId: "iframe-two-step",
+      username: "alice@163.com",
+    },
+  });
+  const reconfirmed = await harness.sendContent(
+    {
+      type: "petaldesk.password.fill-confirm",
+      frameOrigin: "https://dl.reg.163.com",
+      offerId: "offer-step-2",
+      origin: "https://mail.163.com",
+      sessionId: "iframe-two-step",
+    },
+    iframeSender,
+  );
+  assert.equal(reconfirmed.confirmed, true);
+  await harness.bridge.route({
+    command: "password.provideCredentials",
+    payload: {
+      offerId: "offer-step-2",
+      origin: "https://mail.163.com",
+      password: "secret-password",
+      sessionId: "iframe-two-step",
+    },
+  });
+  const secret = harness.tabMessages.at(-1);
+  assert.equal(secret.message.command, "fillSecret");
+  assert.equal(secret.options.frameId, 7);
+});
+
+test("a cross-site iframe confirmation is rejected and clears the fill session", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(89, { id: 89, url: "https://mail.163.com/" });
+  await harness.bridge.route({
+    command: "password.offerFillDirect",
+    payload: {
+      entryId: "entry-163",
+      offerId: "offer-xsite",
+      origin: "https://mail.163.com",
+      sessionId: "iframe-xsite",
+      tabId: 89,
+      username: "alice@163.com",
+    },
+  });
+  const evilSender = {
+    documentId: "evil-document",
+    frameId: 9,
+    tab: { id: 89, url: "https://mail.163.com/" },
+    url: "https://evil.example/phish",
+  };
+  await assert.rejects(
+    harness.sendContent(
+      {
+        type: "petaldesk.password.fill-confirm",
+        frameOrigin: "https://evil.example",
+        offerId: "offer-xsite",
+        origin: "https://mail.163.com",
+        sessionId: "iframe-xsite",
+      },
+      evilSender,
+    ),
+    /same-site/i,
+  );
+  assert.equal(harness.events.some((event) => event.event === "fillConfirm"), false);
+  // The session was dropped: no credentials can be provided afterwards.
+  await assert.rejects(
+    harness.bridge.route({
+      command: "password.provideCredentials",
+      payload: {
+        offerId: "offer-xsite",
+        origin: "https://mail.163.com",
+        password: "secret-password",
+        sessionId: "iframe-xsite",
+      },
+    }),
+    /expired/i,
+  );
+  assert.equal(harness.tabMessages.some((entry) => entry.message.command === "fillSecret"), false);
+});
+
+test("a forged frameOrigin that disagrees with the sender URL is rejected", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(93, { id: 93, url: "https://mail.163.com/" });
+  await harness.bridge.route({
+    command: "password.offerFillDirect",
+    payload: {
+      entryId: "entry-163",
+      offerId: "offer-forged",
+      origin: "https://mail.163.com",
+      sessionId: "iframe-forged",
+      tabId: 93,
+      username: "alice@163.com",
+    },
+  });
+  const forgedSender = {
+    documentId: "forged-frame-document",
+    frameId: 11,
+    tab: { id: 93, url: "https://mail.163.com/" },
+    url: "https://evil.example/phish",
+  };
+  await assert.rejects(
+    harness.sendContent(
+      {
+        type: "petaldesk.password.fill-confirm",
+        frameOrigin: "https://dl.reg.163.com",
+        offerId: "offer-forged",
+        origin: "https://mail.163.com",
+        sessionId: "iframe-forged",
+      },
+      forgedSender,
+    ),
+    /does not match/i,
+  );
+  assert.equal(harness.events.some((event) => event.event === "fillConfirm"), false);
+});
+
+test("a same-site iframe capture candidate promotes with its frame origin", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(92, { id: 92, url: "https://mail.163.com/" });
+  await harness.bridge.route({ command: "password.setCaptureEnabled", payload: { enabled: true } });
+  const iframeSender = {
+    documentId: "iframe-document-92",
+    frameId: 7,
+    tab: { id: 92, url: "https://mail.163.com/" },
+    url: "https://dl.reg.163.com/login",
+  };
+  const candidate = {
+    candidateId: "iframe-candidate",
+    frameOrigin: "https://dl.reg.163.com",
+    origin: "https://mail.163.com",
+    password: "iframe-secret",
+    username: "alice",
+  };
+  const accepted = await harness.sendContent(
+    { type: "petaldesk.password.capture-submitted", candidate },
+    iframeSender,
+  );
+  assert.equal(accepted.accepted, true);
+  assert.equal(candidate.password, "");
+  const promoted = await harness.sendContent(
+    {
+      type: "petaldesk.password.capture-success",
+      candidateId: "iframe-candidate",
+      confidence: "high",
+      origin: "https://mail.163.com",
+    },
+    iframeSender,
+  );
+  assert.equal(promoted.promoted, true);
+  const nativeCandidate = harness.events.at(-1);
+  assert.equal(nativeCandidate.event, "captureCandidate");
+  assert.equal(nativeCandidate.payload.origin, "https://mail.163.com");
+  assert.equal(nativeCandidate.payload.frameOrigin, "https://dl.reg.163.com");
+  assert.equal(nativeCandidate.payload.frameId, 7);
+  assert.equal(nativeCandidate.payload.password, "iframe-secret");
+});
+
+test("a cross-site iframe capture candidate is discarded", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(94, { id: 94, url: "https://mail.163.com/" });
+  await harness.bridge.route({ command: "password.setCaptureEnabled", payload: { enabled: true } });
+  const evilSender = {
+    documentId: "evil-capture-document",
+    frameId: 9,
+    tab: { id: 94, url: "https://mail.163.com/" },
+    url: "https://evil.example/login",
+  };
+  await assert.rejects(
+    harness.sendContent(
+      {
+        type: "petaldesk.password.capture-submitted",
+        candidate: {
+          candidateId: "xsite-candidate",
+          frameOrigin: "https://evil.example",
+          origin: "https://mail.163.com",
+          password: "stolen",
+          username: "alice",
+        },
+      },
+      evilSender,
+    ),
+    /cross-site|origin/i,
+  );
+  const status = await harness.bridge.route({ command: "password.getStatus", payload: {} });
+  assert.equal(status.pendingCandidates, 0);
+  assert.equal(harness.events.some((event) => event.event === "captureCandidate"), false);
+});
+
+test("a same-origin refresh replays the cached badge without waiting for the desktop", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(73, { id: 73, url: "https://example.test/login" });
+  await harness.bridge.route({
+    command: "password.updateBadge",
+    payload: {
+      accounts: [
+        { entryId: "entry-a", siteName: "Example", username: "alice" },
+        { entryId: "entry-b", siteName: "Example", username: "bob" },
+      ],
+      origin: "https://example.test",
+      tabId: 73,
+    },
+  });
+  assert.deepEqual(harness.actionUpdates.badgeTexts.at(-1), { tabId: 73, text: "2" });
+  const sender = {
+    documentId: "document-73-refresh",
+    frameId: 0,
+    tab: { id: 73, url: "https://example.test/login" },
+    url: "https://example.test/login",
+  };
+  await harness.sendContent(
+    { type: "petaldesk.password.tab-ready", origin: "https://example.test" },
+    sender,
+  );
+  assert.equal(harness.events.at(-1).event, "originActive");
+  // The cached count is re-applied immediately after the same-origin refresh.
+  assert.deepEqual(harness.actionUpdates.badgeTexts.at(-1), { tabId: 73, text: "2" });
+});
+
+test("capture enable broadcasts to every frame of the tab", async () => {
+  const harness = loadBridge();
+  harness.tabs.set(74, { id: 74, url: "https://example.test/login" });
+  await harness.bridge.route({ command: "password.setCaptureEnabled", payload: { enabled: true } });
+  const enable = harness.tabMessages.find((entry) => entry.message.command === "captureEnable");
+  assert.ok(enable, "the capture enable command should be sent");
+  assert.equal(enable.options, undefined);
+});
+
+test("an iframe tab-ready learns the capture state without tab bookkeeping", async () => {
+  const harness = loadBridge();
+  await harness.bridge.route({ command: "password.setCaptureEnabled", payload: { enabled: true } });
+  harness.tabs.set(75, { id: 75, url: "https://mail.163.com/" });
+  const iframeSender = {
+    documentId: "iframe-document-75",
+    frameId: 4,
+    tab: { id: 75, url: "https://mail.163.com/" },
+    url: "https://dl.reg.163.com/login",
+  };
+  const ready = await harness.sendContent(
+    { type: "petaldesk.password.tab-ready", origin: "https://dl.reg.163.com" },
+    iframeSender,
+  );
+  assert.equal(ready.captureEnabled, true);
+  // No originActive event and no badge/bookkeeping for a non-top frame.
+  assert.equal(harness.events.some((event) => event.event === "originActive"), false);
+  await assert.rejects(
+    harness.sendContent(
+      { type: "petaldesk.password.tab-ready", origin: "https://mail.163.com" },
+      iframeSender,
+    ),
+    /did not match/i,
+  );
+  const topSender = {
+    documentId: "document-75",
+    frameId: 0,
+    tab: { id: 75, url: "https://mail.163.com/" },
+    url: "https://mail.163.com/",
+  };
+  await harness.sendContent(
+    { type: "petaldesk.password.tab-ready", origin: "https://mail.163.com" },
+    topSender,
+  );
+  assert.equal(harness.events.at(-1).event, "originActive");
+  assert.deepEqual(harness.events.at(-1).payload, { origin: "https://mail.163.com", tabId: 75 });
 });

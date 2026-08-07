@@ -61,6 +61,52 @@
     return origin.startsWith("https://");
   }
 
+  // Fill offers are broadcast to every frame: a frame may participate when it
+  // is the offer origin itself or same-site with it (e.g. the dl.reg.163.com
+  // login iframe inside mail.163.com). Cross-site frames must never fill.
+  function fillOriginAllowed(requestedOrigin, { allowInsecureHttp = false } = {}) {
+    let origin;
+    let ownOrigin;
+    try {
+      origin = templates.exactOrigin(requestedOrigin);
+      ownOrigin = currentOrigin();
+    } catch (_error) {
+      return false;
+    }
+    if (origin !== ownOrigin && !templates.sameSite(origin, ownOrigin)) return false;
+    if (ownOrigin.startsWith("http://")) {
+      return allowInsecureHttp || captureAllowedHttpOrigins.has(ownOrigin);
+    }
+    return ownOrigin.startsWith("https://");
+  }
+
+  // The top-level origin of this frame, used when reporting captured logins.
+  // Firefox exposes no location.ancestorOrigins, so cross-origin iframes fall
+  // back to their own origin there.
+  function topMostOrigin() {
+    try {
+      const ancestors = root.location && root.location.ancestorOrigins;
+      if (ancestors && ancestors.length > 0) {
+        return templates.exactOrigin(ancestors[ancestors.length - 1]);
+      }
+    } catch (_error) {
+      // Fall through to this frame's own origin.
+    }
+    return currentOrigin();
+  }
+
+  function offerLoginFields(userTemplate) {
+    try {
+      const fields = templates.identifyLoginFields(root.document, {
+        origin: currentOrigin(),
+        userTemplate,
+      });
+      return fields && (fields.passwordField || fields.usernameField) ? fields : null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
   function randomId(prefix) {
     if (root.crypto && typeof root.crypto.randomUUID === "function") {
       return `${prefix}-${root.crypto.randomUUID()}`;
@@ -309,7 +355,7 @@
     if (!activeOffer || !payload || typeof payload !== "object") return false;
     if (String(payload.sessionId || "") !== activeOffer.sessionId) return false;
     if (String(payload.offerId || "") !== activeOffer.offerId) return false;
-    if (!originIsAllowed(payload.origin, { allowInsecureHttp: activeOffer.allowInsecureHttp })) {
+    if (!fillOriginAllowed(payload.origin, { allowInsecureHttp: activeOffer.allowInsecureHttp })) {
       return false;
     }
     return Date.now() < activeOffer.expiresAt;
@@ -318,18 +364,24 @@
   function showFillOffer(payload) {
     if (!payload || typeof payload !== "object") throw new Error("A fill offer is required");
     const origin = templates.exactOrigin(payload.origin);
-    if (!originIsAllowed(origin, { allowInsecureHttp: payload.allowInsecureHttp === true })) {
-      throw new Error("The fill offer origin does not match the current page");
-    }
     if (Object.prototype.hasOwnProperty.call(payload, "password")) {
       throw new Error("Fill offers must not contain credentials");
     }
     const sessionId = safeString(payload.sessionId, 160);
     const offerId = safeString(payload.offerId || randomId("offer"), 160);
     if (!sessionId) throw new Error("A fill session is required");
+    // The offer reaches every frame of the tab. Frames that are not same-site
+    // with the offer origin, or that contain no login fields, stay silent so
+    // the frame holding the login form is the only one that answers.
+    if (!fillOriginAllowed(origin, { allowInsecureHttp: payload.allowInsecureHttp === true })) {
+      return { ignored: true, offerId, sessionId };
+    }
     let userTemplate = null;
     if (payload.userTemplate) {
       userTemplate = templates.normalizeUserTemplate(payload.userTemplate, origin);
+    }
+    if (!offerLoginFields(userTemplate)) {
+      return { ignored: true, offerId, sessionId };
     }
     clearActiveOffer();
     const offer = {
@@ -356,6 +408,7 @@
       offer.confirmed = true;
       void sendBackground({
         type: FILL_CONFIRM_MESSAGE,
+        frameOrigin: currentOrigin(),
         sessionId,
         offerId,
         origin,
@@ -375,6 +428,7 @@
             removeOverlay();
             void sendBackground({
               type: FILL_CONFIRM_MESSAGE,
+              frameOrigin: currentOrigin(),
               sessionId,
               offerId,
               origin,
@@ -388,6 +442,7 @@
               clearActiveOffer();
               void sendBackground({
                 type: FILL_CANCEL_MESSAGE,
+                frameOrigin: currentOrigin(),
                 sessionId,
                 offerId,
                 origin,
@@ -481,7 +536,8 @@
     if ((!password && !username) || password.length > 4_096 || username.length > 1_024) return null;
     return {
       confidence: fields.ambiguous ? "low" : fields.confidence,
-      origin: currentOrigin(),
+      frameOrigin: currentOrigin(),
+      origin: topMostOrigin(),
       password,
       source: fields.source,
       stage: fields.stage,
@@ -693,7 +749,7 @@
   }
 
   function onSubmit(event) {
-    if (!captureEnabled || !isTopFrame()) return;
+    if (!captureEnabled) return;
     const form = event && event.target && typeof event.target.querySelectorAll === "function"
       ? event.target
       : root.document;
@@ -701,7 +757,7 @@
   }
 
   function onClick(event) {
-    if (!captureEnabled || !isTopFrame()) return;
+    if (!captureEnabled) return;
     const target = event && event.target;
     if (!target || typeof target.closest !== "function") return;
     const submit = target.closest('button[type="submit"], input[type="submit"], button[role="button"]');
@@ -875,10 +931,18 @@
     removeOverlay();
   });
 
-  if (isTopFrame()) {
+  // Every frame announces itself: the top frame drives the tab bookkeeping,
+  // and same-site iframes learn the capture state for login detection.
+  let readyOrigin = "";
+  try {
+    readyOrigin = currentOrigin();
+  } catch (_error) {
+    readyOrigin = "";
+  }
+  if (readyOrigin) {
     void sendBackground({
       type: READY_MESSAGE,
-      origin: currentOrigin(),
+      origin: readyOrigin,
     }).then((response) => {
       if (response && response.captureEnabled) {
         captureAllowedHttpOrigins = new Set(response.insecureOrigins || []);

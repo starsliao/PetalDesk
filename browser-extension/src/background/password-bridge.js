@@ -290,12 +290,12 @@
       return origin;
     }
 
-    async function sendContent(session, command, payload) {
+    async function sendContent(session, command, payload, { broadcast = false } = {}) {
       await validateLiveTab(session);
       const response = await api.sendTabMessage(
         session.tabId,
         { type: CONTENT_MESSAGE_TYPE, command, payload },
-        { frameId: session.frameId },
+        broadcast ? undefined : { frameId: session.frameId },
       );
       if (!response || response.ok !== true) {
         throw bridgeError(
@@ -381,13 +381,11 @@
         throw bridgeError("PASSWORD_SESSION_STATE", `The fill session is ${session.state}`);
       }
       const requestedTabId = optionalRoutingId(payload.tabId, "tabId") ?? session.tabId;
-      const requestedFrameId = optionalRoutingId(payload.frameId, "frameId") ?? session.frameId;
       const origin = templates.exactOrigin(payload.origin);
-      if (
-        requestedTabId !== session.tabId
-        || requestedFrameId !== session.frameId
-        || origin !== session.origin
-      ) {
+      // The offer is broadcast to every frame of the tab, so a requested
+      // frameId is advisory only: the binding to a concrete frame (possibly a
+      // same-site iframe) is established by the fill-confirm message.
+      if (requestedTabId !== session.tabId || origin !== session.origin) {
         throw bridgeError("PASSWORD_TARGET_MISMATCH", "The fill offer target does not match its session");
       }
       const offerId = requiredString(payload.offerId || secureRandomId("offer"), "offerId", 160);
@@ -399,6 +397,9 @@
       // page, and that fill-confirm can arrive before sendContent resolves.
       session.offerId = offerId;
       session.state = "awaiting-confirmation";
+      // Broadcast the offer to every frame: the login form may live in a
+      // same-site iframe (e.g. dl.reg.163.com inside mail.163.com), and each
+      // frame decides for itself whether it can fill this origin.
       let result;
       try {
         result = await sendContent(session, "fillOffer", {
@@ -410,7 +411,7 @@
           sessionId: session.sessionId,
           userTemplate: payload.userTemplate || null,
           username,
-        });
+        }, { broadcast: true });
       } catch (error) {
         session.offerId = null;
         session.state = "ready";
@@ -535,7 +536,7 @@
           offerId: session.offerId,
           origin: session.origin,
           sessionId: session.sessionId,
-        });
+        }, { broadcast: true });
       } catch (_error) {
         // Navigation can remove the content script; cancellation still clears the session.
       }
@@ -645,6 +646,8 @@
         }
         const allowed = origin.startsWith("https://") || captureInsecureOrigins.has(origin);
         const command = captureEnabled && allowed ? "captureEnable" : "captureDisable";
+        // No frameId: every frame of the tab toggles its own login detection,
+        // so same-site iframes can report submitted credentials too.
         await api.sendTabMessage(
           tab.id,
           {
@@ -652,7 +655,6 @@
             command,
             payload: { insecureOrigins: Array.from(captureInsecureOrigins) },
           },
-          { frameId: 0 },
         ).catch(() => {});
       }));
     }
@@ -818,6 +820,7 @@
         confidence: record.confidence,
         documentId: record.promptBinding.documentId,
         frameId: record.promptBinding.frameId,
+        frameOrigin: record.frameOrigin,
         origin: record.origin,
         password: record.password,
         source: record.source,
@@ -946,10 +949,14 @@
         clearCandidate(candidateId);
         throw bridgeError("PASSWORD_CANDIDATE_EXPIRED", "The login candidate has expired");
       }
+      const sameFrame = binding.frameId === record.frameId && binding.origin === record.origin;
+      const sameSiteFrame = binding.frameId === record.frameId
+        && Boolean(record.frameOrigin)
+        && binding.origin === record.frameOrigin
+        && templates.sameSite(record.frameOrigin, record.origin);
       if (
         binding.tabId !== record.tabId
-        || binding.frameId !== record.frameId
-        || binding.origin !== record.origin
+        || !sameFrame && !sameSiteFrame
         || record.documentId && binding.documentId && binding.documentId !== record.documentId
       ) {
         throw bridgeError("PASSWORD_TARGET_MISMATCH", "The success signal came from another page");
@@ -966,7 +973,20 @@
       } catch (_error) {
         announcedOrigin = "";
       }
-      if (binding.frameId === 0 && !announcedOrigin) {
+      if (binding.frameId !== 0) {
+        // Non-top frames announce themselves only to learn the capture state;
+        // tab bookkeeping and originActive remain top-frame responsibilities.
+        if (!announcedOrigin || announcedOrigin !== binding.origin) {
+          throw bridgeError("PASSWORD_TARGET_MISMATCH", "The ready page did not match its browser frame");
+        }
+        const frameCaptureAllowed = binding.origin.startsWith("https://")
+          || captureInsecureOrigins.has(binding.origin);
+        return {
+          captureEnabled: Boolean(captureEnabled && frameCaptureAllowed),
+          insecureOrigins: Array.from(captureInsecureOrigins),
+        };
+      }
+      if (!announcedOrigin) {
         // A top-level page without a valid HTTP(S) origin has no accounts; drop
         // stale badge state and report the tab as having no active origin.
         tabContexts.set(binding.tabId, { documentId: binding.documentId, origin: "" });
@@ -974,7 +994,7 @@
         postEvent("originActive", { origin: "", tabId: binding.tabId });
         throw bridgeError("PASSWORD_TARGET_MISMATCH", "The ready page did not match its browser frame");
       }
-      if (announcedOrigin !== binding.origin || binding.frameId !== 0) {
+      if (announcedOrigin !== binding.origin) {
         throw bridgeError("PASSWORD_TARGET_MISMATCH", "The ready page did not match its browser frame");
       }
       tabContexts.set(binding.tabId, { documentId: binding.documentId, origin: binding.origin });
@@ -984,6 +1004,15 @@
         // The desktop pushes badge accounts per origin; a navigation makes any
         // previously cached list stale until the next password.updateBadge.
         clearTabAccounts(binding.tabId);
+      } else if (cachedAccounts) {
+        // Same-origin refresh: replay the cached badge at once so the count
+        // does not flash empty while the desktop re-pushes its account list.
+        setBadgeText(
+          binding.tabId,
+          cachedAccounts.locked || cachedAccounts.accounts.length === 0
+            ? ""
+            : String(cachedAccounts.accounts.length),
+        );
       }
       for (const recording of Array.from(recordings.values())) {
         if (recording.tabId !== binding.tabId) continue;
@@ -1090,23 +1119,53 @@
       const binding = senderBinding(sender);
       const offerId = requiredString(message.offerId, "offerId", 160);
       const origin = templates.exactOrigin(message.origin);
+      // frameOrigin is the sending frame's own origin; it must agree with the
+      // browser-reported sender URL so a frame cannot claim another identity.
+      const frameOrigin = message.frameOrigin == null
+        ? binding.origin
+        : templates.exactOrigin(message.frameOrigin);
+      // The bound frame is the exact top-level frame the session started on.
+      // Once a same-site iframe confirmed, the session is re-bound to it, so
+      // later messages from that frame take the same-site path below.
+      const boundFrame = binding.frameId === session.frameId && binding.origin === session.origin;
       if (
         binding.tabId !== session.tabId
-        || binding.frameId !== session.frameId
-        || binding.origin !== session.origin
         || origin !== session.origin
         || offerId !== session.offerId
-        || session.documentId && binding.documentId && binding.documentId !== session.documentId
+        || frameOrigin !== binding.origin
+        || boundFrame && session.documentId && binding.documentId && binding.documentId !== session.documentId
       ) {
         throw bridgeError("PASSWORD_TARGET_MISMATCH", "The page message does not match its fill session");
       }
-      return { binding, session };
+      if (!boundFrame && !templates.sameSite(binding.origin, session.origin)) {
+        // A cross-site frame must never confirm or cancel another site's fill.
+        throw bridgeError(
+          "PASSWORD_CROSS_SITE_FRAME",
+          "The page frame is not same-site with the fill session",
+        );
+      }
+      return { binding, frameOrigin, session };
     }
 
     function onFillConfirm(message, sender) {
-      const { binding, session } = sessionForContent(message, sender);
+      let context;
+      try {
+        context = sessionForContent(message, sender);
+      } catch (error) {
+        if (error && error.code === "PASSWORD_CROSS_SITE_FRAME") {
+          // Fail closed: a cross-site frame tried to confirm this fill.
+          clearSession(String(message.sessionId || ""));
+        }
+        throw error;
+      }
+      const { binding, frameOrigin, session } = context;
       if (session.state !== "awaiting-confirmation") {
         throw bridgeError("PASSWORD_SESSION_STATE", "The fill offer is not awaiting confirmation");
+      }
+      if (binding.frameId !== session.frameId) {
+        // The login form lives in a same-site iframe: bind the session to the
+        // confirming frame so credentials are delivered only there.
+        session.frameId = binding.frameId;
       }
       session.state = "confirmed";
       renewSession(session);
@@ -1114,6 +1173,7 @@
         documentId: binding.documentId,
         entryId: session.entryId,
         frameId: binding.frameId,
+        frameOrigin,
         offerId: session.offerId,
         origin: session.origin,
         sessionId: session.sessionId,
@@ -1181,11 +1241,27 @@
         : {};
       const candidateId = requiredString(value.candidateId, "candidateId", 160);
       const origin = templates.exactOrigin(value.origin);
-      if (origin !== binding.origin) {
-        throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The login candidate origin is invalid");
+      // origin is the top-level origin; frameOrigin is the submitting frame's
+      // own origin and must agree with the browser-reported sender URL.
+      const frameOrigin = value.frameOrigin == null
+        ? binding.origin
+        : templates.exactOrigin(value.frameOrigin);
+      if (frameOrigin !== binding.origin) {
+        throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The login candidate frame origin is invalid");
+      }
+      if (binding.frameId === 0) {
+        if (origin !== binding.origin) {
+          throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The login candidate origin is invalid");
+        }
+      } else if (!templates.sameSite(frameOrigin, origin)) {
+        // A cross-site iframe must never attach credentials to the top site.
+        throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The login candidate came from a cross-site frame");
       }
       if (origin.startsWith("http://") && !captureInsecureOrigins.has(origin)) {
         throw bridgeError("PASSWORD_INSECURE_ORIGIN", "HTTP login detection was not enabled for this origin");
+      }
+      if (frameOrigin.startsWith("http://") && !captureInsecureOrigins.has(frameOrigin)) {
+        throw bridgeError("PASSWORD_INSECURE_ORIGIN", "HTTP login detection was not enabled for this frame");
       }
       let username = String(value.username == null ? "" : value.username);
       let password = String(value.password == null ? "" : value.password);
@@ -1208,6 +1284,7 @@
         documentId: binding.documentId,
         expiresAt: Date.now() + CANDIDATE_TTL_MS,
         frameId: binding.frameId,
+        frameOrigin,
         origin,
         password,
         promoted: false,
