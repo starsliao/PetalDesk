@@ -6,20 +6,20 @@
 
 <https://starsliao.github.io/PetalDesk/>
 
-## 0.8.2 平台范围
+## 0.8.3 平台范围
 
-Windows 10/11 x64 与 macOS 12+ 共享便签、甘特图、计时器、提醒、系统通知、MFA 和普通截图能力。Windows `0.8.2` 在常规设置中提供开机启动选项，登录系统后静默驻留托盘，不弹出主界面或便签。Firefox 扩展把密码账户与本地 TOTP 关联：密码填入或唯一账户完全匹配后，可自动或经用户确认填入受信任的 6/7/8 位 TOTP 字段，且绝不主动提交表单；账号密码填入成功后保持静默，工具栏账户卡片可分别复制用户名、密码和 MFA，并通过右键菜单二次确认删除。登录检测默认开启且可在扩展弹窗中主动开关；异常断线立即快速重连 3 次，全部失败后才显示手动重连。待保存/更新提示跨同一标签页页面变化保留至用户明确处理，弹窗另提供主程序、密码管理器、MFA 验证器和新建便签四个入口。普通关闭密码管理器或 MFA 窗口不会错误关闭登录检测或显式锁定 MFA；MFA 导入预览可编辑显示信息，桌面密码管理器提供按住显示密码及统一的三项复制按钮。Chrome/Edge 的密码能力延期。Windows 继续提供密码管理器、长截图、自动滚动和 Native Messaging Host。macOS 使用 Keychain 提供 MFA 本机免密解锁，并支持普通区域截图，但当前不提供密码管理器、长截图、浏览器联动、Native Messaging 注册或自动更新。
+Windows 10/11 x64 与 macOS 12+ 共享便签、甘特图、计时器、提醒、系统通知、MFA 和普通截图能力。Windows `0.8.3` 修复开机启动注册表权限并把设置错误固定显示在对话框顶部，托盘入口改为“打开主界面”，便签操作合并到带新建项和列表的二级菜单；关于页安全渲染更新内容中的 Markdown。Firefox 扩展把密码账户与本地 TOTP 关联：密码填入或唯一账户完全匹配后，可自动或经用户确认填入受信任的 6/7/8 位 TOTP 字段，且绝不主动提交表单；账号密码填入成功后保持静默，工具栏账户卡片可分别复制用户名、密码和 MFA，并通过右键菜单二次确认删除。扩展状态默认折叠，四个状态点分别概览安装权限、Native Host、桌面密码通道和登录检测；登录检测主动关闭时使用黑色，异常或未知状态使用红色。登录检测默认开启且可在扩展弹窗中主动开关；异常断线立即快速重连 3 次，全部失败后才显示手动重连。待保存/更新提示跨同一标签页页面变化保留至用户明确处理，弹窗另提供同一行的主界面、密码、MFA 和便签四个入口。复制关联 MFA 后会显示真实剩余有效秒数，验证码到期不再因此自动清空系统剪贴板；主动锁定 MFA 或退出飞花时仍会清理未被替换的验证码。普通关闭密码管理器或 MFA 窗口不会错误关闭登录检测或显式锁定 MFA；MFA 导入预览可编辑显示信息，桌面密码管理器提供按住显示密码及统一的三项复制按钮。Chrome/Edge 的密码能力延期。Windows 继续提供密码管理器、长截图、自动滚动和 Native Messaging Host。macOS 使用 Keychain 提供 MFA 本机免密解锁，并支持普通区域截图，但当前不提供密码管理器、长截图、浏览器联动、Native Messaging 注册或自动更新。
 
 macOS Release 是一个 Universal DMG，内部同时包含 `x86_64-apple-darwin` 与 `aarch64-apple-darwin`，所以 Intel 和 Apple Silicon 不需要两个安装包。当前发布资产为：
 
-- `PetalDesk_0.8.2_x64-setup.exe`
-- `PetalDesk_0.8.2_x64-setup.exe.sig`
+- `PetalDesk_0.8.3_x64-setup.exe`
+- `PetalDesk_0.8.3_x64-setup.exe.sig`
 - `latest.json`
-- `PetalDesk_0.8.2_universal.dmg`
-- `PetalDesk_Firefox_AMO-upload_0.8.2.zip`
-- `PetalDesk_Firefox_AMO-source_0.8.2.zip`
+- `PetalDesk_0.8.3_universal.dmg`
+- `PetalDesk_Firefox_AMO-upload_0.8.3.zip`
+- `PetalDesk_Firefox_AMO-source_0.8.3.zip`
 
-Windows `0.5.2` 及后续版本可以通过客户端自动更新到 `0.8.2`，无需先在本机手工打包或安装。macOS 的 `0.5.0` 是首个公开版本，`0.8.2` 可以直接覆盖升级。MFA 保险库继续兼容已有 DPAPI/Keychain 包装；Windows 密码保险库 v1 会透明迁移到保留旧 AAD 的 v2，并在首次成功写入前创建备份。
+Windows `0.5.2` 及后续版本可以通过客户端自动更新到 `0.8.3`，无需先在本机手工打包或安装。macOS 的 `0.5.0` 是首个公开版本，`0.8.3` 可以直接覆盖升级。MFA 保险库继续兼容已有 DPAPI/Keychain 包装；Windows 密码保险库 v1 会透明迁移到保留旧 AAD 的 v2，并在首次成功写入前创建备份。
 
 ## 本地构建
 
@@ -90,7 +90,7 @@ Windows 包始终包含并注册 Firefox Native Messaging Host。构建 Chromium
 - Firefox 扩展安装页：<https://starsliao.github.io/PetalDesk/firefox.html>
 - 浏览器增强隐私政策：<https://starsliao.github.io/PetalDesk/privacy.html>
 
-AMO 公开提交前应先把包含这两个页面的 `main` 分支推送并等待 Pages 部署成功，再创建 `v0.8.2` 标签和提交 AMO，避免审核材料引用尚未上线的页面。
+AMO 公开提交前应先把包含这两个页面的 `main` 分支推送并等待 Pages 部署成功，再创建 `v0.8.3` 标签和提交 AMO，避免审核材料引用尚未上线的页面。
 
 本地生成带版本号的 AMO 上传包：
 
@@ -102,4 +102,4 @@ npm --prefix browser-extension run package:firefox
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.8.2>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.8.3>

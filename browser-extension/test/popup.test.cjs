@@ -21,7 +21,7 @@ function loadPopup({ tab, diagnostics, onMessage } = {}) {
       captureAvailable: true,
       captureDesiredEnabled: true,
       captureEnabled: true,
-      extensionVersion: "0.8.2",
+      extensionVersion: "0.8.3",
       nativeConnected: true,
       secretConnected: true,
       loginDetection: {
@@ -132,6 +132,12 @@ function loadPopup({ tab, diagnostics, onMessage } = {}) {
     "tool-launcher-status": "p",
   };
   for (const id of [
+    "diagnostics-panel",
+    "diagnostics-indicators",
+    "status-dot-permission",
+    "status-dot-native",
+    "status-dot-secret",
+    "status-dot-login",
     "diagnostics-list",
     "diagnostics-status",
     "site-origin",
@@ -336,6 +342,9 @@ function loadPopup({ tab, diagnostics, onMessage } = {}) {
     diagnosticsStatus() {
       return elements.get("diagnostics-status").textContent;
     },
+    statusIndicator(name) {
+      return elements.get(`status-dot-${name}`) || null;
+    },
     nestedButtons() {
       const buttons = descendants(accountList, (element) => element.tagName === "BUTTON");
       return buttons.filter((button) => descendants(button, (element) => element.tagName === "BUTTON").length > 0);
@@ -366,7 +375,7 @@ function loginDiagnostics(overrides = {}) {
     captureAvailable: loginDetection.available,
     captureDesiredEnabled: loginDetection.desiredEnabled,
     captureEnabled: loginDetection.enabled,
-    extensionVersion: "0.8.2",
+    extensionVersion: "0.8.3",
     nativeConnected: loginDetection.connectionState !== "disconnected",
     secretConnected: loginDetection.connectionState === "connected",
     ...overrides,
@@ -392,6 +401,36 @@ test("login detection uses an accessible switch and help tooltip", async () => {
   assert.match(tooltip.textContent, /关闭后仍可填充和复制/);
 });
 
+test("the collapsed status summary exposes one indicator for each diagnostic", async () => {
+  const harness = loadPopup({ diagnostics: loginDiagnostics() });
+  await flush();
+
+  for (const name of ["permission", "native", "secret", "login"]) {
+    const indicator = harness.statusIndicator(name);
+    assert.ok(indicator);
+    assert.equal(indicator.getAttribute("data-state"), "ok");
+    assert.match(indicator.getAttribute("aria-label"), /正常/);
+    assert.equal(indicator.getAttribute("title"), indicator.getAttribute("aria-label"));
+  }
+});
+
+test("only an explicit login detection preference renders its indicator as off", async () => {
+  const disabled = loadPopup({
+    diagnostics: loginDiagnostics({
+      loginDetection: { desiredEnabled: false, enabled: false },
+    }),
+  });
+  await flush();
+  assert.equal(disabled.statusIndicator("login").getAttribute("data-state"), "off");
+  assert.match(disabled.statusIndicator("login").getAttribute("title"), /主动关闭/);
+
+  const unknown = loadPopup({ diagnostics: {} });
+  await flush();
+  assert.equal(unknown.statusIndicator("login").getAttribute("data-state"), "error");
+  assert.equal(unknown.statusIndicator("native").getAttribute("data-state"), "error");
+  assert.equal(unknown.statusIndicator("secret").getAttribute("data-state"), "error");
+});
+
 test("manual login detection disable stays off without disabling account fill", async () => {
   const harness = loadPopup({
     diagnostics: loginDiagnostics({
@@ -402,6 +441,7 @@ test("manual login detection disable stays off without disabling account fill", 
 
   assert.equal(harness.loginDetectionState(), "已关闭");
   assert.equal(harness.loginDetectionToggle().getAttribute("aria-checked"), "false");
+  assert.equal(harness.statusIndicator("login").getAttribute("data-state"), "off");
   assert.equal(harness.reconnectButton().hidden, true);
   harness.buttonInCard(0, "填充 Example 的账户").click();
   await flush();
@@ -423,8 +463,34 @@ test("automatic attempts keep the switch on and hide reconnect until all three f
     await flush();
     assert.equal(harness.loginDetectionToggle().getAttribute("aria-checked"), "true");
     assert.equal(harness.loginDetectionState(), `正在重连（${attempt}/3）`);
+    assert.equal(harness.statusIndicator("login").getAttribute("data-state"), "error");
     assert.equal(harness.reconnectButton().hidden, true);
   }
+});
+
+test("connection indicators use channel health instead of the latest command outcome", async () => {
+  const degraded = loadPopup({
+    diagnostics: loginDiagnostics({
+      nativeConnected: true,
+      secretConnected: false,
+      loginDetection: {
+        connectionState: "reconnecting",
+        enabled: false,
+        reconnectAttempt: 1,
+      },
+    }),
+  });
+  await flush();
+  assert.equal(degraded.statusIndicator("permission").getAttribute("data-state"), "ok");
+  assert.equal(degraded.statusIndicator("native").getAttribute("data-state"), "ok");
+  assert.equal(degraded.statusIndicator("secret").getAttribute("data-state"), "error");
+  assert.equal(degraded.statusIndicator("login").getAttribute("data-state"), "error");
+
+  const commandFailure = loadPopup({
+    diagnostics: loginDiagnostics({ lastCommandOk: false }),
+  });
+  await flush();
+  assert.equal(commandFailure.statusIndicator("secret").getAttribute("data-state"), "ok");
 });
 
 test("a saved enabled preference keeps polling until the desktop effective state arrives", async () => {
@@ -629,7 +695,14 @@ test("copy icons send the selected field without triggering password fill", asyn
 });
 
 test("the reserved MFA slot is inert while linked MFA copies through the background", async () => {
-  const harness = loadPopup();
+  const harness = loadPopup({
+    onMessage(message) {
+      if (message.type === "petaldesk.popup.copySecret" && message.field === "mfa") {
+        return { accepted: true, expiresInSeconds: 27 };
+      }
+      return undefined;
+    },
+  });
   await flush();
 
   const before = harness.sentMessages.length;
@@ -643,7 +716,7 @@ test("the reserved MFA slot is inert while linked MFA copies through the backgro
     entryId: "entry-b",
     field: "mfa",
   });
-  assert.equal(harness.status(), "MFA 验证码已复制，过期后自动清除");
+  assert.equal(harness.status(), "MFA 验证码已复制，27 秒后过期");
 });
 
 test("the account body remains the only fill action", async () => {
@@ -901,13 +974,21 @@ test("popup CSS removes the delete slot and keeps context actions out of documen
   assert.match(css, /\.switch-control\[aria-checked="true"\]/);
   assert.match(css, /\.help-tip:hover \.help-tooltip/);
   assert.match(css, /\.diagnostics-feedback:empty\s*\{[^}]*display:\s*none/s);
-  assert.match(css, /\.tool-launchers\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/s);
+  assert.match(css, /\.tool-launchers\s*\{[^}]*grid-template-columns:\s*repeat\(4,\s*minmax\(0,\s*1fr\)\)/s);
   assert.match(css, /button\.tool-launcher\[aria-busy="true"\]/);
   assert.match(css, /\.tool-launcher-feedback:empty\s*\{[^}]*display:\s*none/s);
   assert.match(html, /id="diagnostics-status"[^>]*aria-live="polite"/);
+  assert.match(html, /<details id="diagnostics-panel" class="status-panel">/);
+  assert.equal(/<details[^>]*\sopen(?:\s|>|=)/.test(html), false);
+  for (const id of ["permission", "native", "secret", "login"]) {
+    assert.match(html, new RegExp(`id="status-dot-${id}"`));
+  }
   for (const id of ["open-main", "open-password-manager", "open-mfa", "open-notes"]) {
     assert.match(html, new RegExp(`id="${id}"[^>]*aria-label="[^"]+"`));
   }
+  assert.match(html, /id="open-main"[^>]*>主界面<\/button>/);
+  assert.match(html, /id="open-password-manager"[^>]*>密码<\/button>/);
+  assert.match(html, /id="open-mfa"[^>]*>MFA<\/button>/);
   assert.match(html, /id="tool-launcher-status"[^>]*aria-live="polite"/);
 });
 

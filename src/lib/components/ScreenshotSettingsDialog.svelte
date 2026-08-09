@@ -170,6 +170,10 @@
         </button>
       </header>
 
+      {#if error}
+        <p class="settings-error-banner" role="alert">{error}</p>
+      {/if}
+
       <div class="settings-content">
         <section class="settings-section" aria-labelledby="general-settings-title">
           <h3 id="general-settings-title">常规</h3>
@@ -372,10 +376,6 @@
           </div>
         </section>
       </div>
-
-      {#if error}
-        <p class="error" role="alert">{error}</p>
-      {/if}
 
       <footer>
         <button type="button" class="secondary-button" disabled={submitting} onclick={oncancel}>取消</button>
@@ -724,14 +724,20 @@
     border-radius: 4px;
   }
 
-  .error {
-    margin-top: 13px;
-    padding: 8px 10px;
+  .settings-error-banner {
+    position: sticky;
+    z-index: 4;
+    top: 0;
+    margin: 10px 0 0;
+    padding: 9px 11px;
     color: #8f1d14;
     font-size: 12.5px;
     line-height: 1.4;
     background: #fff0ee;
+    border: 1px solid #efc0ba;
     border-left: 3px solid var(--app-danger);
+    border-radius: 4px;
+    box-shadow: 0 5px 16px rgb(80 20 15 / 14%);
   }
 
   footer {

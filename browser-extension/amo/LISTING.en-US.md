@@ -20,7 +20,7 @@ Features:
 - Show the number of saved accounts for the current site on the toolbar badge. Clicking the toolbar button opens a popup with layered connection diagnostics and the current site's account list; choosing an account silently fills the current page without a success overlay or form submission.
 - Open the PetalDesk main window, password manager, MFA authenticator, or a new standalone note directly from the toolbar popup.
 - Link a password account to one local MFA entry. After credentials are filled, a trusted login journey can fill one clear 6-, 7-, or 8-digit TOTP field. Ambiguous fields require a user click, and an exact cross-origin HTTPS MFA page requires confirmation the first time.
-- Copy the username, password, or linked MFA code from fixed account-card actions. PetalDesk writes an MFA copy directly to the system clipboard and clears it when the code expires. Account deletion starts from the card's context menu and still requires confirmation.
+- Copy the username, password, or linked MFA code from fixed account-card actions. PetalDesk writes an MFA copy directly to the system clipboard and reports only its remaining validity to the popup. Account deletion starts from the card's context menu and still requires confirmation.
 - Record constrained field templates for changed or internal sites. Recording stores selectors only and does not read field contents.
 - Use generic login-form detection and built-in field templates for Google, Microsoft, Alibaba Cloud, Tencent Cloud, and Huawei Cloud.
 
@@ -42,12 +42,12 @@ The password vault remains encrypted on the user's Windows device. The extension
 - Alternative category: Other
 - Tags: password manager, productivity, screenshot, local-first, PetalDesk
 
-## 0.8.2 release notes
+## 0.8.3 release notes
 
-- Login detection starts enabled and can be turned off independently in the toolbar popup. An unexpected disconnect starts three immediate fast reconnect attempts before a manual reconnect button appears; low-rate background recovery continues after that. Closing the password-manager window normally does not stop detection; turning detection off affects save/update prompts only, not fill, copy, MFA, or long screenshots.
-- Pending save or update prompts survive same-tab navigation, refreshes, redirects, iframe replacement, and BFCache restoration until the user explicitly handles them or a real termination condition occurs.
-- The toolbar popup adds four PetalDesk launchers for the main window, password manager, MFA authenticator, and a new standalone note.
-- Once a save prompt is established, the extension immediately clears the candidate password and retains only password-free prompt metadata. No Firefox permission was added, and filling still never submits forms.
+- Extension status is collapsed by default in the toolbar popup. Four summary dots cover install permission, Native Host, the desktop password channel, and login detection; green means healthy, red means unavailable or abnormal, and black is reserved for login detection explicitly turned off by the user.
+- Main, Password, MFA, and Notes launchers now share one row while the account list and detailed login-detection controls remain available on demand.
+- Copying a linked MFA code reports its actual remaining validity. Expiry alone no longer clears the system clipboard; an explicit MFA lock or PetalDesk shutdown still clears an unchanged code. The code, MFA ID, and secret never return to the extension.
+- No Firefox permission was added. Filling still never submits forms, and an unexpected login-detection disconnect still starts three immediate reconnect attempts.
 
 ## Required owner details before submission
 
@@ -56,5 +56,5 @@ The password vault remains encrypted on the user's Windows device. The extension
 - Support page: https://github.com/starsliao/PetalDesk/issues
 - Homepage: https://starsliao.github.io/PetalDesk/
 - Public privacy-policy URL: https://starsliao.github.io/PetalDesk/privacy.html
-- Public Windows installer URL: https://github.com/starsliao/PetalDesk/releases/download/v0.8.2/PetalDesk_0.8.2_x64-setup.exe
+- Public Windows installer URL: https://github.com/starsliao/PetalDesk/releases/download/v0.8.3/PetalDesk_0.8.3_x64-setup.exe
 - License: MIT

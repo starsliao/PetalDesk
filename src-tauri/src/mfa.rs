@@ -502,7 +502,13 @@ struct PendingImport {
 struct ClipboardLease {
     sequence: u32,
     marker: Vec<u8>,
-    clear_at: Instant,
+    clear_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardRetention {
+    ClearAtCodeExpiry,
+    KeepUntilReplaced,
 }
 
 struct RuntimeState {
@@ -1914,6 +1920,31 @@ impl MfaStore {
     }
 
     pub(crate) fn write_browser_code_to_clipboard(&self, result: &BrowserMfaCode) -> AppResult<()> {
+        self.write_browser_code_to_clipboard_with_retention(
+            result,
+            ClipboardRetention::ClearAtCodeExpiry,
+        )
+        .map(|_| ())
+    }
+
+    /// Writes a code requested by the browser popup without scheduling an
+    /// expiry cleanup. The lease remains tracked so an explicit vault lock or
+    /// application shutdown can still clear an unchanged clipboard value.
+    pub(crate) fn write_browser_code_to_clipboard_persistent(
+        &self,
+        result: &BrowserMfaCode,
+    ) -> AppResult<u64> {
+        self.write_browser_code_to_clipboard_with_retention(
+            result,
+            ClipboardRetention::KeepUntilReplaced,
+        )
+    }
+
+    fn write_browser_code_to_clipboard_with_retention(
+        &self,
+        result: &BrowserMfaCode,
+        retention: ClipboardRetention,
+    ) -> AppResult<u64> {
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
         let runtime = lock_unpoisoned(&self.runtime);
         if runtime.manually_locked {
@@ -1926,7 +1957,13 @@ impl MfaStore {
                 "MFA 验证码已过期，请重试。",
             ));
         }
-        write_code_to_clipboard(&result.code, result.valid_until, &self.clipboard)
+        write_code_to_clipboard_with_retention(
+            &result.code,
+            result.valid_until,
+            &self.clipboard,
+            retention,
+        )?;
+        Ok(result.valid_until.saturating_sub(unix_seconds()))
     }
 
     fn browser_code_now(&self, entry_id: &str) -> AppResult<BrowserMfaCode> {
@@ -2052,8 +2089,7 @@ impl MfaStore {
     }
 
     /// Clears decrypted entries, pending imports and an unchanged MFA
-    /// clipboard value.  This is safe to call repeatedly from window destroy
-    /// and application exit handlers.
+    /// clipboard value during application shutdown.
     pub fn lock(&self) {
         {
             let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
@@ -2068,6 +2104,10 @@ impl MfaStore {
         }
         let epoch = self.deactivate();
         self.clear_deactivated_state(epoch);
+        force_expire_clipboard(&self.clipboard, true);
+        if !clear_clipboard_now(&self.clipboard) {
+            schedule_clipboard_cleanup(self.clipboard.clone(), Instant::now());
+        }
     }
 
     /// Explicitly locks the MFA vault while keeping the window session alive
@@ -2090,7 +2130,7 @@ impl MfaStore {
         runtime.manually_locked = self.vault_path.exists();
         runtime.recovered_from_backup = false;
         drop(runtime);
-        force_expire_clipboard(&self.clipboard);
+        force_expire_clipboard(&self.clipboard, true);
         if !clear_clipboard_now(&self.clipboard) {
             schedule_clipboard_cleanup(self.clipboard.clone(), Instant::now());
         }
@@ -2110,11 +2150,9 @@ impl MfaStore {
         }
         let mut imports = lock_unpoisoned(&self.imports);
         imports.clear();
-        force_expire_clipboard(&self.clipboard);
+        drop(imports);
+        force_expire_clipboard(&self.clipboard, false);
         if !clear_clipboard_now(&self.clipboard) {
-            // Keep a background retry for a clipboard owner that is briefly
-            // busy, while the synchronous attempts above cover explicit app
-            // exit before Windows tears down the process.
             schedule_clipboard_cleanup(self.clipboard.clone(), Instant::now());
         }
     }
@@ -3681,17 +3719,31 @@ fn write_code_to_clipboard(
     valid_until: u64,
     lease: &std::sync::Arc<Mutex<Option<ClipboardLease>>>,
 ) -> AppResult<()> {
+    write_code_to_clipboard_with_retention(
+        code,
+        valid_until,
+        lease,
+        ClipboardRetention::ClearAtCodeExpiry,
+    )
+}
+
+fn write_code_to_clipboard_with_retention(
+    code: &str,
+    valid_until: u64,
+    lease: &std::sync::Arc<Mutex<Option<ClipboardLease>>>,
+    retention: ClipboardRetention,
+) -> AppResult<()> {
     #[cfg(windows)]
     {
-        write_code_to_clipboard_windows(code, valid_until, lease)
+        write_code_to_clipboard_windows(code, valid_until, lease, retention)
     }
     #[cfg(target_os = "macos")]
     {
-        write_code_to_clipboard_macos(code, valid_until, lease)
+        write_code_to_clipboard_macos(code, valid_until, lease, retention)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = (code, valid_until, lease);
+        let _ = (code, valid_until, lease, retention);
         Err(AppError::new(
             "unsupported_platform",
             "MFA 剪贴板仅支持 Windows。",
@@ -3699,9 +3751,29 @@ fn write_code_to_clipboard(
     }
 }
 
-fn force_expire_clipboard(lease: &std::sync::Arc<Mutex<Option<ClipboardLease>>>) {
+fn force_expire_clipboard(
+    lease: &std::sync::Arc<Mutex<Option<ClipboardLease>>>,
+    include_persistent: bool,
+) {
     if let Some(value) = lock_unpoisoned(lease).as_mut() {
-        value.clear_at = Instant::now();
+        if include_persistent || value.clear_at.is_some() {
+            value.clear_at = Some(Instant::now());
+        }
+    }
+}
+
+fn clipboard_clear_at(
+    valid_until: u64,
+    retention: ClipboardRetention,
+    now_unix: u64,
+    now: Instant,
+) -> Option<Instant> {
+    match retention {
+        ClipboardRetention::ClearAtCodeExpiry => {
+            let remaining = valid_until.saturating_sub(now_unix);
+            Some(now + CLIPBOARD_MAX_SECONDS.min(Duration::from_secs(remaining.max(1))))
+        }
+        ClipboardRetention::KeepUntilReplaced => None,
     }
 }
 
@@ -3775,10 +3847,12 @@ fn write_code_to_clipboard_macos(
     code: &str,
     valid_until: u64,
     lease: &Arc<Mutex<Option<ClipboardLease>>>,
+    retention: ClipboardRetention,
 ) -> AppResult<()> {
     use arboard::SetExtApple;
 
     let marker = new_macos_clipboard_marker(code)?;
+    let mut lease_guard = lock_unpoisoned(lease);
     let mut clipboard = arboard::Clipboard::new().map_err(|error| {
         AppError::new("clipboard_error", format!("打开 macOS 剪贴板失败: {error}"))
     })?;
@@ -3789,15 +3863,16 @@ fn write_code_to_clipboard_macos(
         .map_err(|error| {
             AppError::new("clipboard_error", format!("写入 macOS 剪贴板失败: {error}"))
         })?;
-    let remaining = valid_until.saturating_sub(unix_seconds());
-    let clear_at =
-        Instant::now() + CLIPBOARD_MAX_SECONDS.min(Duration::from_secs(remaining.max(1)));
-    *lock_unpoisoned(lease) = Some(ClipboardLease {
+    let clear_at = clipboard_clear_at(valid_until, retention, unix_seconds(), Instant::now());
+    *lease_guard = Some(ClipboardLease {
         sequence: 0,
         marker,
         clear_at,
     });
-    schedule_clipboard_cleanup(lease.clone(), clear_at);
+    drop(lease_guard);
+    if let Some(clear_at) = clear_at {
+        schedule_clipboard_cleanup(lease.clone(), clear_at);
+    }
     Ok(())
 }
 
@@ -3808,7 +3883,10 @@ fn try_clear_owned_clipboard_macos(lease: &Arc<Mutex<Option<ClipboardLease>>>) -
         let Some(value) = guard.as_ref() else {
             return Ok(true);
         };
-        if value.clear_at > Instant::now() {
+        if value
+            .clear_at
+            .is_none_or(|clear_at| clear_at > Instant::now())
+        {
             return Ok(true);
         }
         value.marker.clone()
@@ -3824,10 +3902,20 @@ fn try_clear_owned_clipboard_macos(lease: &Arc<Mutex<Option<ClipboardLease>>>) -
         clear_matching_lease(lease, 0, &expected);
         return Ok(true);
     }
+    let mut guard = lock_unpoisoned(lease);
+    if guard.as_ref().is_none_or(|value| {
+        value.sequence != 0
+            || value.marker != expected
+            || value
+                .clear_at
+                .is_none_or(|clear_at| clear_at > Instant::now())
+    }) {
+        return Ok(true);
+    }
     clipboard.clear().map_err(|error| {
         AppError::new("clipboard_error", format!("清理 macOS 剪贴板失败: {error}"))
     })?;
-    clear_matching_lease(lease, 0, &expected);
+    guard.take();
     Ok(true)
 }
 
@@ -3873,6 +3961,7 @@ fn write_code_to_clipboard_windows(
     code: &str,
     valid_until: u64,
     lease: &std::sync::Arc<Mutex<Option<ClipboardLease>>>,
+    retention: ClipboardRetention,
 ) -> AppResult<()> {
     use std::mem::size_of;
     use std::ptr::null_mut;
@@ -4001,18 +4090,17 @@ fn write_code_to_clipboard_windows(
     }
     drop(_guard);
     let sequence = unsafe { GetClipboardSequenceNumber() };
-    let clear_after = unix_seconds();
-    let remaining = valid_until.saturating_sub(clear_after);
-    let clear_at =
-        Instant::now() + CLIPBOARD_MAX_SECONDS.min(Duration::from_secs(remaining.max(1)));
+    let clear_at = clipboard_clear_at(valid_until, retention, unix_seconds(), Instant::now());
     *lock_unpoisoned(lease) = Some(ClipboardLease {
         sequence,
         marker: marker.clone(),
         clear_at,
     });
-    // Replace the old lease and let its worker observe the newer deadline.
-    // The worker owns only a marker and timestamp, never the OTP itself.
-    schedule_clipboard_cleanup(lease.clone(), clear_at);
+    if let Some(clear_at) = clear_at {
+        // Replace the old lease and let its worker observe the newer deadline.
+        // The worker owns only a marker and timestamp, never the OTP itself.
+        schedule_clipboard_cleanup(lease.clone(), clear_at);
+    }
     Ok(())
 }
 
@@ -4031,8 +4119,12 @@ fn try_clear_owned_clipboard_windows(
         let Some(value) = guard.as_ref() else {
             return Ok(true);
         };
-        if value.clear_at > Instant::now() {
-            // This is an older cleanup worker observing a newer copy.
+        if value
+            .clear_at
+            .is_none_or(|clear_at| clear_at > Instant::now())
+        {
+            // This is an older cleanup worker observing a newer or persistent
+            // copy.
             return Ok(true);
         }
         (value.sequence, value.marker.clone())
@@ -4721,6 +4813,51 @@ mod tests {
             code,
             &first[..first.len() - 1]
         ));
+    }
+
+    #[test]
+    fn clipboard_retention_only_schedules_expiry_for_regular_copies() {
+        let now = Instant::now();
+        let bounded =
+            clipboard_clear_at(160, ClipboardRetention::ClearAtCodeExpiry, 100, now).unwrap();
+        assert_eq!(bounded.duration_since(now), CLIPBOARD_MAX_SECONDS);
+
+        let nearly_expired =
+            clipboard_clear_at(100, ClipboardRetention::ClearAtCodeExpiry, 100, now).unwrap();
+        assert_eq!(nearly_expired.duration_since(now), Duration::from_secs(1));
+        assert_eq!(
+            clipboard_clear_at(160, ClipboardRetention::KeepUntilReplaced, 100, now),
+            None
+        );
+    }
+
+    #[test]
+    fn window_close_preserves_only_persistent_clipboard_leases() {
+        let lease = Arc::new(Mutex::new(Some(ClipboardLease {
+            sequence: 1,
+            marker: vec![1],
+            clear_at: None,
+        })));
+        force_expire_clipboard(&lease, false);
+        assert!(lock_unpoisoned(&lease)
+            .as_ref()
+            .is_some_and(|value| value.clear_at.is_none()));
+
+        force_expire_clipboard(&lease, true);
+        assert!(lock_unpoisoned(&lease)
+            .as_ref()
+            .is_some_and(|value| value.clear_at.is_some()));
+
+        *lock_unpoisoned(&lease) = Some(ClipboardLease {
+            sequence: 2,
+            marker: vec![2],
+            clear_at: Some(Instant::now() + Duration::from_secs(60)),
+        });
+        force_expire_clipboard(&lease, false);
+        assert!(lock_unpoisoned(&lease)
+            .as_ref()
+            .and_then(|value| value.clear_at)
+            .is_some_and(|clear_at| clear_at <= Instant::now()));
     }
 
     #[test]
@@ -6219,12 +6356,52 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn browser_popup_copy_has_no_expiry_cleanup_but_regular_copy_still_does() {
+        let (_root, store) = test_store();
+        let entry = import_public_rfc_entry(&store, "browser-persistent-copy");
+        let result = store.browser_code_at(&entry.id, 5).unwrap();
+        let before = unix_seconds();
+
+        let remaining = store
+            .write_browser_code_to_clipboard_persistent(&result)
+            .unwrap();
+        let after = unix_seconds();
+        assert!(remaining <= result.valid_until.saturating_sub(before));
+        assert!(remaining >= result.valid_until.saturating_sub(after));
+        assert!(lock_unpoisoned(&store.clipboard)
+            .as_ref()
+            .is_some_and(|lease| lease.clear_at.is_none()));
+
+        let closing_epoch = store.deactivate();
+        store.clear_deactivated_state(closing_epoch);
+        assert!(lock_unpoisoned(&store.clipboard)
+            .as_ref()
+            .is_some_and(|lease| lease.clear_at.is_none()));
+
+        store.lock();
+        assert!(lock_unpoisoned(&store.clipboard).is_none());
+
+        store.write_browser_code_to_clipboard(&result).unwrap();
+        assert!(lock_unpoisoned(&store.clipboard)
+            .as_ref()
+            .is_some_and(|lease| lease.clear_at.is_some()));
+        let closing_epoch = store.deactivate();
+        store.clear_deactivated_state(closing_epoch);
+        assert!(lock_unpoisoned(&store.clipboard).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn explicit_mfa_lock_blocks_browser_unlock_until_reauthenticated() {
         let (_root, store) = test_store();
         let entry = import_public_rfc_entry(&store, "browser-manual-lock");
         let generated = store.browser_code_at(&entry.id, 0).unwrap();
+        store
+            .write_browser_code_to_clipboard_persistent(&generated)
+            .unwrap();
 
         store.lock_current_session().unwrap();
+        assert!(lock_unpoisoned(&store.clipboard).is_none());
         let status = store.status().unwrap();
         assert!(status.locked);
         assert_eq!(status.recovery_state, MfaRecoveryState::PasswordRequired);

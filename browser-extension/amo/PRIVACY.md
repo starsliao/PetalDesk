@@ -1,6 +1,6 @@
 # PetalDesk Browser Companion privacy notice (draft)
 
-Last updated: 2026-08-09
+Last updated: 2026-08-10
 
 This draft must be reviewed by the product owner and published at a stable HTTPS URL before the extension is submitted to AMO.
 
@@ -25,7 +25,7 @@ The extension does not intentionally collect page text, browsing history, paymen
 - A login candidate submitted by the user is sent to the local PetalDesk process so the encrypted vault can decide whether it is unchanged, new, or an update. After handoff the extension clears the password and keeps only non-secret metadata needed to restore the prompt after navigation. The prompt offers saving as a new account or updating an existing one, and reports when the vault is manually locked.
 - The toolbar badge shows the number of accounts saved for the exact current origin, and the toolbar popup lists those account labels on click. Both are read from the local vault through the local channel, refresh on tab or vault changes, and are cleared when the vault is manually locked. After the extension connects, capture, fill, and badge keep working while the PetalDesk password window is closed; a manual lock stops them immediately.
 - After PetalDesk fills a linked password, or a manual login exactly matches one unique linked account, PetalDesk creates a five-minute second-factor journey for that tab. A single high-confidence TOTP field can be filled automatically; ambiguous fields require a user click. An exact cross-origin HTTPS MFA page requires first-use confirmation and is then stored with the password entry. The extension never clicks a button, sends Enter, or submits the form.
-- The popup receives only a `hasMfa` flag for account-card alignment. When the user clicks its MFA copy action, the desktop application validates the current tab and account binding, generates the code, writes it directly to the system clipboard, and clears it when it expires. The MFA entry ID, secret, and code are not returned to the popup.
+- The popup receives only a `hasMfa` flag for account-card alignment. When the user clicks its MFA copy action, the desktop application validates the current tab and account binding, generates the code, and writes it directly to the system clipboard. TOTP expiry alone does not clear the copied value; it remains until replaced, or until an explicit MFA lock or PetalDesk shutdown clears the unchanged value. Only the remaining validity in seconds is returned for the popup status; the MFA entry ID, secret, and code are not returned to the popup.
 
 The extension does not bypass multi-factor authentication. It can fill a locally generated TOTP only for an explicitly linked account inside the trusted journey above. It does not handle recovery codes, CAPTCHA, passkeys, SMS or email verification, security keys, CVV, postal codes, or coupons.
 

@@ -8,11 +8,19 @@
 <body>
   <main class="popup">
     <h1>飞花密码管理</h1>
-    <section class="status-panel" aria-label="扩展状态">
-      <h2>扩展状态</h2>
+    <details id="diagnostics-panel" class="status-panel">
+      <summary class="status-summary">
+        <span class="status-title">扩展状态</span>
+        <span id="diagnostics-indicators" class="status-indicators" aria-label="扩展状态概览">
+          <span id="status-dot-permission" class="status-dot" role="img"></span>
+          <span id="status-dot-native" class="status-dot" role="img"></span>
+          <span id="status-dot-secret" class="status-dot" role="img"></span>
+          <span id="status-dot-login" class="status-dot" role="img"></span>
+        </span>
+      </summary>
       <ul id="diagnostics-list" class="diagnostics"></ul>
       <p id="diagnostics-status" class="diagnostics-feedback" aria-live="polite"></p>
-    </section>
+    </details>
     <section aria-label="当前站点">
       <h2>当前站点</h2>
       <p id="site-origin" class="origin"></p>
@@ -22,9 +30,9 @@
     <section class="tool-launcher-panel" aria-labelledby="tool-launcher-title">
       <h2 id="tool-launcher-title">打开飞花</h2>
       <div class="tool-launchers" role="group" aria-label="飞花快捷入口">
-        <button id="open-main" type="button" class="tool-launcher" aria-label="打开飞花主程序">主程序</button>
-        <button id="open-password-manager" type="button" class="tool-launcher" aria-label="打开飞花密码管理器">密码管理器</button>
-        <button id="open-mfa" type="button" class="tool-launcher" aria-label="打开飞花 MFA 验证器">MFA 验证器</button>
+        <button id="open-main" type="button" class="tool-launcher" aria-label="打开飞花主界面">主界面</button>
+        <button id="open-password-manager" type="button" class="tool-launcher" aria-label="打开飞花密码管理器">密码</button>
+        <button id="open-mfa" type="button" class="tool-launcher" aria-label="打开飞花 MFA 验证器">MFA</button>
         <button id="open-notes" type="button" class="tool-launcher" aria-label="新建飞花便签" title="新建并打开便签">便签</button>
       </div>
       <p id="tool-launcher-status" class="tool-launcher-feedback" aria-live="polite"></p>

@@ -44,7 +44,7 @@ function loadBridge({ longTimerDelayMs = null } = {}) {
   }
   const api = {
     browserFamily: "firefox",
-    extensionVersion: "0.8.2",
+    extensionVersion: "0.8.3",
     action: {
       async setBadgeText(value) {
         actionUpdates.badgeTexts.push(JSON.parse(JSON.stringify(value)));
@@ -1287,7 +1287,7 @@ test("popup state reports diagnostics recorded at the command boundary", async (
   await harness.bridge.route({ command: "password.getStatus", payload: {} });
   let state = await harness.sendPopup({ type: "petaldesk.popup.getState" });
   assert.equal(state.diagnostics.nativeConnected, true);
-  assert.equal(state.diagnostics.extensionVersion, "0.8.2");
+  assert.equal(state.diagnostics.extensionVersion, "0.8.3");
   assert.equal(state.diagnostics.lastCommandOk, true);
   assert.equal(state.diagnostics.lastCommandErrorCode, null);
   assert.equal(typeof state.diagnostics.lastCommandAt, "number");
@@ -1786,9 +1786,15 @@ test("popup MFA copy requires hasMfa and resolves only after the desktop result"
   assert.equal(confirmation.tabId, 861);
   await harness.bridge.route({
     command: "password.copyMfaResult",
-    payload: { requestId: request.payload.requestId, success: true },
+    payload: {
+      expiresInSeconds: 27,
+      requestId: request.payload.requestId,
+      success: true,
+    },
   });
-  assert.equal((await pendingCopy).accepted, true);
+  const copiedResult = await pendingCopy;
+  assert.equal(copiedResult.accepted, true);
+  assert.equal(copiedResult.expiresInSeconds, 27);
 
   const failedCopy = harness.sendPopup({
     type: "petaldesk.popup.copySecret",

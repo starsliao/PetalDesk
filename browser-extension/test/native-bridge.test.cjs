@@ -61,7 +61,7 @@ function loadBridge(family = "chrome", { timerCapMs = null } = {}) {
       return createPort();
     },
     getManifest() {
-      return { version: "0.8.2" };
+      return { version: "0.8.3" };
     },
   };
   const callbackTabs = {

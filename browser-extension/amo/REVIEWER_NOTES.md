@@ -2,7 +2,7 @@
 
 ## Dependency
 
-The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.8.2/PetalDesk_0.8.2_x64-setup.exe.
+The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.8.3/PetalDesk_0.8.3_x64-setup.exe.
 
 The extension ID is fixed as `petaldesk-capture@petaldesk.app`, and the Native Messaging host name is `com.petaldesk.capture`.
 
@@ -42,7 +42,7 @@ The project has no runtime npm dependencies, bundler, minifier, generated JavaSc
 ## Toolbar popup and badge test
 
 1. With accounts saved for a site, open that site: the toolbar badge shows the saved-account count for the exact origin and refreshes on tab switch, navigation, and vault changes. Lock the vault manually in PetalDesk: the badge clears.
-2. Click the toolbar button: the popup shows layered diagnostics, the current site's fixed account cards, and four local launch buttons for the PetalDesk main window, password manager, MFA authenticator, and a new standalone note. Each card has fixed icon actions to copy username, password, and linked MFA; there is no three-dot menu or delete icon taking card height.
+2. Click the toolbar button: the popup shows a collapsed diagnostic summary with four status dots, the current site's fixed account cards, and one row of launch buttons for Main, Password, MFA, and Notes. Expanding the summary exposes the detailed connection and login-detection controls. Each card has fixed icon actions to copy username, password, and linked MFA; there is no three-dot menu or delete icon taking card height.
 3. Choose the body of an account card: the current page is filled directly and silently, and the form is not submitted. Icon clicks do not trigger a fill.
 4. Right-click a card and choose **Delete account**. Cancel the confirmation: no request is sent. Open the context menu again and confirm **Delete**: the popup waits for the desktop result, then refreshes the badge and list. `Shift+F10`, Escape, and outside-click behavior can be checked with the keyboard as well.
 
@@ -53,14 +53,15 @@ Use a reviewer-controlled HTTPS login page with an ordinary username/password st
 1. Import or create a standard TOTP entry in PetalDesk, create a password entry for the exact HTTPS login origin, and link the two in the password editor. The selector lists only the MFA name, issuer, and account name; it never reveals the secret or current code.
 2. Fill the linked password account from PetalDesk or the toolbar popup, then advance the website normally to its TOTP step. A single high-confidence field is filled without PetalDesk submitting the form. Multiple or low-confidence candidates display a one-click confirmation instead.
 3. For a TOTP page on a different origin, confirm that the exact HTTPS origin requires first-use confirmation. HTTP pages and cross-origin OTP iframes fail closed.
-4. In the toolbar popup, click the linked MFA icon. PetalDesk writes the code directly to the system clipboard; the popup shows only a success message, and the clipboard value is cleared when that TOTP expires. An unlinked account keeps the same disabled icon position.
+4. In the toolbar popup, click the linked MFA icon. PetalDesk writes the code directly to the system clipboard; the popup shows only a success message with the remaining validity in seconds. TOTP expiry alone does not clear the copied value; it remains until replaced, or until an explicit MFA lock or PetalDesk shutdown clears the unchanged value. An unlinked account keeps the same disabled icon position.
 5. Lock the MFA vault manually and repeat either path. TOTP filling/copying is refused without affecting ordinary username/password filling.
 
-## PetalDesk 0.8.2 desktop companion checks
+## PetalDesk 0.8.3 desktop companion checks
 
 1. Close the MFA tool normally, then copy a linked MFA code from the extension or password manager. The code is copied without a recovery-password prompt. Use the dedicated **Lock vault** action and repeat: the copy is rejected until the user unlocks it.
 2. Import a QR code, image, or `otpauth://` URI. In the confirmation view, edit the account name, issuer, account identifier, and icon. Algorithm, digits, and period remain read-only, and the secret is never displayed.
 3. In the desktop password manager, hold the adjacent eye control to reveal a password and release it to hide. The username, password, and MFA copy controls use the same three icons as the extension; MFA is disabled when the password entry is not linked.
+4. In Settings, enable launch at login and then disable it again. Both operations complete without an access-denied error; any settings error appears at the top of the dialog. The tray menu uses **Open main window** and groups note creation plus the note list under one Notes submenu.
 
 ## Login-detection test
 

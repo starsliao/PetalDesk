@@ -1617,7 +1617,19 @@
       if (pending.timer != null) clearTimeout(pending.timer);
       pendingMfaCopies.delete(requestId);
       if (payload.success === true) {
-        pending.resolve({ accepted: true });
+        let expiresInSeconds = Number(payload.expiresInSeconds);
+        if (!Number.isFinite(expiresInSeconds) || expiresInSeconds < 0) {
+          const expiresAt = Number(payload.expiresAt);
+          expiresInSeconds = Number.isFinite(expiresAt) && expiresAt > 0
+            ? Math.max(0, Math.ceil((expiresAt - Date.now()) / 1_000))
+            : Number.NaN;
+        }
+        pending.resolve({
+          accepted: true,
+          ...(Number.isFinite(expiresInSeconds)
+            ? { expiresInSeconds: Math.ceil(expiresInSeconds) }
+            : {}),
+        });
       } else {
         const errorValue = payload.error && typeof payload.error === "object" ? payload.error : {};
         pending.reject(bridgeError(

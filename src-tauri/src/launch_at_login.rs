@@ -113,17 +113,31 @@ fn launch_at_login_error(action: &str, error: std::io::Error) -> AppError {
 mod windows_registry {
     use super::*;
     use std::io;
-    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE};
     use winreg::{RegKey, RegValue};
 
     pub(super) struct WindowsLaunchAtLoginRegistry;
 
-    fn optional_subkey(path: &str) -> io::Result<Option<RegKey>> {
-        match RegKey::predef(HKEY_CURRENT_USER).open_subkey(path) {
+    fn optional_subkey_with_flags(path: &str, permissions: u32) -> io::Result<Option<RegKey>> {
+        match RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(path, permissions) {
             Ok(key) => Ok(Some(key)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    fn optional_read_subkey(path: &str) -> io::Result<Option<RegKey>> {
+        optional_subkey_with_flags(path, KEY_QUERY_VALUE)
+    }
+
+    fn optional_write_subkey(path: &str) -> io::Result<Option<RegKey>> {
+        optional_subkey_with_flags(path, KEY_SET_VALUE)
+    }
+
+    fn write_string_value(path: &str, name: &str, value: &str) -> io::Result<()> {
+        let (key, _) =
+            RegKey::predef(HKEY_CURRENT_USER).create_subkey_with_flags(path, KEY_SET_VALUE)?;
+        key.set_value(name, &value)
     }
 
     fn delete_optional_value(key: &RegKey, name: &str) -> io::Result<()> {
@@ -136,7 +150,7 @@ mod windows_registry {
 
     impl LaunchAtLoginRegistry for WindowsLaunchAtLoginRegistry {
         fn read_run_value(&self) -> io::Result<Option<String>> {
-            let Some(key) = optional_subkey(RUN_KEY_PATH)? else {
+            let Some(key) = optional_read_subkey(RUN_KEY_PATH)? else {
                 return Ok(None);
             };
             match key.get_value(AUTOSTART_VALUE_NAME) {
@@ -154,19 +168,18 @@ mod windows_registry {
         }
 
         fn write_run_value(&self, value: &str) -> io::Result<()> {
-            let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(RUN_KEY_PATH)?;
-            key.set_value(AUTOSTART_VALUE_NAME, &value)
+            write_string_value(RUN_KEY_PATH, AUTOSTART_VALUE_NAME, value)
         }
 
         fn delete_run_value(&self) -> io::Result<()> {
-            let Some(key) = optional_subkey(RUN_KEY_PATH)? else {
+            let Some(key) = optional_write_subkey(RUN_KEY_PATH)? else {
                 return Ok(());
             };
             delete_optional_value(&key, AUTOSTART_VALUE_NAME)
         }
 
         fn read_startup_approved(&self) -> io::Result<Option<Vec<u8>>> {
-            let Some(key) = optional_subkey(STARTUP_APPROVED_KEY_PATH)? else {
+            let Some(key) = optional_read_subkey(STARTUP_APPROVED_KEY_PATH)? else {
                 return Ok(None);
             };
             match key.get_raw_value(AUTOSTART_VALUE_NAME) {
@@ -177,10 +190,55 @@ mod windows_registry {
         }
 
         fn delete_startup_approved(&self) -> io::Result<()> {
-            let Some(key) = optional_subkey(STARTUP_APPROVED_KEY_PATH)? else {
+            let Some(key) = optional_write_subkey(STARTUP_APPROVED_KEY_PATH)? else {
                 return Ok(());
             };
             delete_optional_value(&key, AUTOSTART_VALUE_NAME)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn minimal_write_subkey_can_create_and_set_a_value() {
+            let test_path = format!(
+                r"Software\PetalDesk.LaunchAtLoginWriteTest.{}",
+                std::process::id()
+            );
+            let current_user = RegKey::predef(HKEY_CURRENT_USER);
+
+            write_string_value(&test_path, "WriteMe", "value").unwrap();
+
+            let key = optional_read_subkey(&test_path).unwrap().unwrap();
+            assert_eq!(key.get_value::<String, _>("WriteMe").unwrap(), "value");
+            drop(key);
+            current_user.delete_subkey_all(&test_path).unwrap();
+        }
+
+        #[test]
+        fn writable_optional_subkey_can_delete_a_value() {
+            let test_path = format!(
+                r"Software\PetalDesk.LaunchAtLoginRegistryTest.{}",
+                std::process::id()
+            );
+            let current_user = RegKey::predef(HKEY_CURRENT_USER);
+            let (key, _) = current_user.create_subkey(&test_path).unwrap();
+            key.set_value("DeleteMe", &"value").unwrap();
+            drop(key);
+
+            let key = optional_write_subkey(&test_path).unwrap().unwrap();
+            delete_optional_value(&key, "DeleteMe").unwrap();
+            drop(key);
+
+            let key = optional_read_subkey(&test_path).unwrap().unwrap();
+            assert_eq!(
+                key.get_value::<String, _>("DeleteMe").unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+            drop(key);
+            current_user.delete_subkey_all(&test_path).unwrap();
         }
     }
 }

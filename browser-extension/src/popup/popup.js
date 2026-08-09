@@ -77,10 +77,20 @@
     if (feedback) feedback.textContent = text;
   }
 
+  function setStatusIndicator(id, state, title) {
+    const indicator = document.getElementById(id);
+    if (!indicator) return;
+    indicator.setAttribute("data-state", state);
+    indicator.setAttribute("title", title);
+    indicator.setAttribute("aria-label", title);
+  }
+
   function loginDetectionModel(diagnostics) {
     const value = diagnostics.loginDetection && typeof diagnostics.loginDetection === "object"
       ? diagnostics.loginDetection
       : {};
+    const desiredKnown = typeof value.desiredEnabled === "boolean"
+      || typeof diagnostics.captureDesiredEnabled === "boolean";
     const desiredEnabled = typeof value.desiredEnabled === "boolean"
       ? value.desiredEnabled
       : typeof diagnostics.captureDesiredEnabled === "boolean"
@@ -136,6 +146,7 @@
       available,
       canReconnect: value.canReconnect === true && connectionState === "disconnected",
       connectionState,
+      desiredKnown,
       desiredEnabled,
       enabled,
       health,
@@ -265,6 +276,39 @@
     }
     addDiagnosticRow(list, "桌面密码通道", channelText, diagnostics.secretConnected === true);
     const loginDetection = renderLoginDetectionRow(list, diagnostics);
+    setStatusIndicator("status-dot-permission", "ok", "安装权限：正常");
+    setStatusIndicator(
+      "status-dot-native",
+      diagnostics.nativeConnected === true ? "ok" : "error",
+      `Native Host：${diagnostics.nativeConnected === true ? "正常" : "异常"}`,
+    );
+    setStatusIndicator(
+      "status-dot-secret",
+      diagnostics.secretConnected === true ? "ok" : "error",
+      `桌面密码通道：${diagnostics.secretConnected === true ? "正常" : "异常"}`,
+    );
+    const loginDetectionHealthy = loginDetection.desiredKnown
+      && loginDetection.desiredEnabled
+      && loginDetection.connectionState === "connected"
+      && loginDetection.available
+      && loginDetection.enabled;
+    const loginIndicatorState = loginDetection.desiredKnown
+      && !loginDetection.desiredEnabled
+      && !loginDetection.enabled
+      ? "off"
+      : loginDetectionHealthy
+        ? "ok"
+        : "error";
+    const loginIndicatorText = loginIndicatorState === "off"
+      ? "主动关闭"
+      : loginIndicatorState === "ok"
+        ? "正常"
+        : `异常（${loginDetection.status}）`;
+    setStatusIndicator(
+      "status-dot-login",
+      loginIndicatorState,
+      `登录检测：${loginIndicatorText}`,
+    );
     const version = document.getElementById("extension-version");
     version.textContent = diagnostics.extensionVersion ? `v${diagnostics.extensionVersion}` : "";
     return loginDetection;
@@ -309,9 +353,16 @@
       const successMessages = {
         username: "已复制用户名",
         password: "已复制密码",
-        mfa: "MFA 验证码已复制，过期后自动清除",
       };
-      setStatus(successMessages[field] || "复制成功");
+      if (field === "mfa") {
+        const expiresInSeconds = Number(response && response.expiresInSeconds);
+        const expiryText = Number.isFinite(expiresInSeconds) && expiresInSeconds >= 0
+          ? `，${Math.ceil(expiresInSeconds)} 秒后过期`
+          : "";
+        setStatus(`MFA 验证码已复制${expiryText}`);
+      } else {
+        setStatus(successMessages[field] || "复制成功");
+      }
       return true;
     } catch (error) {
       setStatus(errorMessage(error));
@@ -620,9 +671,9 @@
   }
 
   for (const launcher of [
-    { id: "open-main", label: "主程序", target: "main" },
-    { id: "open-password-manager", label: "密码管理器", target: "passwords" },
-    { id: "open-mfa", label: "MFA 验证器", target: "mfa" },
+    { id: "open-main", label: "主界面", target: "main" },
+    { id: "open-password-manager", label: "密码", target: "passwords" },
+    { id: "open-mfa", label: "MFA", target: "mfa" },
     { id: "open-notes", label: "便签", target: "notes" },
   ]) {
     const button = document.getElementById(launcher.id);

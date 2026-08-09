@@ -15,6 +15,7 @@
     type UpdateSettings,
     type UpdateState,
   } from "$lib/updater";
+  import { renderMarkdown } from "$lib/editor";
 
   interface Props {
     currentVersion?: string;
@@ -50,6 +51,9 @@
 
   let displayedVersion = $derived(updateState.currentVersion || currentVersion || "未知");
   let displayedBuild = $derived(formatBuildTimestamp(buildTimestamp));
+  let releaseNotesHtml = $derived(
+    updateState.releaseNotes ? renderMarkdown(updateState.releaseNotes) : "",
+  );
   let working = $derived(
     actionBusy
       || updateState.phase === "checking"
@@ -329,7 +333,7 @@
         {#if updateState.releaseNotes && ["available", "downloading", "ready"].includes(updateState.phase)}
           <details class="release-notes" open={updateState.phase === "ready"}>
             <summary>v{updateState.availableVersion ?? "新版本"} 更新内容</summary>
-            <div>{updateState.releaseNotes}</div>
+            <div class="release-notes-body">{@html releaseNotesHtml}</div>
           </details>
         {/if}
       {:else}
@@ -638,13 +642,75 @@
     cursor: pointer;
   }
 
-  .release-notes div {
+  .release-notes-body {
     max-height: 150px;
     padding: 10px 12px;
     overflow: auto;
+    overflow-wrap: anywhere;
     line-height: 1.55;
-    white-space: pre-wrap;
     border-top: 1px solid var(--app-border);
+  }
+
+  .release-notes-body :global(:first-child) {
+    margin-top: 0;
+  }
+
+  .release-notes-body :global(:last-child) {
+    margin-bottom: 0;
+  }
+
+  .release-notes-body :global(h1),
+  .release-notes-body :global(h2),
+  .release-notes-body :global(h3),
+  .release-notes-body :global(h4),
+  .release-notes-body :global(h5),
+  .release-notes-body :global(h6) {
+    margin: 12px 0 6px;
+    font-size: 13px;
+    line-height: 1.4;
+  }
+
+  .release-notes-body :global(p),
+  .release-notes-body :global(ul),
+  .release-notes-body :global(ol),
+  .release-notes-body :global(blockquote),
+  .release-notes-body :global(pre) {
+    margin: 0 0 8px;
+  }
+
+  .release-notes-body :global(ul),
+  .release-notes-body :global(ol) {
+    padding-left: 20px;
+  }
+
+  .release-notes-body :global(li + li) {
+    margin-top: 3px;
+  }
+
+  .release-notes-body :global(a) {
+    color: var(--app-accent);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .release-notes-body :global(code) {
+    padding: 1px 4px;
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    font-size: 11px;
+    background: var(--app-surface-hover);
+    border-radius: 3px;
+  }
+
+  .release-notes-body :global(pre) {
+    padding: 8px;
+    overflow: auto;
+    background: var(--app-surface-hover);
+    border-radius: 4px;
+  }
+
+  .release-notes-body :global(pre code) {
+    padding: 0;
+    background: transparent;
   }
 
   .unsupported-status {

@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
-use tauri::menu::{Menu, MenuItem, Submenu};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
@@ -410,11 +410,15 @@ fn build_tray_menu(
     notes: Vec<models::NoteSummary>,
     screenshot_shortcut: &str,
 ) -> Result<Menu<tauri::Wry>, Box<dyn std::error::Error>> {
-    let show = MenuItem::with_id(app, "show", "打开 飞花", true, None::<&str>)?;
-    let note_list = Submenu::with_id(app, "note-list", "便签列表", true)?;
+    let show = MenuItem::with_id(app, "show", "打开主界面", true, None::<&str>)?;
+    let notes_menu = Submenu::with_id(app, "notes", "便签", true)?;
+    let new_note = MenuItem::with_id(app, "new-note", "新建便签", true, None::<&str>)?;
+    let note_separator = PredefinedMenuItem::separator(app)?;
+    notes_menu.append(&new_note)?;
+    notes_menu.append(&note_separator)?;
     if notes.is_empty() {
         let empty = MenuItem::with_id(app, "no-notes", "暂无便签", false, None::<&str>)?;
-        note_list.append(&empty)?;
+        notes_menu.append(&empty)?;
     } else {
         for note in notes {
             let title = tray_note_label(&note.title);
@@ -425,7 +429,7 @@ fn build_tray_menu(
                 true,
                 None::<&str>,
             )?;
-            note_list.append(&item)?;
+            notes_menu.append(&item)?;
         }
     }
     let tools = Submenu::with_id(app, "tools", "小工具", true)?;
@@ -449,12 +453,11 @@ fn build_tray_menu(
     tools.append(&mfa)?;
     tools.append(&passwords)?;
     tools.append(&screenshot)?;
-    let new_note = MenuItem::with_id(app, "new-note", "新建便签", true, None::<&str>)?;
     let about = MenuItem::with_id(app, ABOUT_MENU_ID, "关于", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     Ok(Menu::with_items(
         app,
-        &[&show, &new_note, &note_list, &tools, &about, &quit],
+        &[&show, &notes_menu, &tools, &about, &quit],
     )?)
 }
 

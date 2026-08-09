@@ -88,6 +88,20 @@ describe("ScreenshotSettingsDialog", () => {
     expect(updating.getByRole("button", { name: "保存" })).toBeDisabled();
   });
 
+  it("shows errors in a sticky banner before the scrollable settings content", () => {
+    const rendered = render(ScreenshotSettingsDialog, {
+      open: true,
+      error: "设置开机启动失败: 拒绝访问。 (os error 5)",
+    });
+    const dialog = rendered.getByRole("dialog");
+    const alert = rendered.getByRole("alert");
+    const content = dialog.querySelector(".settings-content");
+
+    expect(alert).toHaveTextContent("设置开机启动失败: 拒绝访问。 (os error 5)");
+    expect(alert).toHaveClass("settings-error-banner");
+    expect(alert.compareDocumentPosition(content!) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
   it("opens the independent about and update dialog without saving other settings", async () => {
     const onsave = vi.fn();
     const onaboutopen = vi.fn();

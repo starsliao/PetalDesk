@@ -59,7 +59,7 @@
     <main>
       <h1>浏览器增强隐私政策</h1>
       <p class="lead">飞花浏览器增强只与同一台 Windows 电脑上的飞花桌面应用通信，不运营云端账号，也不把浏览数据或凭据上传到飞花服务器。</p>
-      <p class="updated">最后更新：2026 年 8 月 7 日</p>
+      <p class="updated">最后更新：2026 年 8 月 10 日</p>
 
       <section>
         <h2>适用范围</h2>
@@ -83,7 +83,7 @@
           <li>用户在飞花或工具栏弹窗中选择账户后，扩展先向目标页面发送不含密码的填充请求；目标 frame 的身份和字段可用性校验通过后，桌面应用才提供一次性凭据。扩展只填写字段，绝不自动提交表单。</li>
           <li>连接的密码保险库可用时，登录检测默认开启，用户也可在扩展弹窗中单独关闭。用户提交登录后，扩展把候选交给本机加密保险库判断是否完全相同、需要新增或需要更新。</li>
           <li>飞花填入已关联账户的密码，或手动登录与唯一已保存账户完全一致时，会为该标签页建立最长 5 分钟的二次验证 journey。唯一可信的 TOTP 字段可自动填入；模糊字段先询问用户，跨 origin 页面首次确认精确 HTTPS origin。飞花不点击按钮、不发送 Enter，也不主动提交表单。</li>
-          <li>工具栏弹窗只知道账户是否关联 MFA。用户点击复制 MFA 后，由桌面应用重新校验当前标签页和账户关联，直接写入系统剪贴板并在验证码失效时清除；MFA ID、密钥和验证码不会返回弹窗。</li>
+          <li>工具栏弹窗只知道账户是否关联 MFA。用户点击复制 MFA 后，由桌面应用重新校验当前标签页和账户关联并直接写入系统剪贴板；验证码失效本身不会清空该值，只有被其他内容替换，或用户主动锁定 MFA、退出飞花时才会清理未被替换的值。弹窗只收到剩余有效秒数，MFA ID、密钥和验证码不会返回弹窗。</li>
         </ul>
         <p>扩展不会绕过多因素认证，只会在上述受信任流程中填入明确关联的本地 TOTP。恢复码、CAPTCHA、Passkey、短信或邮件验证码、安全密钥、CVV、邮编和优惠码完全排除。</p>
       </section>
@@ -114,14 +114,14 @@
       <div class="english" lang="en">
         <section>
           <h2>PetalDesk Browser Companion Privacy Notice</h2>
-          <p>Last updated: August 9, 2026</p>
+          <p>Last updated: August 10, 2026</p>
           <p>PetalDesk Browser Companion communicates only with the PetalDesk desktop application on the same Windows computer. It has no PetalDesk cloud account and does not upload browsing data or credentials to a PetalDesk server.</p>
         </section>
 
         <section>
           <h2>Information handled and purpose</h2>
           <p>The extension handles website activity needed for user-initiated long screenshots; exact origins and tab, document, and frame identifiers needed to bind a password request; and usernames, passwords, and a short-lived current TOTP when the user has linked local MFA. The authentication-information permission is required and granted once at install time.</p>
-          <p>A fill offer contains no password. After the user chooses an account in PetalDesk or the toolbar popup, the target frame confirms its identity and field availability before the desktop application provides one-time credentials. The extension fills fields but never submits a form. A linked password fill, or a manual login that exactly matches one unique saved account, can start a five-minute second-factor journey. One high-confidence TOTP field can be filled automatically; ambiguous candidates require a user click, and a different exact HTTPS origin requires first-use confirmation. The popup receives only a <code>hasMfa</code> flag; MFA copy is written directly by PetalDesk and cleared when it expires.</p>
+          <p>A fill offer contains no password. After the user chooses an account in PetalDesk or the toolbar popup, the target frame confirms its identity and field availability before the desktop application provides one-time credentials. The extension fills fields but never submits a form. A linked password fill, or a manual login that exactly matches one unique saved account, can start a five-minute second-factor journey. One high-confidence TOTP field can be filled automatically; ambiguous candidates require a user click, and a different exact HTTPS origin requires first-use confirmation. The popup receives only a <code>hasMfa</code> flag. PetalDesk writes an MFA copy directly to the system clipboard and returns only its remaining validity; TOTP expiry alone does not clear the value, while an explicit MFA lock or PetalDesk shutdown may clear the unchanged copy.</p>
         </section>
 
         <section>

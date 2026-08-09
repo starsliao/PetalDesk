@@ -1983,7 +1983,7 @@ impl PasswordBrowserService {
         else {
             return;
         };
-        let result = (|| -> AppResult<u64> {
+        let result = (|| -> AppResult<(u64, u64)> {
             let entry_id = event
                 .payload
                 .get("entryId")
@@ -2086,17 +2086,16 @@ impl PasswordBrowserService {
                     "关联的 MFA 账户已变化，请重试。",
                 ));
             }
-            app.state::<MfaStore>()
-                .write_browser_code_to_clipboard(&code)?;
-            Ok(code.valid_until.saturating_mul(1_000))
+            let expires_in_seconds = app
+                .state::<MfaStore>()
+                .write_browser_code_to_clipboard_persistent(&code)?;
+            Ok((code.valid_until.saturating_mul(1_000), expires_in_seconds))
         })();
 
         let payload = match result {
-            Ok(expires_at) => serde_json::json!({
-                "requestId": request_id,
-                "success": true,
-                "expiresAt": expires_at,
-            }),
+            Ok((expires_at, expires_in_seconds)) => {
+                mfa_copy_success_payload(&request_id, expires_at, expires_in_seconds)
+            }
             Err(error) => serde_json::json!({
                 "requestId": request_id,
                 "success": false,
@@ -3185,6 +3184,15 @@ fn unix_time_ms() -> u128 {
         .as_millis()
 }
 
+fn mfa_copy_success_payload(request_id: &str, expires_at: u64, expires_in_seconds: u64) -> Value {
+    serde_json::json!({
+        "requestId": request_id,
+        "success": true,
+        "expiresAt": expires_at,
+        "expiresInSeconds": expires_in_seconds,
+    })
+}
+
 struct SecondFactorBinding {
     flow_id: String,
     challenge_id: String,
@@ -3730,6 +3738,19 @@ mod tests {
             ));
         }
         assert!(!mfa_copy_confirmation_matches(None, "copy-request", 42));
+    }
+
+    #[test]
+    fn mfa_copy_success_reports_lifetime_without_secret_material() {
+        let payload = mfa_copy_success_payload("copy-request", 1_755_000_030_000, 27);
+
+        assert_eq!(payload["requestId"], "copy-request");
+        assert_eq!(payload["success"], true);
+        assert_eq!(payload["expiresAt"], 1_755_000_030_000_u64);
+        assert_eq!(payload["expiresInSeconds"], 27);
+        assert!(payload.get("code").is_none());
+        assert!(payload.get("entryId").is_none());
+        assert!(payload.get("mfaEntryId").is_none());
     }
 
     #[test]
