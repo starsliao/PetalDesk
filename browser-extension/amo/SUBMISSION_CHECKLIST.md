@@ -4,7 +4,7 @@
 - [ ] Product owner reviews `PRIVACY.md` and publishes the approved text at a stable HTTPS URL.
 - [ ] Replace the remaining `<PUBLISHER_NAME>` and `<SUPPORT_EMAIL>` fields during submission.
 - [ ] Confirm the extension and desktop app use one release version.
-- [ ] Confirm the desktop app, both extension manifests, both package manifests, and the release tag all use `0.8.1` / `v0.8.1`.
+- [ ] Confirm the desktop app, both extension manifests, both package manifests, and the release tag all use `0.8.2` / `v0.8.2`.
 - [ ] Run `npm test`, `npm run build`, and `npm run package:firefox`.
 - [ ] Confirm `web-ext lint` has no errors or minimum-version compatibility warnings. The Firefox manifest requires Firefox 142 or newer.
 - [ ] Upload `dist/artifacts/PetalDesk_Firefox_AMO-upload_<version>.zip` as **On this site / Listed** in AMO Developer Hub.
@@ -14,7 +14,7 @@
 - [ ] Capture the real release screenshots described in `SCREENSHOTS.md`; do not mock Firefox permission UI.
 - [ ] The product owner performs the final submission while signed into the verified AMO account with 2FA.
 - [ ] Confirm no new WebExtension permission was added: `nativeMessaging`, `tabs`, `<all_urls>`, required `websiteActivity`, and required `authenticationInfo` remain the complete declared set.
-- [ ] After approval, install from the public AMO page and verify Native Messaging, badge/account cards, password fill/capture, linked TOTP fill/copy, confirmed deletion, long screenshots, and update behavior.
+- [ ] After approval, install from the public AMO page and verify Native Messaging, all four tool launchers, login-detection switch/three-attempt reconnect UI, badge/account cards, silent password fill, navigation-persistent save prompts, linked TOTP fill/copy, right-click confirmed deletion, long screenshots, and update behavior.
 
 Optional API submission after the first listing exists:
 

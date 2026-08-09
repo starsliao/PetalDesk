@@ -83,6 +83,7 @@
   let templateExpiryTimer: number | null = null;
   let unlistenEntriesChanged: (() => void) | undefined;
   let unlistenTemplateRecording: (() => void) | undefined;
+  let unlistenCapturePreference: (() => void) | undefined;
   let destroyed = false;
 
   type TooltipPlacement = "top" | "bottom";
@@ -337,7 +338,6 @@
         ...status,
         locked: true,
         recoveryState: "password-required",
-        captureEnabled: false,
       };
     }
     error = "";
@@ -975,12 +975,22 @@
               if (payload.state === "completed") void refresh();
             }
           });
+          const capturePreferenceCleanup = await listen<{ enabled?: boolean }>("password-capture-preference-changed", ({ payload }) => {
+            if (typeof payload.enabled !== "boolean" || !status) return;
+            status = {
+              ...status,
+              captureConfigured: true,
+              captureEnabled: payload.enabled,
+            };
+          });
           if (destroyed) {
             cleanup();
             templateCleanup();
+            capturePreferenceCleanup();
           } else {
             unlistenEntriesChanged = cleanup;
             unlistenTemplateRecording = templateCleanup;
+            unlistenCapturePreference = capturePreferenceCleanup;
           }
         })
         .catch(() => undefined);
@@ -1003,6 +1013,8 @@
     unlistenEntriesChanged = undefined;
     unlistenTemplateRecording?.();
     unlistenTemplateRecording = undefined;
+    unlistenCapturePreference?.();
+    unlistenCapturePreference = undefined;
     if (browserStatusTimer !== null) window.clearTimeout(browserStatusTimer);
     if (templateExpiryTimer !== null) window.clearTimeout(templateExpiryTimer);
     clearAllReveals();

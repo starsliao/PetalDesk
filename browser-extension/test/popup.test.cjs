@@ -4,7 +4,7 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-function loadPopup({ tab, onMessage } = {}) {
+function loadPopup({ tab, diagnostics, onMessage } = {}) {
   const sentMessages = [];
   let currentTab = tab === undefined
     ? {
@@ -16,6 +16,26 @@ function loadPopup({ tab, onMessage } = {}) {
       origin: "https://example.test",
     }
     : tab;
+  let currentDiagnostics = diagnostics === undefined
+    ? {
+      captureAvailable: true,
+      captureDesiredEnabled: true,
+      captureEnabled: true,
+      extensionVersion: "0.8.2",
+      nativeConnected: true,
+      secretConnected: true,
+      loginDetection: {
+        available: true,
+        canReconnect: false,
+        connectionState: "connected",
+        desiredEnabled: true,
+        enabled: true,
+        preferenceBusy: false,
+        reconnectAttempt: 0,
+        reconnectMaxAttempts: 3,
+      },
+    }
+    : diagnostics;
   let document;
 
   class FakeElement {
@@ -27,6 +47,7 @@ function loadPopup({ tab, onMessage } = {}) {
       this.textContent = "";
       this.className = "";
       this.disabled = false;
+      this.hidden = false;
       this.id = "";
       this.parentElement = null;
       this.type = "";
@@ -103,14 +124,24 @@ function loadPopup({ tab, onMessage } = {}) {
   const elementTags = {
     "account-list": "ul",
     "diagnostics-list": "ul",
-    "open-manager": "button",
+    "diagnostics-status": "p",
+    "open-main": "button",
+    "open-password-manager": "button",
+    "open-mfa": "button",
+    "open-notes": "button",
+    "tool-launcher-status": "p",
   };
   for (const id of [
     "diagnostics-list",
+    "diagnostics-status",
     "site-origin",
     "site-status",
     "account-list",
-    "open-manager",
+    "open-main",
+    "open-password-manager",
+    "open-mfa",
+    "open-notes",
+    "tool-launcher-status",
     "extension-version",
   ]) {
     const element = new FakeElement(elementTags[id] || "p");
@@ -142,12 +173,14 @@ function loadPopup({ tab, onMessage } = {}) {
         const result = onMessage(serialized, {
           getTab: () => currentTab,
           setTab: (nextTab) => { currentTab = nextTab; },
+          getDiagnostics: () => currentDiagnostics,
+          setDiagnostics: (nextDiagnostics) => { currentDiagnostics = nextDiagnostics; },
         });
         if (result !== undefined) return Promise.resolve(result);
       }
       if (message.type === "petaldesk.popup.getState") {
         return Promise.resolve({
-          diagnostics: { captureEnabled: true, extensionVersion: "0.8.1" },
+          diagnostics: currentDiagnostics,
           tab: currentTab,
         });
       }
@@ -176,6 +209,7 @@ function loadPopup({ tab, onMessage } = {}) {
   );
 
   const accountList = elements.get("account-list");
+  const diagnosticsList = elements.get("diagnostics-list");
 
   function descendants(element, predicate, found = []) {
     for (const child of element.children) {
@@ -203,6 +237,7 @@ function loadPopup({ tab, onMessage } = {}) {
 
   return {
     accountList,
+    diagnosticsList,
     document,
     elements,
     sentMessages,
@@ -247,6 +282,60 @@ function loadPopup({ tab, onMessage } = {}) {
       const card = accountList.children[cardIndex];
       return descendants(card, (element) => element.tagName === "BUTTON" && hasClass(element, "icon-button"));
     },
+    loginDetectionCard() {
+      return descendants(
+        diagnosticsList,
+        (element) => hasClass(element, "login-detection-card"),
+      )[0] || null;
+    },
+    loginDetectionState() {
+      const state = descendants(
+        diagnosticsList,
+        (element) => hasClass(element, "login-detection-state"),
+      )[0];
+      return state ? state.textContent : "";
+    },
+    loginDetectionToggle() {
+      return descendants(
+        diagnosticsList,
+        (element) => element.tagName === "BUTTON" && element.getAttribute("role") === "switch",
+      )[0] || null;
+    },
+    launcherButton(target) {
+      const ids = {
+        main: "open-main",
+        passwords: "open-password-manager",
+        mfa: "open-mfa",
+        notes: "open-notes",
+      };
+      return elements.get(ids[target]) || null;
+    },
+    launcherStatus() {
+      return elements.get("tool-launcher-status").textContent;
+    },
+    reconnectButton() {
+      return descendants(
+        diagnosticsList,
+        (element) => element.tagName === "BUTTON"
+          && element.getAttribute("aria-label") === "重新连接登录检测",
+      )[0] || null;
+    },
+    helpButton() {
+      return descendants(
+        diagnosticsList,
+        (element) => element.tagName === "BUTTON"
+          && element.getAttribute("aria-label") === "登录检测说明",
+      )[0] || null;
+    },
+    helpTooltip() {
+      return descendants(
+        diagnosticsList,
+        (element) => element.getAttribute("role") === "tooltip",
+      )[0] || null;
+    },
+    diagnosticsStatus() {
+      return elements.get("diagnostics-status").textContent;
+    },
     nestedButtons() {
       const buttons = descendants(accountList, (element) => element.tagName === "BUTTON");
       return buttons.filter((button) => descendants(button, (element) => element.tagName === "BUTTON").length > 0);
@@ -260,6 +349,232 @@ function loadPopup({ tab, onMessage } = {}) {
 function flush() {
   return new Promise((resolve) => setImmediate(resolve));
 }
+
+function loginDiagnostics(overrides = {}) {
+  const loginDetection = {
+    available: true,
+    canReconnect: false,
+    connectionState: "connected",
+    desiredEnabled: true,
+    enabled: true,
+    preferenceBusy: false,
+    reconnectAttempt: 0,
+    reconnectMaxAttempts: 3,
+    ...(overrides.loginDetection || {}),
+  };
+  return {
+    captureAvailable: loginDetection.available,
+    captureDesiredEnabled: loginDetection.desiredEnabled,
+    captureEnabled: loginDetection.enabled,
+    extensionVersion: "0.8.2",
+    nativeConnected: loginDetection.connectionState !== "disconnected",
+    secretConnected: loginDetection.connectionState === "connected",
+    ...overrides,
+    loginDetection,
+  };
+}
+
+test("login detection uses an accessible switch and help tooltip", async () => {
+  const harness = loadPopup({ diagnostics: loginDiagnostics() });
+  await flush();
+
+  assert.ok(harness.loginDetectionCard());
+  assert.equal(harness.loginDetectionState(), "已开启");
+  const toggle = harness.loginDetectionToggle();
+  assert.equal(toggle.getAttribute("aria-checked"), "true");
+  assert.equal(toggle.getAttribute("aria-label"), "关闭登录检测");
+  assert.equal(toggle.disabled, false);
+  const help = harness.helpButton();
+  const tooltip = harness.helpTooltip();
+  assert.equal(help.getAttribute("aria-describedby"), "login-detection-tooltip");
+  assert.equal(tooltip.getAttribute("role"), "tooltip");
+  assert.match(tooltip.textContent, /提示保存或更新/);
+  assert.match(tooltip.textContent, /关闭后仍可填充和复制/);
+});
+
+test("manual login detection disable stays off without disabling account fill", async () => {
+  const harness = loadPopup({
+    diagnostics: loginDiagnostics({
+      loginDetection: { desiredEnabled: false, enabled: false },
+    }),
+  });
+  await flush();
+
+  assert.equal(harness.loginDetectionState(), "已关闭");
+  assert.equal(harness.loginDetectionToggle().getAttribute("aria-checked"), "false");
+  assert.equal(harness.reconnectButton().hidden, true);
+  harness.buttonInCard(0, "填充 Example 的账户").click();
+  await flush();
+  assert.equal(harness.sentMessages.at(-1).type, "petaldesk.popup.fill");
+});
+
+test("automatic attempts keep the switch on and hide reconnect until all three fail", async () => {
+  for (const attempt of [1, 2, 3]) {
+    const harness = loadPopup({
+      diagnostics: loginDiagnostics({
+        loginDetection: {
+          canReconnect: false,
+          connectionState: "reconnecting",
+          enabled: false,
+          reconnectAttempt: attempt,
+        },
+      }),
+    });
+    await flush();
+    assert.equal(harness.loginDetectionToggle().getAttribute("aria-checked"), "true");
+    assert.equal(harness.loginDetectionState(), `正在重连（${attempt}/3）`);
+    assert.equal(harness.reconnectButton().hidden, true);
+  }
+});
+
+test("a saved enabled preference keeps polling until the desktop effective state arrives", async () => {
+  const harness = loadPopup({
+    diagnostics: loginDiagnostics({
+      loginDetection: {
+        available: true,
+        connectionState: "connected",
+        desiredEnabled: true,
+        enabled: false,
+      },
+    }),
+  });
+  await flush();
+  assert.equal(harness.loginDetectionState(), "正在恢复");
+  const initialReads = harness.sentMessages.filter(
+    (message) => message.type === "petaldesk.popup.getState",
+  ).length;
+
+  await new Promise((resolve) => setTimeout(resolve, 650));
+  await flush();
+  assert.ok(
+    harness.sentMessages.filter((message) => message.type === "petaldesk.popup.getState").length
+      > initialReads,
+  );
+});
+
+test("the reconnect button appears only after exhaustion and starts an immediate new round", async () => {
+  const harness = loadPopup({
+    diagnostics: loginDiagnostics({
+      loginDetection: {
+        canReconnect: true,
+        connectionState: "disconnected",
+        enabled: false,
+        reconnectAttempt: 3,
+      },
+    }),
+  });
+  await flush();
+
+  assert.equal(harness.loginDetectionState(), "连接已断开");
+  assert.equal(harness.loginDetectionToggle().getAttribute("aria-checked"), "true");
+  const reconnect = harness.reconnectButton();
+  assert.equal(reconnect.hidden, false);
+  reconnect.click();
+  await flush();
+  assert.deepEqual(
+    harness.sentMessages.find((message) => message.type === "petaldesk.popup.reconnectLoginDetection"),
+    { type: "petaldesk.popup.reconnectLoginDetection" },
+  );
+  assert.equal(
+    harness.sentMessages.some((message) => message.type === "petaldesk.popup.setLoginDetection"),
+    false,
+  );
+});
+
+test("the login detection switch stays busy until the desktop acknowledgement refreshes state", async () => {
+  let resolvePreference;
+  let preferenceState;
+  const acknowledgement = new Promise((resolve) => { resolvePreference = resolve; });
+  const harness = loadPopup({
+    diagnostics: loginDiagnostics(),
+    onMessage(message, state) {
+      if (message.type !== "petaldesk.popup.setLoginDetection") return undefined;
+      preferenceState = state;
+      return acknowledgement;
+    },
+  });
+  await flush();
+
+  const toggle = harness.loginDetectionToggle();
+  toggle.click();
+  await Promise.resolve();
+  assert.equal(toggle.disabled, true);
+  assert.equal(toggle.getAttribute("aria-busy"), "true");
+  assert.deepEqual(harness.sentMessages.at(-1), {
+    enabled: false,
+    type: "petaldesk.popup.setLoginDetection",
+  });
+
+  preferenceState.setDiagnostics(loginDiagnostics({
+    loginDetection: { desiredEnabled: false, enabled: false },
+  }));
+  resolvePreference({ accepted: true, enabled: false });
+  await flush();
+  await flush();
+  assert.equal(harness.loginDetectionState(), "已关闭");
+  assert.equal(harness.loginDetectionToggle().getAttribute("aria-checked"), "false");
+});
+
+test("login detection errors stay in the status panel instead of the site status", async () => {
+  const harness = loadPopup({
+    diagnostics: loginDiagnostics(),
+    onMessage(message) {
+      if (message.type === "petaldesk.popup.setLoginDetection") {
+        return { ok: false, error: { message: "登录检测设置保存失败" } };
+      }
+      return undefined;
+    },
+  });
+  await flush();
+
+  const originalSiteStatus = harness.status();
+  harness.loginDetectionToggle().click();
+  await flush();
+  assert.equal(harness.diagnosticsStatus(), "登录检测设置保存失败");
+  assert.equal(harness.status(), originalSiteStatus);
+});
+
+test("the popup exposes four distinct PetalDesk launch targets", async () => {
+  const harness = loadPopup();
+  await flush();
+
+  for (const target of ["main", "passwords", "mfa", "notes"]) {
+    const button = harness.launcherButton(target);
+    assert.ok(button);
+    button.click();
+    await flush();
+    assert.deepEqual(harness.sentMessages.at(-1), {
+      type: "petaldesk.popup.openTool",
+      target,
+    });
+    assert.equal(button.disabled, false);
+    assert.equal(button.getAttribute("aria-busy"), null);
+  }
+});
+
+test("a launcher keeps an accessible busy state and reports errors separately", async () => {
+  let resolveOpen;
+  const pending = new Promise((resolve) => { resolveOpen = resolve; });
+  const harness = loadPopup({
+    onMessage(message) {
+      if (message.type === "petaldesk.popup.openTool") return pending;
+      return undefined;
+    },
+  });
+  await flush();
+
+  const button = harness.launcherButton("mfa");
+  button.click();
+  await Promise.resolve();
+  assert.equal(button.disabled, true);
+  assert.equal(button.getAttribute("aria-busy"), "true");
+
+  resolveOpen({ ok: false, error: { message: "无法打开 MFA 验证器" } });
+  await flush();
+  assert.equal(button.disabled, false);
+  assert.equal(button.getAttribute("aria-busy"), null);
+  assert.equal(harness.launcherStatus(), "无法打开 MFA 验证器");
+});
 
 test("account cards keep three copy actions and no delete icon or nested buttons", async () => {
   const harness = loadPopup();
@@ -573,6 +888,7 @@ test("an MFA copy error stays in popup status and does not disable password fill
 
 test("popup CSS removes the delete slot and keeps context actions out of document flow", () => {
   const css = fs.readFileSync(path.join(__dirname, "..", "src", "popup", "popup.css"), "utf8");
+  const html = fs.readFileSync(path.join(__dirname, "..", "src", "popup", "popup.html"), "utf8");
   assert.match(css, /width:\s*360px/);
   assert.match(css, /grid-template-columns:\s*minmax\(0,\s*1fr\)\s+106px/);
   assert.match(css, /min-height:\s*64px/);
@@ -581,6 +897,18 @@ test("popup CSS removes the delete slot and keeps context actions out of documen
   assert.equal(css.includes("grid-template-rows"), false);
   assert.equal(css.includes("delete-trigger"), false);
   assert.equal(css.includes("lucide-trash-2"), false);
+  assert.match(css, /\.diagnostics li\.login-detection-card\s*\{[^}]*display:\s*grid/s);
+  assert.match(css, /\.switch-control\[aria-checked="true"\]/);
+  assert.match(css, /\.help-tip:hover \.help-tooltip/);
+  assert.match(css, /\.diagnostics-feedback:empty\s*\{[^}]*display:\s*none/s);
+  assert.match(css, /\.tool-launchers\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/s);
+  assert.match(css, /button\.tool-launcher\[aria-busy="true"\]/);
+  assert.match(css, /\.tool-launcher-feedback:empty\s*\{[^}]*display:\s*none/s);
+  assert.match(html, /id="diagnostics-status"[^>]*aria-live="polite"/);
+  for (const id of ["open-main", "open-password-manager", "open-mfa", "open-notes"]) {
+    assert.match(html, new RegExp(`id="${id}"[^>]*aria-label="[^"]+"`));
+  }
+  assert.match(html, /id="tool-launcher-status"[^>]*aria-live="polite"/);
 });
 
 test("the four locally packaged Lucide sources retain their package license marker", () => {

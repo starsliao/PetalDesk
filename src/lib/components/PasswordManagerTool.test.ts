@@ -292,6 +292,30 @@ describe("PasswordManagerTool", () => {
     expect(view.queryByText(/请更新 Firefox 扩展/)).not.toBeInTheDocument();
   });
 
+  it("updates the persisted capture preference when the browser popup changes it", async () => {
+    const api: PasswordApi = {
+      ...captureEnabledHarness({
+        browser: "firefox",
+        connection: "connected",
+        extensionInstalled: true,
+        nativeHostInstalled: true,
+        capturePermission: "unknown",
+        stdioConnected: true,
+        pipeConnected: true,
+      }),
+      isDesktop: () => true,
+    };
+    const view = render(PasswordManagerTool, { api });
+
+    expect(await view.findByText("Firefox 扩展通信异常")).toBeInTheDocument();
+    await waitFor(() => expect(eventHarness.listeners.get("password-capture-preference-changed")?.size).toBe(1));
+    eventHarness.emit("password-capture-preference-changed", { enabled: false });
+    await waitFor(() => expect(view.queryByText("Firefox 扩展通信异常")).not.toBeInTheDocument());
+
+    eventHarness.emit("password-capture-preference-changed", { enabled: true });
+    expect(await view.findByText("Firefox 扩展通信异常")).toBeInTheDocument();
+  });
+
   it("points at the extension install when the stdio layer is down", async () => {
     const api = captureEnabledHarness({
       browser: "firefox",

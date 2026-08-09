@@ -47,6 +47,47 @@ describe("ScreenshotSettingsDialog", () => {
     expect(rendered.getByText("C:\\Users\\tester\\Documents\\PetalDesk")).toBeInTheDocument();
   });
 
+  it("renders and changes the supported launch-at-login checkbox", async () => {
+    const onlaunchatloginchange = vi.fn();
+    const rendered = render(ScreenshotSettingsDialog, {
+      open: true,
+      launchAtLoginSupported: true,
+      launchAtLoginEnabled: false,
+      onlaunchatloginchange,
+    });
+
+    const checkbox = rendered.getByRole("checkbox", { name: "开机启动" });
+    expect(checkbox).not.toBeChecked();
+    expect(rendered.getByText("登录 Windows 后自动启动，启动后隐藏到系统托盘")).toBeInTheDocument();
+
+    await fireEvent.click(checkbox);
+    expect(onlaunchatloginchange).toHaveBeenCalledWith(true);
+
+    rendered.rerender({
+      open: true,
+      launchAtLoginSupported: true,
+      launchAtLoginEnabled: true,
+      onlaunchatloginchange,
+    });
+    expect(rendered.getByRole("checkbox", { name: "开机启动" })).toBeChecked();
+  });
+
+  it("disables launch-at-login when unsupported or updating", () => {
+    const unsupported = render(ScreenshotSettingsDialog, { open: true });
+    expect(unsupported.getByRole("checkbox", { name: "开机启动" })).toBeDisabled();
+    expect(unsupported.getByText("仅 Windows 桌面版支持此功能")).toBeInTheDocument();
+    unsupported.unmount();
+
+    const updating = render(ScreenshotSettingsDialog, {
+      open: true,
+      launchAtLoginSupported: true,
+      launchAtLoginEnabled: true,
+      launchAtLoginBusy: true,
+    });
+    expect(updating.getByRole("checkbox", { name: "开机启动" })).toBeDisabled();
+    expect(updating.getByRole("button", { name: "保存" })).toBeDisabled();
+  });
+
   it("opens the independent about and update dialog without saving other settings", async () => {
     const onsave = vi.fn();
     const onaboutopen = vi.fn();

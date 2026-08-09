@@ -15,6 +15,7 @@
     notesApi,
     type AppError,
     type AppInfo,
+    type LaunchAtLoginStatus,
     type NoteColor,
     type NoteListItem,
     type NoteMeta,
@@ -136,6 +137,11 @@
     ...DEFAULT_TRAY_SHORTCUT_SETTINGS,
   });
   let protectSensitiveWindows = $state(false);
+  let launchAtLoginStatus = $state<LaunchAtLoginStatus>({
+    supported: false,
+    enabled: false,
+  });
+  let launchAtLoginBusy = $state(false);
 
   let activeNote = $state<NoteSnapshot | null>(null);
   let NoteEditor = $state<NoteEditorComponent | null>(null);
@@ -478,6 +484,32 @@
     }
   }
 
+  async function changeLaunchAtLogin(enabled: boolean): Promise<void> {
+    if (
+      launchAtLoginBusy
+      || !launchAtLoginStatus.supported
+      || enabled === launchAtLoginStatus.enabled
+    ) return;
+
+    const previous = { ...launchAtLoginStatus };
+    launchAtLoginStatus = { ...launchAtLoginStatus, enabled };
+    launchAtLoginBusy = true;
+    settingsError = null;
+    try {
+      launchAtLoginStatus = await notesApi.setLaunchAtLoginEnabled(enabled);
+      showToast(
+        launchAtLoginStatus.enabled
+          ? "开机启动已开启，登录后飞花会隐藏到系统托盘"
+          : "开机启动已关闭",
+      );
+    } catch (error) {
+      launchAtLoginStatus = previous;
+      settingsError = errorMessage(error);
+    } finally {
+      launchAtLoginBusy = false;
+    }
+  }
+
   function setNoteEditorMode(mode: EditorMode): void {
     if (!activeNote || mode === noteEditorMode) return;
     noteEditorMode = mode;
@@ -645,15 +677,36 @@
     settingsOpen = true;
     settingsBusy = true;
     settingsError = null;
+    launchAtLoginStatus = { supported: false, enabled: false };
+    const errors: string[] = [];
     try {
-      const latestAppInfo = await notesApi.appInfo();
-      appInfo = latestAppInfo;
-      defaultEditorMode = latestAppInfo.defaultEditorMode ?? "typora";
-      trayShortcutSettings = {
-        ...(latestAppInfo.trayShortcutSettings ?? DEFAULT_TRAY_SHORTCUT_SETTINGS),
-      };
-      protectSensitiveWindows = latestAppInfo.protectSensitiveWindows ?? false;
-      screenshotShortcut = (await screenshotApi.getSettings()).shortcut;
+      const [appInfoResult, screenshotResult, launchAtLoginResult] = await Promise.allSettled([
+        notesApi.appInfo(),
+        screenshotApi.getSettings(),
+        notesApi.getLaunchAtLoginStatus(),
+      ]);
+      if (appInfoResult.status === "fulfilled") {
+        const latestAppInfo = appInfoResult.value;
+        appInfo = latestAppInfo;
+        defaultEditorMode = latestAppInfo.defaultEditorMode ?? "typora";
+        trayShortcutSettings = {
+          ...(latestAppInfo.trayShortcutSettings ?? DEFAULT_TRAY_SHORTCUT_SETTINGS),
+        };
+        protectSensitiveWindows = latestAppInfo.protectSensitiveWindows ?? false;
+      } else {
+        errors.push(errorMessage(appInfoResult.reason));
+      }
+      if (screenshotResult.status === "fulfilled") {
+        screenshotShortcut = screenshotResult.value.shortcut;
+      } else {
+        errors.push(errorMessage(screenshotResult.reason));
+      }
+      if (launchAtLoginResult.status === "fulfilled") {
+        launchAtLoginStatus = launchAtLoginResult.value;
+      } else {
+        errors.push(errorMessage(launchAtLoginResult.reason));
+      }
+      settingsError = errors[0] ?? null;
     } catch (error) {
       settingsError = errorMessage(error);
     } finally {
@@ -1160,6 +1213,10 @@
     oneditormodechange={(mode) => void changeDefaultEditorMode(mode)}
     protectSensitiveWindows={protectSensitiveWindows}
     onprotectsensitivechange={(enabled) => void changeProtectSensitiveWindows(enabled)}
+    launchAtLoginSupported={launchAtLoginStatus.supported}
+    launchAtLoginEnabled={launchAtLoginStatus.enabled}
+    {launchAtLoginBusy}
+    onlaunchatloginchange={(enabled) => void changeLaunchAtLogin(enabled)}
     ondatastoragechange={() => void chooseDataStoragePath()}
     onaboutopen={() => {
       if (settingsBusy) return;

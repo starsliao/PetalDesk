@@ -44,10 +44,12 @@ password publication remains a later release step.
 The Firefox manifest declares required `websiteActivity` for scroll geometry
 and required `authenticationInfo` for usernames, passwords, and short-lived
 linked TOTP filling; both are granted at installation time. The toolbar action
-opens a popup with connection diagnostics and fixed account cards for the active
-tab. The Native Messaging host is on the same machine; the extension does not
-send data to a remote service. AMO listing, privacy, permission, and reviewer
-drafts are in `amo/`.
+opens a popup with four PetalDesk launchers, login-detection status and controls,
+connection diagnostics, and fixed account cards for the active tab. Login
+detection starts enabled, but the user can turn only that feature off without
+disabling fill, copy, linked MFA, or long screenshots. The Native Messaging host
+is on the same machine; the extension does not send data to a remote service.
+AMO listing, privacy, permission, and reviewer drafts are in `amo/`.
 
 ## Capture protocol
 
@@ -116,18 +118,25 @@ Firefox advertises `password-fill`, `password-capture`, and
 - `password.offerSecondFactor`
 - `password.provideSecondFactor`
 - `password.cancelSecondFactor`
+- `password.confirmMfaCopy`
 - `password.copyMfaResult`
 - `password.deleteResult`
+- `password.capturePreferenceResult`
 
 `password.requestConsent` is a no-op compatibility probe: authentication
 access is a required install-time permission, so it always reports a granted
 state. `password.updateBadge` caches up to 16 account summaries
 (`entryId`/`username`/`siteName`/`hasMfa`, never an MFA ID or secret) for one
 tab, mirrors the count into the toolbar badge, and backs the action popup. The
-popup talks to
-the background over `petaldesk.popup.*` runtime messages (`getState`, `fill`,
-`openManager`, `copySecret`, `deleteEntry`) that only accept the extension's
-own popup sender. Username and password copies are written by the desktop.
+popup talks to the background over `petaldesk.popup.*` runtime messages
+(`getState`, `fill`, `openTool`, the legacy `openManager`, `copySecret`,
+`deleteEntry`, `setLoginDetection`, and `reconnectLoginDetection`) that only
+accept the extension's own popup sender. `openTool` provides four local
+shortcuts: the PetalDesk main window, password manager, MFA authenticator, and a
+new standalone note. Account cards expose fixed username, password, and MFA copy
+actions; deletion starts from the card's right-click context menu and still
+requires confirmation. There is no three-dot action menu. Username and password
+copies are written by the desktop.
 An MFA copy carries only the selected password entry, tab, and exact origin;
 the desktop revalidates the association and writes the code directly to the
 system clipboard, so the MFA ID and code never return to extension JavaScript.
@@ -137,8 +146,9 @@ Deletion carries a random request ID and resolves only after the desktop sends
 Password events use
 `{ "type": "extension.event", "event": "...", "payload": { ... } }`.
 The event names are `tabReady`, `fillConfirm`, `fillResult`,
-`captureCandidate`, `saveDecision`, `originActive`, `fillRequest`,
-`openPasswordManager`, `copySecret`, `copyMfaCode`, `deleteEntry`,
+`captureCandidate`, `capturePreferenceChanged`, `saveDecision`, `originActive`,
+`fillRequest`, `openPasswordManager`, `openTool`, `copySecret`, `copyMfaCode`,
+`deleteEntry`, `pageClosed`,
 `secondFactorOffer`, `secondFactorConfirm`, `secondFactorResult`,
 `cancelSecondFactor`, `templateRecordingReady`,
 `templateRecordingProgress`, `templateRecordingResult`, and
@@ -146,9 +156,9 @@ The event names are `tabReady`, `fillConfirm`, `fillResult`,
 `password.captureMatch` can return `new`, `update`, `same`, `select`,
 `username-required`, or `locked`; a `select` or `new` decision with accounts
 is completed by a bound `replace` save action, and `locked` dismisses the
-candidate with an unlock notice. `password.saveResult` keeps a failed
-candidate available for a short retry window and clears it only after a
-confirmed success.
+candidate with an unlock notice. `password.saveResult` keeps a failed candidate
+available until the user retries or explicitly closes/ignores the prompt, and
+clears it after a confirmed success.
 
 The two-phase fill protocol is mandatory: `password.offerFill` contains no
 password; after the page produces `fillConfirm`, the host sends one
@@ -176,9 +186,17 @@ and dispatch `input`/`change` events but never submit the form. A submitted
 password form, a semantic login control (including anchor-based controls), or
 an Enter action is reported as a high-confidence success immediately; the
 save prompt does not wait for a post-submit success signal. Login candidates
-stay in extension memory for at most 30 seconds. A username captured on the
-first page of a two-step login can remain in memory for at most two minutes on
-the same tab and exact origin. Neither value is written to extension storage.
+that still contain a password stay in extension memory for at most 30 seconds
+before a save/update prompt is established. Once the candidate is accepted by
+the local desktop process, the extension clears its password and keeps only the
+password-free prompt metadata needed to restore the prompt after a page
+navigation or login-iframe replacement in the same tab. The desktop keeps the
+pending candidate only in process memory until the user saves, updates, ignores,
+or closes the prompt, or until the tab is really closed, login detection is
+disabled, the vault is locked, or the local connection ends. Each tab has at
+most one unresolved prompt. A username captured on the first page of a two-step
+login can remain in memory for at most two minutes on the same tab and exact
+origin. None of these values is written to extension storage.
 `password.offerFill.userTemplate` is either `null` or a complete constrained
 template object; legacy string template IDs are rejected instead of silently
 falling back to generic field detection.
@@ -198,3 +216,14 @@ script accepts one 6/7/8-digit field or 6/7/8 one-character segments, clears
 the code immediately after use, and never clicks, submits, or synthesizes
 Enter. Recovery, SMS/email, CAPTCHA, passkey, security-key, payment, postal,
 coupon, hidden, HTTP, and cross-origin iframe candidates are rejected.
+
+## Login-detection connection lifecycle
+
+The saved preference, current page-listener state, desktop-vault availability,
+and native connection state are tracked independently. An unexpected disconnect
+never rewrites an enabled user preference or presents it as manually switched
+off. Reconnection starts immediately and makes three fast attempts with delays
+of 0 ms, 350 ms, and 900 ms; each attempt allows up to 2.5 seconds for the
+Firefox password-channel handshake. The popup shows a manual reconnect button
+only after all three attempts fail, while the background continues a low-rate
+recovery attempt every 30 seconds. A manual reconnect restarts the fast cycle.

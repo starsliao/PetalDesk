@@ -16,11 +16,20 @@
     "restore",
     "cancel",
   ]);
-  const MAX_RECONNECT_DELAY_MS = 30_000;
+  const MAX_FAST_RECONNECT_ATTEMPTS = 3;
+  const FAST_RECONNECT_DELAYS_MS = Object.freeze([0, 350, 900]);
+  const RECONNECT_HANDSHAKE_TIMEOUT_MS = 2_500;
+  const BACKGROUND_RECONNECT_DELAY_MS = 30_000;
 
   let nativePort = null;
   let reconnectTimer = null;
-  let reconnectDelayMs = 1_000;
+  let handshakeTimer = null;
+  let backgroundReconnectTimer = null;
+  let reconnectAttempt = 0;
+  let recoveryMode = null;
+  let connectionState = "connecting";
+  let secretConnected = api.browserFamily !== "firefox";
+  let passwordChannelDisconnected = false;
   const activeSessions = new Map();
   let defaultSessionKey = null;
   const passwordBridge = api.browserFamily === "firefox"
@@ -29,6 +38,7 @@
       api,
       postToNative,
       protocolVersion: PROTOCOL_VERSION,
+      requestNativeReconnect,
     })
     : null;
 
@@ -37,17 +47,81 @@
   }
 
   function postToNative(message) {
-    if (!nativePort) {
+    const port = nativePort;
+    if (!port) {
       return false;
     }
 
     try {
-      nativePort.postMessage(message);
+      port.postMessage(message);
       return true;
     } catch (error) {
       console.warn("PetalDesk native response failed", error);
+      handleNativePortLost(port);
       return false;
     }
+  }
+
+  function connectionSnapshot() {
+    return {
+      canReconnect: connectionState === "disconnected",
+      connected: nativePort != null,
+      reconnectAttempt,
+      reconnectMaxAttempts: MAX_FAST_RECONNECT_ATTEMPTS,
+      secretConnected,
+      state: connectionState,
+    };
+  }
+
+  function publishConnectionState() {
+    if (!passwordBridge) return;
+    const snapshot = connectionSnapshot();
+    if (typeof passwordBridge.setNativeConnectionState === "function") {
+      passwordBridge.setNativeConnectionState(snapshot);
+      return;
+    }
+    if (typeof passwordBridge.setNativeConnected === "function") {
+      passwordBridge.setNativeConnected(snapshot.connected);
+    }
+  }
+
+  function clearReconnectTimer() {
+    if (reconnectTimer != null) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  function clearHandshakeTimer() {
+    if (handshakeTimer != null) clearTimeout(handshakeTimer);
+    handshakeTimer = null;
+  }
+
+  function clearBackgroundReconnectTimer() {
+    if (backgroundReconnectTimer != null) clearTimeout(backgroundReconnectTimer);
+    backgroundReconnectTimer = null;
+  }
+
+  function unrefTimer(timer) {
+    if (timer && typeof timer.unref === "function") timer.unref();
+  }
+
+  function closeNativePort() {
+    const port = nativePort;
+    nativePort = null;
+    if (port && typeof port.disconnect === "function") {
+      try {
+        port.disconnect();
+      } catch (_error) {
+        // The port may already be closed. Its stale disconnect callback is
+        // ignored because nativePort no longer points at this instance.
+      }
+    }
+  }
+
+  function notifyPasswordDisconnected() {
+    cancelActiveSessions();
+    if (passwordChannelDisconnected) return;
+    passwordChannelDisconnected = true;
+    if (passwordBridge) passwordBridge.disconnect();
   }
 
   async function activeTabId() {
@@ -161,15 +235,18 @@
   }
 
   async function onNativeMessage(request) {
-    reconnectDelayMs = 1_000;
     if (request && request.type === "extension.event") {
       if (request.event === "secretDisconnected") {
-        cancelActiveSessions();
-        if (passwordBridge) passwordBridge.disconnect();
+        secretConnected = false;
+        notifyPasswordDisconnected();
+        publishConnectionState();
+        // A newly-created native host announces the unavailable pipe before it
+        // starts its own handshake loop. During an active recovery attempt the
+        // watchdog gives that loop a short chance to reconnect. Outside a
+        // recovery attempt, rebuild the complete Native Messaging port now.
+        if (recoveryMode == null) beginFastReconnect();
       } else if (request.event === "secretConnected") {
-        if (passwordBridge && typeof passwordBridge.onSecretConnected === "function") {
-          void passwordBridge.onSecretConnected();
-        }
+        markConnectionHealthy();
       }
       return;
     }
@@ -179,6 +256,10 @@
       if (requestVersion != null && requestVersion !== PROTOCOL_VERSION) {
         throw new Error(`Unsupported native protocol version: ${requestVersion}`);
       }
+      // A protocol-compatible request necessarily crossed both the Native
+      // Messaging port and the desktop secret pipe, so it is a successful
+      // reconnect signal even if the requested command itself later fails.
+      markConnectionHealthy();
       const result = await routeRequest(request);
       postToNative({
         protocolVersion: PROTOCOL_VERSION,
@@ -201,45 +282,58 @@
     }
   }
 
-  function scheduleReconnect() {
-    if (reconnectTimer != null) {
-      return;
+  function markConnectionHealthy() {
+    const wasSecretConnected = secretConnected;
+    clearReconnectTimer();
+    clearHandshakeTimer();
+    clearBackgroundReconnectTimer();
+    reconnectAttempt = 0;
+    recoveryMode = null;
+    connectionState = "connected";
+    secretConnected = true;
+    passwordChannelDisconnected = false;
+    publishConnectionState();
+    if (
+      !wasSecretConnected
+      && passwordBridge
+      && typeof passwordBridge.onSecretConnected === "function"
+    ) {
+      void passwordBridge.onSecretConnected();
     }
-
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      connect();
-    }, reconnectDelayMs);
-    reconnectDelayMs = Math.min(reconnectDelayMs * 2, MAX_RECONNECT_DELAY_MS);
   }
 
-  function setNativeConnected(connected) {
-    if (passwordBridge && typeof passwordBridge.setNativeConnected === "function") {
-      passwordBridge.setNativeConnected(connected);
-    }
+  function armHandshakeWatchdog(mode) {
+    clearHandshakeTimer();
+    handshakeTimer = setTimeout(() => {
+      handshakeTimer = null;
+      if (secretConnected) return;
+      if (mode === "fast" && recoveryMode === "fast") {
+        failFastReconnectAttempt();
+      } else if (mode === "slow" && recoveryMode === "slow") {
+        finishBackgroundReconnectAttempt();
+      } else if (mode === "initial" && recoveryMode == null) {
+        beginFastReconnect();
+      }
+    }, RECONNECT_HANDSHAKE_TIMEOUT_MS);
+    unrefTimer(handshakeTimer);
   }
 
-  function connect() {
-    if (nativePort) {
-      return;
-    }
-
+  function openNativePort(mode) {
+    if (nativePort) return true;
     try {
       const port = api.connectNative(HOST_NAME);
       nativePort = port;
-      setNativeConnected(true);
-      port.onMessage.addListener(onNativeMessage);
+      port.onMessage.addListener((request) => {
+        if (nativePort !== port) return;
+        void onNativeMessage(request);
+      });
       port.onDisconnect.addListener(() => {
         api.consumeRuntimeLastError();
-        nativePort = null;
-        cancelActiveSessions();
-        setNativeConnected(false);
-        if (passwordBridge) {
-          passwordBridge.disconnect();
-        }
-        scheduleReconnect();
+        handleNativePortLost(port);
       });
-      postToNative({
+      publishConnectionState();
+      armHandshakeWatchdog(mode);
+      const readyPosted = postToNative({
         protocolVersion: PROTOCOL_VERSION,
         type: "extension.ready",
         browser: api.browserFamily,
@@ -250,12 +344,144 @@
           ...(passwordBridge ? Array.from(passwordBridge.capabilities) : []),
         ],
       });
+      if (readyPosted && nativePort === port && api.browserFamily !== "firefox") {
+        markConnectionHealthy();
+      }
+      return readyPosted && nativePort === port;
     } catch (error) {
       nativePort = null;
-      setNativeConnected(false);
       console.warn("PetalDesk native host connection failed", error);
-      scheduleReconnect();
+      publishConnectionState();
+      return false;
     }
+  }
+
+  function handleNativePortLost(port) {
+    if (nativePort !== port) return;
+    nativePort = null;
+    clearHandshakeTimer();
+    secretConnected = false;
+    notifyPasswordDisconnected();
+    publishConnectionState();
+    if (recoveryMode === "fast") {
+      failFastReconnectAttempt();
+    } else if (recoveryMode === "slow") {
+      finishBackgroundReconnectAttempt();
+    } else {
+      beginFastReconnect();
+    }
+  }
+
+  function scheduleFastReconnectAttempt() {
+    clearReconnectTimer();
+    if (reconnectAttempt >= MAX_FAST_RECONNECT_ATTEMPTS) {
+      finishFastReconnectCycle();
+      return;
+    }
+    reconnectAttempt += 1;
+    connectionState = "reconnecting";
+    publishConnectionState();
+    const delay = FAST_RECONNECT_DELAYS_MS[reconnectAttempt - 1] || 0;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (recoveryMode !== "fast" || secretConnected) return;
+      closeNativePort();
+      publishConnectionState();
+      const openingAttempt = reconnectAttempt;
+      if (
+        !openNativePort("fast")
+        && recoveryMode === "fast"
+        && reconnectAttempt === openingAttempt
+      ) {
+        failFastReconnectAttempt();
+      }
+    }, delay);
+    unrefTimer(reconnectTimer);
+  }
+
+  function failFastReconnectAttempt() {
+    if (recoveryMode !== "fast") return;
+    clearHandshakeTimer();
+    closeNativePort();
+    secretConnected = false;
+    publishConnectionState();
+    if (reconnectAttempt >= MAX_FAST_RECONNECT_ATTEMPTS) {
+      finishFastReconnectCycle();
+      return;
+    }
+    scheduleFastReconnectAttempt();
+  }
+
+  function finishFastReconnectCycle() {
+    clearReconnectTimer();
+    clearHandshakeTimer();
+    closeNativePort();
+    recoveryMode = null;
+    reconnectAttempt = MAX_FAST_RECONNECT_ATTEMPTS;
+    connectionState = "disconnected";
+    secretConnected = false;
+    publishConnectionState();
+    scheduleBackgroundReconnect();
+  }
+
+  function beginFastReconnect() {
+    if (recoveryMode === "fast") return connectionSnapshot();
+    clearReconnectTimer();
+    clearHandshakeTimer();
+    clearBackgroundReconnectTimer();
+    closeNativePort();
+    recoveryMode = "fast";
+    reconnectAttempt = 0;
+    connectionState = "reconnecting";
+    secretConnected = false;
+    notifyPasswordDisconnected();
+    publishConnectionState();
+    scheduleFastReconnectAttempt();
+    return connectionSnapshot();
+  }
+
+  function scheduleBackgroundReconnect() {
+    if (backgroundReconnectTimer != null || secretConnected) return;
+    backgroundReconnectTimer = setTimeout(() => {
+      backgroundReconnectTimer = null;
+      if (secretConnected || recoveryMode != null) return;
+      recoveryMode = "slow";
+      closeNativePort();
+      publishConnectionState();
+      if (!openNativePort("slow")) finishBackgroundReconnectAttempt();
+    }, BACKGROUND_RECONNECT_DELAY_MS);
+    unrefTimer(backgroundReconnectTimer);
+  }
+
+  function finishBackgroundReconnectAttempt() {
+    if (recoveryMode !== "slow") return;
+    clearHandshakeTimer();
+    closeNativePort();
+    recoveryMode = null;
+    reconnectAttempt = MAX_FAST_RECONNECT_ATTEMPTS;
+    connectionState = "disconnected";
+    secretConnected = false;
+    publishConnectionState();
+    scheduleBackgroundReconnect();
+  }
+
+  function requestNativeReconnect() {
+    if (connectionState === "connected" && secretConnected) {
+      return connectionSnapshot();
+    }
+    return beginFastReconnect();
+  }
+
+  function connect() {
+    if (nativePort || recoveryMode === "fast") return;
+    if (connectionState === "disconnected" || recoveryMode === "slow") {
+      requestNativeReconnect();
+      return;
+    }
+    connectionState = "connecting";
+    reconnectAttempt = 0;
+    secretConnected = api.browserFamily !== "firefox";
+    if (!openNativePort("initial")) beginFastReconnect();
   }
 
   api.runtime.onStartup.addListener(connect);

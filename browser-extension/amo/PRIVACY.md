@@ -1,6 +1,6 @@
 # PetalDesk Browser Companion privacy notice (draft)
 
-Last updated: 2026-08-07
+Last updated: 2026-08-09
 
 This draft must be reviewed by the product owner and published at a stable HTTPS URL before the extension is submitted to AMO.
 
@@ -22,7 +22,7 @@ The extension does not intentionally collect page text, browsing history, paymen
 
 - Long-screenshot measurements are sent through Firefox Native Messaging to the local PetalDesk process to coordinate a screenshot requested by the user.
 - After the user chooses an account in PetalDesk or the toolbar popup, a password-free offer is sent to the intended page. The bound content frame confirms its identity and field availability before PetalDesk provides one-time credentials for field filling; no second page confirmation is required.
-- A login candidate submitted by the user is held briefly in memory and sent to the local PetalDesk process so the encrypted vault can decide whether it is unchanged, new, or an update. The prompt offers saving as a new account or updating an existing one, and reports when the vault is manually locked.
+- A login candidate submitted by the user is sent to the local PetalDesk process so the encrypted vault can decide whether it is unchanged, new, or an update. After handoff the extension clears the password and keeps only non-secret metadata needed to restore the prompt after navigation. The prompt offers saving as a new account or updating an existing one, and reports when the vault is manually locked.
 - The toolbar badge shows the number of accounts saved for the exact current origin, and the toolbar popup lists those account labels on click. Both are read from the local vault through the local channel, refresh on tab or vault changes, and are cleared when the vault is manually locked. After the extension connects, capture, fill, and badge keep working while the PetalDesk password window is closed; a manual lock stops them immediately.
 - After PetalDesk fills a linked password, or a manual login exactly matches one unique linked account, PetalDesk creates a five-minute second-factor journey for that tab. A single high-confidence TOTP field can be filled automatically; ambiguous fields require a user click. An exact cross-origin HTTPS MFA page requires first-use confirmation and is then stored with the password entry. The extension never clicks a button, sends Enter, or submits the form.
 - The popup receives only a `hasMfa` flag for account-card alignment. When the user clicks its MFA copy action, the desktop application validates the current tab and account binding, generates the code, writes it directly to the system clipboard, and clears it when it expires. The MFA entry ID, secret, and code are not returned to the popup.
@@ -31,7 +31,7 @@ The extension does not bypass multi-factor authentication. It can fill a locally
 
 ## Storage and retention
 
-The extension does not persist credentials, TOTP codes, MFA identifiers, or login candidates in Firefox storage or on disk. Candidate credentials expire after at most 30 seconds and are also cleared on pagehide, tab close, disconnect, or a user decision. For a two-step login, a username-only first step may remain in extension memory for at most two minutes, bound to the same tab and exact origin; it is cleared on timeout, tab close, disconnect, or a new origin. Password and automatic-fill TOTP values are cleared from extension message objects immediately after use. A second-factor journey lasts at most five minutes; each bound field challenge lasts at most 30 seconds and can be consumed only once.
+The extension does not persist credentials, TOTP codes, MFA identifiers, or login candidates in Firefox storage or on disk. Before a save prompt is established, a password-bearing candidate expires from extension memory after at most 30 seconds. Once handed to the local PetalDesk process, its password is cleared from the extension and only non-secret prompt metadata remains so the prompt can survive navigation in the same tab. The desktop holds the pending candidate only in process memory until the user saves, updates, ignores, or closes it, or until the tab closes, login detection is disabled, the vault is locked, or the local connection ends. For a two-step login, a username-only first step may remain in extension memory for at most two minutes, bound to the same tab and exact origin. Automatic-fill password and TOTP values are cleared from extension message objects immediately after use. A second-factor journey lasts at most five minutes; each bound field challenge lasts at most 30 seconds and can be consumed only once.
 
 Saved credentials are stored by the PetalDesk desktop application in an encrypted local vault under the user's chosen PetalDesk data location. Vault retention and deletion are controlled by the user in PetalDesk.
 
@@ -46,7 +46,7 @@ The extension does not sell, rent, share, or remotely transmit personal informat
 - An explicit account choice before password filling; linked TOTP is limited to the resulting trusted journey, with no automatic submission.
 - Second-factor binding to one connection, flow, tab, top-level origin, frame, document, and one-time field challenge. Cross-origin TOTP is HTTPS-only and requires the exact origin to be confirmed; cross-origin OTP iframes are rejected.
 - HTTPS by default; HTTP requires a separate per-site warning and opt-in.
-- Short in-memory expiration for pending requests and login candidates.
+- Short expiration for pre-prompt secret requests; an actionable save prompt is lifecycle-bound to the user decision, tab, detection setting, vault, and local connection.
 
 No security control can make an already compromised device or website safe. Users should keep Firefox, Windows, and PetalDesk updated.
 

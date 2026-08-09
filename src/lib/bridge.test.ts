@@ -102,7 +102,7 @@ describe("browser note styles", () => {
   });
 
   it("defaults to Typora mode and persists a new global selection", async () => {
-    expect((await notesApi.appInfo()).version).toBe("0.8.1");
+    expect((await notesApi.appInfo()).version).toBe("0.8.2");
     expect((await notesApi.appInfo()).defaultEditorMode).toBe("typora");
 
     await expect(notesApi.setDefaultEditorMode("plain")).resolves.toBe("plain");
@@ -121,6 +121,16 @@ describe("browser note styles", () => {
 
     await expect(notesApi.setProtectSensitiveWindows(false)).resolves.toBe(false);
     expect((await notesApi.appInfo()).protectSensitiveWindows).toBe(false);
+  });
+
+  it("reports launch-at-login as unsupported in the browser preview", async () => {
+    await expect(notesApi.getLaunchAtLoginStatus()).resolves.toEqual({
+      supported: false,
+      enabled: false,
+    });
+    await expect(notesApi.setLaunchAtLoginEnabled(true)).rejects.toMatchObject({
+      code: "unsupported_platform",
+    });
   });
 
   it("persists configurable tray double-click actions in the browser fallback", async () => {

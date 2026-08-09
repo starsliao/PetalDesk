@@ -103,6 +103,11 @@ export interface AppInfo {
   colors?: string[];
 }
 
+export interface LaunchAtLoginStatus {
+  supported: boolean;
+  enabled: boolean;
+}
+
 export interface AppError {
   code: string;
   message: string;
@@ -475,7 +480,7 @@ export const notesApi = {
     if (isTauriRuntime()) return command<AppInfo>("get_app_info");
     return {
       workspacePath: "浏览器演示数据",
-      version: "0.8.1",
+      version: "0.8.2",
       defaultEditorMode: readBrowserDefaultEditorMode(),
       trayShortcutSettings: readBrowserTrayShortcutSettings(),
       protectSensitiveWindows: readBrowserProtectSensitiveWindows(),
@@ -507,6 +512,25 @@ export const notesApi = {
       new CustomEvent("petaldesk:protect-sensitive-windows-changed", { detail: normalized }),
     );
     return normalized;
+  },
+
+  async getLaunchAtLoginStatus(): Promise<LaunchAtLoginStatus> {
+    if (isTauriRuntime()) {
+      return command<LaunchAtLoginStatus>("get_launch_at_login_status");
+    }
+    return { supported: false, enabled: false };
+  },
+
+  async setLaunchAtLoginEnabled(enabled: boolean): Promise<LaunchAtLoginStatus> {
+    if (isTauriRuntime()) {
+      return command<LaunchAtLoginStatus>("set_launch_at_login_enabled", {
+        enabled: enabled === true,
+      });
+    }
+    throw {
+      code: "unsupported_platform",
+      message: "开机启动仅支持 Windows 桌面版。",
+    } satisfies AppError;
   },
 
   async setTrayShortcutSettings(

@@ -14,6 +14,9 @@
     trayShortcutSettings?: TrayShortcutSettings;
     editorMode?: EditorMode;
     protectSensitiveWindows?: boolean;
+    launchAtLoginSupported?: boolean;
+    launchAtLoginEnabled?: boolean;
+    launchAtLoginBusy?: boolean;
     dataStoragePath?: string;
     dataStorageLabel?: string;
     busy?: boolean;
@@ -25,6 +28,7 @@
     oncancel?: () => void;
     oneditormodechange?: (mode: EditorMode) => void | Promise<void>;
     onprotectsensitivechange?: (enabled: boolean) => void | Promise<void>;
+    onlaunchatloginchange?: (enabled: boolean) => void | Promise<void>;
     ondatastoragechange?: () => void | Promise<void>;
     onaboutopen?: () => void;
   }
@@ -35,6 +39,9 @@
     trayShortcutSettings = { ...DEFAULT_TRAY_SHORTCUT_SETTINGS },
     editorMode = "typora",
     protectSensitiveWindows = false,
+    launchAtLoginSupported = false,
+    launchAtLoginEnabled = false,
+    launchAtLoginBusy = false,
     dataStoragePath = "",
     dataStorageLabel = "尚未获取到存储路径",
     busy = false,
@@ -43,6 +50,7 @@
     oncancel,
     oneditormodechange,
     onprotectsensitivechange,
+    onlaunchatloginchange,
     ondatastoragechange,
     onaboutopen,
   }: Props = $props();
@@ -53,7 +61,8 @@
   let lastShortcut = $state("");
   let lastTraySettings = $state("");
   let trayDraft = $state<TrayShortcutSettings>({ ...DEFAULT_TRAY_SHORTCUT_SETTINGS });
-  let submitting = $derived(busy || saving);
+  let saveInProgress = $derived(busy || saving);
+  let submitting = $derived(saveInProgress || launchAtLoginBusy);
   let storagePathText = $derived(dataStoragePath || dataStorageLabel);
 
   const trayActionOptions: ReadonlyArray<{ value: TrayShortcutAction; label: string }> = [
@@ -132,6 +141,11 @@
       saving = false;
     }
   }
+
+  function handleLaunchAtLoginChange(event: Event): void {
+    const input = event.currentTarget as HTMLInputElement;
+    void onlaunchatloginchange?.(input.checked);
+  }
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -186,6 +200,28 @@
               </button>
             </div>
           </div>
+          <label
+            class="setting-row launch-at-login-row"
+            class:disabled={!launchAtLoginSupported || submitting}
+          >
+            <div class="setting-copy">
+              <strong>开机启动</strong>
+              <span>
+                {launchAtLoginSupported
+                  ? "登录 Windows 后自动启动，启动后隐藏到系统托盘"
+                  : "仅 Windows 桌面版支持此功能"}
+              </span>
+            </div>
+            <input
+              class="setting-checkbox"
+              type="checkbox"
+              aria-label="开机启动"
+              aria-busy={launchAtLoginBusy}
+              checked={launchAtLoginEnabled}
+              disabled={submitting || !launchAtLoginSupported}
+              onchange={handleLaunchAtLoginChange}
+            />
+          </label>
         </section>
 
         <section class="settings-section" aria-labelledby="privacy-settings-title">
@@ -344,7 +380,7 @@
       <footer>
         <button type="button" class="secondary-button" disabled={submitting} onclick={oncancel}>取消</button>
         <button type="button" class="primary-button" disabled={submitting || !draft} onclick={() => void save()}>
-          {submitting ? "保存中…" : "保存"}
+          {saveInProgress ? "保存中…" : "保存"}
         </button>
       </footer>
     </div>
@@ -511,6 +547,36 @@
     color: var(--app-muted);
     font-size: 12px;
     line-height: 1.4;
+  }
+
+  .launch-at-login-row {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--app-border);
+    cursor: pointer;
+  }
+
+  .launch-at-login-row.disabled {
+    cursor: default;
+  }
+
+  .setting-checkbox {
+    width: 18px;
+    height: 18px;
+    margin: 0 3px 0 0;
+    flex: 0 0 auto;
+    accent-color: var(--app-accent);
+    cursor: pointer;
+  }
+
+  .setting-checkbox:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .setting-checkbox:focus-visible {
+    outline: 2px solid rgb(0 103 192 / 22%);
+    outline-offset: 3px;
   }
 
   .mode-selector {

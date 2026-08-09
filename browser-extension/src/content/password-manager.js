@@ -12,7 +12,6 @@
   const FILL_CONFIRM_MESSAGE = "petaldesk.password.fill-confirm";
   const FILL_CANCEL_MESSAGE = "petaldesk.password.fill-cancel";
   const CAPTURE_SUBMITTED_MESSAGE = "petaldesk.password.capture-submitted";
-  const CAPTURE_SUCCESS_MESSAGE = "petaldesk.password.capture-success";
   const PAGE_CLOSED_MESSAGE = "petaldesk.password.page-closed";
   const FRAME_STATE_MESSAGE = "petaldesk.password.frame-state";
   const CAPTURE_USERNAME_STAGE_MESSAGE = "petaldesk.password.capture-username-stage";
@@ -156,6 +155,37 @@
     }, Math.max(0, delayMs));
   }
 
+  function ensureFieldObserver() {
+    if (
+      fieldObserver
+      || typeof MutationObserver !== "function"
+      || !root.document.documentElement
+    ) return;
+    fieldObserver = new MutationObserver(() => {
+      scheduleFrameStateAnnouncement(100);
+      scheduleSecondFactorScan(100);
+      if (
+        activeCapturePrompt
+        && (!overlay || !overlay.isConnected || activeCapturePrompt.overlay !== overlay)
+      ) {
+        showCapturePrompt(
+          activeCapturePrompt,
+          activeCapturePrompt.confidence,
+          activeCapturePrompt.error && activeCapturePrompt.error.message || "",
+        );
+      }
+    });
+    fieldObserver.observe(root.document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: [
+        "aria-hidden", "aria-label", "autocomplete", "class", "disabled", "hidden", "id",
+        "inputmode", "maxlength", "name", "placeholder", "readonly", "style", "type",
+      ],
+    });
+  }
+
   function randomId(prefix) {
     if (root.crypto && typeof root.crypto.randomUUID === "function") {
       return `${prefix}-${root.crypto.randomUUID()}`;
@@ -198,11 +228,13 @@
   }
 
   function notifyDocumentClosed() {
-    if (!isTopFrame()) return;
-    // The background keeps the authoritative candidate copy. A pagehide
-    // notification clears this document's password candidate even when the
-    // browser keeps the tab alive for a navigation or bfcache transition.
-    void sendBackground({ type: PAGE_CLOSED_MESSAGE }).catch(() => {});
+    // Every frame reports its own browser-authenticated sender identity. This
+    // lets the background move a promoted prompt out of a disappearing login
+    // iframe while still clearing any unpromoted secret owned by that frame.
+    void sendBackground({
+      type: PAGE_CLOSED_MESSAGE,
+      reason: "document-unloaded",
+    }).catch(() => {});
   }
 
   function removeOverlay() {
@@ -993,8 +1025,11 @@
     const choices = Array.isArray(candidate.accountChoices) ? candidate.accountChoices : [];
     const title = isUpdate ? "更新飞花中的密码？" : "保存登录信息到飞花？";
     activeCapturePrompt = { ...activeCapturePrompt, ...candidate, confidence };
+    // The background owns the promoted prompt from this point onward. The
+    // content document must never expire or dismiss it on a timer.
+    clearCandidate(id);
     if (activeCapturePrompt.savePending) {
-      createOverlay(
+      activeCapturePrompt.overlay = createOverlay(
         "正在保存到飞花",
         `${candidate.origin}\n请稍候，保存结果确认后才会清除这条登录信息。${insecureOriginWarning(candidate.origin)}`,
         [],
@@ -1036,7 +1071,21 @@
       });
     }
     if (notice) {
-      actions.unshift({ label: "关闭", onClick: () => { clearCandidate(id); activeCapturePrompt = null; removeOverlay(); } });
+      actions.unshift({
+        label: "关闭",
+        onClick: () => {
+          clearCandidate(id);
+          activeCapturePrompt = null;
+          removeOverlay();
+          // With no automatic TTL, closing an error notice is an explicit
+          // ignore decision so neither side keeps an unreachable candidate.
+          void sendBackground({
+            type: SAVE_DECISION_MESSAGE,
+            candidateId: id,
+            action: "ignore",
+          }).catch(() => {});
+        },
+      });
     } else {
       actions.push({
         label: "忽略",
@@ -1048,7 +1097,7 @@
         },
       });
     }
-    createOverlay(
+    activeCapturePrompt.overlay = createOverlay(
       title,
       `${candidate.origin}\n账户：${candidate.username || "请选择要更新的账户"}${notice ? `\n${notice}` : ""}${insecureOriginWarning(candidate.origin)}`,
       actions,
@@ -1080,6 +1129,7 @@
   function submitCaptureDecision(candidateId, action, entryId = null) {
     if (!activeCapturePrompt || activeCapturePrompt.candidateId !== candidateId || activeCapturePrompt.savePending) return;
     activeCapturePrompt.savePending = true;
+    activeCapturePrompt.error = null;
     showCapturePrompt(activeCapturePrompt, activeCapturePrompt.confidence);
     void sendBackground({
       type: SAVE_DECISION_MESSAGE,
@@ -1158,7 +1208,13 @@
       // Keep a separate wire object until Firefox has cloned the message. A
       // few WebExtension implementations clone asynchronously; clearing the
       // same object immediately can otherwise erase the password in transit.
-      const wireCandidate = { ...candidate };
+      const wireCandidate = {
+        ...candidate,
+        // The background promotes this candidate in the same authenticated
+        // message that transfers the password. A fast navigation can destroy
+        // this content-script realm before a second message/Promise callback.
+        promote: true,
+      };
       const submitted = sendBackground({
         type: CAPTURE_SUBMITTED_MESSAGE,
         candidate: wireCandidate,
@@ -1179,14 +1235,7 @@
           suggestedAction: null,
           username: candidateUsername,
         };
-        // A submitted password form is reported as successful immediately; the
-        // save prompt must not wait for a post-submit navigation signal.
-        return sendBackground({
-          type: CAPTURE_SUCCESS_MESSAGE,
-          candidateId,
-          confidence: "high",
-          origin: topOrigin,
-        });
+        return response;
       }).catch((error) => {
         if (activeCapturePrompt && activeCapturePrompt.candidateId === candidateId) {
           activeCapturePrompt = null;
@@ -1386,7 +1435,14 @@
             username: safeString(choice && choice.username, 1_024),
           })).filter((choice) => choice.entryId)
           : [];
-        showCapturePrompt(activeCapturePrompt, activeCapturePrompt.confidence);
+        activeCapturePrompt.savePending = payload.savePending === true;
+        activeCapturePrompt.error = payload.error && typeof payload.error === "object"
+          ? { message: safeString(payload.error.message, 512) }
+          : null;
+        const captureError = payload.error && typeof payload.error === "object"
+          ? safeString(payload.error.message, 512)
+          : "";
+        showCapturePrompt(activeCapturePrompt, activeCapturePrompt.confidence, captureError);
         return { matched: true, action: activeCapturePrompt.suggestedAction };
       case "captureSaveResult": {
         const candidateId = safeString(payload.candidateId, 160);
@@ -1402,11 +1458,11 @@
           showCaptureSuccess(completed, payload.action);
           return { handled: true, success: true };
         }
-        scheduleCandidateExpiry(candidateId, payload.expiresInMs);
         activeCapturePrompt.savePending = false;
         const message = payload.error && payload.error.message
           ? safeString(payload.error.message, 512)
           : "保存到飞花失败，请重试。";
+        activeCapturePrompt.error = { message };
         showCapturePrompt(activeCapturePrompt, activeCapturePrompt.confidence, message);
         return { handled: true, success: false };
       }
@@ -1457,13 +1513,23 @@
         activeSecondFactor.confirmed = false;
         reportSecondFactorCandidates(true);
       }
-      notifyDocumentClosed();
-      for (const candidateId of candidateTimers.keys()) clearCandidate(candidateId);
-      activeCapturePrompt = null;
-      if (!activeRecording) removeOverlay();
       clearActiveOffer();
+      // Switching tabs is not a navigation. Keep a save/update prompt mounted
+      // so it is still present when the user returns; other transient overlays
+      // retain their existing hidden-page cleanup behavior.
+      if (!activeRecording && !activeCapturePrompt) removeOverlay();
     } else {
       scheduleSecondFactorScan(0);
+      if (
+        activeCapturePrompt
+        && (!overlay || !overlay.isConnected || activeCapturePrompt.overlay !== overlay)
+      ) {
+        showCapturePrompt(
+          activeCapturePrompt,
+          activeCapturePrompt.confidence,
+          activeCapturePrompt.error && activeCapturePrompt.error.message || "",
+        );
+      }
     }
   });
   root.addEventListener("pagehide", () => {
@@ -1481,16 +1547,18 @@
   });
 
   // Every frame announces itself: the top frame drives the tab bookkeeping,
-  // and explicitly trusted login frames learn the capture state too.
-  let readyOrigin = "";
-  try {
-    readyOrigin = currentOrigin();
-  } catch (_error) {
-    readyOrigin = "";
-  }
-  if (readyOrigin) {
+  // and explicitly trusted login frames learn the capture state too. The same
+  // handshake also rehydrates a promoted save prompt after navigation/bfcache.
+  function announceReadyState() {
+    let readyOrigin = "";
+    try {
+      readyOrigin = currentOrigin();
+    } catch (_error) {
+      readyOrigin = "";
+    }
+    if (!readyOrigin) return Promise.resolve(null);
     const readyFields = loginFieldState();
-    void sendBackground({
+    return sendBackground({
       type: READY_MESSAGE,
       origin: readyOrigin,
       ...readyFields,
@@ -1502,25 +1570,22 @@
       if (response && response.secondFactorArm) {
         armSecondFactor(response.secondFactorArm);
       }
-    }).catch(() => {});
+      if (response && response.capturePrompt) {
+        handleCommand("captureMatch", response.capturePrompt);
+      }
+      return response;
+    });
   }
+  void announceReadyState().catch(() => {});
+  root.addEventListener("pageshow", (event) => {
+    if (event && event.persisted === true) {
+      ensureFieldObserver();
+      void announceReadyState().catch(() => {});
+    }
+  });
 
   // Login forms are frequently inserted after document_idle (163 is one
   // example). Keep a secret-free frame capability record current so the
   // background can target the frame that actually owns the fields.
-  if (typeof MutationObserver === "function" && root.document.documentElement) {
-    fieldObserver = new MutationObserver(() => {
-      scheduleFrameStateAnnouncement(100);
-      scheduleSecondFactorScan(100);
-    });
-    fieldObserver.observe(root.document.documentElement, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: [
-        "aria-hidden", "aria-label", "autocomplete", "class", "disabled", "hidden", "id",
-        "inputmode", "maxlength", "name", "placeholder", "readonly", "style", "type",
-      ],
-    });
-  }
+  ensureFieldObserver();
 })(typeof globalThis !== "undefined" ? globalThis : this);

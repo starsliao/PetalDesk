@@ -51,6 +51,7 @@
 
   function addDiagnosticRow(list, label, value, healthy) {
     const item = document.createElement("li");
+    item.className = "diagnostic-row";
     const name = document.createElement("span");
     name.className = "label";
     name.textContent = label;
@@ -63,6 +64,185 @@
     state.textContent = value;
     item.append(name, state);
     list.appendChild(item);
+    return item;
+  }
+
+  function setDiagnosticsStatus(text) {
+    const feedback = document.getElementById("diagnostics-status");
+    if (feedback) feedback.textContent = text;
+  }
+
+  function setToolLauncherStatus(text) {
+    const feedback = document.getElementById("tool-launcher-status");
+    if (feedback) feedback.textContent = text;
+  }
+
+  function loginDetectionModel(diagnostics) {
+    const value = diagnostics.loginDetection && typeof diagnostics.loginDetection === "object"
+      ? diagnostics.loginDetection
+      : {};
+    const desiredEnabled = typeof value.desiredEnabled === "boolean"
+      ? value.desiredEnabled
+      : typeof diagnostics.captureDesiredEnabled === "boolean"
+        ? diagnostics.captureDesiredEnabled
+        : diagnostics.captureEnabled === true;
+    const enabled = typeof value.enabled === "boolean"
+      ? value.enabled
+      : diagnostics.captureEnabled === true;
+    const available = typeof value.available === "boolean"
+      ? value.available
+      : typeof diagnostics.captureAvailable === "boolean"
+        ? diagnostics.captureAvailable
+        : true;
+    const connectionState = ["connecting", "connected", "reconnecting", "disconnected"]
+      .includes(value.connectionState)
+      ? value.connectionState
+      : diagnostics.secretConnected === true || diagnostics.captureEnabled === true
+        ? "connected"
+        : diagnostics.nativeConnected === false
+          ? "disconnected"
+          : "connecting";
+    const reconnectAttempt = Number.isInteger(Number(value.reconnectAttempt))
+      ? Math.max(0, Number(value.reconnectAttempt))
+      : 0;
+    const reconnectMaxAttempts = Number.isInteger(Number(value.reconnectMaxAttempts))
+      && Number(value.reconnectMaxAttempts) > 0
+      ? Number(value.reconnectMaxAttempts)
+      : 3;
+    let status = "已关闭";
+    let health = null;
+    if (desiredEnabled) {
+      if (connectionState === "reconnecting") {
+        status = reconnectAttempt > 0
+          ? `正在重连（${Math.min(reconnectAttempt, reconnectMaxAttempts)}/${reconnectMaxAttempts}）`
+          : "正在重连";
+        health = false;
+      } else if (connectionState === "connecting") {
+        status = "正在连接";
+      } else if (connectionState === "disconnected") {
+        status = "连接已断开";
+        health = false;
+      } else if (enabled) {
+        status = "已开启";
+        health = true;
+      } else if (!available) {
+        status = "暂不可用";
+        health = false;
+      } else {
+        status = "正在恢复";
+      }
+    }
+    return {
+      available,
+      canReconnect: value.canReconnect === true && connectionState === "disconnected",
+      connectionState,
+      desiredEnabled,
+      enabled,
+      health,
+      preferenceBusy: value.preferenceBusy === true,
+      reconnectAttempt,
+      reconnectMaxAttempts,
+      status,
+    };
+  }
+
+  function helpTip() {
+    const wrapper = document.createElement("span");
+    wrapper.className = "help-tip";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "help-tip-button";
+    button.setAttribute("aria-label", "登录检测说明");
+    button.setAttribute("aria-describedby", "login-detection-tooltip");
+    button.setAttribute("title", "登录检测说明");
+    button.textContent = "?";
+    const tooltip = document.createElement("span");
+    tooltip.id = "login-detection-tooltip";
+    tooltip.className = "help-tooltip";
+    tooltip.setAttribute("role", "tooltip");
+    tooltip.textContent = "登录检测会识别网页上的登录操作，在发现新账号或密码变化时提示保存或更新。关闭后仍可填充和复制已保存的账号，但不会再提示保存登录信息。";
+    wrapper.append(button, tooltip);
+    return wrapper;
+  }
+
+  function renderLoginDetectionRow(list, diagnostics) {
+    const model = loginDetectionModel(diagnostics);
+    const item = document.createElement("li");
+    item.className = "login-detection-card";
+    const summary = document.createElement("div");
+    summary.className = "login-detection-summary";
+    const title = document.createElement("div");
+    title.className = "login-detection-title";
+    const label = document.createElement("span");
+    label.id = "login-detection-label";
+    label.textContent = "登录检测";
+    title.append(label, helpTip());
+    const state = document.createElement("span");
+    state.className = model.health === true
+      ? "login-detection-state ok"
+      : model.health === false
+        ? "login-detection-state warn"
+        : "login-detection-state";
+    state.setAttribute("role", "status");
+    state.textContent = model.status;
+    summary.append(title, state);
+
+    const controls = document.createElement("div");
+    controls.className = "login-detection-controls";
+    const reconnect = document.createElement("button");
+    reconnect.type = "button";
+    reconnect.className = "reconnect-button";
+    reconnect.textContent = "重连";
+    reconnect.setAttribute("aria-label", "重新连接登录检测");
+    reconnect.hidden = !model.desiredEnabled || !model.canReconnect;
+    reconnect.addEventListener("click", () => {
+      setDiagnosticsStatus("");
+      void runBusy(reconnect, async () => {
+        try {
+          const response = await sendMessage({ type: "petaldesk.popup.reconnectLoginDetection" });
+          if (response && response.ok === false) {
+            throw new Error(response.error && response.error.message || "重连请求失败");
+          }
+          await refresh();
+        } catch (error) {
+          setDiagnosticsStatus(errorMessage(error));
+        }
+      });
+    });
+
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "switch-control";
+    toggle.setAttribute("role", "switch");
+    toggle.setAttribute("aria-labelledby", "login-detection-label");
+    toggle.setAttribute("aria-checked", model.desiredEnabled ? "true" : "false");
+    toggle.setAttribute("aria-label", model.desiredEnabled ? "关闭登录检测" : "开启登录检测");
+    toggle.setAttribute("title", model.desiredEnabled ? "关闭登录检测" : "开启登录检测");
+    toggle.disabled = model.preferenceBusy || model.connectionState !== "connected";
+    const thumb = document.createElement("span");
+    thumb.className = "switch-thumb";
+    toggle.appendChild(thumb);
+    toggle.addEventListener("click", () => {
+      setDiagnosticsStatus("");
+      void runBusy(toggle, async () => {
+        try {
+          const response = await sendMessage({
+            type: "petaldesk.popup.setLoginDetection",
+            enabled: !model.desiredEnabled,
+          });
+          if (response && response.ok === false) {
+            throw new Error(response.error && response.error.message || "登录检测设置失败");
+          }
+          await refresh();
+        } catch (error) {
+          setDiagnosticsStatus(errorMessage(error));
+        }
+      });
+    });
+    controls.append(reconnect, toggle);
+    item.append(summary, controls);
+    list.appendChild(item);
+    return model;
   }
 
   function renderDiagnostics(diagnostics) {
@@ -84,14 +264,10 @@
       }
     }
     addDiagnosticRow(list, "桌面密码通道", channelText, diagnostics.secretConnected === true);
-    addDiagnosticRow(
-      list,
-      "登录检测",
-      diagnostics.captureEnabled ? "已开启" : "已关闭",
-      diagnostics.captureEnabled === true,
-    );
+    const loginDetection = renderLoginDetectionRow(list, diagnostics);
     const version = document.getElementById("extension-version");
     version.textContent = diagnostics.extensionVersion ? `v${diagnostics.extensionVersion}` : "";
+    return loginDetection;
   }
 
   function setStatus(text) {
@@ -396,24 +572,78 @@
     }
   }
 
+  let diagnosticsRefreshTimer = null;
+
+  function scheduleDiagnosticsRefresh(loginDetection) {
+    if (diagnosticsRefreshTimer != null) clearTimeout(diagnosticsRefreshTimer);
+    diagnosticsRefreshTimer = null;
+    const connectionPending = loginDetection
+      && ["connecting", "reconnecting", "disconnected"].includes(
+        loginDetection.connectionState,
+      );
+    const effectiveStatePending = loginDetection
+      && loginDetection.connectionState === "connected"
+      && loginDetection.available
+      && !loginDetection.enabled;
+    if (
+      !loginDetection
+      || !loginDetection.desiredEnabled
+      || (!connectionPending && !effectiveStatePending)
+    ) return;
+    const delay = loginDetection.connectionState === "disconnected" ? 2_000 : 600;
+    diagnosticsRefreshTimer = setTimeout(() => {
+      diagnosticsRefreshTimer = null;
+      void refresh();
+    }, delay);
+    if (diagnosticsRefreshTimer && typeof diagnosticsRefreshTimer.unref === "function") {
+      diagnosticsRefreshTimer.unref();
+    }
+  }
+
   async function refresh() {
     try {
       const response = await sendMessage({ type: "petaldesk.popup.getState" });
       if (response && response.ok === false) {
         throw new Error(response.error && response.error.message || "无法读取扩展状态");
       }
-      renderDiagnostics(response && response.diagnostics ? response.diagnostics : {});
+      const loginDetection = renderDiagnostics(
+        response && response.diagnostics ? response.diagnostics : {},
+      );
       renderSite(response && response.tab ? response.tab : {});
+      scheduleDiagnosticsRefresh(loginDetection);
     } catch (error) {
       renderDiagnostics({});
       renderSite({});
+      scheduleDiagnosticsRefresh(null);
       setStatus(errorMessage(error));
     }
   }
 
-  document.getElementById("open-manager").addEventListener("click", () => {
-    void sendMessage({ type: "petaldesk.popup.openManager" }).catch(() => {});
-  });
+  for (const launcher of [
+    { id: "open-main", label: "主程序", target: "main" },
+    { id: "open-password-manager", label: "密码管理器", target: "passwords" },
+    { id: "open-mfa", label: "MFA 验证器", target: "mfa" },
+    { id: "open-notes", label: "便签", target: "notes" },
+  ]) {
+    const button = document.getElementById(launcher.id);
+    if (!button) continue;
+    button.addEventListener("click", () => {
+      setToolLauncherStatus("");
+      void runBusy(button, async () => {
+        try {
+          const response = await sendMessage({
+            type: "petaldesk.popup.openTool",
+            target: launcher.target,
+          });
+          if (response && response.ok === false) {
+            throw new Error(response.error && response.error.message || `无法打开${launcher.label}`);
+          }
+        } catch (error) {
+          setToolLauncherStatus(errorMessage(error));
+        }
+      });
+    });
+  }
 
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape" || (!activeAccountEntryId && !accountContextMenu && !deleteConfirmation)) return;

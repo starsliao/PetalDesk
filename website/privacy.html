@@ -81,7 +81,7 @@
         <ul>
           <li>长截图数据通过 Firefox Native Messaging 发送给本机飞花进程，用于完成用户主动发起的截图。</li>
           <li>用户在飞花或工具栏弹窗中选择账户后，扩展先向目标页面发送不含密码的填充请求；目标 frame 的身份和字段可用性校验通过后，桌面应用才提供一次性凭据。扩展只填写字段，绝不自动提交表单。</li>
-          <li>连接的密码保险库可用时，登录检测始终开启。用户提交登录后，扩展把短时登录候选交给本机加密保险库判断是否完全相同、需要新增或需要更新。</li>
+          <li>连接的密码保险库可用时，登录检测默认开启，用户也可在扩展弹窗中单独关闭。用户提交登录后，扩展把候选交给本机加密保险库判断是否完全相同、需要新增或需要更新。</li>
           <li>飞花填入已关联账户的密码，或手动登录与唯一已保存账户完全一致时，会为该标签页建立最长 5 分钟的二次验证 journey。唯一可信的 TOTP 字段可自动填入；模糊字段先询问用户，跨 origin 页面首次确认精确 HTTPS origin。飞花不点击按钮、不发送 Enter，也不主动提交表单。</li>
           <li>工具栏弹窗只知道账户是否关联 MFA。用户点击复制 MFA 后，由桌面应用重新校验当前标签页和账户关联，直接写入系统剪贴板并在验证码失效时清除；MFA ID、密钥和验证码不会返回弹窗。</li>
         </ul>
@@ -90,7 +90,7 @@
 
       <section>
         <h2>存储与保留</h2>
-        <p>扩展不会把密码、MFA ID、TOTP 或登录候选写入 Firefox storage、磁盘、日志、诊断或旧的截图文件通信目录。包含密码的登录候选最多在扩展内存中保留 30 秒；两步登录中的纯用户名阶段最多保留 2 分钟，只用于同一标签页和精确 origin 的下一步。二次验证 journey 最长 5 分钟，每个字段 challenge 最长 30 秒且只能消费一次。它们都会在超时、页面关闭或连接断开时清除；填充完成或取消后立即丢弃秘密引用。</p>
+        <p>扩展不会把密码、MFA ID、TOTP 或登录候选写入 Firefox storage、磁盘、日志、诊断或旧的截图文件通信目录。尚未进入保存提示的含密码候选最多在扩展内存中保留 30 秒；提交给本机飞花后，扩展立即清空密码，只保留恢复提示所需的非秘密元数据。桌面端把待确认候选仅保留在当前进程内存中，直到用户保存、更新、忽略或关闭，或标签页关闭、用户关闭登录检测、锁库、断连。两步登录中的纯用户名阶段最多保留 2 分钟；二次验证 journey 最长 5 分钟，每个字段 challenge 最长 30 秒且只能消费一次。</p>
         <p>用户选择保存的凭据由飞花桌面应用写入本地 XChaCha20-Poly1305 加密保险库，保留与删除由用户在飞花中控制。</p>
       </section>
 
@@ -114,7 +114,7 @@
       <div class="english" lang="en">
         <section>
           <h2>PetalDesk Browser Companion Privacy Notice</h2>
-          <p>Last updated: August 7, 2026</p>
+          <p>Last updated: August 9, 2026</p>
           <p>PetalDesk Browser Companion communicates only with the PetalDesk desktop application on the same Windows computer. It has no PetalDesk cloud account and does not upload browsing data or credentials to a PetalDesk server.</p>
         </section>
 
@@ -126,7 +126,7 @@
 
         <section>
           <h2>Storage, sharing, and retention</h2>
-          <p>Credentials, MFA identifiers, TOTP codes, and login candidates are not written to Firefox storage, disk, logs, diagnostics, or the legacy screenshot file bridge. Candidates containing a password remain in extension memory for no more than 30 seconds. A username-only stage may remain for up to two minutes. A second-factor journey lasts at most five minutes and each bound field challenge lasts at most 30 seconds and is single-use. Values are cleared on timeout, pagehide, tab close, disconnect, a user decision, or immediately after filling. Saved credentials and MFA secrets remain in encrypted local PetalDesk vaults.</p>
+          <p>Credentials, MFA identifiers, TOTP codes, and login candidates are not written to Firefox storage, disk, logs, diagnostics, or the legacy screenshot file bridge. A pre-prompt candidate containing a password remains in extension memory for no more than 30 seconds. After it is handed to the local PetalDesk process, the extension clears the password and keeps only non-secret metadata needed to restore the prompt after navigation. The desktop keeps the pending candidate only in process memory until the user saves, updates, ignores, or closes it, or until the tab closes, login detection is disabled, the vault is locked, or the local connection ends. A username-only stage may remain for up to two minutes. A second-factor journey lasts at most five minutes and each bound field challenge lasts at most 30 seconds and is single-use.</p>
           <p>The extension does not sell, rent, or remotely transmit personal information. Native Messaging transfers data only to the registered PetalDesk executable under the same Windows user account.</p>
         </section>
 

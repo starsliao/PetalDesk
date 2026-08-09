@@ -20,7 +20,6 @@ use zeroize::Zeroize;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const FILL_TTL: Duration = Duration::from_secs(5 * 60);
-const CAPTURE_TTL: Duration = Duration::from_secs(30);
 const TEMPLATE_RECORDING_TTL: Duration = Duration::from_secs(5 * 60);
 const TEMPLATE_RECORDING_TIMEOUT: Duration = Duration::from_secs(15);
 const SECOND_FACTOR_TTL: Duration = Duration::from_secs(5 * 60);
@@ -106,8 +105,39 @@ struct PendingCapture {
     frame_id: i64,
     document_id: String,
     prompt_origin: String,
-    created_at: Instant,
     save_pending: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaptureSyncState {
+    enabled: bool,
+    desired_enabled: bool,
+    available: bool,
+    insecure_origins: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupOpenTarget {
+    Main,
+    Passwords,
+    Mfa,
+    Notes,
+}
+
+impl PopupOpenTarget {
+    fn from_payload(payload: &Value) -> Option<Self> {
+        let object = payload.as_object()?;
+        if object.len() != 1 {
+            return None;
+        }
+        match object.get("target").and_then(Value::as_str) {
+            Some("main") => Some(Self::Main),
+            Some("passwords") => Some(Self::Passwords),
+            Some("mfa") => Some(Self::Mfa),
+            Some("notes") => Some(Self::Notes),
+            _ => None,
+        }
+    }
 }
 
 impl Drop for PendingCapture {
@@ -127,8 +157,10 @@ pub struct PasswordBrowserService {
     // revocation. Code generation happens outside this guard.
     second_factor_publish: Mutex<()>,
     // Last setCaptureEnabled payload sent per connection; suppresses duplicate
-    // broadcasts triggered by password-status polling.
-    synced_capture: Mutex<HashMap<String, (bool, Vec<String>)>>,
+    // broadcasts triggered by password-status polling. The persisted user
+    // preference is separate from effective availability so a disconnect or
+    // vault lock can never masquerade as the user turning detection off.
+    synced_capture: Mutex<HashMap<String, CaptureSyncState>>,
     // Active tab origins per connection, reported by the extension for badge
     // account counts.
     badge_tabs: Mutex<HashMap<String, HashMap<i64, String>>>,
@@ -145,6 +177,12 @@ pub struct PasswordBrowserStatus {
     install_url: Option<String>,
     capture_permission: &'static str,
     authentication_consent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capture_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capture_desired_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capture_available: Option<bool>,
     stdio_connected: bool,
     pipe_connected: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -207,6 +245,9 @@ impl PasswordBrowserService {
                 install_url: None,
                 capture_permission: "unavailable",
                 authentication_consent: false,
+                capture_enabled: None,
+                capture_desired_enabled: None,
+                capture_available: None,
                 stdio_connected: false,
                 pipe_connected: false,
                 connection_id: None,
@@ -256,6 +297,22 @@ impl PasswordBrowserService {
             .and_then(|status| status.get("authenticationConsent"))
             .and_then(Value::as_bool);
         #[cfg(windows)]
+        let capture_enabled = extension_status
+            .as_ref()
+            .and_then(|status| status.get("captureEnabled"))
+            .and_then(Value::as_bool);
+        #[cfg(windows)]
+        let capture_desired_enabled = extension_status
+            .as_ref()
+            .and_then(|status| status.get("desiredEnabled"))
+            .and_then(Value::as_bool)
+            .or(capture_enabled);
+        #[cfg(windows)]
+        let capture_available = extension_status
+            .as_ref()
+            .and_then(|status| status.get("available"))
+            .and_then(Value::as_bool);
+        #[cfg(windows)]
         let unsupported = status_error
             .as_deref()
             .is_some_and(password_status_error_is_unsupported);
@@ -281,6 +338,9 @@ impl PasswordBrowserService {
                 _ => "unavailable",
             },
             authentication_consent: authentication_consent.unwrap_or(false),
+            capture_enabled,
+            capture_desired_enabled,
+            capture_available,
             stdio_connected,
             pipe_connected: connected,
             connection_id,
@@ -459,19 +519,14 @@ impl PasswordBrowserService {
             .map_err(|error| browser_error("password_template_cancel_failed", error))
     }
 
-    pub(crate) fn suspend_capture(&self) {
-        let connection_ids = self.bridge.connection_ids(BrowserFamily::Firefox);
-        for connection_id in connection_ids {
-            let _ = self.bridge.request_connection(
-                &connection_id,
-                "password.setCaptureEnabled",
-                serde_json::json!({ "enabled": false, "insecureOrigins": [] }),
-                Duration::from_secs(2),
-            );
-        }
-        // The extension-side state no longer matches the cache, so the next
-        // successful sync must broadcast again.
-        lock_unpoisoned(&self.synced_capture).clear();
+    pub(crate) fn suspend_capture(&self, store: &PasswordStore) {
+        let desired_enabled = store.capture_preference().1;
+        self.broadcast_capture_state(CaptureSyncState {
+            enabled: false,
+            desired_enabled,
+            available: false,
+            insecure_origins: Vec::new(),
+        });
         lock_unpoisoned(&self.captures).clear();
         let fills = lock_unpoisoned(&self.fills).drain().collect::<Vec<_>>();
         for (session_id, session) in fills {
@@ -573,37 +628,53 @@ impl PasswordBrowserService {
     }
 
     pub(crate) fn sync_capture_from_store(&self, store: &PasswordStore) {
+        let desired_enabled = store.capture_preference().1;
         let Ok(epoch) = store.require_any_epoch() else {
-            self.suspend_capture();
+            self.suspend_capture(store);
             return;
         };
         let Ok(status) = store.status_at(epoch) else {
-            self.suspend_capture();
+            self.suspend_capture(store);
             return;
         };
         if status.locked
             || !status.available
             || status.recovery_state != crate::passwords::PasswordRecoveryState::Ready
         {
-            self.suspend_capture();
+            self.suspend_capture(store);
             return;
         }
-        let insecure_origins = store
-            .list_entries_at(epoch)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|entry| entry.allow_insecure_http)
-            .map(|entry| entry.origin)
-            .collect::<Vec<_>>();
+        let insecure_origins = if desired_enabled {
+            store
+                .list_entries_at(epoch)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|entry| entry.allow_insecure_http)
+                .map(|entry| entry.origin)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if !desired_enabled {
+            // Turning login detection off only revokes pending capture data.
+            // Fill, copy, template recording and MFA use the same native
+            // channel and must remain available.
+            lock_unpoisoned(&self.captures).clear();
+        }
+        self.broadcast_capture_state(CaptureSyncState {
+            enabled: desired_enabled,
+            desired_enabled,
+            available: true,
+            insecure_origins,
+        });
+    }
+
+    fn broadcast_capture_state(&self, desired: CaptureSyncState) {
         let connection_ids = self.bridge.connection_ids(BrowserFamily::Firefox);
         if connection_ids.is_empty() {
             return;
         }
         for connection_id in connection_ids {
-            // Login detection is mandatory since 0.7.2: the stored setting
-            // is ignored and capture is always pushed as enabled. Skip the
-            // broadcast when nothing changed since the last successful sync.
-            let desired = (true, insecure_origins.clone());
             if lock_unpoisoned(&self.synced_capture).get(&connection_id) == Some(&desired) {
                 continue;
             }
@@ -611,14 +682,16 @@ impl PasswordBrowserService {
                 &connection_id,
                 "password.setCaptureEnabled",
                 serde_json::json!({
-                    "enabled": desired.0,
-                    "insecureOrigins": desired.1,
+                    "enabled": desired.enabled,
+                    "desiredEnabled": desired.desired_enabled,
+                    "available": desired.available,
+                    "insecureOrigins": desired.insecure_origins.clone(),
                 }),
                 Duration::from_secs(2),
             );
             let mut synced = lock_unpoisoned(&self.synced_capture);
             if result.is_ok() {
-                synced.insert(connection_id, desired);
+                synced.insert(connection_id, desired.clone());
             } else {
                 synced.remove(&connection_id);
             }
@@ -649,11 +722,13 @@ impl PasswordBrowserService {
                 }
                 self.sync_capture_from_store(&app.state());
             }
+            "capturePreferenceChanged" => self.handle_capture_preference_changed(app, &event),
             "originActive" => self.handle_origin_active(&app.state(), &event),
             "fillRequest" => self.handle_fill_request(&app.state(), &event),
             "copySecret" => self.handle_copy_secret(&app.state(), &event),
             "copyMfaCode" => self.handle_copy_mfa_code(app, &event),
             "deleteEntry" => self.handle_delete_entry(app, &event),
+            "openTool" => self.handle_popup_open_tool(app, &event),
             "openPasswordManager" => {
                 if let Err(error) = crate::commands::open_password_window(app) {
                     eprintln!("打开密码管理器窗口失败: {error}");
@@ -686,6 +761,145 @@ impl PasswordBrowserService {
             }
             _ => {}
         }
+    }
+
+    fn handle_popup_open_tool(&self, app: &AppHandle, event: &BrowserSecretEvent) {
+        let Some(target) = PopupOpenTarget::from_payload(&event.payload) else {
+            self.bridge
+                .record_event("popup", "open-tool-rejected", "reason=invalid-target");
+            return;
+        };
+        let result = match target {
+            PopupOpenTarget::Main => {
+                crate::show_main_window(app);
+                Ok(())
+            }
+            PopupOpenTarget::Passwords => crate::commands::open_password_window(app),
+            PopupOpenTarget::Mfa => {
+                crate::commands::open_mfa_window_inner(app, &app.state()).map(|_| ())
+            }
+            PopupOpenTarget::Notes => {
+                crate::spawn_create_note(app);
+                Ok(())
+            }
+        };
+        if let Err(error) = result {
+            self.bridge.record_event(
+                "popup",
+                "open-tool-failed",
+                format!("target={target:?} code={}", error.code),
+            );
+        }
+    }
+
+    fn handle_capture_preference_changed(&self, app: &AppHandle, event: &BrowserSecretEvent) {
+        let store = app.state::<PasswordStore>();
+        let Some(enabled) = self.apply_capture_preference_changed(&store, event) else {
+            return;
+        };
+        let _ = app.emit_to(
+            "passwords",
+            "password-capture-preference-changed",
+            serde_json::json!({ "enabled": enabled }),
+        );
+    }
+
+    fn apply_capture_preference_changed(
+        &self,
+        store: &PasswordStore,
+        event: &BrowserSecretEvent,
+    ) -> Option<bool> {
+        let Some(request_id) = event
+            .payload
+            .get("requestId")
+            .and_then(Value::as_str)
+            .filter(|value| is_safe_protocol_id(value, 160))
+        else {
+            self.bridge.record_event(
+                "capture",
+                "preference-rejected",
+                "reason=invalid-request-id",
+            );
+            return None;
+        };
+        let Some(enabled) = event.payload.get("enabled").and_then(Value::as_bool) else {
+            let current = store.capture_preference().1;
+            self.send_capture_preference_result(
+                &event.connection_id,
+                request_id,
+                false,
+                current,
+                Some(("PASSWORD_PROTOCOL_INVALID", "登录检测开关请求无效。")),
+            );
+            return None;
+        };
+
+        match store.set_capture_enabled_from_browser(enabled) {
+            Ok(()) => {
+                if !enabled {
+                    // Pending candidates contain credentials and must be
+                    // wiped as soon as the user disables detection.
+                    lock_unpoisoned(&self.captures).clear();
+                }
+                // Publish the effective state before acknowledging the
+                // preference. This prevents the popup from observing a saved
+                // "on" preference while page capture is still running with a
+                // stale availability snapshot.
+                self.sync_capture_from_store(store);
+                self.send_capture_preference_result(
+                    &event.connection_id,
+                    request_id,
+                    true,
+                    enabled,
+                    None,
+                );
+                Some(enabled)
+            }
+            Err(error) => {
+                self.bridge.record_event(
+                    "capture",
+                    "preference-write-failed",
+                    format!("code={}", error.code),
+                );
+                let current = store.capture_preference().1;
+                self.send_capture_preference_result(
+                    &event.connection_id,
+                    request_id,
+                    false,
+                    current,
+                    Some((
+                        "PASSWORD_PREFERENCE_WRITE_FAILED",
+                        "登录检测设置保存失败，请重试。",
+                    )),
+                );
+                self.sync_capture_from_store(store);
+                None
+            }
+        }
+    }
+
+    fn send_capture_preference_result(
+        &self,
+        connection_id: &str,
+        request_id: &str,
+        success: bool,
+        enabled: bool,
+        error: Option<(&str, &str)>,
+    ) {
+        let mut payload = serde_json::json!({
+            "requestId": request_id,
+            "success": success,
+            "enabled": enabled,
+        });
+        if let Some((code, message)) = error {
+            payload["error"] = serde_json::json!({ "code": code, "message": message });
+        }
+        let _ = self.bridge.request_connection(
+            connection_id,
+            "password.capturePreferenceResult",
+            payload,
+            Duration::from_secs(2),
+        );
     }
 
     fn clear_connection_state(&self, app: &AppHandle, connection_id: &str) {
@@ -755,15 +969,15 @@ impl PasswordBrowserService {
             _ => return,
         };
 
-        // The content script clears its own references on pagehide, while this
-        // event removes the native copy that already crossed the bridge. Drop
-        // matching values under the connection/tab/document binding so
-        // PendingCapture's Drop implementation zeroizes username and password.
-        // A top-level pagehide invalidates every frame in the tab.  Child
-        // frame notifications are narrower and only remove the matching
-        // frame/document binding.  Keeping the distinction here prevents a
-        // stale iframe secret from surviving a top-level navigation while
-        // still allowing an unrelated iframe to continue its journey.
+        let tab_closed = event.payload.get("reason").and_then(Value::as_str) == Some("tab-closed")
+            || (document_id.is_none() && event.payload.get("frameId").is_none());
+
+        // Page navigation invalidates page-bound fill, recording and OTP field
+        // references, but an actionable save prompt belongs to the tab rather
+        // than the old document. Keep its native PendingCapture until the user
+        // decides, the tab is really closed, capture is disabled, the vault is
+        // locked, or the native connection ends. Dropping it on pagehide would
+        // make a normal post-login redirect silently lose the save prompt.
         lock_unpoisoned(&self.fills).retain(|_, session| {
             !(session.connection_id == event.connection_id
                 && session.tab_id == Some(tab_id)
@@ -772,13 +986,11 @@ impl PasswordBrowserService {
                         && document_id
                             .map_or(true, |value| session.document_id.as_deref() == Some(value)))))
         });
-        lock_unpoisoned(&self.captures).retain(|_, capture| {
-            !(capture.connection_id == event.connection_id
-                && capture.tab_id == tab_id
-                && (frame_id == 0
-                    || (capture.frame_id == frame_id
-                        && document_id.map_or(true, |value| capture.document_id == value))))
-        });
+        if tab_closed {
+            lock_unpoisoned(&self.captures).retain(|_, capture| {
+                !(capture.connection_id == event.connection_id && capture.tab_id == tab_id)
+            });
+        }
         lock_unpoisoned(&self.recordings).retain(|_, recording| {
             !(recording.connection_id == event.connection_id
                 && recording.tab_id == Some(tab_id)
@@ -2244,7 +2456,14 @@ impl PasswordBrowserService {
             ),
         };
         if !matches!(action, "same" | "username-required" | "locked") {
-            lock_unpoisoned(&self.captures).insert(
+            let mut captures = lock_unpoisoned(&self.captures);
+            // A tab can expose only one unresolved save/update prompt. Replace
+            // an older candidate from that same tab and connection so secrets
+            // cannot accumulate indefinitely while the user keeps navigating.
+            captures.retain(|_, capture| {
+                capture.connection_id != event.connection_id || capture.tab_id != tab_id
+            });
+            captures.insert(
                 candidate_id.to_string(),
                 PendingCapture {
                     connection_id: event.connection_id.clone(),
@@ -2259,7 +2478,6 @@ impl PasswordBrowserService {
                     frame_id,
                     document_id,
                     prompt_origin,
-                    created_at: Instant::now(),
                     save_pending: false,
                 },
             );
@@ -2595,7 +2813,6 @@ impl PasswordBrowserService {
                     if !captures.contains_key(candidate_id) {
                         let mut retry = pending;
                         retry.save_pending = false;
-                        retry.created_at = Instant::now();
                         captures.insert(candidate_id.to_string(), retry);
                     }
                 }
@@ -2749,8 +2966,6 @@ impl PasswordBrowserService {
     fn prune(&self, app: &AppHandle) {
         let now = Instant::now();
         lock_unpoisoned(&self.fills).retain(|_, session| session.expires_at > now);
-        lock_unpoisoned(&self.captures)
-            .retain(|_, capture| now.duration_since(capture.created_at) <= CAPTURE_TTL);
         let expired = {
             let mut recordings = lock_unpoisoned(&self.recordings);
             let ids = recordings
@@ -3433,6 +3648,31 @@ mod tests {
     }
 
     #[test]
+    fn popup_open_target_accepts_only_the_four_exact_allowlisted_values() {
+        for (value, expected) in [
+            ("main", PopupOpenTarget::Main),
+            ("passwords", PopupOpenTarget::Passwords),
+            ("mfa", PopupOpenTarget::Mfa),
+            ("notes", PopupOpenTarget::Notes),
+        ] {
+            assert_eq!(
+                PopupOpenTarget::from_payload(&serde_json::json!({ "target": value })),
+                Some(expected)
+            );
+        }
+
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({ "target": "password" }),
+            serde_json::json!({ "target": "MFA" }),
+            serde_json::json!({ "target": "notes", "extra": true }),
+            serde_json::json!("main"),
+        ] {
+            assert_eq!(PopupOpenTarget::from_payload(&payload), None);
+        }
+    }
+
+    #[test]
     fn second_factor_binding_requires_exact_https_and_all_page_ids() {
         let valid = serde_json::json!({
             "flowId": "flow-a",
@@ -3798,7 +4038,6 @@ mod tests {
             frame_id: 0,
             document_id: "document-a".to_string(),
             prompt_origin: "https://example.com".to_string(),
-            created_at: Instant::now(),
             save_pending: false,
         };
         let matching = serde_json::json!({
@@ -3826,7 +4065,7 @@ mod tests {
     }
 
     #[test]
-    fn page_closed_drops_only_the_matching_native_capture() {
+    fn document_close_preserves_native_capture_until_the_tab_really_closes() {
         let service = service();
         let capture = |connection_id: &str, document_id: &str, frame_id: i64| PendingCapture {
             connection_id: connection_id.to_string(),
@@ -3841,7 +4080,6 @@ mod tests {
             frame_id,
             document_id: document_id.to_string(),
             prompt_origin: "https://example.com".to_string(),
-            created_at: Instant::now(),
             save_pending: false,
         };
         lock_unpoisoned(&service.captures).insert(
@@ -3869,7 +4107,7 @@ mod tests {
         });
 
         let captures = lock_unpoisoned(&service.captures);
-        assert!(!captures.contains_key("matching"));
+        assert!(captures.contains_key("matching"));
         assert!(captures.contains_key("other-document"));
         assert!(captures.contains_key("other-connection"));
         drop(captures);
@@ -3878,9 +4116,14 @@ mod tests {
             connection_id: "connection-a".to_string(),
             browser: BrowserFamily::Firefox,
             event: "pageClosed".to_string(),
-            payload: serde_json::json!({ "tabId": 7, "documentId": null }),
+            payload: serde_json::json!({
+                "tabId": 7,
+                "documentId": null,
+                "reason": "tab-closed"
+            }),
         });
         let captures = lock_unpoisoned(&service.captures);
+        assert!(!captures.contains_key("matching"));
         assert!(!captures.contains_key("other-document"));
         assert!(captures.contains_key("other-connection"));
     }
@@ -4156,7 +4399,6 @@ mod tests {
             frame_id: 0,
             document_id: "document-1".to_string(),
             prompt_origin: "https://example.com".to_string(),
-            created_at: Instant::now(),
             save_pending: false,
         }
     }
@@ -4592,6 +4834,102 @@ mod tests {
     }
 
     #[test]
+    fn capture_survives_document_navigation_and_saves_with_the_original_binding() {
+        let (_root, store) = test_store();
+        let (service, recorded) = connected_service("connection-a");
+        service.handle_capture_candidate(
+            &store,
+            &secret_event(
+                "connection-a",
+                "captureCandidate",
+                serde_json::json!({
+                    "candidateId": "candidate-navigation",
+                    "origin": "https://example.com",
+                    "promptOrigin": "https://example.com",
+                    "username": "alice",
+                    "password": "one",
+                    "tabId": 7,
+                    "frameId": 0,
+                    "documentId": "login-document",
+                }),
+            ),
+        );
+
+        service.handle_page_closed(&secret_event(
+            "connection-a",
+            "pageClosed",
+            serde_json::json!({
+                "tabId": 7,
+                "frameId": 0,
+                "documentId": "login-document",
+                "reason": "document-unloaded",
+            }),
+        ));
+        assert!(lock_unpoisoned(&service.captures).contains_key("candidate-navigation"));
+
+        let saved = service.save_decision_from_event(
+            &store,
+            &secret_event(
+                "connection-a",
+                "saveDecision",
+                serde_json::json!({
+                    "candidateId": "candidate-navigation",
+                    "action": "new",
+                    "origin": "https://example.com",
+                    "promptOrigin": "https://example.com",
+                    "tabId": 7,
+                    "frameId": 0,
+                    "documentId": "login-document",
+                }),
+            ),
+        );
+
+        let Some((entry_id, action)) = saved else {
+            panic!("a prompt restored after navigation must still save");
+        };
+        assert_eq!(action, "new");
+        let epoch = store.require_active_epoch().unwrap();
+        let entry = store.browser_fill_data_at(&entry_id, epoch).unwrap();
+        assert_eq!(entry.username, "alice");
+        assert_eq!(entry.password, "one");
+        assert_eq!(recorded.requests_for("password.saveResult").len(), 1);
+    }
+
+    #[test]
+    fn a_new_actionable_candidate_replaces_the_older_one_in_the_same_tab() {
+        let (_root, store) = test_store();
+        let (service, _recorded) = connected_service("connection-a");
+
+        for (candidate_id, document_id, username) in [
+            ("candidate-old", "document-old", "alice"),
+            ("candidate-new", "document-new", "bob"),
+        ] {
+            service.handle_capture_candidate(
+                &store,
+                &secret_event(
+                    "connection-a",
+                    "captureCandidate",
+                    serde_json::json!({
+                        "candidateId": candidate_id,
+                        "origin": "https://example.com",
+                        "promptOrigin": "https://example.com",
+                        "username": username,
+                        "password": "one",
+                        "tabId": 7,
+                        "frameId": 0,
+                        "documentId": document_id,
+                    }),
+                ),
+            );
+        }
+
+        let captures = lock_unpoisoned(&service.captures);
+        assert_eq!(captures.len(), 1);
+        assert!(!captures.contains_key("candidate-old"));
+        assert_eq!(captures["candidate-new"].username, "bob");
+    }
+
+    #[test]
     fn capture_candidate_accepts_explicit_163_iframe_and_binds_the_frame() {
         let (_root, store) = test_store();
         let (service, recorded) = connected_service("connection-a");
@@ -4907,11 +5245,10 @@ mod tests {
     }
 
     #[test]
-    fn sync_capture_always_pushes_enabled_since_0_7_2() {
+    fn sync_capture_preserves_an_explicit_disabled_preference() {
         let (_root, store) = test_store();
         {
             let epoch = store.require_active_epoch().unwrap();
-            // The legacy toggle no longer disables capture.
             store.set_capture_enabled_at(false, epoch).unwrap();
         }
         let (service, recorded) = connected_service("connection-a");
@@ -4919,7 +5256,123 @@ mod tests {
         service.sync_capture_from_store(&store);
         let syncs = recorded.requests_for("password.setCaptureEnabled");
         assert_eq!(syncs.len(), 1);
-        assert_eq!(syncs[0]["payload"]["enabled"], true);
+        assert_eq!(syncs[0]["payload"]["enabled"], false);
+        assert_eq!(syncs[0]["payload"]["desiredEnabled"], false);
+        assert_eq!(syncs[0]["payload"]["available"], true);
+    }
+
+    #[test]
+    fn locked_vault_suspends_effective_capture_without_rewriting_desired_preference() {
+        let (_root, store) = test_store();
+        let epoch = store.require_active_epoch().unwrap();
+        store.set_capture_enabled_at(false, epoch).unwrap();
+        store.lock_current_session().unwrap();
+        let (service, recorded) = connected_service("connection-a");
+
+        service.sync_capture_from_store(&store);
+
+        assert_eq!(store.capture_preference(), (true, false));
+        let syncs = recorded.requests_for("password.setCaptureEnabled");
+        assert_eq!(syncs.len(), 1);
+        assert_eq!(syncs[0]["payload"]["enabled"], false);
+        assert_eq!(syncs[0]["payload"]["desiredEnabled"], false);
+        assert_eq!(syncs[0]["payload"]["available"], false);
+    }
+
+    #[test]
+    fn browser_preference_event_is_acknowledged_and_only_clears_capture_candidates() {
+        let (_root, store) = test_store();
+        let (service, recorded) = connected_service("connection-a");
+        lock_unpoisoned(&service.captures).insert(
+            "candidate-a".to_string(),
+            PendingCapture {
+                connection_id: "connection-a".to_string(),
+                entry_id: None,
+                account_choices: Vec::new(),
+                matched_action: "new".to_string(),
+                origin: "https://example.com".to_string(),
+                username: "alice".to_string(),
+                password: "secret".to_string(),
+                allow_insecure_http: false,
+                tab_id: 7,
+                frame_id: 0,
+                document_id: "document-a".to_string(),
+                prompt_origin: "https://example.com".to_string(),
+                save_pending: false,
+            },
+        );
+        lock_unpoisoned(&service.fills).insert("fill-a".to_string(), fill_session());
+        lock_unpoisoned(&service.recordings).insert(
+            "recording-a".to_string(),
+            TemplateRecordingSession {
+                connection_id: "connection-a".to_string(),
+                entry_id: "entry-a".to_string(),
+                origin: "https://example.com".to_string(),
+                tab_id: Some(7),
+                frame_id: Some(0),
+                document_id: Some("document-a".to_string()),
+                state: TemplateRecordingState::Recording,
+                expires_at: Instant::now() + TEMPLATE_RECORDING_TTL,
+            },
+        );
+        lock_unpoisoned(&service.second_factors)
+            .insert("flow-a".to_string(), second_factor_session());
+
+        let applied = service.apply_capture_preference_changed(
+            &store,
+            &secret_event(
+                "connection-a",
+                "capturePreferenceChanged",
+                serde_json::json!({ "requestId": "capture-toggle-a", "enabled": false }),
+            ),
+        );
+
+        assert_eq!(applied, Some(false));
+        assert!(!store.capture_preference().1);
+        assert!(lock_unpoisoned(&service.captures).is_empty());
+        assert!(lock_unpoisoned(&service.fills).contains_key("fill-a"));
+        assert!(lock_unpoisoned(&service.recordings).contains_key("recording-a"));
+        assert!(lock_unpoisoned(&service.second_factors).contains_key("flow-a"));
+
+        let results = recorded.requests_for("password.capturePreferenceResult");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["payload"]["requestId"], "capture-toggle-a");
+        assert_eq!(results[0]["payload"]["success"], true);
+        assert_eq!(results[0]["payload"]["enabled"], false);
+        let syncs = recorded.requests_for("password.setCaptureEnabled");
+        assert_eq!(syncs.len(), 1);
+        assert_eq!(syncs[0]["payload"]["enabled"], false);
+        assert_eq!(syncs[0]["payload"]["desiredEnabled"], false);
+        assert_eq!(syncs[0]["payload"]["available"], true);
+    }
+
+    #[test]
+    fn malformed_browser_preference_event_returns_failure_without_changing_preference() {
+        let (_root, store) = test_store();
+        let (service, recorded) = connected_service("connection-a");
+
+        let applied = service.apply_capture_preference_changed(
+            &store,
+            &secret_event(
+                "connection-a",
+                "capturePreferenceChanged",
+                serde_json::json!({ "requestId": "capture-toggle-b", "enabled": "false" }),
+            ),
+        );
+
+        assert_eq!(applied, None);
+        assert!(store.capture_preference().1);
+        let results = recorded.requests_for("password.capturePreferenceResult");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["payload"]["success"], false);
+        assert_eq!(results[0]["payload"]["enabled"], true);
+        assert_eq!(
+            results[0]["payload"]["error"]["code"],
+            "PASSWORD_PROTOCOL_INVALID"
+        );
+        assert!(recorded
+            .requests_for("password.setCaptureEnabled")
+            .is_empty());
     }
 
     #[cfg(windows)]
@@ -5099,13 +5552,24 @@ mod tests {
         let (service, recorded) = connected_service("connection-a");
         recorded.set_response(
             "password.getStatus",
-            serde_json::json!({ "authenticationConsent": false }),
+            serde_json::json!({
+                "authenticationConsent": false,
+                "captureEnabled": false,
+                "desiredEnabled": true,
+                "available": false,
+            }),
         );
         let status = service.status();
         assert_eq!(status.capture_permission, "unknown");
+        assert_eq!(status.capture_enabled, Some(false));
+        assert_eq!(status.capture_desired_enabled, Some(true));
+        assert_eq!(status.capture_available, Some(false));
         assert!(status.message.as_deref().unwrap().contains("权限状态异常"));
         let value = serde_json::to_value(&status).unwrap();
         assert_eq!(value["capturePermission"], "unknown");
+        assert_eq!(value["captureEnabled"], false);
+        assert_eq!(value["captureDesiredEnabled"], true);
+        assert_eq!(value["captureAvailable"], false);
         assert_eq!(value["pipeConnected"], true);
         assert_eq!(value["connectionId"], "connection-a");
         assert!(value.get("consentArmed").is_none());
@@ -5113,7 +5577,12 @@ mod tests {
 
         recorded.set_response(
             "password.getStatus",
-            serde_json::json!({ "authenticationConsent": true }),
+            serde_json::json!({
+                "authenticationConsent": true,
+                "captureEnabled": true,
+                "desiredEnabled": true,
+                "available": true,
+            }),
         );
         assert_eq!(service.status().capture_permission, "granted");
 

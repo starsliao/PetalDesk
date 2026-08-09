@@ -47,6 +47,16 @@ h2 {
   padding: 2px 0;
 }
 
+.diagnostics-feedback {
+  margin: 4px 0 0;
+  color: #b00020;
+  overflow-wrap: anywhere;
+}
+
+.diagnostics-feedback:empty {
+  display: none;
+}
+
 .diagnostics .label {
   color: #566573;
   flex: none;
@@ -63,6 +73,158 @@ h2 {
 
 .diagnostics .value.warn {
   color: #b26a00;
+}
+
+.diagnostics li.login-detection-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 10px;
+  align-items: center;
+  margin-top: 6px;
+  padding: 8px 9px;
+  border: 1px solid #dbe3ea;
+  border-radius: 7px;
+  background: #fff;
+}
+
+.login-detection-summary {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.login-detection-title {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 5px;
+  color: #273746;
+  font-weight: 600;
+}
+
+.login-detection-state {
+  color: #566573;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.login-detection-state.ok {
+  color: #2e7d32;
+}
+
+.login-detection-state.warn {
+  color: #b26a00;
+}
+
+.help-tip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+button.help-tip-button {
+  display: inline-grid;
+  place-items: center;
+  width: 17px;
+  height: 17px;
+  min-width: 17px;
+  padding: 0;
+  border: 1px solid #9aa8b5;
+  border-radius: 50%;
+  color: #566573;
+  background: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+button.help-tip-button:hover,
+button.help-tip-button:focus-visible {
+  color: #1769aa;
+  border-color: #1769aa;
+  background: #edf4fa;
+}
+
+.help-tooltip {
+  position: absolute;
+  z-index: 20;
+  left: 0;
+  top: calc(100% + 7px);
+  display: none;
+  width: 230px;
+  max-width: min(230px, calc(100vw - 28px));
+  padding: 7px 8px;
+  border: 1px solid #c6d0d9;
+  border-radius: 5px;
+  color: #17202a;
+  background: #fff;
+  box-shadow: 0 5px 14px rgb(23 32 42 / 18%);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+  white-space: normal;
+}
+
+.help-tip:hover .help-tooltip,
+.help-tip:focus-within .help-tooltip {
+  display: block;
+}
+
+.login-detection-controls {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.switch-control {
+  position: relative;
+  width: 38px;
+  height: 22px;
+  min-width: 38px;
+  padding: 0;
+  border: 1px solid #9aa8b5;
+  border-radius: 999px;
+  background: #d7dee5;
+}
+
+.switch-control[aria-checked="true"] {
+  border-color: #1769aa;
+  background: #1769aa;
+}
+
+.switch-thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgb(23 32 42 / 28%);
+  transition: transform 120ms ease;
+}
+
+.switch-control[aria-checked="true"] .switch-thumb {
+  transform: translateX(16px);
+}
+
+.reconnect-button {
+  padding: 4px 8px;
+  color: #1769aa;
+  border-color: #7f9eb8;
+  font-size: 11px;
+}
+
+.reconnect-button:hover:not(:disabled),
+.reconnect-button:focus-visible {
+  color: #fff;
+  border-color: #1769aa;
+  background: #1769aa;
+}
+
+button[hidden] {
+  display: none !important;
 }
 
 .origin {
@@ -102,12 +264,51 @@ button:disabled {
   opacity: 0.42;
 }
 
-button.primary {
-  background: #1769aa;
-  border-color: #1769aa;
-  color: #fff;
-  width: 100%;
+.tool-launcher-panel {
   margin-top: 12px;
+  padding-top: 1px;
+  border-top: 1px solid #dbe3ea;
+}
+
+.tool-launchers {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+
+button.tool-launcher {
+  min-width: 0;
+  min-height: 38px;
+  padding: 7px 8px;
+  border-color: #b8c4cf;
+  color: #24435c;
+  background: #fff;
+  overflow-wrap: anywhere;
+}
+
+button.tool-launcher:hover:not(:disabled),
+button.tool-launcher:focus-visible {
+  color: #fff;
+  border-color: #1769aa;
+  background: #1769aa;
+}
+
+button.tool-launcher[aria-busy="true"] {
+  color: #566573;
+  border-color: #c6d0d9;
+  background: #edf1f4;
+}
+
+.tool-launcher-feedback {
+  min-height: 0;
+  margin: 5px 0 0;
+  color: #b00020;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.tool-launcher-feedback:empty {
+  display: none;
 }
 
 .account-card {
@@ -140,10 +341,6 @@ button.account-main {
 
 button.account-main:hover {
   background: #edf4fa;
-}
-
-button.primary:hover {
-  filter: brightness(0.96);
 }
 
 .account-text {

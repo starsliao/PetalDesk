@@ -9,6 +9,7 @@ function loadManager({
   fieldScenario = "login",
   templateMultiple = false,
   frame = null,
+  longTimerDelayMs = null,
   otpScenario = null,
 } = {}) {
   const runtimeMessages = [];
@@ -17,6 +18,12 @@ function loadManager({
   const windowListeners = new Map();
   const createdElements = [];
   let submitted = false;
+  let visibilityState = "visible";
+  const managerSetTimeout = (callback, delay, ...args) => setTimeout(
+    callback,
+    longTimerDelayMs != null && delay >= 30_000 ? longTimerDelayMs : delay,
+    ...args,
+  );
 
   class FakeElement {
     constructor(tagName = "div") {
@@ -190,7 +197,7 @@ function loadManager({
     },
     documentElement: new FakeElement("html"),
     get visibilityState() {
-      return "visible";
+      return visibilityState;
     },
     querySelectorAll(selector) {
       if (selector === "input") return inputs;
@@ -241,7 +248,7 @@ function loadManager({
     crypto: { randomUUID: () => "manager-test" },
     document,
     location,
-    setTimeout,
+    setTimeout: managerSetTimeout,
     top: null,
   };
   context.top = frame && frame.top === false ? { iframe: true } : context;
@@ -279,6 +286,10 @@ function loadManager({
       const paragraphs = createdElements.filter((element) => element.tagName === "P");
       return paragraphs.length ? paragraphs.at(-1).textContent : "";
     },
+    overlayVisible() {
+      const overlays = createdElements.filter((element) => element.id === "petaldesk-password-overlay");
+      return Boolean(overlays.length > 0 && overlays.at(-1).isConnected);
+    },
     command(command, payload) {
       return new Promise((resolve) => {
         runtimeMessages[0]({ type: "petaldesk.password.command", command, payload }, null, resolve);
@@ -295,6 +306,9 @@ function loadManager({
       return replacements;
     },
     submitted: () => submitted,
+    setVisibilityState(value) {
+      visibilityState = value;
+    },
     markSubmitted() {
       submitted = true;
     },
@@ -373,7 +387,7 @@ test("direct fill offers confirm themselves and fill without a confirmation over
   assert.equal(harness.submitted(), false);
 });
 
-test("a submitted password form is reported as a success immediately", async () => {
+test("a submitted password form requests promotion in the same message", async () => {
   const harness = loadManager();
   const enabled = await harness.command("captureEnable", {});
   assert.equal(enabled.ok, true);
@@ -386,14 +400,12 @@ test("a submitted password form is reported as a success immediately", async () 
   const types = harness.backgroundMessages.map((message) => message.type);
   const submittedIndex = types.indexOf("petaldesk.password.capture-submitted");
   assert.notEqual(submittedIndex, -1);
-  assert.equal(types[submittedIndex + 1], "petaldesk.password.capture-success");
   const submittedMessage = harness.backgroundMessages[submittedIndex];
   assert.equal(submittedMessage.candidate.username, "alice");
   assert.equal(submittedMessage.candidate.password, "secret-password");
-  const successMessage = harness.backgroundMessages[submittedIndex + 1];
-  assert.equal(successMessage.candidateId, submittedMessage.candidate.candidateId);
-  assert.equal(successMessage.confidence, "high");
-  assert.equal(successMessage.origin, "https://accounts.google.com");
+  assert.equal(submittedMessage.candidate.promote, true);
+  assert.equal(submittedMessage.candidate.confidence, "high");
+  assert.equal(types.includes("petaldesk.password.capture-success"), false);
   // Disabling capture clears the in-memory candidate TTL timer.
   await harness.command("captureDisable", {});
 });
@@ -665,12 +677,8 @@ test("an iframe capture reports the top-level origin plus its frame origin", asy
   assert.equal(submitted.candidate.origin, "https://mail.163.com");
   assert.equal(submitted.candidate.frameOrigin, "https://dl.reg.163.com");
   assert.equal(submitted.candidate.password, "secret-password");
-  const success = harness.backgroundMessages.find(
-    (message) => message.type === "petaldesk.password.capture-success",
-  );
-  assert.ok(success);
-  assert.equal(success.origin, "https://mail.163.com");
-  assert.equal(success.candidateId, submitted.candidate.candidateId);
+  assert.equal(submitted.candidate.promote, true);
+  assert.equal(submitted.candidate.confidence, "high");
   await harness.command("captureDisable", {});
 });
 
@@ -730,11 +738,8 @@ test("a semantic login anchor click captures a password form", async () => {
   assert.equal(submitted.candidate.origin, "https://dl.reg.163.com");
   assert.equal(submitted.candidate.username, "alice");
   assert.equal(submitted.candidate.password, "secret-password");
-  const success = harness.backgroundMessages.find(
-    (message) => message.type === "petaldesk.password.capture-success",
-  );
-  assert.ok(success, "a semantic login anchor should immediately promote its candidate");
-  assert.equal(success.candidateId, submitted.candidate.candidateId);
+  assert.equal(submitted.candidate.promote, true);
+  assert.equal(submitted.candidate.confidence, "high");
   await harness.command("captureDisable", {});
 });
 
@@ -791,6 +796,82 @@ test("pagehide notifies the background bridge before local candidate cleanup", (
   const harness = loadManager();
   harness.windowListeners.get("pagehide")({ type: "pagehide" });
   assert.equal(harness.backgroundMessages.at(-1).type, "petaldesk.password.page-closed");
+});
+
+test("a child login frame also reports pagehide so its prompt can move to the top page", () => {
+  const harness = loadManager({
+    frame: {
+      href: "https://dl.reg.163.com/login",
+      top: false,
+    },
+    fieldScenario: "netease",
+  });
+  harness.windowListeners.get("pagehide")({ type: "pagehide" });
+  assert.equal(harness.backgroundMessages.at(-1).type, "petaldesk.password.page-closed");
+});
+
+test("a promoted capture prompt ignores the candidate timer and survives tab visibility changes", async () => {
+  const harness = loadManager({ longTimerDelayMs: 40 });
+  await harness.command("captureEnable", {});
+  harness.inputs.username.value = "alice";
+  harness.inputs.password.value = "secret-password";
+  harness.documentListeners.get("submit")({
+    isTrusted: true,
+    target: harness.document,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const submitted = harness.backgroundMessages.find(
+    (message) => message.type === "petaldesk.password.capture-submitted",
+  );
+  assert.ok(submitted);
+  await harness.command("captureMatch", {
+    action: "new",
+    candidateId: submitted.candidate.candidateId,
+    confidence: "high",
+    origin: "https://accounts.google.com",
+    username: "alice",
+  });
+  await new Promise((resolve) => setTimeout(resolve, 70));
+  assert.equal(harness.overlayVisible(), true);
+
+  const pageClosedBefore = harness.backgroundMessages.filter(
+    (message) => message.type === "petaldesk.password.page-closed",
+  ).length;
+  harness.setVisibilityState("hidden");
+  harness.documentListeners.get("visibilitychange")({ type: "visibilitychange" });
+  assert.equal(harness.overlayVisible(), true);
+  assert.equal(
+    harness.backgroundMessages.filter(
+      (message) => message.type === "petaldesk.password.page-closed",
+    ).length,
+    pageClosedBefore,
+  );
+});
+
+test("closing a failed save notice explicitly ignores the retained candidate", async () => {
+  const harness = loadManager();
+  await harness.command("captureMatch", {
+    action: "new",
+    candidateId: "failed-candidate",
+    confidence: "high",
+    origin: "https://accounts.google.com",
+    username: "alice",
+  });
+  harness.clickButton("保存到飞花");
+  await new Promise((resolve) => setImmediate(resolve));
+  await harness.command("captureSaveResult", {
+    action: "new",
+    candidateId: "failed-candidate",
+    error: { code: "PASSWORD_SAVE_FAILED", message: "保存失败" },
+    success: false,
+  });
+  harness.clickButton("关闭");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(harness.backgroundMessages.at(-1), {
+    action: "ignore",
+    candidateId: "failed-candidate",
+    type: "petaldesk.password.save-decision",
+  });
 });
 
 test("a unique trusted TOTP field reports metadata only and fills without submitting", async () => {

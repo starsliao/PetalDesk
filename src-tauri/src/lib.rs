@@ -4,6 +4,7 @@ mod browser_secret_bridge;
 mod commands;
 mod error;
 mod gantt;
+mod launch_at_login;
 mod long_screenshot;
 mod long_screenshot_input;
 mod mfa;
@@ -193,7 +194,7 @@ fn current_tray_double_click_action(
     tray_action_for_modifiers(settings, false, false, false)
 }
 
-fn show_main_window(app: &tauri::AppHandle) {
+pub(crate) fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -388,7 +389,7 @@ fn spawn_primary_activation_action(app: &tauri::AppHandle) {
     });
 }
 
-fn spawn_create_note(app: &tauri::AppHandle) {
+pub(crate) fn spawn_create_note(app: &tauri::AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let Ok(note) = app.state::<WorkspaceStore>().create_note() else {
@@ -662,6 +663,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let autostart_launch = launch_at_login::current_launch_is_autostart();
     let store = WorkspaceStore::load().expect("无法初始化飞花 - PetalDesk 数据存储");
     let data_storage_path = store.data_storage_path();
     let reminder_store =
@@ -679,7 +681,13 @@ pub fn run() {
             // Keep this body free of file I/O and locks: it runs synchronously
             // on the message pump while the relaunched process waits inside
             // SendMessageW. Tracing happens on the worker instead.
-            |app, _arguments, _cwd| spawn_primary_activation_action(app),
+            |app, arguments, _cwd| {
+                if launch_at_login::args_contain_autostart(arguments.iter()) {
+                    trace_activation("single_instance:autostart_suppressed");
+                } else {
+                    spawn_primary_activation_action(app);
+                }
+            },
         ))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -695,7 +703,7 @@ pub fn run() {
     #[cfg(windows)]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     let app = builder
-        .on_page_load(|webview, payload| {
+        .on_page_load(move |webview, payload| {
             if webview.label() == "main"
                 && payload.event() == tauri::webview::PageLoadEvent::Finished
                 && INITIAL_ACTIVATION_SCHEDULED
@@ -707,7 +715,11 @@ pub fn run() {
                 // main page to finish loading avoids losing the configured
                 // activation target on fast, installed launches.
                 trace_activation("main_page:finished");
-                spawn_primary_activation_action(webview.app_handle());
+                if autostart_launch {
+                    trace_activation("main_page:autostart_suppressed");
+                } else {
+                    spawn_primary_activation_action(webview.app_handle());
+                }
             }
         })
         .setup(setup_tray)
@@ -806,6 +818,8 @@ pub fn run() {
             commands::get_app_info,
             commands::set_default_editor_mode,
             commands::set_protect_sensitive_windows,
+            commands::get_launch_at_login_status,
+            commands::set_launch_at_login_enabled,
             commands::set_tray_shortcut_settings,
             commands::set_data_storage_path,
             commands::restart_app,

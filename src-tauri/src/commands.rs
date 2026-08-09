@@ -223,6 +223,22 @@ pub async fn set_protect_sensitive_windows(app: AppHandle, enabled: bool) -> App
 }
 
 #[tauri::command]
+pub async fn get_launch_at_login_status() -> AppResult<crate::launch_at_login::LaunchAtLoginStatus>
+{
+    run_background("读取开机启动设置", crate::launch_at_login::get_status).await
+}
+
+#[tauri::command]
+pub async fn set_launch_at_login_enabled(
+    enabled: bool,
+) -> AppResult<crate::launch_at_login::LaunchAtLoginStatus> {
+    run_background("设置开机启动", move || {
+        crate::launch_at_login::set_enabled(enabled)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn set_data_storage_path(
     app: AppHandle,
     path: String,
@@ -812,7 +828,7 @@ fn close_sensitive_window_for_remote_session(app: &AppHandle, label: &str) {
             tauri::async_runtime::spawn_blocking(move || {
                 cleanup_app
                     .state::<crate::password_browser::PasswordBrowserService>()
-                    .suspend_capture();
+                    .suspend_capture(&cleanup_app.state::<crate::passwords::PasswordStore>());
             });
         }
         _ => {}

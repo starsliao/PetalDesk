@@ -1731,11 +1731,17 @@ pub async fn get_long_capture_tile(
 }
 
 fn purge_expired_annotation_exports(store: &LongScreenshotStore) {
+    purge_expired_annotation_exports_at(store, Instant::now());
+}
+
+fn purge_expired_annotation_exports_at(store: &LongScreenshotStore, now: Instant) {
     let directories = {
         let mut tickets = lock_unpoisoned(&store.annotation_exports);
         let expired = tickets
             .iter()
-            .filter(|(_, ticket)| ticket.issued_at.elapsed() > ANNOTATION_EXPORT_TICKET_TTL)
+            .filter(|(_, ticket)| {
+                now.saturating_duration_since(ticket.issued_at) > ANNOTATION_EXPORT_TICKET_TTL
+            })
             .map(|(token, _)| token.clone())
             .collect::<Vec<_>>();
         expired
@@ -9188,6 +9194,7 @@ mod tests {
             LongCaptureState::Ready,
         ));
         let store = test_store(root.path().to_path_buf());
+        let issued_at = Instant::now();
         lock_unpoisoned(&store.annotation_exports).insert(
             "expired".to_string(),
             LongCaptureAnnotationExportTicket {
@@ -9201,11 +9208,14 @@ mod tests {
                 height: 1,
                 strip_height: 1,
                 next_y: 0,
-                issued_at: Instant::now() - ANNOTATION_EXPORT_TICKET_TTL - Duration::from_secs(1),
+                issued_at,
             },
         );
 
-        purge_expired_annotation_exports(&store);
+        purge_expired_annotation_exports_at(
+            &store,
+            issued_at + ANNOTATION_EXPORT_TICKET_TTL + Duration::from_secs(1),
+        );
 
         assert!(lock_unpoisoned(&store.annotation_exports).is_empty());
         assert!(!export_directory.exists());

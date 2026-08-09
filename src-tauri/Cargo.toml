@@ -1,6 +1,6 @@
 [package]
 name = "petaldesk"
-version = "0.8.1"
+version = "0.8.2"
 description = "飞花 - PetalDesk local Markdown notes and desktop tools"
 authors = ["飞花 - PetalDesk contributors"]
 edition = "2021"
@@ -71,6 +71,7 @@ rfd = { version = "=0.16.0", default-features = false, features = ["common-contr
 
 [target.'cfg(windows)'.dependencies]
 tauri-plugin-updater = "2"
+winreg = "0.55"
 windows-sys = { version = "0.60", features = [
   "Win32_Foundation",
   "Win32_Graphics_Dwm",

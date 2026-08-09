@@ -18,6 +18,7 @@
   const SECOND_FACTOR_SCAN_SETTLE_MS = 50;
   const MFA_COPY_RESULT_TTL_MS = 20_000;
   const DELETE_RESULT_TTL_MS = 8_000;
+  const CAPTURE_PREFERENCE_RESULT_TTL_MS = 8_000;
   const BADGE_ACCOUNT_LIMIT = 16;
   const CAPABILITY_GROUPS = Object.freeze([
     "password-fill",
@@ -46,8 +47,11 @@
     "password.confirmMfaCopy",
     "password.copyMfaResult",
     "password.deleteResult",
+    "password.capturePreferenceResult",
   ]);
   const SAVE_ACTIONS = new Set(["new", "update", "replace", "ignore"]);
+  const CAPTURE_PROMPT_ACTIONS = new Set(["new", "update", "select"]);
+  const POPUP_OPEN_TARGETS = new Set(["main", "passwords", "mfa", "notes"]);
 
   function bridgeError(code, message) {
     const error = new Error(message);
@@ -99,7 +103,7 @@
     };
   }
 
-  function createPasswordBridge({ api, postToNative, protocolVersion }) {
+  function createPasswordBridge({ api, postToNative, protocolVersion, requestNativeReconnect }) {
     if (!api || api.browserFamily !== "firefox") {
       throw new Error("The password bridge is only available in Firefox v1");
     }
@@ -114,6 +118,7 @@
     const secondFactorByTab = new Map();
     const pendingMfaCopies = new Map();
     const pendingDeletes = new Map();
+    const pendingCapturePreferences = new Map();
     const diagnostics = {
       lastCommandAt: null,
       lastCommandErrorCode: null,
@@ -122,7 +127,17 @@
       secretConnected: false,
     };
     let captureEnabled = false;
+    let captureDesiredEnabled = true;
+    let captureAvailable = false;
     let captureInsecureOrigins = new Set();
+    let nativeConnectionState = {
+      canReconnect: false,
+      connected: false,
+      reconnectAttempt: 0,
+      reconnectMaxAttempts: 3,
+      secretConnected: false,
+      state: "connecting",
+    };
 
     function setBadgeText(tabId, text) {
       if (!api.action || typeof api.action.setBadgeText !== "function") return;
@@ -453,6 +468,21 @@
       }
     }
 
+    function rejectPendingCapturePreference(requestId, error) {
+      const pending = pendingCapturePreferences.get(requestId);
+      if (!pending) return false;
+      if (pending.timer != null) clearTimeout(pending.timer);
+      pendingCapturePreferences.delete(requestId);
+      pending.reject(error);
+      return true;
+    }
+
+    function clearPendingCapturePreferences(code, message) {
+      for (const requestId of Array.from(pendingCapturePreferences.keys())) {
+        rejectPendingCapturePreference(requestId, bridgeError(code, message));
+      }
+    }
+
     function clearCandidate(candidateId) {
       const record = candidates.get(candidateId);
       if (!record) return;
@@ -471,6 +501,153 @@
         clearCandidate(record.candidateId);
       }, ttlMs);
       if (record.timer && typeof record.timer.unref === "function") record.timer.unref();
+    }
+
+    function persistPromotedCandidate(record) {
+      if (!record) return;
+      if (record.timer != null) clearTimeout(record.timer);
+      record.timer = null;
+      // Once the native desktop has accepted the candidate, the extension no
+      // longer owns the password. Keep only secret-free prompt metadata until
+      // the user explicitly saves or ignores it, or the tab is really closed.
+      record.expiresAt = Number.POSITIVE_INFINITY;
+    }
+
+    function candidateCanSurviveNavigation(record) {
+      return Boolean(
+        record
+        && record.promoted
+        && record.nativeAccepted
+        && record.password === "",
+      );
+    }
+
+    function capturePromptSurfaceAllowed(record, binding) {
+      if (!record || !binding || binding.frameId !== 0) return false;
+      if (binding.origin.startsWith("https://")) return true;
+      // HTTP capture is opt-in and may be shown on the exact document that
+      // produced it. Do not replay a retained in-page prompt into a later
+      // HTTP navigation, where the old candidate would be an unrelated page
+      // overlay. The desktop candidate remains pending until a safe HTTPS
+      // document announces itself.
+      return Boolean(
+        binding.origin.startsWith("http://")
+        && captureInsecureOrigins.has(binding.origin)
+        && binding.origin === record.origin
+        && record.topDocumentId
+        && binding.documentId
+        && record.topDocumentId === binding.documentId,
+      );
+    }
+
+    function promptBindingMatches(binding, tabId, frameId = null, documentId = null) {
+      if (!binding || binding.tabId !== tabId) return false;
+      if (frameId != null && binding.frameId !== frameId) return false;
+      if (documentId && binding.documentId && binding.documentId !== documentId) return false;
+      return true;
+    }
+
+    function retireCapturePromptBindings(tabId, frameId = null, documentId = null) {
+      for (const record of candidates.values()) {
+        if (!promptBindingMatches(record.promptBinding, tabId, frameId, documentId)) continue;
+        record.promptBinding = null;
+      }
+    }
+
+    function capturePromptPayload(record) {
+      if (!record || !CAPTURE_PROMPT_ACTIONS.has(record.matchedAction)) return null;
+      return {
+        action: record.matchedAction,
+        accounts: record.accountChoices.map((choice) => ({ ...choice })),
+        candidateId: record.candidateId,
+        confidence: record.confidence,
+        origin: record.origin,
+        savePending: record.savePending === true,
+        username: record.username,
+        ...(record.saveError ? { error: { ...record.saveError } } : {}),
+      };
+    }
+
+    function trustedTopPromptBinding(record) {
+      const context = record ? tabContexts.get(record.tabId) : null;
+      if (!record || !context || !context.documentId || !context.origin) return null;
+      return {
+        documentId: context.documentId,
+        frameId: 0,
+        origin: context.origin,
+        tabId: record.tabId,
+      };
+    }
+
+    function bindCapturePrompt(record, binding, topOrigin) {
+      const payload = capturePromptPayload(record);
+      if (!payload || !binding || binding.tabId !== record.tabId) return null;
+      // A prompt may follow its tab across safe top-level navigations, like a
+      // browser-owned password prompt. Only extension code receives the
+      // metadata; the password was already erased, and child frames can never
+      // become the rehydrated prompt surface.
+      if (
+        binding.frameId !== 0
+        || !topOrigin
+        || topOrigin !== binding.origin
+        || !capturePromptSurfaceAllowed(record, binding)
+      ) {
+        return null;
+      }
+      if (
+        record.promptBinding
+        && !promptBindingMatches(
+          record.promptBinding,
+          binding.tabId,
+          binding.frameId,
+          binding.documentId,
+        )
+      ) return null;
+      record.promptBinding = { ...binding };
+      return payload;
+    }
+
+    function pendingCapturePromptForBinding(binding, topOrigin) {
+      // Rehydration always targets the stable top document. A child frame may
+      // still receive the original prompt while it is alive, but a newly
+      // announced child must never steal a retained prompt from its tab.
+      if (!binding || binding.frameId !== 0) return null;
+      for (const record of candidates.values()) {
+        if (record.tabId !== binding.tabId || !candidateCanSurviveNavigation(record)) continue;
+        const payload = bindCapturePrompt(record, binding, topOrigin);
+        if (payload) return payload;
+      }
+      return null;
+    }
+
+    async function sendCapturePrompt(record, binding = record && record.promptBinding) {
+      const payload = capturePromptPayload(record);
+      if (!payload || !binding) return false;
+      try {
+        const response = await api.sendTabMessage(
+          binding.tabId,
+          {
+            type: CONTENT_MESSAGE_TYPE,
+            command: "captureMatch",
+            payload,
+          },
+          {
+            frameId: binding.frameId,
+            ...(binding.documentId ? { documentId: binding.documentId } : {}),
+          },
+        );
+        return Boolean(response && response.ok !== false);
+      } catch (_error) {
+        if (record && promptBindingMatches(
+          record.promptBinding,
+          binding.tabId,
+          binding.frameId,
+          binding.documentId,
+        )) {
+          record.promptBinding = null;
+        }
+        return false;
+      }
     }
 
     function usernameStageKey(tabId, origin) {
@@ -498,7 +675,11 @@
       for (const sessionId of Array.from(recordings.keys())) clearRecording(sessionId);
     }
 
-    function clearTabState(tabId, documentId = null, { preserveUsernameStage = false } = {}) {
+    function clearTabState(
+      tabId,
+      documentId = null,
+      { preserveUsernameStage = false, preservePromotedCandidates = false } = {},
+    ) {
       for (const [sessionId, session] of sessions.entries()) {
         if (session.tabId !== tabId) continue;
         if (documentId && session.documentId && session.documentId !== documentId) continue;
@@ -507,6 +688,7 @@
       for (const [candidateId, record] of candidates.entries()) {
         if (record.tabId !== tabId) continue;
         if (documentId && record.documentId && record.documentId !== documentId) continue;
+        if (preservePromotedCandidates && candidateCanSurviveNavigation(record)) continue;
         clearCandidate(candidateId);
       }
       for (const [sessionId, recording] of recordings.entries()) {
@@ -522,15 +704,19 @@
       }
     }
 
-    function onPageClosed(sender) {
+    async function onPageClosed(sender) {
       const tabId = optionalRoutingId(sender && sender.tab && sender.tab.id, "tabId");
       const documentId = sender && sender.documentId ? String(sender.documentId) : null;
       const frameId = optionalRoutingId(sender && sender.frameId, "frameId") ?? 0;
       // A top-level navigation invalidates every document in the tab. Child
       // frame notifications remain document-scoped so an unrelated frame does
       // not retire another frame's pending secret.
-      clearTabState(tabId, frameId === 0 ? null : documentId, { preserveUsernameStage: true });
+      clearTabState(tabId, frameId === 0 ? null : documentId, {
+        preservePromotedCandidates: true,
+        preserveUsernameStage: true,
+      });
       if (tabId != null) {
+        retireCapturePromptBindings(tabId, frameId === 0 ? null : frameId, documentId);
         clearFrameContext(tabId, frameId === 0 ? null : frameId, documentId);
         if (frameId === 0) {
           clearTabAccounts(tabId);
@@ -572,8 +758,25 @@
             clearSecondFactorChallenge(journey);
           }
         }
+        // When only a login iframe disappears, the top document does not emit
+        // another tab-ready event. Move the secret-free prompt to the existing
+        // top frame immediately so it cannot vanish with the iframe.
+        if (frameId > 0) {
+          for (const record of candidates.values()) {
+            if (record.tabId !== tabId || record.promptBinding) continue;
+            const topBinding = trustedTopPromptBinding(record);
+            if (!topBinding) continue;
+            const payload = bindCapturePrompt(record, topBinding, topBinding.origin);
+            if (payload) await sendCapturePrompt(record, topBinding);
+          }
+        }
       }
-      postEvent("pageClosed", { documentId, frameId, tabId });
+      postEvent("pageClosed", {
+        documentId,
+        frameId,
+        reason: "document-unloaded",
+        tabId,
+      });
       return { cleared: true, tabId, documentId, frameId };
     }
 
@@ -1064,12 +1267,24 @@
 
     async function setCaptureEnabled(payload) {
       const enabled = payload.enabled === true;
+      if (typeof payload.desiredEnabled === "boolean") {
+        captureDesiredEnabled = payload.desiredEnabled;
+      } else if (typeof payload.enabled === "boolean") {
+        // Backward-compatible with desktop builds that predate the explicit
+        // desired/available split. New builds always send desiredEnabled.
+        captureDesiredEnabled = enabled;
+      }
+      captureAvailable = typeof payload.available === "boolean"
+        ? payload.available
+        : true;
       captureInsecureOrigins = normalizeInsecureOrigins(payload.insecureOrigins);
-      captureEnabled = enabled;
-      if (!enabled) clearCaptureState();
+      captureEnabled = Boolean(enabled && captureDesiredEnabled && captureAvailable);
+      if (!captureEnabled) clearCaptureState();
       await broadcastCaptureState();
       return {
         enabled: captureEnabled,
+        desiredEnabled: captureDesiredEnabled,
+        available: captureAvailable,
         insecureOrigins: Array.from(captureInsecureOrigins),
       };
     }
@@ -1461,6 +1676,48 @@
       return { requestId, resolved: true };
     }
 
+    function capturePreferenceResult(payload) {
+      const requestId = requiredString(payload.requestId, "requestId", 160);
+      const pending = pendingCapturePreferences.get(requestId);
+      if (!pending) {
+        throw bridgeError(
+          "PASSWORD_REQUEST_EXPIRED",
+          "The login detection preference request is no longer pending",
+        );
+      }
+      if (pending.timer != null) clearTimeout(pending.timer);
+      pendingCapturePreferences.delete(requestId);
+      if (payload.success === true) {
+        if (typeof payload.enabled !== "boolean" || payload.enabled !== pending.enabled) {
+          const error = bridgeError(
+            "PASSWORD_PROTOCOL_INVALID",
+            "The login detection preference result did not match the request",
+          );
+          pending.reject(error);
+          throw error;
+        }
+        captureDesiredEnabled = payload.enabled;
+        // Only the desktop's password.setCaptureEnabled command may enable
+        // page listeners: the cached availability could have become stale
+        // while the preference write was in flight. Disabling is safe to apply
+        // immediately and prevents another candidate from being captured
+        // before the authoritative desktop state arrives.
+        if (!captureDesiredEnabled) {
+          captureEnabled = false;
+          clearCaptureState();
+          void broadcastCaptureState().catch(() => {});
+        }
+        pending.resolve({ accepted: true, enabled: payload.enabled });
+      } else {
+        const errorValue = payload.error && typeof payload.error === "object" ? payload.error : {};
+        pending.reject(bridgeError(
+          String(errorValue.code || "PASSWORD_CAPTURE_PREFERENCE_FAILED").slice(0, 80),
+          String(errorValue.message || "登录检测设置保存失败").slice(0, 512),
+        ));
+      }
+      return { requestId, resolved: true };
+    }
+
     async function requestConsent() {
       // Authentication access is now a required install-time permission, so the
       // desktop's legacy consent probe always reports an already granted state.
@@ -1499,23 +1756,40 @@
       }
       record.matchedAction = action;
       record.accountChoices = normalizeAccountChoices(payload.accounts);
-      await api.sendTabMessage(
-        record.tabId,
-        {
-          type: CONTENT_MESSAGE_TYPE,
-          command: "captureMatch",
-          payload: {
-            action,
-            candidateId,
-            confidence: record.confidence,
-            expiresInMs: Math.max(0, record.expiresAt - Date.now()),
-            origin: record.origin,
-            username: record.username,
-            accounts: record.accountChoices,
+      if (CAPTURE_PROMPT_ACTIONS.has(action)) {
+        // Prefer the top document even when the login fields lived in a known
+        // child frame. This gives the prompt a stable full-tab surface and lets
+        // it survive removal of the login iframe.
+        const topBinding = trustedTopPromptBinding(record);
+        if (topBinding) {
+          record.promptBinding = capturePromptSurfaceAllowed(record, topBinding)
+            ? topBinding
+            : null;
+        }
+        await sendCapturePrompt(record);
+      } else if (record.promptBinding) {
+        await api.sendTabMessage(
+          record.promptBinding.tabId,
+          {
+            type: CONTENT_MESSAGE_TYPE,
+            command: "captureMatch",
+            payload: {
+              action,
+              candidateId,
+              confidence: record.confidence,
+              origin: record.origin,
+              username: record.username,
+              accounts: record.accountChoices,
+            },
           },
-        },
-        { frameId: record.frameId },
-      ).catch(() => {});
+          {
+            frameId: record.promptBinding.frameId,
+            ...(record.promptBinding.documentId
+              ? { documentId: record.promptBinding.documentId }
+              : {}),
+          },
+        ).catch(() => {});
+      }
       if (action === "same" || action === "username-required" || action === "locked") {
         clearCandidate(candidateId);
       }
@@ -1549,6 +1823,8 @@
         consentActionRequired: null,
         consentArmed: false,
         captureEnabled,
+        desiredEnabled: captureDesiredEnabled,
+        available: captureAvailable,
         pendingCandidates: candidates.size,
         pendingUsernameStages: captureUsernames.size,
         pendingFillSessions: sessions.size,
@@ -1582,6 +1858,7 @@
         case "password.confirmMfaCopy": return confirmMfaCopy(payload);
         case "password.copyMfaResult": return copyMfaResult(payload);
         case "password.deleteResult": return deleteResult(payload);
+        case "password.capturePreferenceResult": return capturePreferenceResult(payload);
         default:
           throw bridgeError("PASSWORD_COMMAND_UNSUPPORTED", `Unsupported password command: ${command || "<empty>"}`);
       }
@@ -1605,7 +1882,6 @@
 
     function promoteCandidate(record, confidence, promptBinding) {
       if (record.promoted) return;
-      record.promoted = true;
       record.confidence = confidence === "high" ? "high" : "low";
       record.promptBinding = promptBinding || {
         documentId: record.documentId,
@@ -1630,13 +1906,24 @@
         tabId: record.promptBinding.tabId,
         username: record.username,
       };
+      let posted = false;
       try {
-        postEvent("captureCandidate", nativeCandidate);
+        posted = postEvent("captureCandidate", nativeCandidate);
       } finally {
         nativeCandidate.password = "";
         nativeCandidate.username = "";
         record.password = "";
       }
+      if (!posted) {
+        clearCandidate(record.candidateId);
+        throw bridgeError(
+          "PASSWORD_NATIVE_DISCONNECTED",
+          "PetalDesk native host is disconnected",
+        );
+      }
+      record.nativeAccepted = true;
+      record.promoted = true;
+      persistPromotedCandidate(record);
     }
 
     function recordingForContent(message, sender) {
@@ -1781,6 +2068,20 @@
         if (!announcedOrigin || announcedOrigin !== binding.origin) {
           throw bridgeError("PASSWORD_TARGET_MISMATCH", "The ready page did not match its browser frame");
         }
+        const previousFrames = tabFrames.get(binding.tabId);
+        const previousFrame = previousFrames ? previousFrames.get(binding.frameId) : null;
+        if (
+          previousFrame
+          && previousFrame.documentId
+          && binding.documentId
+          && previousFrame.documentId !== binding.documentId
+        ) {
+          retireCapturePromptBindings(
+            binding.tabId,
+            binding.frameId,
+            previousFrame.documentId,
+          );
+        }
         setFrameContext(binding, message);
         const frameTopOrigin = await topLevelOrigin(binding, sender);
         const trustedFrame = Boolean(frameTopOrigin)
@@ -1790,8 +2091,10 @@
           || captureInsecureOrigins.has(binding.origin)
         );
         const secondFactorArm = await secondFactorArmForBinding(binding, sender);
+        const capturePrompt = pendingCapturePromptForBinding(binding, frameTopOrigin);
         return {
           captureEnabled: Boolean(captureEnabled && frameCaptureAllowed),
+          capturePrompt,
           insecureOrigins: Array.from(captureInsecureOrigins),
           secondFactorArm,
           topLevelOrigin: frameTopOrigin,
@@ -1815,6 +2118,7 @@
       // because the top-frame context has not been recorded yet; clear the
       // map only when an established top document actually changes.
       if (previousContext && previousContext.documentId !== binding.documentId) {
+        retireCapturePromptBindings(binding.tabId);
         clearFrameContext(binding.tabId);
         const journey = secondFactors.get(secondFactorByTab.get(binding.tabId));
         if (journey) clearSecondFactorChallenge(journey);
@@ -1933,8 +2237,10 @@
       const originCaptureAllowed = binding.origin.startsWith("https://")
         || captureInsecureOrigins.has(binding.origin);
       const secondFactorArm = await secondFactorArmForBinding(binding, sender);
+      const capturePrompt = pendingCapturePromptForBinding(binding, binding.origin);
       return {
         captureEnabled: Boolean(captureEnabled && originCaptureAllowed),
+        capturePrompt,
         insecureOrigins: Array.from(captureInsecureOrigins),
         secondFactorArm,
         topLevelOrigin: binding.origin,
@@ -2277,7 +2583,13 @@
       if (frameOrigin !== binding.origin) {
         throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The login candidate frame origin is invalid");
       }
-      const origin = await topLevelOrigin(binding, sender);
+      // Bind capture to the browser-authenticated sender snapshot at the time
+      // of the trusted login action. Reading the live tab after awaiting an API
+      // call can observe the redirect destination and wrongly discard a valid
+      // candidate from the document that initiated the navigation.
+      const origin = binding.frameId === 0
+        ? binding.origin
+        : topLevelOriginSnapshot(binding, sender) || await topLevelOrigin(binding, sender);
       if (!origin) {
         throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The login candidate tab has no HTTP origin");
       }
@@ -2294,6 +2606,25 @@
       }
       if (frameOrigin.startsWith("http://") && !captureInsecureOrigins.has(frameOrigin)) {
         throw bridgeError("PASSWORD_INSECURE_ORIGIN", "HTTP login detection was not enabled for this frame");
+      }
+      const existingPrompt = Array.from(candidates.values()).find((record) => (
+        record.tabId === binding.tabId
+        && candidateCanSurviveNavigation(record)
+      ));
+      if (existingPrompt) {
+        value.password = "";
+        value.username = "";
+        throw bridgeError(
+          "PASSWORD_CAPTURE_PENDING",
+          "This tab already has a login waiting for a save decision",
+        );
+      }
+      // A tab may emit a second candidate before the first submit/success
+      // round-trip completes (for example a click plus a framework submit).
+      // Keep one authoritative pending candidate per tab and discard the
+      // older, still-secret-bearing records before accepting the replacement.
+      for (const existing of Array.from(candidates.values())) {
+        if (existing.tabId === binding.tabId) clearCandidate(existing.candidateId);
       }
       let username = String(value.username == null ? "" : value.username);
       let password = String(value.password == null ? "" : value.password);
@@ -2318,11 +2649,19 @@
         frameId: binding.frameId,
         frameOrigin,
         origin,
+        topDocumentId: (() => {
+          const context = tabContexts.get(binding.tabId);
+          return binding.frameId === 0
+            ? binding.documentId
+            : context && context.origin === origin ? context.documentId : null;
+        })(),
         password,
         promoted: false,
+        nativeAccepted: false,
         promptBinding: null,
         matchedAction: null,
         accountChoices: [],
+        saveError: null,
         savePending: false,
         confidence: "low",
         source: String(value.source || "generic"),
@@ -2333,10 +2672,24 @@
       };
       candidates.set(candidateId, record);
       renewCandidate(record);
-      password = "";
-      username = "";
-      value.password = "";
-      return { accepted: true, candidateId, expiresInMs: CANDIDATE_TTL_MS, origin };
+      try {
+        if (value.promote === true) {
+          promoteCandidate(record, value.confidence === "high" ? "high" : "low", binding);
+        }
+      } finally {
+        password = "";
+        username = "";
+        value.password = "";
+      }
+      return {
+        accepted: true,
+        candidateId,
+        // Keep the legacy finite hint for older content scripts; the
+        // background record itself has no timer once promoted.
+        expiresInMs: CANDIDATE_TTL_MS,
+        origin,
+        promoted: record.promoted,
+      };
     }
 
     function onSaveDecision(message, sender) {
@@ -2380,14 +2733,17 @@
         postEvent("saveDecision", {
           action,
           candidateId,
-          documentId: binding.documentId,
-          frameId: binding.frameId,
+          // The background has authenticated the current prompt surface above.
+          // Keep the immutable capture binding on the native protocol so the
+          // desktop never has to weaken its original candidate check.
+          documentId: record.documentId,
+          frameId: record.frameId,
           origin: record.origin,
           // Keep promptOrigin compatible with desktop builds that require it
           // to match the top-level vault origin. The exact prompt frame is
           // independently bound by tabId/frameId/documentId above.
           promptOrigin: record.origin,
-          tabId: binding.tabId,
+          tabId: record.tabId,
         });
         return { accepted: true, action, candidateId };
       }
@@ -2395,15 +2751,15 @@
         throw bridgeError("PASSWORD_SAVE_BUSY", "The login candidate is already being saved");
       }
       record.savePending = true;
-      renewCandidate(record, CANDIDATE_TTL_MS);
+      record.saveError = null;
       const posted = postEvent("saveDecision", {
         action,
         candidateId,
-        documentId: binding.documentId,
-        frameId: binding.frameId,
+        documentId: record.documentId,
+        frameId: record.frameId,
         origin: record.origin,
         promptOrigin: record.origin,
-        tabId: binding.tabId,
+        tabId: record.tabId,
         ...(action === "replace" ? { entryId } : {}),
       });
       if (!posted) {
@@ -2427,36 +2783,47 @@
       const action = String(payload.action || record.matchedAction || "");
       if (!success) {
         record.savePending = false;
-        renewCandidate(record, CANDIDATE_TTL_MS);
+        record.saveError = payload.error && typeof payload.error === "object"
+          ? {
+            code: String(payload.error.code || "PASSWORD_SAVE_FAILED").slice(0, 80),
+            message: String(payload.error.message || "保存到飞花失败").slice(0, 512),
+          }
+          : {
+            code: "PASSWORD_SAVE_FAILED",
+            message: "保存到飞花失败，请重试。",
+          };
       }
-      const expiresInMs = success
-        ? 0
-        : Math.max(0, record.expiresAt - Date.now());
-      await api.sendTabMessage(
-        record.tabId,
-        {
-          type: CONTENT_MESSAGE_TYPE,
-          command: "captureSaveResult",
-          payload: {
-            action,
-            candidateId,
-            entryId: payload.entryId == null ? null : String(payload.entryId),
-            origin: record.origin,
-            success,
-            error: payload.error && typeof payload.error === "object"
-              ? {
-                code: String(payload.error.code || "PASSWORD_SAVE_FAILED"),
-                message: String(payload.error.message || "保存到飞花失败"),
-              }
-              : null,
-            expiresInMs,
+      const promptBinding = record.promptBinding;
+      if (promptBinding) {
+        await api.sendTabMessage(
+          promptBinding.tabId,
+          {
+            type: CONTENT_MESSAGE_TYPE,
+            command: "captureSaveResult",
+            payload: {
+              action,
+              candidateId,
+              entryId: payload.entryId == null ? null : String(payload.entryId),
+              origin: record.origin,
+              success,
+              error: record.saveError ? { ...record.saveError } : null,
+            },
           },
-        },
-        { frameId: record.frameId },
-      ).catch((error) => {
-        clearCandidate(candidateId);
-        throw error;
-      });
+          {
+            frameId: promptBinding.frameId,
+            ...(promptBinding.documentId ? { documentId: promptBinding.documentId } : {}),
+          },
+        ).catch(() => {
+          if (promptBindingMatches(
+            record.promptBinding,
+            promptBinding.tabId,
+            promptBinding.frameId,
+            promptBinding.documentId,
+          )) {
+            record.promptBinding = null;
+          }
+        });
+      }
       if (success) {
         clearCandidate(candidateId);
       }
@@ -2495,12 +2862,24 @@
       return {
         diagnostics: {
           captureEnabled,
+          captureDesiredEnabled,
+          captureAvailable,
           extensionVersion: String(api.extensionVersion || ""),
           lastCommandAt: diagnostics.lastCommandAt,
           lastCommandErrorCode: diagnostics.lastCommandErrorCode,
           lastCommandOk: diagnostics.lastCommandOk,
           nativeConnected: diagnostics.nativeConnected,
           secretConnected: diagnostics.secretConnected,
+          loginDetection: {
+            available: captureAvailable,
+            canReconnect: nativeConnectionState.canReconnect === true,
+            desiredEnabled: captureDesiredEnabled,
+            enabled: captureEnabled,
+            preferenceBusy: pendingCapturePreferences.size > 0,
+            reconnectAttempt: nativeConnectionState.reconnectAttempt,
+            reconnectMaxAttempts: nativeConnectionState.reconnectMaxAttempts,
+            connectionState: nativeConnectionState.state,
+          },
         },
         tab: {
           accounts: cached ? cached.accounts.map((account) => ({ ...account })) : [],
@@ -2531,6 +2910,18 @@
         throw bridgeError("PASSWORD_NATIVE_DISCONNECTED", "PetalDesk native host is disconnected");
       }
       return { accepted: true };
+    }
+
+    function popupOpenTool(message) {
+      const target = requiredString(message.target, "target", 32);
+      if (!POPUP_OPEN_TARGETS.has(target)) {
+        throw bridgeError("PASSWORD_PROTOCOL_INVALID", "The popup open target is not supported");
+      }
+      const posted = postEvent("openTool", { target });
+      if (!posted) {
+        throw bridgeError("PASSWORD_NATIVE_DISCONNECTED", "PetalDesk native host is disconnected");
+      }
+      return { accepted: true, target };
     }
 
     async function cachedPopupAccount(entryId) {
@@ -2643,6 +3034,55 @@
       return result;
     }
 
+    function popupSetLoginDetection(message) {
+      if (typeof message.enabled !== "boolean") {
+        throw bridgeError(
+          "PASSWORD_PROTOCOL_INVALID",
+          "enabled must be a boolean",
+        );
+      }
+      if (pendingCapturePreferences.size > 0) {
+        throw bridgeError(
+          "PASSWORD_CAPTURE_PREFERENCE_BUSY",
+          "另一项登录检测设置正在保存，请稍候",
+        );
+      }
+      const requestId = secureRandomId("capture-pref");
+      const enabled = message.enabled;
+      const result = new Promise((resolve, reject) => {
+        const pending = {
+          enabled,
+          reject,
+          resolve,
+          timer: null,
+        };
+        pending.timer = setTimeout(() => {
+          rejectPendingCapturePreference(
+            requestId,
+            bridgeError("PASSWORD_REQUEST_EXPIRED", "登录检测设置保存超时"),
+          );
+        }, CAPTURE_PREFERENCE_RESULT_TTL_MS);
+        if (pending.timer && typeof pending.timer.unref === "function") pending.timer.unref();
+        pendingCapturePreferences.set(requestId, pending);
+      });
+      const posted = postEvent("capturePreferenceChanged", { enabled, requestId });
+      if (!posted) {
+        rejectPendingCapturePreference(
+          requestId,
+          bridgeError("PASSWORD_NATIVE_DISCONNECTED", "PetalDesk native host is disconnected"),
+        );
+      }
+      return result;
+    }
+
+    function popupReconnectLoginDetection() {
+      if (typeof requestNativeReconnect !== "function") {
+        throw bridgeError("PASSWORD_NATIVE_DISCONNECTED", "Native reconnect is unavailable");
+      }
+      const state = requestNativeReconnect();
+      return { accepted: true, ...(state && typeof state === "object" ? state : {}) };
+    }
+
     function onPopupMessage(message, sender) {
       // The action popup is an extension page without a tab; content scripts
       // and other extensions must never reach these handlers.
@@ -2673,8 +3113,11 @@
         case "petaldesk.popup.getState": return popupGetState();
         case "petaldesk.popup.fill": return popupFill(message);
         case "petaldesk.popup.openManager": return popupOpenManager();
+        case "petaldesk.popup.openTool": return popupOpenTool(message);
         case "petaldesk.popup.copySecret": return popupCopySecret(message);
         case "petaldesk.popup.deleteEntry": return popupDeleteEntry(message);
+        case "petaldesk.popup.setLoginDetection": return popupSetLoginDetection(message);
+        case "petaldesk.popup.reconnectLoginDetection": return popupReconnectLoginDetection();
         default: return null;
       }
     }
@@ -2744,7 +3187,11 @@
             );
           }
         }
-        postEvent("pageClosed", { documentId: null, tabId });
+        postEvent("pageClosed", {
+          documentId: null,
+          reason: "tab-closed",
+          tabId,
+        });
       });
     }
 
@@ -2813,6 +3260,10 @@
         "PASSWORD_NATIVE_DISCONNECTED",
         "PetalDesk native host is disconnected",
       );
+      clearPendingCapturePreferences(
+        "PASSWORD_NATIVE_DISCONNECTED",
+        "PetalDesk native host is disconnected",
+      );
       tabFrames.clear();
       clearCaptureState();
     }
@@ -2823,8 +3274,33 @@
       disconnect,
       onSecretConnected,
       route,
+      setNativeConnectionState(value) {
+        const state = value && typeof value === "object" ? value : {};
+        const connectionName = ["connecting", "connected", "reconnecting", "disconnected"]
+          .includes(state.state)
+          ? state.state
+          : "disconnected";
+        const attempt = Number(state.reconnectAttempt);
+        const maxAttempts = Number(state.reconnectMaxAttempts);
+        nativeConnectionState = {
+          canReconnect: state.canReconnect === true,
+          connected: state.connected === true,
+          reconnectAttempt: Number.isInteger(attempt) && attempt >= 0 ? attempt : 0,
+          reconnectMaxAttempts: Number.isInteger(maxAttempts) && maxAttempts > 0
+            ? maxAttempts
+            : 3,
+          secretConnected: state.secretConnected === true,
+          state: connectionName,
+        };
+        diagnostics.nativeConnected = nativeConnectionState.connected;
+        diagnostics.secretConnected = nativeConnectionState.secretConnected;
+      },
       setNativeConnected(connected) {
         diagnostics.nativeConnected = connected === true;
+        nativeConnectionState = {
+          ...nativeConnectionState,
+          connected: diagnostics.nativeConnected,
+        };
       },
       supportsCommand(command) {
         return COMMANDS.has(String(command || ""));

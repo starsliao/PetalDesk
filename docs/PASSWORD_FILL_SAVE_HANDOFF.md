@@ -1,19 +1,19 @@
 # 密码填充与保存功能交接文档（2026-08-07）
 
 > 历史说明：本文记录 `0.7.x` 填充/保存故障的现场状态与排查证据，
-> 不代表 `0.8.0` 当前行为。当前扩展协议、安全边界和发布说明以
+> 不代表 `0.8.1` 及后续版本的当前行为。当前扩展协议、安全边界和发布说明以
 > `browser-extension/README.md`、`browser-extension/amo/` 与
 > `docs/publishing.md` 为准；本文提到但已移除的旧文档仍可在 Git 历史中查看。
 >
 > 读者：接手修复的开发者（codex）。
 > 范围：飞花密码管理器的**浏览器填充**（fill）与**登录保存提示**（capture）两条功能链。
 
-## 0. 当前状态速览
+## 0. 2026-08-07 当时状态速览（0.7.x）
 
 | 链路 | 状态 | 证据 |
 | --- | --- | --- |
 | 通道（桌面↔host↔扩展） | ✅ 已修复并验证 | 连接稳定数小时；探针实测 ping/getStatus 50ms 应答 |
-| `openPasswordManager`、`setCaptureEnabled`、状态同步 | ✅ 真机验证 | 弹窗"打开飞花密码管理器"可用，检测开关显示已开启 |
+| `openTool`、`setCaptureEnabled`、状态同步 | ✅ 自动化覆盖 | 弹窗有四个工具入口；登录检测偏好、实际可用性与连接状态分离 |
 | 角标（badge） | ✅ 真机验证（切换标签与刷新均正常） | 2026-08-07 用户实测确认；修复见 §4.3 |
 | 弹窗点击填充 | ❌ 真机不工作（至少对 163 邮箱） | 见 §4.1 |
 | 登录提交→保存提示 | ❌ 真机从未观察到提示 | 见 §4.2 |
@@ -25,9 +25,10 @@
 1. 打开网站时，若保险库有该站点账户，扩展角标显示数量（1/2/3…）。
 2. 无记录时用户手动登录，**提交登录按钮后立即提示保存**（不等成功信号——登录失败也提示，用户点忽略）。
 3. 有记录但输入的用户名或密码不一致时，提示"保存为新账户"或"更新既有账户"（多账户可选更新哪个）；完全一致不提示。
-4. 弹窗点账户**直接填充**（不要页面二次确认），填充后页面 2 秒轻提示，绝不自动提交。
-5. 弹窗账户行右侧菜单：复制账号 / 复制密码（桌面端写剪贴板，凭据不经扩展）/ 删除（二次确认）。
-6. 登录检测**强制开启**，密码管理器里不再有开关。
+4. 弹窗点账户**直接静默填充**（不要页面二次确认，也不显示“已填充”成功浮层），绝不自动提交。
+5. 弹窗账户卡片固定显示复制用户名、复制密码、复制 MFA 三个图标；未关联 MFA 时第三个位置置灰。删除不使用三点菜单或占高图标，而是通过卡片右键菜单进入并二次确认。
+6. 登录检测默认开启，但扩展弹窗提供独立开关。异常断开不能改写用户偏好：先立即自动重连 3 次，全部失败后才显示手动“重连”；失败后仍每 30 秒低频恢复，手动重连会重新开始快速周期。
+7. 新增/更新提示属于标签页级待处理状态：页面导航或 iframe 销毁只重建提示 UI，直到用户明确保存、更新、忽略或关闭；真实标签页关闭、主动关闭检测、锁库或断连才清除。
 
 ## 2. 链路与关键文件
 
@@ -41,12 +42,12 @@
 - 桌面：`src-tauri/src/password_browser.rs`（事件编排）、`browser_secret_bridge.rs`（管道服务）、`browser_native_host.rs`（host 进程）、`passwords.rs`（保险库、`capture_decision_at` 匹配规则）。
 - 协议清单：`browser-extension/README.md` 最准（随代码更新）。
 
-## 3. 已修复（有证据，勿再怀疑）
+## 3. 当时已修复（有证据，勿再怀疑）
 
 1. **双端同步管道死锁**（0.6.3 以来"请求必超时"的根因）：Windows 同步管道句柄挂起阻塞读时，另一方向的写永久阻塞。两端已改 `FILE_FLAG_OVERLAPPED` 重叠 I/O（commit `b6595d3`，含"挂起读时写必须 2s 内完成"的真实管道回归测试）；旧调试交接已移除，需要时可从 Git 历史查看。
 2. **扩展上报过期 origin**：标签页激活改用实时 URL（不再用加载时缓存）；非网页标签通知桌面清跟踪。
 
-## 4. 现存问题与嫌疑点
+## 4. 当时现存问题与嫌疑点
 
 ### 4.1 弹窗点击填充无反应（用户实测，0.7.2 扩展 + 修复版桌面）
 用户点弹窗账户后显示提示但页面无浮层/无填充。已实现的修复（`fc933e4`，未验证）：fillOffer 广播到全 frame，含登录字段的同站 iframe 自动确认并绑定，`fillSecret` 定向该 frame。若用新扩展实测仍失败，按此顺序查：
@@ -58,7 +59,7 @@
 5. 桌面端诊断点会给出答案：密码管理器→连接诊断→复制，看 `fill offer-fill-direct ok=…` 还是 `fill-request-rejected reason=…`。
 
 ### 4.2 登录提交不提示保存（用户从未见过提示）
-已实现（0.7.3）：提交即发 `capture-submitted` + `capture-success`（无成功判定）。同站 iframe 捕获在 `fc933e4`。排查顺序：
+0.7.3 当时使用 `capture-submitted` + `capture-success` 两条消息（无成功判定）。当前实现改为在一次 `capture-submitted` 中携带 `promote=true`，原子上报候选并立即擦除扩展内密码，避免快速跳转销毁旧页面后第二条消息来不及发送；background 只保留旧 `capture-success` handler 用于兼容旧 content script。同站 iframe 捕获在 `fc933e4`。历史排查顺序：
 
 1. 同上：扩展版本 + 页面刷新 + iframe 注入时机。
 2. **`location.ancestorOrigins` 回退风险**：iframe 内 candidate 的 `origin` 取顶层 origin（`ancestorOrigins` 末位），取不到则回退为 iframe 自身 origin（`dl.reg.163.com`）。回退后与条目 origin（`mail.163.com`）不匹配 → 桌面端 `capture_decision_at` 找不到同 origin 账户 → 按"新增"提示或 origin 校验失败静默丢弃。Firefox 140+ 支持 `ancestorOrigins`，但要在真实页面确认返回顺序与值。
@@ -85,7 +86,7 @@
 
 **强烈建议**：用 playwright 持久化上下文 + `--load-extension` 把真实扩展装进真实 Chromium（native messaging 需把 manifest 注册到 `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.petaldesk.capture`，模板在 `browser-extension/native-host/manifests/chromium.json.template`），可以无人值守地复现整条链路，比手工点可靠得多。
 
-## 6. 本机环境状态
+## 6. 2026-08-07 本机环境快照
 
 - 桌面端 exe：`%LOCALAPPDATA%\PetalDesk\petaldesk.exe` 是本地构建的 0.7.3+iframe 修复版（备份：`petaldesk.prev3` 等）；host exe 同理为修复版（备份 `.old-0.7.1`）。
 - 扩展：`browser-extension/dist/firefox`（当前源码构建，含 iframe 支持）；zip 产物在 `browser-extension/dist/artifacts/`。用户通过 about:debugging 临时加载 zip——**重载 zip 不会更新内容，必须移除后重新载入**。

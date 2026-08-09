@@ -516,6 +516,9 @@ Function PetalDeskRegisterNativeMessagingHost
 FunctionEnd
 
 Function un.PetalDeskUnregisterNativeMessagingHost
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "PetalDesk"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "PetalDesk"
+
   DeleteRegKey HKCU "Software\Google\Chrome\NativeMessagingHosts\com.petaldesk.capture"
   DeleteRegKey HKCU "Software\Microsoft\Edge\NativeMessagingHosts\com.petaldesk.capture"
   DeleteRegKey HKCU "Software\Mozilla\NativeMessagingHosts\com.petaldesk.capture"

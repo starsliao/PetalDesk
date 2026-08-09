@@ -33,6 +33,12 @@ export interface PasswordBrowserStatus {
   installUrl?: string | null;
   capturePermission?: PasswordBrowserCapturePermission;
   authenticationConsent?: boolean;
+  /** Effective content-script login detection state for the live connection. */
+  captureEnabled?: boolean;
+  /** Persisted user preference; unlike captureEnabled this survives disconnects. */
+  captureDesiredEnabled?: boolean;
+  /** Whether the unlocked desktop vault can currently service login detection. */
+  captureAvailable?: boolean;
   stdioConnected?: boolean;
   pipeConnected?: boolean;
   connectionId?: string | null;
@@ -362,6 +368,9 @@ function normalizeBrowser(value: Partial<PasswordBrowserStatus> & Record<string,
     : [];
   const lastRequestOutcome = normalizeDiagEntry(value.lastRequestOutcome ?? value.last_request_outcome);
   const connectionId = value.connectionId ?? value.connection_id;
+  const captureEnabled = value.captureEnabled ?? value.capture_enabled;
+  const captureDesiredEnabled = value.captureDesiredEnabled ?? value.capture_desired_enabled;
+  const captureAvailable = value.captureAvailable ?? value.capture_available;
   return {
     browser: "firefox",
     connection: normalizedConnection,
@@ -375,6 +384,9 @@ function normalizeBrowser(value: Partial<PasswordBrowserStatus> & Record<string,
       : String(value.installUrl),
     ...(normalizedCapturePermission ? { capturePermission: normalizedCapturePermission } : {}),
     authenticationConsent: Boolean(value.authenticationConsent ?? value.authentication_consent ?? false),
+    ...(typeof captureEnabled === "boolean" ? { captureEnabled } : {}),
+    ...(typeof captureDesiredEnabled === "boolean" ? { captureDesiredEnabled } : {}),
+    ...(typeof captureAvailable === "boolean" ? { captureAvailable } : {}),
     stdioConnected: Boolean(value.stdioConnected ?? value.stdio_connected ?? false),
     pipeConnected: Boolean(value.pipeConnected ?? value.pipe_connected ?? false),
     connectionId: connectionId == null ? null : String(connectionId),

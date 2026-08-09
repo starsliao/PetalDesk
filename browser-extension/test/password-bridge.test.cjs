@@ -16,6 +16,7 @@ function eventTarget() {
 
 function loadBridge({ longTimerDelayMs = null } = {}) {
   const events = [];
+  const nativeReconnects = [];
   const runtimeMessages = eventTarget();
   const tabActivations = eventTarget();
   const tabRemovals = eventTarget();
@@ -43,7 +44,7 @@ function loadBridge({ longTimerDelayMs = null } = {}) {
   }
   const api = {
     browserFamily: "firefox",
-    extensionVersion: "0.8.1",
+    extensionVersion: "0.8.2",
     action: {
       async setBadgeText(value) {
         actionUpdates.badgeTexts.push(JSON.parse(JSON.stringify(value)));
@@ -136,6 +137,17 @@ function loadBridge({ longTimerDelayMs = null } = {}) {
       events.push(JSON.parse(JSON.stringify(message)));
     },
     protocolVersion: 1,
+    requestNativeReconnect() {
+      nativeReconnects.push(Date.now());
+      return {
+        canReconnect: false,
+        connected: false,
+        reconnectAttempt: 1,
+        reconnectMaxAttempts: 3,
+        secretConnected: false,
+        state: "reconnecting",
+      };
+    },
   });
   async function sendContent(message, sender) {
     const result = await new Promise((resolve) => {
@@ -159,6 +171,7 @@ function loadBridge({ longTimerDelayMs = null } = {}) {
     api,
     bridge,
     events,
+    nativeReconnects,
     sendContent,
     sendPopup,
     setActiveTab(tabId) {
@@ -1274,7 +1287,7 @@ test("popup state reports diagnostics recorded at the command boundary", async (
   await harness.bridge.route({ command: "password.getStatus", payload: {} });
   let state = await harness.sendPopup({ type: "petaldesk.popup.getState" });
   assert.equal(state.diagnostics.nativeConnected, true);
-  assert.equal(state.diagnostics.extensionVersion, "0.8.1");
+  assert.equal(state.diagnostics.extensionVersion, "0.8.2");
   assert.equal(state.diagnostics.lastCommandOk, true);
   assert.equal(state.diagnostics.lastCommandErrorCode, null);
   assert.equal(typeof state.diagnostics.lastCommandAt, "number");
@@ -1282,6 +1295,174 @@ test("popup state reports diagnostics recorded at the command boundary", async (
   state = await harness.sendPopup({ type: "petaldesk.popup.getState" });
   assert.equal(state.diagnostics.lastCommandOk, false);
   assert.equal(state.diagnostics.lastCommandErrorCode, "PASSWORD_COMMAND_UNSUPPORTED");
+});
+
+test("login detection keeps the persisted desire separate from availability and reconnect state", async () => {
+  const harness = loadBridge();
+  await harness.bridge.route({
+    command: "password.setCaptureEnabled",
+    payload: {
+      available: false,
+      desiredEnabled: true,
+      enabled: false,
+      insecureOrigins: [],
+    },
+  });
+  harness.bridge.setNativeConnectionState({
+    canReconnect: false,
+    connected: true,
+    reconnectAttempt: 2,
+    reconnectMaxAttempts: 3,
+    secretConnected: false,
+    state: "reconnecting",
+  });
+  harness.bridge.disconnect();
+
+  const status = await harness.bridge.route({ command: "password.getStatus", payload: {} });
+  assert.equal(status.captureEnabled, false);
+  assert.equal(status.desiredEnabled, true);
+  assert.equal(status.available, false);
+  const popup = await harness.sendPopup({ type: "petaldesk.popup.getState" });
+  assert.deepEqual(JSON.parse(JSON.stringify(popup.diagnostics.loginDetection)), {
+    available: false,
+    canReconnect: false,
+    connectionState: "reconnecting",
+    desiredEnabled: true,
+    enabled: false,
+    preferenceBusy: false,
+    reconnectAttempt: 2,
+    reconnectMaxAttempts: 3,
+  });
+});
+
+test("a reconnect never turns a manually disabled login detection preference back on", async () => {
+  const harness = loadBridge();
+  await harness.bridge.route({
+    command: "password.setCaptureEnabled",
+    payload: {
+      available: true,
+      desiredEnabled: false,
+      enabled: false,
+      insecureOrigins: [],
+    },
+  });
+  harness.bridge.disconnect();
+  await harness.bridge.onSecretConnected();
+
+  const status = await harness.bridge.route({ command: "password.getStatus", payload: {} });
+  assert.equal(status.captureEnabled, false);
+  assert.equal(status.desiredEnabled, false);
+  assert.equal(status.available, true);
+  const popup = await harness.sendPopup({ type: "petaldesk.popup.getState" });
+  assert.equal(popup.diagnostics.loginDetection.desiredEnabled, false);
+  assert.equal(popup.diagnostics.loginDetection.enabled, false);
+});
+
+test("popup login detection changes wait for an explicit desktop result", async () => {
+  const harness = loadBridge();
+  assert.equal(harness.bridge.supportsCommand("password.capturePreferenceResult"), true);
+  await harness.bridge.route({
+    command: "password.setCaptureEnabled",
+    payload: { available: true, desiredEnabled: true, enabled: true, insecureOrigins: [] },
+  });
+
+  const pendingDisable = harness.sendPopup({
+    type: "petaldesk.popup.setLoginDetection",
+    enabled: false,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const disableRequest = harness.events.at(-1);
+  assert.equal(disableRequest.event, "capturePreferenceChanged");
+  assert.equal(disableRequest.payload.enabled, false);
+  assert.match(disableRequest.payload.requestId, /^capture-pref-/);
+  let state = await harness.sendPopup({ type: "petaldesk.popup.getState" });
+  assert.equal(state.diagnostics.loginDetection.preferenceBusy, true);
+  assert.equal(state.diagnostics.loginDetection.desiredEnabled, true);
+
+  await harness.bridge.route({
+    command: "password.setCaptureEnabled",
+    payload: { available: true, desiredEnabled: false, enabled: false, insecureOrigins: [] },
+  });
+  await harness.bridge.route({
+    command: "password.capturePreferenceResult",
+    payload: {
+      enabled: false,
+      requestId: disableRequest.payload.requestId,
+      success: true,
+    },
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(await pendingDisable)), {
+    accepted: true,
+    enabled: false,
+  });
+  state = await harness.sendPopup({ type: "petaldesk.popup.getState" });
+  assert.equal(state.diagnostics.loginDetection.preferenceBusy, false);
+  assert.equal(state.diagnostics.loginDetection.desiredEnabled, false);
+
+  const pendingEnable = harness.sendPopup({
+    type: "petaldesk.popup.setLoginDetection",
+    enabled: true,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const enableRequest = harness.events.at(-1);
+  await harness.bridge.route({
+    command: "password.capturePreferenceResult",
+    payload: {
+      enabled: false,
+      error: { code: "PASSWORD_CAPTURE_SETTING_WRITE_FAILED", message: "设置保存失败" },
+      requestId: enableRequest.payload.requestId,
+      success: false,
+    },
+  });
+  const failed = await pendingEnable;
+  assert.equal(failed.ok, false);
+  assert.equal(failed.error.code, "PASSWORD_CAPTURE_SETTING_WRITE_FAILED");
+  state = await harness.sendPopup({ type: "petaldesk.popup.getState" });
+  assert.equal(state.diagnostics.loginDetection.desiredEnabled, false);
+  assert.equal(state.diagnostics.loginDetection.preferenceBusy, false);
+
+  await harness.bridge.onSecretConnected();
+  const retryEnable = harness.sendPopup({
+    type: "petaldesk.popup.setLoginDetection",
+    enabled: true,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const retryRequest = harness.events.at(-1);
+  await harness.bridge.route({
+    command: "password.setCaptureEnabled",
+    payload: { available: true, desiredEnabled: true, enabled: true, insecureOrigins: [] },
+  });
+  await harness.bridge.route({
+    command: "password.capturePreferenceResult",
+    payload: {
+      enabled: true,
+      requestId: retryRequest.payload.requestId,
+      success: true,
+    },
+  });
+  assert.equal((await retryEnable).enabled, true);
+  const status = await harness.bridge.route({ command: "password.getStatus", payload: {} });
+  assert.equal(status.captureEnabled, true);
+  assert.equal(status.desiredEnabled, true);
+});
+
+test("popup login detection preference times out and manual reconnect uses the native callback", async () => {
+  const harness = loadBridge({ longTimerDelayMs: 5 });
+  const reconnect = await harness.sendPopup({ type: "petaldesk.popup.reconnectLoginDetection" });
+  assert.equal(reconnect.accepted, true);
+  assert.equal(reconnect.state, "reconnecting");
+  assert.equal(reconnect.reconnectAttempt, 1);
+  assert.equal(harness.nativeReconnects.length, 1);
+
+  const timedOut = await harness.sendPopup({
+    type: "petaldesk.popup.setLoginDetection",
+    enabled: false,
+  });
+  assert.equal(timedOut.ok, false);
+  assert.equal(timedOut.error.code, "PASSWORD_REQUEST_EXPIRED");
+  const state = await harness.sendPopup({ type: "petaldesk.popup.getState" });
+  assert.equal(state.diagnostics.loginDetection.desiredEnabled, true);
+  assert.equal(state.diagnostics.loginDetection.preferenceBusy, false);
 });
 
 test("popup messages reject content-script and foreign senders", async () => {
@@ -1356,6 +1537,31 @@ test("popup fill validates the cached account and posts a fill request", async (
   assert.equal(opened.accepted, true);
   assert.equal(harness.events.at(-1).event, "openPasswordManager");
   assert.deepEqual(harness.events.at(-1).payload, {});
+});
+
+test("popup tool launch accepts only the four allowlisted desktop targets", async () => {
+  const harness = loadBridge();
+
+  for (const target of ["main", "passwords", "mfa", "notes"]) {
+    const opened = await harness.sendPopup({
+      type: "petaldesk.popup.openTool",
+      target,
+    });
+    assert.deepEqual(JSON.parse(JSON.stringify(opened)), { accepted: true, target });
+    assert.equal(harness.events.at(-1).event, "openTool");
+    assert.deepEqual(harness.events.at(-1).payload, { target });
+  }
+
+  const eventCount = harness.events.length;
+  for (const target of ["", "password", "MFA", "notes/recent"]) {
+    const rejected = await harness.sendPopup({
+      type: "petaldesk.popup.openTool",
+      target,
+    });
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.error.code, "PASSWORD_PROTOCOL_INVALID");
+  }
+  assert.equal(harness.events.length, eventCount);
 });
 
 test("popup copy and delete validate the cached account and wait for desktop deletion", async () => {
@@ -1795,6 +2001,455 @@ test("capture candidates remain in memory until a bound save decision and then c
   });
   const after = await harness.bridge.route({ command: "password.getStatus", payload: {} });
   assert.equal(after.pendingCandidates, 0);
+});
+
+test("a promoted save prompt follows its tab across navigation and keeps the native capture binding", async () => {
+  const harness = loadBridge();
+  await harness.bridge.route({
+    command: "password.setCaptureEnabled",
+    payload: { enabled: true },
+  });
+  const originalSender = {
+    documentId: "capture-document",
+    frameId: 0,
+    tab: { id: 109, url: "https://login.example.test/signin" },
+    url: "https://login.example.test/signin",
+  };
+  harness.tabs.set(109, originalSender.tab);
+  await harness.sendContent({
+    type: "petaldesk.password.tab-ready",
+    origin: "https://login.example.test",
+    hasPassword: true,
+    hasUsername: true,
+  }, originalSender);
+  await harness.sendContent({
+    type: "petaldesk.password.capture-submitted",
+    candidate: {
+      candidateId: "navigation-candidate",
+      origin: "https://login.example.test",
+      password: "navigation-secret",
+      username: "alice@example.test",
+    },
+  }, originalSender);
+  await harness.sendContent({
+    type: "petaldesk.password.capture-success",
+    candidateId: "navigation-candidate",
+    confidence: "high",
+    origin: "https://login.example.test",
+  }, originalSender);
+  await harness.bridge.route({
+    command: "password.captureMatch",
+    payload: { action: "new", candidateId: "navigation-candidate" },
+  });
+  assert.equal(harness.tabMessages.at(-1).options.documentId, "capture-document");
+
+  await harness.sendContent({ type: "petaldesk.password.page-closed" }, originalSender);
+  assert.equal(
+    (await harness.bridge.route({ command: "password.getStatus", payload: {} })).pendingCandidates,
+    1,
+  );
+  assert.equal(harness.events.at(-1).event, "pageClosed");
+  assert.equal(harness.events.at(-1).payload.reason, "document-unloaded");
+
+  const redirectedSender = {
+    documentId: "redirected-document",
+    frameId: 0,
+    tab: { id: 109, url: "https://app.other.test/home" },
+    url: "https://app.other.test/home",
+  };
+  harness.tabs.set(109, redirectedSender.tab);
+  const ready = await harness.sendContent({
+    type: "petaldesk.password.tab-ready",
+    origin: "https://app.other.test",
+    hasPassword: false,
+    hasUsername: false,
+  }, redirectedSender);
+  assert.equal(ready.capturePrompt.action, "new");
+  assert.equal(ready.capturePrompt.candidateId, "navigation-candidate");
+  assert.equal(ready.capturePrompt.origin, "https://login.example.test");
+  assert.equal(ready.capturePrompt.username, "alice@example.test");
+  assert.equal(JSON.stringify(ready.capturePrompt).includes("navigation-secret"), false);
+
+  const decision = await harness.sendContent({
+    type: "petaldesk.password.save-decision",
+    action: "new",
+    candidateId: "navigation-candidate",
+  }, redirectedSender);
+  assert.equal(decision.accepted, true);
+  const nativeDecision = harness.events.at(-1);
+  assert.equal(nativeDecision.event, "saveDecision");
+  assert.equal(nativeDecision.payload.documentId, "capture-document");
+  assert.equal(nativeDecision.payload.frameId, 0);
+  assert.equal(nativeDecision.payload.origin, "https://login.example.test");
+  assert.equal(nativeDecision.payload.tabId, 109);
+
+  await harness.bridge.route({
+    command: "password.saveResult",
+    payload: {
+      action: "new",
+      candidateId: "navigation-candidate",
+      entryId: "saved-entry",
+      success: true,
+    },
+  });
+  const saveResult = harness.tabMessages.at(-1);
+  assert.equal(saveResult.message.command, "captureSaveResult");
+  assert.equal(saveResult.options.documentId, "redirected-document");
+  assert.equal(saveResult.options.frameId, 0);
+  assert.equal(
+    (await harness.bridge.route({ command: "password.getStatus", payload: {} })).pendingCandidates,
+    0,
+  );
+});
+
+test("a retained prompt never replays into an unrelated child frame", async () => {
+  const harness = loadBridge();
+  await harness.bridge.route({
+    command: "password.setCaptureEnabled",
+    payload: { enabled: true },
+  });
+  const originalSender = {
+    documentId: "trusted-document",
+    frameId: 0,
+    tab: { id: 110, url: "https://login.example.test/signin" },
+    url: "https://login.example.test/signin",
+  };
+  harness.tabs.set(110, originalSender.tab);
+  await harness.sendContent({
+    type: "petaldesk.password.tab-ready",
+    origin: "https://login.example.test",
+  }, originalSender);
+  await harness.sendContent({
+    type: "petaldesk.password.capture-submitted",
+    candidate: {
+      candidateId: "frame-replay-candidate",
+      origin: "https://login.example.test",
+      password: "frame-secret",
+      username: "alice",
+    },
+  }, originalSender);
+  await harness.sendContent({
+    type: "petaldesk.password.capture-success",
+    candidateId: "frame-replay-candidate",
+    confidence: "high",
+  }, originalSender);
+  await harness.bridge.route({
+    command: "password.captureMatch",
+    payload: { action: "new", candidateId: "frame-replay-candidate" },
+  });
+  await harness.sendContent({ type: "petaldesk.password.page-closed" }, originalSender);
+
+  harness.tabs.set(110, { id: 110, url: "https://unrelated.test/home" });
+  const childSender = {
+    documentId: "unrelated-child-document",
+    frameId: 6,
+    tab: { id: 110, url: "https://unrelated.test/home" },
+    url: "https://widgets.attacker.test/frame",
+  };
+  const childReady = await harness.sendContent({
+    type: "petaldesk.password.tab-ready",
+    origin: "https://widgets.attacker.test",
+  }, childSender);
+  assert.equal(childReady.capturePrompt, null);
+
+  const topSender = {
+    documentId: "unrelated-top-document",
+    frameId: 0,
+    tab: { id: 110, url: "https://unrelated.test/home" },
+    url: "https://unrelated.test/home",
+  };
+  const topReady = await harness.sendContent({
+    type: "petaldesk.password.tab-ready",
+    origin: "https://unrelated.test",
+  }, topSender);
+  assert.equal(topReady.capturePrompt.candidateId, "frame-replay-candidate");
+  assert.equal(JSON.stringify(topReady.capturePrompt).includes("frame-secret"), false);
+  harness.tabRemovals.listeners[0](110);
+});
+
+test("a retained prompt waits for the top document instead of replaying into a same-origin child", async () => {
+  const harness = loadBridge();
+  await harness.bridge.route({ command: "password.setCaptureEnabled", payload: { enabled: true } });
+  const originalSender = {
+    documentId: "same-origin-old-document",
+    frameId: 0,
+    tab: { id: 112, url: "https://login.example.test/signin" },
+    url: "https://login.example.test/signin",
+  };
+  harness.tabs.set(112, originalSender.tab);
+  await harness.sendContent({ type: "petaldesk.password.tab-ready", origin: "https://login.example.test" }, originalSender);
+  await harness.sendContent({
+    type: "petaldesk.password.capture-submitted",
+    candidate: {
+      candidateId: "same-origin-replay-candidate",
+      origin: "https://login.example.test",
+      password: "same-origin-secret",
+      username: "alice",
+    },
+  }, originalSender);
+  await harness.sendContent({
+    type: "petaldesk.password.capture-success",
+    candidateId: "same-origin-replay-candidate",
+    confidence: "high",
+  }, originalSender);
+  await harness.bridge.route({
+    command: "password.captureMatch",
+    payload: { action: "new", candidateId: "same-origin-replay-candidate" },
+  });
+  await harness.sendContent({ type: "petaldesk.password.page-closed" }, originalSender);
+
+  harness.tabs.set(112, { id: 112, url: "https://login.example.test/redirect" });
+  const childSender = {
+    documentId: "same-origin-child-document",
+    frameId: 4,
+    tab: { id: 112, url: "https://login.example.test/redirect" },
+    url: "https://login.example.test/embedded-step",
+  };
+  const childReady = await harness.sendContent({
+    type: "petaldesk.password.tab-ready",
+    origin: "https://login.example.test",
+  }, childSender);
+  assert.equal(childReady.capturePrompt, null);
+
+  const topSender = {
+    documentId: "same-origin-new-document",
+    frameId: 0,
+    tab: { id: 112, url: "https://login.example.test/redirect" },
+    url: "https://login.example.test/redirect",
+  };
+  const topReady = await harness.sendContent({
+    type: "petaldesk.password.tab-ready",
+    origin: "https://login.example.test",
+  }, topSender);
+  assert.equal(topReady.capturePrompt.candidateId, "same-origin-replay-candidate");
+  assert.equal(JSON.stringify(topReady.capturePrompt).includes("same-origin-secret"), false);
+  harness.tabRemovals.listeners[0](112);
+});
+
+test("a retained prompt is not replayed into an HTTP navigation", async () => {
+  const harness = loadBridge();
+  await harness.bridge.route({ command: "password.setCaptureEnabled", payload: { enabled: true } });
+  const originalSender = {
+    documentId: "https-old-document",
+    frameId: 0,
+    tab: { id: 113, url: "https://secure.example.test/login" },
+    url: "https://secure.example.test/login",
+  };
+  harness.tabs.set(113, originalSender.tab);
+  await harness.sendContent({ type: "petaldesk.password.tab-ready", origin: "https://secure.example.test" }, originalSender);
+  await harness.sendContent({
+    type: "petaldesk.password.capture-submitted",
+    candidate: {
+      candidateId: "https-to-http-candidate",
+      origin: "https://secure.example.test",
+      password: "https-secret",
+      username: "alice",
+    },
+  }, originalSender);
+  await harness.sendContent({
+    type: "petaldesk.password.capture-success",
+    candidateId: "https-to-http-candidate",
+    confidence: "high",
+  }, originalSender);
+  await harness.bridge.route({
+    command: "password.captureMatch",
+    payload: { action: "new", candidateId: "https-to-http-candidate" },
+  });
+  await harness.sendContent({ type: "petaldesk.password.page-closed" }, originalSender);
+
+  harness.tabs.set(113, { id: 113, url: "http://insecure.example.test/" });
+  const httpSender = {
+    documentId: "http-document",
+    frameId: 0,
+    tab: { id: 113, url: "http://insecure.example.test/" },
+    url: "http://insecure.example.test/",
+  };
+  const httpReady = await harness.sendContent({
+    type: "petaldesk.password.tab-ready",
+    origin: "http://insecure.example.test",
+  }, httpSender);
+  assert.equal(httpReady.capturePrompt, null);
+  assert.equal((await harness.bridge.route({ command: "password.getStatus", payload: {} })).pendingCandidates, 1);
+
+  harness.tabs.set(113, { id: 113, url: "https://secure.example.test/continue" });
+  const httpsSender = {
+    documentId: "https-new-document",
+    frameId: 0,
+    tab: { id: 113, url: "https://secure.example.test/continue" },
+    url: "https://secure.example.test/continue",
+  };
+  const httpsReady = await harness.sendContent({
+    type: "petaldesk.password.tab-ready",
+    origin: "https://secure.example.test",
+  }, httpsSender);
+  assert.equal(httpsReady.capturePrompt.candidateId, "https-to-http-candidate");
+  harness.tabRemovals.listeners[0](113);
+});
+
+test("each tab keeps one pending candidate while allowing the latest submission", async () => {
+  const harness = loadBridge();
+  await harness.bridge.route({ command: "password.setCaptureEnabled", payload: { enabled: true } });
+  const sender = {
+    documentId: "single-pending-document",
+    frameId: 0,
+    tab: { id: 114, url: "https://example.test/login" },
+    url: "https://example.test/login",
+  };
+  harness.tabs.set(114, sender.tab);
+  await harness.sendContent({
+    type: "petaldesk.password.capture-submitted",
+    candidate: {
+      candidateId: "old-pending-candidate",
+      origin: "https://example.test",
+      password: "old-secret",
+      username: "alice",
+    },
+  }, sender);
+  await harness.sendContent({
+    type: "petaldesk.password.capture-submitted",
+    candidate: {
+      candidateId: "latest-pending-candidate",
+      origin: "https://example.test",
+      password: "latest-secret",
+      username: "alice",
+    },
+  }, sender);
+  assert.equal((await harness.bridge.route({ command: "password.getStatus", payload: {} })).pendingCandidates, 1);
+  await assert.rejects(
+    harness.sendContent({
+      type: "petaldesk.password.capture-success",
+      candidateId: "old-pending-candidate",
+      confidence: "high",
+    }, sender),
+    /expired/i,
+  );
+  await harness.sendContent({
+    type: "petaldesk.password.capture-success",
+    candidateId: "latest-pending-candidate",
+    confidence: "high",
+  }, sender);
+  assert.equal(harness.events.at(-1).event, "captureCandidate");
+  assert.equal(harness.events.at(-1).payload.password, "latest-secret");
+  harness.tabRemovals.listeners[0](114);
+});
+
+test("a promoted candidate remains available beyond the pre-promotion TTL", async () => {
+  const harness = loadBridge({ longTimerDelayMs: 25 });
+  await harness.bridge.route({ command: "password.setCaptureEnabled", payload: { enabled: true } });
+  const sender = {
+    documentId: "long-lived-document",
+    frameId: 0,
+    tab: { id: 115, url: "https://example.test/login" },
+    url: "https://example.test/login",
+  };
+  harness.tabs.set(115, sender.tab);
+  await harness.sendContent({
+    type: "petaldesk.password.capture-submitted",
+    candidate: {
+      candidateId: "long-lived-candidate",
+      origin: "https://example.test",
+      password: "long-lived-secret",
+      username: "alice",
+    },
+  }, sender);
+  await harness.sendContent({
+    type: "petaldesk.password.capture-success",
+    candidateId: "long-lived-candidate",
+    confidence: "high",
+  }, sender);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal((await harness.bridge.route({ command: "password.getStatus", payload: {} })).pendingCandidates, 1);
+  await harness.bridge.route({
+    command: "password.captureMatch",
+    payload: { action: "new", candidateId: "long-lived-candidate" },
+  });
+  assert.equal(harness.tabMessages.at(-1).message.command, "captureMatch");
+  harness.tabRemovals.listeners[0](115);
+});
+
+test("capture submission can promote atomically before a fast redirect", async () => {
+  const harness = loadBridge();
+  await harness.bridge.route({ command: "password.setCaptureEnabled", payload: { enabled: true } });
+  const sender = {
+    documentId: "atomic-document",
+    frameId: 0,
+    // The authenticated sender snapshot is the page that submitted the form;
+    // the live tab has already moved on by the time the test handles it.
+    tab: { id: 116, url: "https://login.example.test/signin" },
+    url: "https://login.example.test/signin",
+  };
+  harness.tabs.set(116, { id: 116, url: "https://app.example.test/home" });
+  const accepted = await harness.sendContent({
+    type: "petaldesk.password.capture-submitted",
+    candidate: {
+      candidateId: "atomic-candidate",
+      confidence: "high",
+      origin: "https://login.example.test",
+      password: "atomic-secret",
+      promote: true,
+      username: "alice",
+    },
+  }, sender);
+  assert.equal(accepted.accepted, true);
+  assert.equal(accepted.promoted, true);
+  assert.equal(harness.events.at(-1).event, "captureCandidate");
+  assert.equal(harness.events.at(-1).payload.password, "atomic-secret");
+  await harness.sendContent({ type: "petaldesk.password.page-closed" }, sender);
+  assert.equal((await harness.bridge.route({ command: "password.getStatus", payload: {} })).pendingCandidates, 1);
+  harness.tabRemovals.listeners[0](116);
+});
+
+test("a promoted iframe candidate moves to the existing top document when the frame closes", async () => {
+  const harness = loadBridge();
+  await harness.bridge.route({
+    command: "password.setCaptureEnabled",
+    payload: { enabled: true },
+  });
+  harness.tabs.set(111, { id: 111, url: "https://mail.163.com/" });
+  const topSender = {
+    documentId: "mail-top-document",
+    frameId: 0,
+    tab: { id: 111, url: "https://mail.163.com/" },
+    url: "https://mail.163.com/",
+  };
+  await harness.sendContent({
+    type: "petaldesk.password.tab-ready",
+    origin: "https://mail.163.com",
+  }, topSender);
+  const frameSender = {
+    documentId: "mail-login-frame-document",
+    frameId: 7,
+    tab: { id: 111, url: "https://mail.163.com/" },
+    url: "https://dl.reg.163.com/login",
+  };
+  await harness.sendContent({
+    type: "petaldesk.password.capture-submitted",
+    candidate: {
+      candidateId: "iframe-persistent-candidate",
+      frameOrigin: "https://dl.reg.163.com",
+      origin: "https://mail.163.com",
+      password: "iframe-persistent-secret",
+      username: "alice",
+    },
+  }, frameSender);
+  await harness.sendContent({
+    type: "petaldesk.password.capture-success",
+    candidateId: "iframe-persistent-candidate",
+    confidence: "high",
+  }, frameSender);
+  await harness.sendContent({ type: "petaldesk.password.page-closed" }, frameSender);
+  assert.equal(
+    (await harness.bridge.route({ command: "password.getStatus", payload: {} })).pendingCandidates,
+    1,
+  );
+  await harness.bridge.route({
+    command: "password.captureMatch",
+    payload: { action: "new", candidateId: "iframe-persistent-candidate" },
+  });
+  const replay = harness.tabMessages.at(-1);
+  assert.equal(replay.message.command, "captureMatch");
+  assert.equal(replay.options.frameId, 0);
+  assert.equal(replay.options.documentId, "mail-top-document");
 });
 
 test("a new match with accounts allows replacing one of the offered accounts", async () => {

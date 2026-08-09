@@ -2,7 +2,7 @@
 
 ## Dependency
 
-The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.8.1/PetalDesk_0.8.1_x64-setup.exe.
+The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.8.2/PetalDesk_0.8.2_x64-setup.exe.
 
 The extension ID is fixed as `petaldesk-capture@petaldesk.app`, and the Native Messaging host name is `com.petaldesk.capture`.
 
@@ -42,7 +42,7 @@ The project has no runtime npm dependencies, bundler, minifier, generated JavaSc
 ## Toolbar popup and badge test
 
 1. With accounts saved for a site, open that site: the toolbar badge shows the saved-account count for the exact origin and refreshes on tab switch, navigation, and vault changes. Lock the vault manually in PetalDesk: the badge clears.
-2. Click the toolbar button: the popup shows layered diagnostics, the current site's fixed account cards, and an **Open PetalDesk password manager** button. Each card has fixed icon actions to copy username, password, and linked MFA; there is no three-dot menu or delete icon taking card height.
+2. Click the toolbar button: the popup shows layered diagnostics, the current site's fixed account cards, and four local launch buttons for the PetalDesk main window, password manager, MFA authenticator, and a new standalone note. Each card has fixed icon actions to copy username, password, and linked MFA; there is no three-dot menu or delete icon taking card height.
 3. Choose the body of an account card: the current page is filled directly and silently, and the form is not submitted. Icon clicks do not trigger a fill.
 4. Right-click a card and choose **Delete account**. Cancel the confirmation: no request is sent. Open the context menu again and confirm **Delete**: the popup waits for the desktop result, then refreshes the badge and list. `Shift+F10`, Escape, and outside-click behavior can be checked with the keyboard as well.
 
@@ -56,7 +56,7 @@ Use a reviewer-controlled HTTPS login page with an ordinary username/password st
 4. In the toolbar popup, click the linked MFA icon. PetalDesk writes the code directly to the system clipboard; the popup shows only a success message, and the clipboard value is cleared when that TOTP expires. An unlinked account keeps the same disabled icon position.
 5. Lock the MFA vault manually and repeat either path. TOTP filling/copying is refused without affecting ordinary username/password filling.
 
-## PetalDesk 0.8.1 desktop companion checks
+## PetalDesk 0.8.2 desktop companion checks
 
 1. Close the MFA tool normally, then copy a linked MFA code from the extension or password manager. The code is copied without a recovery-password prompt. Use the dedicated **Lock vault** action and repeat: the copy is rejected until the user unlocks it.
 2. Import a QR code, image, or `otpauth://` URI. In the confirmation view, edit the account name, issuer, account identifier, and icon. Algorithm, digits, and period remain read-only, and the secret is never displayed.
@@ -65,9 +65,10 @@ Use a reviewer-controlled HTTPS login page with an ordinary username/password st
 ## Login-detection test
 
 1. The `authenticationInfo` data permission is granted once at installation together with `websiteActivity`; there is no runtime or toolbar consent prompt. Confirm password features work immediately after installation.
-2. Submit a test form. Login detection is always active while the connected vault is available, so submission immediately prompts to save as a new account or update an existing one (with a choice of which account); an unchanged account creates no prompt after PetalDesk's match decision.
-3. Close the password-manager window normally and submit another dummy login. Detection remains active and the save/update prompt still appears.
-4. Lock the vault manually in PetalDesk and submit again: detection is suspended until the vault becomes available again instead of offering a save.
+2. Login detection starts enabled and has an independent switch in the toolbar popup. Submit a test form: it immediately prompts to save as a new account or update an existing one (with a choice of which account); an unchanged account creates no prompt after PetalDesk's match decision. Navigate or refresh the same tab before choosing: the prompt is restored and remains pending until an explicit choice. Turning detection off stops save/update prompts but does not disable account fill.
+3. To test recovery, stop the local Native Messaging/desktop channel. The switch remains visually on while the extension performs three fast reconnect attempts; the manual **Reconnect** button appears only after all three fail. Low-rate background recovery continues, and pressing **Reconnect** immediately restarts the fast cycle.
+4. Close the password-manager window normally and submit another dummy login. Detection remains active and the save/update prompt still appears.
+5. Lock the vault manually in PetalDesk and submit again: detection is suspended until the vault becomes available again instead of offering a save.
 
 ## Local no-real-account fixture
 
