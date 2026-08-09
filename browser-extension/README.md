@@ -153,9 +153,9 @@ confirmed success.
 The two-phase fill protocol is mandatory: `password.offerFill` contains no
 password; after the page produces `fillConfirm`, the host sends one
 `password.provideCredentials` command. Fill offers carry `direct: true`, so
-the content script confirms immediately without a page overlay and shows a
-short auto-dismissing notice once the fields are filled; the overlay is still
-used for template recording. `password.offerFillDirect` skips
+the content script confirms immediately and fills without showing a success
+overlay; overlays remain reserved for errors, required confirmations, and
+template recording. `password.offerFillDirect` skips
 `password.open` by binding an existing tab and exact origin into a
 ready session, then follows the same offer and confirmation steps. The
 request is bound to one session, tab, document, and exact origin. Fill offers
@@ -168,7 +168,7 @@ declared login frame (currently `dl.reg.163.com` inside `mail.163.com`) and
 contains login fields, and the sender metadata on `fillConfirm` binds that frame as
 the sole `fillSecret` target. Login capture follows the same rule: the
 background derives the live top-level origin from the sender's tab and keeps
-the submitting frame's own `frameOrigin`. This supports Firefox 140-147,
+the submitting frame's own `frameOrigin`. This supports Firefox 142-147,
 where `Location.ancestorOrigins` is unavailable, while cross-site frames are
 discarded.
 Content scripts fill fields

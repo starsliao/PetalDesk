@@ -2,7 +2,7 @@
 
 ## Dependency
 
-The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.8.0/PetalDesk_0.8.0_x64-setup.exe.
+The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.8.1/PetalDesk_0.8.1_x64-setup.exe.
 
 The extension ID is fixed as `petaldesk-capture@petaldesk.app`, and the Native Messaging host name is `com.petaldesk.capture`.
 
@@ -26,7 +26,7 @@ The project has no runtime npm dependencies, bundler, minifier, generated JavaSc
 
 ## Temporary-load test
 
-1. Run `npm run build`.
+1. Use Firefox Desktop 142 or later and run `npm run build`.
 2. Open `about:debugging#/runtime/this-firefox`.
 3. Choose **Load Temporary Add-on** and select `dist/firefox/manifest.json`.
 4. Install/start PetalDesk so its Firefox Native Messaging host is registered.
@@ -37,14 +37,14 @@ The project has no runtime npm dependencies, bundler, minifier, generated JavaSc
 1. In PetalDesk, create a test entry for an HTTPS login page or use the loopback fixture below with the HTTP warning explicitly accepted.
 2. Choose **Open and fill**. The extension creates a new Firefox tab bound to the request.
 3. The user action in PetalDesk starts a password-free offer. The bound content frame is validated, then the one-time credential is sent without a second page confirmation.
-4. Confirm the username/password fields change, a short fill notice appears, and the form is not submitted.
+4. Confirm the username/password fields change silently: no success overlay appears and the form is not submitted.
 
 ## Toolbar popup and badge test
 
 1. With accounts saved for a site, open that site: the toolbar badge shows the saved-account count for the exact origin and refreshes on tab switch, navigation, and vault changes. Lock the vault manually in PetalDesk: the badge clears.
-2. Click the toolbar button: the popup shows layered diagnostics, the current site's fixed account cards, and an **Open PetalDesk password manager** button. Each card has icon actions to copy username, password, and linked MFA, plus a separate top-right delete icon; there is no three-dot or expanded text menu.
-3. Choose the body of an account card: the current page is filled directly, a short result notice appears, and the form is not submitted. Icon clicks do not trigger a fill.
-4. Click delete once and cancel the anchored confirmation: no request is sent. Open it again and confirm **Delete**: the popup waits for the desktop result, then refreshes the badge and list.
+2. Click the toolbar button: the popup shows layered diagnostics, the current site's fixed account cards, and an **Open PetalDesk password manager** button. Each card has fixed icon actions to copy username, password, and linked MFA; there is no three-dot menu or delete icon taking card height.
+3. Choose the body of an account card: the current page is filled directly and silently, and the form is not submitted. Icon clicks do not trigger a fill.
+4. Right-click a card and choose **Delete account**. Cancel the confirmation: no request is sent. Open the context menu again and confirm **Delete**: the popup waits for the desktop result, then refreshes the badge and list. `Shift+F10`, Escape, and outside-click behavior can be checked with the keyboard as well.
 
 ## Linked TOTP test
 
@@ -56,11 +56,18 @@ Use a reviewer-controlled HTTPS login page with an ordinary username/password st
 4. In the toolbar popup, click the linked MFA icon. PetalDesk writes the code directly to the system clipboard; the popup shows only a success message, and the clipboard value is cleared when that TOTP expires. An unlinked account keeps the same disabled icon position.
 5. Lock the MFA vault manually and repeat either path. TOTP filling/copying is refused without affecting ordinary username/password filling.
 
+## PetalDesk 0.8.1 desktop companion checks
+
+1. Close the MFA tool normally, then copy a linked MFA code from the extension or password manager. The code is copied without a recovery-password prompt. Use the dedicated **Lock vault** action and repeat: the copy is rejected until the user unlocks it.
+2. Import a QR code, image, or `otpauth://` URI. In the confirmation view, edit the account name, issuer, account identifier, and icon. Algorithm, digits, and period remain read-only, and the secret is never displayed.
+3. In the desktop password manager, hold the adjacent eye control to reveal a password and release it to hide. The username, password, and MFA copy controls use the same three icons as the extension; MFA is disabled when the password entry is not linked.
+
 ## Login-detection test
 
 1. The `authenticationInfo` data permission is granted once at installation together with `websiteActivity`; there is no runtime or toolbar consent prompt. Confirm password features work immediately after installation.
 2. Submit a test form. Login detection is always active while the connected vault is available, so submission immediately prompts to save as a new account or update an existing one (with a choice of which account); an unchanged account creates no prompt after PetalDesk's match decision.
-3. Lock the vault manually in PetalDesk and submit again: the prompt reports the locked state instead of offering a save.
+3. Close the password-manager window normally and submit another dummy login. Detection remains active and the save/update prompt still appears.
+4. Lock the vault manually in PetalDesk and submit again: detection is suspended until the vault becomes available again instead of offering a save.
 
 ## Local no-real-account fixture
 

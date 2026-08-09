@@ -43,7 +43,7 @@ function loadBridge({ longTimerDelayMs = null } = {}) {
   }
   const api = {
     browserFamily: "firefox",
-    extensionVersion: "0.8.0",
+    extensionVersion: "0.8.1",
     action: {
       async setBadgeText(value) {
         actionUpdates.badgeTexts.push(JSON.parse(JSON.stringify(value)));
@@ -1274,7 +1274,7 @@ test("popup state reports diagnostics recorded at the command boundary", async (
   await harness.bridge.route({ command: "password.getStatus", payload: {} });
   let state = await harness.sendPopup({ type: "petaldesk.popup.getState" });
   assert.equal(state.diagnostics.nativeConnected, true);
-  assert.equal(state.diagnostics.extensionVersion, "0.8.0");
+  assert.equal(state.diagnostics.extensionVersion, "0.8.1");
   assert.equal(state.diagnostics.lastCommandOk, true);
   assert.equal(state.diagnostics.lastCommandErrorCode, null);
   assert.equal(typeof state.diagnostics.lastCommandAt, "number");

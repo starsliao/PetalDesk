@@ -74,6 +74,7 @@ const MAX_TEMPLATE_SELECTOR_BYTES: usize = 512;
 const MAX_TEMPLATE_SELECTORS: usize = 16;
 const MAX_MFA_ENTRY_ID_BYTES: usize = 128;
 const MAX_MFA_ALLOWED_ORIGINS: usize = 8;
+const MFA_COPY_MIN_VALIDITY_SECONDS: u64 = 5;
 const MAX_CAPTURE_ACCOUNT_CHOICES: usize = 16;
 const BACKUP_LIMIT: usize = 5;
 const CONFLICT_LIMIT: usize = 10;
@@ -965,6 +966,30 @@ impl PasswordStore {
             user_template: entry.user_template.clone(),
             allow_insecure_http: entry.allow_insecure_http,
         })
+    }
+
+    /// Re-reads and validates only the MFA relationship for a trusted
+    /// password-window action. No username, password, MFA code or secret is
+    /// returned to the webview.
+    pub(crate) fn mfa_link_at(&self, entry_id: &str, epoch: u64) -> AppResult<PasswordMfaLink> {
+        validate_entry_id(entry_id)?;
+        let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
+        self.validate_epoch(epoch)?;
+        let mut runtime = lock_unpoisoned(&self.runtime);
+        self.ensure_unlocked(&mut runtime)?;
+        let entry = runtime
+            .vault
+            .as_ref()
+            .and_then(|vault| {
+                vault
+                    .payload
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == entry_id)
+            })
+            .ok_or_else(|| AppError::not_found("没有找到这个站点账户。"))?;
+        validate_mfa_link(entry.mfa_link.as_ref(), &entry.origin)?
+            .ok_or_else(|| AppError::new("password_mfa_not_linked", "这个密码账户尚未关联 MFA。"))
     }
 
     pub(crate) fn add_mfa_allowed_origin_at(
@@ -3434,6 +3459,51 @@ pub async fn copy_password_secret(
     .map_err(|_| AppError::new("password_copy_error", "复制密码任务异常结束。"))?
 }
 
+fn copy_linked_mfa_code_at(
+    password_store: &PasswordStore,
+    mfa_store: &crate::mfa::MfaStore,
+    entry_id: &str,
+    epoch: u64,
+) -> AppResult<()> {
+    let link = password_store.mfa_link_at(entry_id, epoch)?;
+    let code = mfa_store.browser_code_at(&link.entry_id, MFA_COPY_MIN_VALIDITY_SECONDS)?;
+
+    // Code generation can wait for the next TOTP period. Re-read the
+    // password entry afterwards so an unlink/relink or window close can
+    // never publish a code authorized by stale UI state.
+    let current_link = password_store.mfa_link_at(entry_id, epoch)?;
+    if current_link != link {
+        return Err(AppError::new(
+            "password_mfa_changed",
+            "关联的 MFA 账户已变化，请重试。",
+        ));
+    }
+    if !mfa_store.browser_code_is_current(&link.entry_id, &code)? {
+        return Err(AppError::new(
+            "mfa_code_expired",
+            "MFA 验证码已变化，请重试。",
+        ));
+    }
+    mfa_store.write_browser_code_to_clipboard(&code)
+}
+
+#[tauri::command]
+pub async fn copy_password_mfa_code(
+    app: AppHandle,
+    window: WebviewWindow,
+    entry_id: String,
+) -> AppResult<()> {
+    ensure_password_window(&window)?;
+    let epoch = app.state::<PasswordStore>().require_active_epoch()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let password_store = app.state::<PasswordStore>();
+        let mfa_store = app.state::<crate::mfa::MfaStore>();
+        copy_linked_mfa_code_at(&password_store, &mfa_store, &entry_id, epoch)
+    })
+    .await
+    .map_err(|_| AppError::new("password_copy_error", "复制 MFA 验证码任务异常结束。"))?
+}
+
 #[tauri::command]
 pub async fn evaluate_password_capture(
     app: AppHandle,
@@ -3785,6 +3855,76 @@ mod tests {
             })
             .unwrap();
         assert!(unlinked.mfa_link.is_none());
+    }
+
+    #[test]
+    fn password_window_mfa_copy_rejects_unlinked_and_missing_relationships_before_publish() {
+        let (root, store) = test_store();
+        let mfa_store = crate::mfa::MfaStore::load(root.path()).unwrap();
+        mfa_store.activate();
+        crate::recovery::configure_shared_recovery_password(
+            &mfa_store,
+            &store,
+            RECOVERY_PASSWORD,
+            None,
+        )
+        .unwrap();
+        let mut preview = mfa_store
+            .preview_manual(
+                serde_json::from_value(serde_json::json!({
+                    "name": "Existing MFA",
+                    "issuer": "Example",
+                    "accountName": "alice@example.com",
+                    "secret": "JBSWY3DPEHPK3PXP",
+                    "iconEmoji": "🔐",
+                    "algorithm": "sha1",
+                    "digits": 6,
+                    "period": 30
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let preview = preview.remove(0);
+        mfa_store
+            .commit_import(
+                &preview.session_id,
+                preview.icon_emoji.as_deref().unwrap_or("🔐"),
+            )
+            .unwrap();
+
+        let unlinked = store
+            .create_entry(input(
+                "Unlinked",
+                "https://unlinked.example/login",
+                "alice",
+                "unlinked-secret",
+            ))
+            .unwrap();
+        let epoch = store.require_active_epoch().unwrap();
+        assert_eq!(
+            copy_linked_mfa_code_at(&store, &mfa_store, &unlinked.id, epoch)
+                .unwrap_err()
+                .code,
+            "password_mfa_not_linked"
+        );
+
+        let mut missing_input = input(
+            "Missing MFA",
+            "https://missing.example/login",
+            "bob",
+            "missing-secret",
+        );
+        missing_input.mfa_link = Some(PasswordMfaLink {
+            entry_id: "missing-mfa-entry".to_string(),
+            allowed_origins: Vec::new(),
+        });
+        let missing = store.create_entry(missing_input).unwrap();
+        assert_eq!(
+            copy_linked_mfa_code_at(&store, &mfa_store, &missing.id, epoch)
+                .unwrap_err()
+                .code,
+            "not_found"
+        );
     }
 
     #[test]

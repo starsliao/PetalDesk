@@ -366,9 +366,9 @@ test("direct fill offers confirm themselves and fill without a confirmation over
   assert.equal(harness.inputs.username.value, "alice@example.com");
   assert.equal(harness.inputs.password.value, "secret-password");
   assert.equal(credentials.password, "");
-  // A lightweight notice replaces the confirmation overlay after filling.
-  assert.equal(harness.overlayTitle(), "飞花密码管理器");
-  assert.match(harness.overlayMessage(), /已填充 alice@example\.com，未自动提交/);
+  // Filling is silent; the page remains untouched apart from the credentials.
+  assert.equal(harness.overlayTitle(), "");
+  assert.equal(harness.overlayMessage(), "");
   assert.deepEqual(harness.overlayButtons(), []);
   assert.equal(harness.submitted(), false);
 });

@@ -8,6 +8,7 @@ import {
   type MfaEntrySummary,
   type MfaTrashEntrySummary,
   type MfaEntryUpdateRequest,
+  type MfaImportCommit,
   type MfaImportPreview,
   type MfaManualImportRequest,
 } from "../mfa";
@@ -97,7 +98,13 @@ describe("mfaApi recovery commands", () => {
       .mockResolvedValueOnce({ previews: [preview()], errors: [{ line: 2, message: "链接无效" }] })
       .mockResolvedValueOnce([entry({ id: "imported" })]);
     const uris = "otpauth://totp/One?secret=A\notpauth://totp/Two?secret=B";
-    const imports = [{ sessionId: "preview-session", iconEmoji: "🐙" }];
+    const imports: MfaImportCommit[] = [{
+      sessionId: "preview-session",
+      name: "GitHub Work",
+      issuer: "GitHub",
+      accountName: "person@example.com",
+      iconEmoji: "🐙",
+    }];
 
     const result = await mfaApi.previewUris(uris);
     await mfaApi.commitImports(imports);
@@ -105,6 +112,22 @@ describe("mfaApi recovery commands", () => {
     expect(result.errors).toEqual([{ line: 2, message: "链接无效" }]);
     expect(backendInvoke).toHaveBeenNthCalledWith(1, "preview_mfa_uris", { uris });
     expect(backendInvoke).toHaveBeenNthCalledWith(2, "commit_mfa_imports", { imports });
+  });
+
+  it("sends editable display fields as one single-import request", async () => {
+    (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
+    backendInvoke.mockResolvedValue(entry({ name: "GitHub Work" }));
+    const request: MfaImportCommit = {
+      sessionId: "preview-session",
+      name: "GitHub Work",
+      issuer: "GitHub Enterprise",
+      accountName: "work@example.com",
+      iconEmoji: "🛡️",
+    };
+
+    await mfaApi.commitImport(request);
+
+    expect(backendInvoke).toHaveBeenCalledWith("commit_mfa_import", { request });
   });
 
   it("keeps browser-demo pin and reorder operations in memory", async () => {
@@ -127,9 +150,17 @@ describe("mfaApi recovery commands", () => {
     expect(batch.errors).toEqual([{ line: 2, message: "请输入有效的 otpauth://totp 单账户链接。" }]);
     const imported = await api.commitImports([{
       sessionId: batch.previews[0].sessionId,
+      name: "Edited demo",
+      issuer: "Demo issuer",
+      accountName: "edited@example.com",
       iconEmoji: batch.previews[0].iconEmoji || "🔐",
     }]);
     expect(imported).toHaveLength(1);
+    expect(imported[0]).toMatchObject({
+      name: "Edited demo",
+      issuer: "Demo issuer",
+      accountName: "edited@example.com",
+    });
     expect((await api.list()).some((item) => item.id === imported[0].id)).toBe(true);
   });
 });
@@ -196,16 +227,23 @@ function mockApi(initial: MfaEntrySummary[] = [entry()]): MfaApi & Record<string
     previewUri: vi.fn().mockResolvedValue([preview()]),
     previewUris: vi.fn().mockResolvedValue({ previews: [preview()], errors: [] }),
     previewManual: vi.fn().mockResolvedValue([preview()]),
-    commitImport: vi.fn().mockImplementation(async (_sessionId: string, iconEmoji: string) => {
-      const saved = entry({ id: "new-entry", accountName: "person@example.com", iconEmoji });
+    commitImport: vi.fn().mockImplementation(async (request: MfaImportCommit) => {
+      const saved = entry({
+        id: "new-entry",
+        name: request.name,
+        issuer: request.issuer,
+        accountName: request.accountName,
+        iconEmoji: request.iconEmoji,
+      });
       items = [...items, saved];
       return saved;
     }),
-    commitImports: vi.fn().mockImplementation(async (imports: Array<{ sessionId: string; iconEmoji: string }>) => {
+    commitImports: vi.fn().mockImplementation(async (imports: MfaImportCommit[]) => {
       const saved = imports.map((item, index) => entry({
         id: `new-entry-${index + 1}`,
-        name: item.sessionId,
-        accountName: `${item.sessionId}@example.com`,
+        name: item.name,
+        issuer: item.issuer,
+        accountName: item.accountName,
         iconEmoji: item.iconEmoji,
       }));
       items = [...items, ...saved];
@@ -378,6 +416,50 @@ describe("MfaTool", () => {
 
     await waitFor(() => expect(api.unlockWithRecoveryPassword).toHaveBeenCalledWith("correct horse battery"));
     await waitFor(() => expect(rendered.queryByRole("dialog", { name: "使用恢复密码迁移" })).not.toBeInTheDocument());
+  });
+
+  it("does not turn a normal close, unload, or component cleanup into an explicit vault lock", async () => {
+    const api = mockApi();
+    const rendered = render(MfaTool, { api });
+    await rendered.findByText("GitHub", { selector: ".account-heading strong" });
+
+    window.dispatchEvent(new Event("beforeunload"));
+    await fireEvent.click(rendered.getByRole("button", { name: "关闭 MFA 验证器" }));
+    rendered.unmount();
+
+    expect(api.lock).not.toHaveBeenCalled();
+  });
+
+  it("uses the dedicated lock action and describes a manual unlock without migration wording", async () => {
+    const api = mockApi();
+    (api.getStatus as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        available: true,
+        locked: false,
+        entryCount: 1,
+        protection: "windows-dpapi-recovery-password",
+        recoveryState: "ready",
+        captureExcluded: true,
+      })
+      .mockResolvedValue({
+        available: true,
+        locked: true,
+        entryCount: 1,
+        protection: "windows-dpapi-recovery-password",
+        recoveryState: "password-required",
+        captureExcluded: true,
+        message: "MFA 保险库已锁定，请输入恢复密码解锁。",
+      });
+    const rendered = render(MfaTool, { api });
+    await rendered.findByText("GitHub", { selector: ".account-heading strong" });
+
+    await fireEvent.click(rendered.getByRole("button", { name: "锁定保险库" }));
+
+    await waitFor(() => expect(api.lock).toHaveBeenCalledTimes(1));
+    const dialog = await rendered.findByRole("dialog", { name: "解锁 MFA 保险库" });
+    expect(within(dialog).getByText("保险库已由你主动锁定")).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "解锁" })).toBeInTheDocument();
+    expect(dialog).not.toHaveTextContent("迁移");
   });
 
   it("changes the recovery password from the titlebar key action", async () => {
@@ -603,9 +685,20 @@ describe("MfaTool", () => {
     expect(rendered.container.textContent).not.toContain("secret=TEST");
     expect(rendered.getByText("链接中的 issuer 与标签不一致，请确认。")).toBeInTheDocument();
     expect(rendered.getByText("选择图标")).toBeInTheDocument();
+    expect(rendered.getByLabelText("二维码验证码参数")).toHaveTextContent("SHA1");
+    await fireEvent.input(rendered.getByLabelText("识别结果账户名称"), { target: { value: "GitHub 工作" } });
+    await fireEvent.input(rendered.getByLabelText("识别结果发行方"), { target: { value: "GitHub Enterprise" } });
+    await fireEvent.input(rendered.getByLabelText("识别结果账户名或邮箱"), { target: { value: "work@example.com" } });
+    await fireEvent.click(rendered.getByRole("button", { name: "识别结果使用 🛡️ 图标" }));
     await fireEvent.click(rendered.getByRole("button", { name: "添加并复制验证码" }));
 
-    await waitFor(() => expect(api.commitImport).toHaveBeenCalledWith(uriPreview.sessionId, "🐙"));
+    await waitFor(() => expect(api.commitImport).toHaveBeenCalledWith({
+      sessionId: uriPreview.sessionId,
+      name: "GitHub 工作",
+      issuer: "GitHub Enterprise",
+      accountName: "work@example.com",
+      iconEmoji: "🛡️",
+    }));
     expect(api.copy).toHaveBeenCalledWith("new-entry");
     expect(rendered.queryByRole("dialog", { name: "添加验证器账户" })).not.toBeInTheDocument();
   });
@@ -637,17 +730,58 @@ describe("MfaTool", () => {
     expect(within(previewList).getByText("Cloud")).toBeInTheDocument();
     expect(rendered.getByLabelText("链接识别错误")).toHaveTextContent("第 2 行");
     expect(rendered.getByLabelText("链接识别错误")).toHaveTextContent("仅支持 otpauth://totp 链接。");
-    expect(rendered.queryByText("选择图标")).not.toBeInTheDocument();
+    await fireEvent.input(rendered.getByLabelText("识别结果账户名称"), { target: { value: "GitHub 工作" } });
+    await fireEvent.input(rendered.getByLabelText("识别结果发行方"), { target: { value: "GitHub 企业版" } });
+    await fireEvent.input(rendered.getByLabelText("识别结果账户名或邮箱"), { target: { value: "github-work@example.com" } });
+    await fireEvent.click(rendered.getByRole("button", { name: "识别结果使用 🛡️ 图标" }));
+    await fireEvent.click(rendered.getByLabelText("编辑 Cloud 的识别信息"));
+    await fireEvent.input(rendered.getByLabelText("识别结果账户名称"), { target: { value: "Cloud 工作" } });
+    await fireEvent.input(rendered.getByLabelText("识别结果账户名或邮箱"), { target: { value: "cloud-work@example.com" } });
+    await fireEvent.click(rendered.getByRole("button", { name: "识别结果使用 ⭐ 图标" }));
 
     await fireEvent.click(rendered.getByRole("button", { name: "添加 2 个账户并复制首个验证码" }));
     await waitFor(() => expect(api.commitImports).toHaveBeenCalledWith([
-      { sessionId: "github-session", iconEmoji: "🐙" },
-      { sessionId: "cloud-session", iconEmoji: "☁️" },
+      {
+        sessionId: "github-session",
+        name: "GitHub 工作",
+        issuer: "GitHub 企业版",
+        accountName: "github-work@example.com",
+        iconEmoji: "🛡️",
+      },
+      {
+        sessionId: "cloud-session",
+        name: "Cloud 工作",
+        issuer: "Cloud",
+        accountName: "cloud-work@example.com",
+        iconEmoji: "⭐",
+      },
     ]));
     expect(api.commitImport).not.toHaveBeenCalled();
     expect(api.copy).toHaveBeenCalledOnce();
     expect(api.copy).toHaveBeenCalledWith("github-entry");
     expect(rendered.queryByRole("dialog", { name: "添加验证器账户" })).not.toBeInTheDocument();
+  });
+
+  it("requires a non-blank account name before committing an edited preview", async () => {
+    const api = mockApi([]);
+    const rendered = render(MfaTool, { api });
+    await rendered.findByText("还没有验证码");
+    await fireEvent.click(rendered.getByRole("button", { name: "新增 MFA 账户" }));
+    await fireEvent.click(rendered.getByRole("tab", { name: "粘贴链接" }));
+    await fireEvent.input(rendered.getByLabelText("验证器链接（一行一个）"), {
+      target: { value: "otpauth://totp/GitHub?secret=TEST" },
+    });
+    await fireEvent.click(rendered.getByRole("button", { name: "识别链接" }));
+    await rendered.findByText("确认识别结果");
+
+    await fireEvent.input(rendered.getByLabelText("识别结果账户名称"), { target: { value: "   " } });
+
+    expect(rendered.getByRole("alert")).toHaveTextContent("账户名称不能为空");
+    expect(rendered.getByRole("button", { name: "添加并复制验证码" })).toBeDisabled();
+    expect(api.commitImport).not.toHaveBeenCalled();
+
+    await fireEvent.input(rendered.getByLabelText("识别结果账户名称"), { target: { value: "GitHub" } });
+    expect(rendered.getByRole("button", { name: "添加并复制验证码" })).toBeEnabled();
   });
 
   it("keeps the complete batch preview available for retry after an atomic commit failure", async () => {
@@ -672,14 +806,40 @@ describe("MfaTool", () => {
     });
     await fireEvent.click(rendered.getByRole("button", { name: "识别链接" }));
     const submit = await rendered.findByRole("button", { name: "添加 2 个账户并复制首个验证码" });
+    await fireEvent.input(rendered.getByLabelText("识别结果账户名称"), { target: { value: "One Edited" } });
+    await fireEvent.input(rendered.getByLabelText("识别结果发行方"), { target: { value: "Issuer One" } });
+    await fireEvent.click(rendered.getByLabelText("编辑 Two 的识别信息"));
+    await fireEvent.input(rendered.getByLabelText("识别结果账户名称"), { target: { value: "Two Edited" } });
+    await fireEvent.input(rendered.getByLabelText("识别结果账户名或邮箱"), { target: { value: "two-edited@example.com" } });
+    await fireEvent.click(rendered.getByRole("button", { name: "识别结果使用 ⭐ 图标" }));
 
     await fireEvent.click(submit);
     expect(await rendered.findByRole("alert")).toHaveTextContent("数据文件暂时被占用。");
-    expect(rendered.getByRole("list", { name: "将导入的账户" })).toHaveTextContent("One");
-    expect(rendered.getByRole("list", { name: "将导入的账户" })).toHaveTextContent("Two");
+    expect(rendered.getByRole("list", { name: "将导入的账户" })).toHaveTextContent("One Edited");
+    expect(rendered.getByRole("list", { name: "将导入的账户" })).toHaveTextContent("Two Edited");
+    expect(rendered.getByLabelText("识别结果账户名称")).toHaveValue("Two Edited");
+    expect(rendered.getByLabelText("识别结果账户名或邮箱")).toHaveValue("two-edited@example.com");
 
     await fireEvent.click(rendered.getByRole("button", { name: "添加 2 个账户并复制首个验证码" }));
     await waitFor(() => expect(api.commitImports).toHaveBeenCalledTimes(2));
+    const expectedImports = [
+      {
+        sessionId: "one-session",
+        name: "One Edited",
+        issuer: "Issuer One",
+        accountName: "person@example.com",
+        iconEmoji: "🔐",
+      },
+      {
+        sessionId: "two-session",
+        name: "Two Edited",
+        issuer: "GitHub",
+        accountName: "two-edited@example.com",
+        iconEmoji: "⭐",
+      },
+    ];
+    expect(api.commitImports).toHaveBeenNthCalledWith(1, expectedImports);
+    expect(api.commitImports).toHaveBeenNthCalledWith(2, expectedImports);
     expect(api.copy).toHaveBeenCalledOnce();
     expect(api.copy).toHaveBeenCalledWith("one-entry");
   });

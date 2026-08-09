@@ -3,14 +3,13 @@
   import {
     AlertTriangle,
     Check,
-    Clipboard,
-    Copy,
     Eye,
     EyeOff,
     ExternalLink,
     KeyRound,
     Lock,
     LockKeyhole,
+    Pencil,
     Plus,
     RefreshCw,
     ScanSearch,
@@ -19,6 +18,7 @@
     Sparkles,
     Trash2,
     Unlock,
+    UserRound,
     X,
   } from "@lucide/svelte";
   import ConfirmDialog from "./ConfirmDialog.svelte";
@@ -69,26 +69,26 @@
   let deleting = $state(false);
   let revealed = $state<Record<string, PasswordRevealResult>>({});
   let revealBusy = $state<Record<string, true>>({});
-  let copyBusy = $state<Record<string, "username" | "password"> | null>(null);
+  let revealHeld = $state<Record<string, true>>({});
+  let revealRequestVersions = new Map<string, number>();
+  let copyBusy = $state<Record<string, "username" | "password" | "mfa"> | null>(null);
   let fillBusy = $state<Record<string, true>>({});
   let templateBusy = $state<Record<string, true>>({});
   let templateRecording = $state<PasswordTemplateRecordingTicket | null>(null);
   let templateCancelBusy = $state(false);
   let lockBusy = $state(false);
   let revealTimers = new Map<string, number>();
-  let countdownTimer: number | null = null;
   let browserStatusTimer: number | null = null;
   let browserStatusRefreshInFlight: Promise<void> | null = null;
   let templateExpiryTimer: number | null = null;
   let unlistenEntriesChanged: (() => void) | undefined;
   let unlistenTemplateRecording: (() => void) | undefined;
   let destroyed = false;
-  let now = $state(Date.now());
 
   type TooltipPlacement = "top" | "bottom";
   const tooltipId = "password-manager-tooltip";
   let tooltipText = $state("");
-  let tooltipOwner = $state<HTMLButtonElement | null>(null);
+  let tooltipOwner = $state<HTMLElement | null>(null);
   let tooltipVisible = $state(false);
   let tooltipLeft = $state(0);
   let tooltipTop = $state(0);
@@ -185,6 +185,19 @@
     return entry.siteName.trim() || displayOrigin(entry).replace(/^https?:\/\//, "");
   }
 
+  function mfaCandidateName(candidate: PasswordMfaCandidate): string {
+    return candidate.name.trim()
+      || candidate.issuer.trim()
+      || candidate.accountName.trim()
+      || "未命名 MFA 账户";
+  }
+
+  function linkedMfaName(entry: PasswordEntrySummary): string {
+    if (!entry.mfaLink) return "";
+    const candidate = mfaCandidates.find((item) => item.id === entry.mfaLink?.entryId);
+    return candidate ? mfaCandidateName(candidate) : "已关联的 MFA 当前不可用";
+  }
+
   function clearEditorInputs(): void {
     editingId = null;
     siteName = "";
@@ -196,7 +209,6 @@
     templateId = null;
     mfaLink = null;
     mfaLinkDirty = false;
-    mfaCandidates = [];
     mfaCandidatesLoading = false;
     mfaCandidatesError = "";
     mfaSearch = "";
@@ -245,14 +257,15 @@
     void tick().then(() => editorFirstInput?.focus());
   }
 
-  async function loadMfaCandidates(): Promise<void> {
+  async function loadMfaCandidates(reportError = true): Promise<void> {
     mfaCandidatesLoading = true;
-    mfaCandidatesError = "";
+    if (reportError) mfaCandidatesError = "";
     try {
       mfaCandidates = await api.listMfaCandidates();
+      mfaCandidatesError = "";
     } catch (reason) {
       mfaCandidates = [];
-      mfaCandidatesError = reasonMessage(reason, "暂时无法读取 MFA 账户。");
+      if (reportError) mfaCandidatesError = reasonMessage(reason, "暂时无法读取 MFA 账户。");
     } finally {
       mfaCandidatesLoading = false;
     }
@@ -286,9 +299,22 @@
     revealed = next;
   }
 
+  function setRevealHeld(id: string, held: boolean): void {
+    const next = { ...revealHeld };
+    if (held) next[id] = true;
+    else delete next[id];
+    revealHeld = next;
+  }
+
+  function invalidateRevealRequest(id: string): void {
+    revealRequestVersions.set(id, (revealRequestVersions.get(id) ?? 0) + 1);
+  }
+
   function clearAllReveals(): void {
+    for (const id of Object.keys(revealHeld)) invalidateRevealRequest(id);
     for (const id of Object.keys(revealed)) clearReveal(id);
     revealed = {};
+    revealHeld = {};
   }
 
   function clearLockedUiState(): void {
@@ -300,6 +326,7 @@
     recoveryMode = null;
     pendingDelete = null;
     entries = [];
+    mfaCandidates = [];
     searchText = "";
     revealBusy = {};
     copyBusy = null;
@@ -316,10 +343,10 @@
     error = "";
   }
 
-  function tooltipButtonFromTarget(target: EventTarget | null): HTMLButtonElement | null {
+  function tooltipOwnerFromTarget(target: EventTarget | null): HTMLElement | null {
     if (!(target instanceof Element)) return null;
-    const button = target.closest("button.icon-button[data-tooltip]");
-    return button instanceof HTMLButtonElement && button.closest(".password-tool") ? button : null;
+    const owner = target.closest<HTMLElement>("[data-tooltip]");
+    return owner instanceof HTMLElement && owner.closest(".password-tool") ? owner : null;
   }
 
   function hideTooltip(): void {
@@ -357,13 +384,13 @@
     tooltipTop = Math.round(Math.max(margin, Math.min(desiredTop, maxTop)));
   }
 
-  function showTooltip(button: HTMLButtonElement): void {
-    const text = button.dataset.tooltip?.trim();
+  function showTooltip(owner: HTMLElement): void {
+    const text = owner.dataset.tooltip?.trim();
     if (!text) return;
-    if (tooltipOwner !== button) {
+    if (tooltipOwner !== owner) {
       tooltipOwner?.removeAttribute("aria-describedby");
-      tooltipOwner = button;
-      button.setAttribute("aria-describedby", tooltipId);
+      tooltipOwner = owner;
+      owner.setAttribute("aria-describedby", tooltipId);
     }
     tooltipText = text;
     tooltipVisible = true;
@@ -371,30 +398,30 @@
   }
 
   function handleTooltipMouseOver(event: MouseEvent): void {
-    const button = tooltipButtonFromTarget(event.target);
-    if (!button) return;
+    const owner = tooltipOwnerFromTarget(event.target);
+    if (!owner) return;
     const related = event.relatedTarget;
-    if (related instanceof Node && button.contains(related)) return;
-    showTooltip(button);
+    if (related instanceof Node && owner.contains(related)) return;
+    showTooltip(owner);
   }
 
   function handleTooltipMouseOut(event: MouseEvent): void {
-    const button = tooltipButtonFromTarget(event.target);
-    if (!button || button !== tooltipOwner) return;
+    const owner = tooltipOwnerFromTarget(event.target);
+    if (!owner || owner !== tooltipOwner) return;
     const related = event.relatedTarget;
-    if (related instanceof Node && button.contains(related)) return;
-    if (button.matches(":focus")) return;
+    if (related instanceof Node && owner.contains(related)) return;
+    if (owner.matches(":focus")) return;
     hideTooltip();
   }
 
   function handleTooltipFocusIn(event: FocusEvent): void {
-    const button = tooltipButtonFromTarget(event.target);
-    if (button) showTooltip(button);
+    const owner = tooltipOwnerFromTarget(event.target);
+    if (owner) showTooltip(owner);
   }
 
   function handleTooltipFocusOut(event: FocusEvent): void {
-    const button = tooltipButtonFromTarget(event.target);
-    if (button === tooltipOwner) hideTooltip();
+    const owner = tooltipOwnerFromTarget(event.target);
+    if (owner === tooltipOwner) hideTooltip();
   }
 
   function clearTemplateRecording(): void {
@@ -416,29 +443,54 @@
     }
   }
 
-  function revealCountdown(entry: PasswordEntrySummary): number {
-    const item = revealFor(entry);
-    return item ? secondsUntilPasswordHidden(item.expiresAt, now) : 0;
+  function endRevealHold(entryId: string): void {
+    invalidateRevealRequest(entryId);
+    setRevealHeld(entryId, false);
+    clearReveal(entryId);
   }
 
-  async function revealPassword(entry: PasswordEntrySummary): Promise<void> {
-    if (revealed[entry.id]) {
-      clearReveal(entry.id);
-      return;
-    }
-    if (revealBusy[entry.id]) return;
+  async function startRevealHold(entry: PasswordEntrySummary): Promise<void> {
+    if (revealHeld[entry.id] || revealBusy[entry.id]) return;
+    setRevealHeld(entry.id, true);
+    const requestVersion = (revealRequestVersions.get(entry.id) ?? 0) + 1;
+    revealRequestVersions.set(entry.id, requestVersion);
     revealBusy = setBusy(revealBusy, entry.id, true);
     try {
       const result = await api.reveal(entry.id);
+      if (!revealHeld[entry.id] || revealRequestVersions.get(entry.id) !== requestVersion) return;
       revealed = { ...revealed, [entry.id]: result };
       const timer = window.setTimeout(() => clearReveal(entry.id), Math.max(1_000, secondsUntilPasswordHidden(result.expiresAt) * 1_000));
       revealTimers.set(entry.id, timer);
       error = "";
     } catch (reason) {
-      error = reasonMessage(reason, "无法显示密码。保险库可能已锁定。");
+      if (revealHeld[entry.id] && revealRequestVersions.get(entry.id) === requestVersion) {
+        error = reasonMessage(reason, "无法显示密码。保险库可能已锁定。");
+      }
     } finally {
       revealBusy = setBusy(revealBusy, entry.id, false);
     }
+  }
+
+  function handleRevealPointerDown(entry: PasswordEntrySummary, event: PointerEvent): void {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    void startRevealHold(entry);
+  }
+
+  function handleRevealPointerEnd(entryId: string): void {
+    endRevealHold(entryId);
+  }
+
+  function handleRevealKeyDown(entry: PasswordEntrySummary, event: KeyboardEvent): void {
+    if ((event.key !== " " && event.key !== "Enter") || event.repeat) return;
+    event.preventDefault();
+    void startRevealHold(entry);
+  }
+
+  function handleRevealKeyUp(entryId: string, event: KeyboardEvent): void {
+    if (event.key !== " " && event.key !== "Enter") return;
+    event.preventDefault();
+    endRevealHold(entryId);
   }
 
   async function copyUsername(entry: PasswordEntrySummary): Promise<void> {
@@ -460,6 +512,20 @@
       showToast(`已复制“${entry.siteName}”的密码`);
     } catch (reason) {
       error = reasonMessage(reason, "复制密码失败。");
+    } finally {
+      copyBusy = null;
+    }
+  }
+
+  async function copyMfa(entry: PasswordEntrySummary): Promise<void> {
+    if (!entry.mfaLink) return;
+    copyBusy = { [entry.id]: "mfa" };
+    try {
+      await api.copyMfa(entry.id);
+      showToast("MFA 验证码已复制，过期后自动清除");
+      error = "";
+    } catch (reason) {
+      error = reasonMessage(reason, "复制 MFA 验证码失败。");
     } finally {
       copyBusy = null;
     }
@@ -751,9 +817,11 @@
       await refreshBrowserStatus();
       if (!nextStatus.available || nextStatus.locked || nextStatus.recoveryState !== "ready") {
         entries = [];
+        mfaCandidates = [];
         clearAllReveals();
       } else {
         entries = await api.list();
+        await loadMfaCandidates(false);
         const validIds = new Set(entries.map((entry) => entry.id));
         revealed = Object.fromEntries(Object.entries(revealed).filter(([id]) => validIds.has(id)));
       }
@@ -881,8 +949,8 @@
     document.addEventListener("scroll", hideTooltip, true);
     window.addEventListener("resize", hideTooltip);
     window.addEventListener("blur", hideTooltip);
+    window.addEventListener("blur", clearAllReveals);
     void refresh();
-    countdownTimer = window.setInterval(() => (now = Date.now()), 1_000);
     if (api.isDesktop()) {
       scheduleBrowserStatusRefresh();
       void import("@tauri-apps/api/event")
@@ -929,16 +997,15 @@
     document.removeEventListener("scroll", hideTooltip, true);
     window.removeEventListener("resize", hideTooltip);
     window.removeEventListener("blur", hideTooltip);
+    window.removeEventListener("blur", clearAllReveals);
     hideTooltip();
     unlistenEntriesChanged?.();
     unlistenEntriesChanged = undefined;
     unlistenTemplateRecording?.();
     unlistenTemplateRecording = undefined;
-    if (countdownTimer !== null) window.clearInterval(countdownTimer);
     if (browserStatusTimer !== null) window.clearTimeout(browserStatusTimer);
     if (templateExpiryTimer !== null) window.clearTimeout(templateExpiryTimer);
-    for (const timer of revealTimers.values()) window.clearTimeout(timer);
-    revealed = {};
+    clearAllReveals();
     clearEditorInputs();
     clearRecoveryInputs();
     if (templateRecording) void api.cancelTemplateRecording(templateRecording.sessionId).catch(() => undefined);
@@ -1085,6 +1152,7 @@
       <section class="entry-list" aria-label="密码账户列表">
         {#each filteredEntries as entry (entry.id)}
           {@const revealedEntry = revealFor(entry)}
+          {@const mfaName = linkedMfaName(entry)}
           {@const canFill = browser?.connection === "connected"}
           {@const fillPermission = browser?.capturePermission}
           {@const fillStatusUnavailable = fillPermission === "unavailable" || fillPermission === "unknown" || !fillPermission}
@@ -1092,22 +1160,39 @@
           <article class="entry-row" data-testid={`password-entry-${entry.id}`}>
             <div class="entry-site-mark" aria-hidden="true">{shortSiteName(entry).slice(0, 1).toUpperCase()}</div>
             <div class="entry-main">
-              <div class="entry-heading"><strong>{shortSiteName(entry)}</strong>{#if entry.templateId}<span class="template-badge">模板</span>{/if}{#if entry.mfaLink}<span class="mfa-badge"><ShieldCheck size={10} aria-hidden="true" />MFA</span>{/if}{#if isHttpUrl(entry.loginUrl)}<span class="http-badge" title="该账户通过未加密的 HTTP 连接填充">HTTP 不安全</span>{/if}</div>
+              <div class="entry-heading"><strong>{shortSiteName(entry)}</strong>{#if entry.templateId}<span class="template-badge">模板</span>{/if}{#if entry.mfaLink}<span class="mfa-badge" role="button" tabindex="0" data-tooltip={`绑定的 MFA：${mfaName}`} aria-label={`绑定的 MFA：${mfaName}`}><ShieldCheck size={10} aria-hidden="true" />MFA</span>{/if}{#if isHttpUrl(entry.loginUrl)}<span class="http-badge" title="该账户通过未加密的 HTTP 连接填充">HTTP 不安全</span>{/if}</div>
               <span class="entry-origin">{displayOrigin(entry)}</span>
               <span class="entry-username">{entry.username || "未填写用户名"}</span>
               {#if entry.notes}<span class="entry-notes">{entry.notes}</span>{/if}
             </div>
             <div class="entry-secret" class:revealed={Boolean(revealedEntry)}>
-              <span>{revealedEntry?.password ?? "••••••••••••"}</span>
-              {#if revealedEntry}<small>{revealCountdown(entry)} 秒后隐藏</small>{/if}
+              <div class="entry-secret-line">
+                <span>{revealedEntry?.password ?? "••••••••••••"}</span>
+                <button
+                  type="button"
+                  class="icon-button password-reveal-button"
+                  data-tooltip={revealedEntry ? "松开隐藏密码" : "按住显示密码"}
+                  aria-label={revealedEntry ? `松开隐藏 ${entry.siteName} 密码` : `按住显示 ${entry.siteName} 密码`}
+                  aria-pressed={Boolean(revealedEntry)}
+                  disabled={Boolean(revealBusy[entry.id] && !revealHeld[entry.id])}
+                  onpointerdown={(event) => handleRevealPointerDown(entry, event)}
+                  onpointerup={() => handleRevealPointerEnd(entry.id)}
+                  onpointercancel={() => handleRevealPointerEnd(entry.id)}
+                  onpointerleave={() => handleRevealPointerEnd(entry.id)}
+                  onkeydown={(event) => handleRevealKeyDown(entry, event)}
+                  onkeyup={(event) => handleRevealKeyUp(entry.id, event)}
+                  onblur={() => endRevealHold(entry.id)}
+                  onclick={(event) => event.preventDefault()}
+                >{#if revealedEntry}<EyeOff size={15} aria-hidden="true" />{:else}<Eye size={15} aria-hidden="true" />{/if}</button>
+              </div>
             </div>
             <div class="entry-actions">
               <button type="button" class="icon-button" data-tooltip={canFill && !fillStatusUnavailable ? (isHttpUrl(entry.loginUrl) ? "通过 HTTP 打开并填充" : "打开并填充") : fillPermission === "unknown" ? "扩展通信异常，暂时仅打开站点" : "打开站点"} aria-label={`${fillActionLabel} ${entry.siteName}`} disabled={Boolean(fillBusy[entry.id])} onclick={() => void openAndFill(entry)}><ExternalLink size={15} aria-hidden="true" /></button>
-              <button type="button" class="icon-button" data-tooltip="复制用户名" aria-label={`复制 ${entry.siteName} 用户名`} disabled={copyBusy?.[entry.id] === "username"} onclick={() => void copyUsername(entry)}><Clipboard size={15} aria-hidden="true" /></button>
-              <button type="button" class="icon-button" data-tooltip={revealedEntry ? "隐藏密码" : "显示密码"} aria-label={revealedEntry ? "隐藏密码" : "显示密码"} disabled={Boolean(revealBusy[entry.id])} onclick={() => void revealPassword(entry)}>{#if revealedEntry}<EyeOff size={15} aria-hidden="true" />{:else}<Eye size={15} aria-hidden="true" />{/if}</button>
-              <button type="button" class="icon-button" data-tooltip="复制密码" aria-label={`复制 ${entry.siteName} 密码`} disabled={copyBusy?.[entry.id] === "password"} onclick={() => void copyPassword(entry)}><Copy size={15} aria-hidden="true" /></button>
+              <button type="button" class="icon-button" data-tooltip="复制用户名" aria-label={`复制 ${entry.siteName} 用户名`} disabled={copyBusy?.[entry.id] === "username"} onclick={() => void copyUsername(entry)}><UserRound size={15} aria-hidden="true" /></button>
+              <button type="button" class="icon-button" data-tooltip="复制密码" aria-label={`复制 ${entry.siteName} 密码`} disabled={copyBusy?.[entry.id] === "password"} onclick={() => void copyPassword(entry)}><KeyRound size={15} aria-hidden="true" /></button>
+              <button type="button" class="icon-button" data-tooltip={entry.mfaLink ? "复制 MFA 验证码" : "未关联 MFA"} title={entry.mfaLink ? undefined : "未关联 MFA"} aria-label={`复制 ${entry.siteName} MFA 验证码`} disabled={!entry.mfaLink || copyBusy?.[entry.id] === "mfa"} onclick={() => void copyMfa(entry)}><ShieldCheck size={15} aria-hidden="true" /></button>
               <button type="button" class="icon-button" data-tooltip={!canFill ? "连接 Firefox 后录制模板" : fillPermission !== "granted" ? "Firefox 密码通道就绪后可录制" : "录制站点模板"} aria-label={`录制 ${entry.siteName} 模板`} disabled={!canFill || fillPermission !== "granted" || Boolean(templateRecording) || Boolean(templateBusy[entry.id])} onclick={() => void startTemplateRecording(entry)}><ScanSearch size={15} aria-hidden="true" /></button>
-              <button type="button" class="icon-button" data-tooltip="编辑" aria-label={`编辑 ${entry.siteName}`} onclick={() => editEntry(entry)}><Sparkles size={15} aria-hidden="true" /></button>
+              <button type="button" class="icon-button" data-tooltip="编辑" aria-label={`编辑 ${entry.siteName}`} onclick={() => editEntry(entry)}><Pencil size={15} aria-hidden="true" /></button>
               <button type="button" class="icon-button danger-icon" data-tooltip="删除" aria-label={`删除 ${entry.siteName}`} onclick={() => (pendingDelete = entry)}><Trash2 size={15} aria-hidden="true" /></button>
             </div>
           </article>
@@ -1315,12 +1400,14 @@
   .entry-username { color: #3e3e3e; }
   .entry-notes { color: #7d7d7d; }
   .template-badge, .mfa-badge, .http-badge { flex: 0 0 auto; padding: 1px 4px; color: #226d51; font-size: 9px; border: 1px solid #b7d9c8; border-radius: 3px; }
-  .mfa-badge { display: inline-flex; align-items: center; gap: 2px; color: #1d638d; border-color: #b8d6e8; background: #f2f9fd; }
+  .mfa-badge { display: inline-flex; align-items: center; gap: 2px; color: #1d638d; border-color: #b8d6e8; outline: 0; background: #f2f9fd; cursor: help; }
+  .mfa-badge:focus-visible { box-shadow: 0 0 0 2px var(--app-focus); }
   .http-badge { color: #a1491c; border-color: #ebc1a5; background: #fff7f1; }
-  .entry-secret { display: flex; min-width: 0; flex-direction: column; gap: 2px; color: #737373; font-family: Consolas, monospace; font-size: 12px; }
-  .entry-secret span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .entry-secret { min-width: 0; color: #737373; font-family: Consolas, monospace; font-size: 12px; }
+  .entry-secret-line { display: flex; min-width: 0; align-items: center; gap: 3px; }
+  .entry-secret-line > span { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .entry-secret.revealed { color: var(--app-fg); }
-  .entry-secret small { color: #8b6c29; font-family: inherit; font-size: 9px; }
+  .password-reveal-button { width: 24px; height: 24px; min-width: 24px; flex: 0 0 24px; touch-action: none; }
   .entry-actions { justify-content: flex-end; gap: 1px; }
   .danger-icon:hover { color: var(--app-danger); }
   .close-button:hover { color: #ffffff; background: #c42b1c; }

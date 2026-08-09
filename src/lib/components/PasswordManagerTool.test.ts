@@ -131,18 +131,79 @@ describe("PasswordManagerTool", () => {
     });
   });
 
-  it("reveals a saved password only through the short-lived API response", async () => {
+  it("reveals a saved password only while the adjacent eye control is held", async () => {
     const api = createBrowserPasswordApi();
     const reveal = vi.spyOn(api, "reveal");
     const view = render(PasswordManagerTool, { api });
     await view.findByText("demo@example.com");
 
-    await fireEvent.click(view.getAllByRole("button", { name: "显示密码" })[0]);
+    const entry = view.getByTestId("password-entry-browser-demo-google-work");
+    const revealButton = within(entry).getByRole("button", { name: "按住显示 Google Workspace 密码" });
+    expect(revealButton.previousElementSibling).toHaveTextContent("••••••••••••");
+
+    await fireEvent.pointerDown(revealButton, { button: 0, pointerId: 1 });
     expect(await view.findByText("Demo-Google-2026!")).toBeInTheDocument();
     expect(reveal).toHaveBeenCalledWith("browser-demo-google-work");
+    expect(revealButton).toHaveAccessibleName("松开隐藏 Google Workspace 密码");
+    expect(revealButton.querySelector(".lucide-eye-off")).toBeInTheDocument();
 
-    await fireEvent.click(view.getAllByRole("button", { name: "隐藏密码" })[0]);
+    await fireEvent.pointerUp(revealButton, { button: 0, pointerId: 1 });
     expect(view.queryByText("Demo-Google-2026!")).not.toBeInTheDocument();
+    expect(revealButton).toHaveAccessibleName("按住显示 Google Workspace 密码");
+  });
+
+  it("never reveals after release when the reveal response arrives late", async () => {
+    const base = createBrowserPasswordApi();
+    let resolveReveal: ((value: { id: string; password: string; expiresAt: number }) => void) | undefined;
+    const reveal = vi.fn(() => new Promise<{ id: string; password: string; expiresAt: number }>((resolve) => {
+      resolveReveal = resolve;
+    }));
+    const api: PasswordApi = { ...base, reveal };
+    const view = render(PasswordManagerTool, { api });
+    await view.findByText("demo@example.com");
+
+    const revealButton = within(view.getByTestId("password-entry-browser-demo-google-work"))
+      .getByRole("button", { name: "按住显示 Google Workspace 密码" });
+    await fireEvent.pointerDown(revealButton, { button: 0, pointerId: 2 });
+    await waitFor(() => expect(reveal).toHaveBeenCalledWith("browser-demo-google-work"));
+    await fireEvent.pointerUp(revealButton, { button: 0, pointerId: 2 });
+    resolveReveal?.({
+      id: "browser-demo-google-work",
+      password: "late-secret-must-stay-hidden",
+      expiresAt: Date.now() + 15_000,
+    });
+
+    await waitFor(() => expect(revealButton).not.toBeDisabled());
+    expect(view.queryByText("late-secret-must-stay-hidden")).not.toBeInTheDocument();
+  });
+
+  it("uses the shared copy icons, disables unlinked MFA, and exposes only the linked MFA name", async () => {
+    const base = createBrowserPasswordApi();
+    const copyMfa = vi.fn().mockResolvedValue(undefined);
+    const api: PasswordApi = { ...base, copyMfa };
+    const view = render(PasswordManagerTool, { api });
+    await view.findByText("demo@example.com");
+
+    const linkedEntry = view.getByTestId("password-entry-browser-demo-google-work");
+    const usernameButton = within(linkedEntry).getByRole("button", { name: "复制 Google Workspace 用户名" });
+    const passwordButton = within(linkedEntry).getByRole("button", { name: "复制 Google Workspace 密码" });
+    const mfaButton = within(linkedEntry).getByRole("button", { name: "复制 Google Workspace MFA 验证码" });
+    expect(usernameButton.querySelector(".lucide-user-round")).toBeInTheDocument();
+    expect(passwordButton.querySelector(".lucide-key-round")).toBeInTheDocument();
+    expect(mfaButton.querySelector(".lucide-shield-check")).toBeInTheDocument();
+    expect(within(linkedEntry).getByRole("button", { name: "编辑 Google Workspace" }).querySelector(".lucide-pencil")).toBeInTheDocument();
+
+    const unlinkedEntry = view.getByTestId("password-entry-browser-demo-google-personal");
+    expect(within(unlinkedEntry).getByRole("button", { name: "复制 Google Workspace MFA 验证码" })).toBeDisabled();
+
+    const mfaBadge = view.getByRole("button", { name: "绑定的 MFA：Google Workspace" });
+    await fireEvent.focusIn(mfaBadge);
+    expect(await view.findByRole("tooltip")).toHaveTextContent("绑定的 MFA：Google Workspace");
+    expect(view.queryByText(/secret|验证码/)).not.toBeInTheDocument();
+
+    await fireEvent.click(mfaButton);
+    await waitFor(() => expect(copyMfa).toHaveBeenCalledWith("browser-demo-google-work"));
+    expect(await view.findByText("MFA 验证码已复制，过期后自动清除")).toBeInTheDocument();
   });
 
   it("opens the site directly without requesting fill when Firefox is disconnected", async () => {

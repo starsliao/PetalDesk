@@ -496,6 +496,14 @@ impl PasswordBrowserService {
         self.cancel_all_second_factors();
     }
 
+    /// Completes a normal password-manager window close without revoking the
+    /// independent Firefox background lease. Security-driven shutdown paths
+    /// (explicit vault lock, remote-session protection, or an unusable vault)
+    /// must call `suspend_capture` themselves before clearing the UI session.
+    pub(crate) fn finish_password_window_close(&self, store: &PasswordStore, closing_epoch: u64) {
+        store.clear_deactivated_state(closing_epoch);
+    }
+
     pub(crate) fn cancel_all_second_factors(&self) {
         let sessions = {
             let _publish = lock_unpoisoned(&self.second_factor_publish);
@@ -4876,6 +4884,26 @@ mod tests {
         let syncs = recorded.requests_for("password.setCaptureEnabled");
         assert_eq!(syncs.len(), 2);
         assert_eq!(syncs[1]["payload"]["enabled"], true);
+    }
+
+    #[test]
+    fn normal_password_window_close_keeps_browser_capture_enabled() {
+        let (_root, store) = test_store();
+        store.activate_browser_session();
+        let (service, recorded) = connected_service("connection-a");
+
+        service.sync_capture_from_store(&store);
+        let closing_epoch = store.deactivate();
+        service.finish_password_window_close(&store, closing_epoch);
+
+        let syncs = recorded.requests_for("password.setCaptureEnabled");
+        assert_eq!(syncs.len(), 1);
+        assert_eq!(syncs[0]["payload"]["enabled"], true);
+        assert!(store.require_any_epoch().is_ok());
+        assert_eq!(
+            store.require_active_epoch().unwrap_err().code,
+            "password_session_closed"
+        );
     }
 
     #[test]

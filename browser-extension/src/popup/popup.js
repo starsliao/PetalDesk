@@ -116,7 +116,7 @@
       if (response && response.ok === false) {
         throw new Error(response.error && response.error.message || "填充请求失败");
       }
-      setStatus("填充请求已发送，请查看页面。");
+      setStatus("选择要填充的账户：");
       return true;
     } catch (error) {
       setStatus(errorMessage(error));
@@ -156,28 +156,52 @@
     }
   }
 
-  let confirmDeleteEntryId = null;
-  let deleteButtons = new Map();
-  let deleteConfirmations = new Map();
+  let activeAccountEntryId = null;
+  let accountContextMenu = null;
+  let deleteConfirmation = null;
+  let accountActionFocusTarget = null;
 
-  function closeDeleteConfirmation(returnFocus = true) {
-    if (!confirmDeleteEntryId) {
-      return;
+  function focusAccountActionTarget() {
+    if (accountActionFocusTarget && typeof accountActionFocusTarget.focus === "function") {
+      accountActionFocusTarget.focus();
     }
-    const entryId = confirmDeleteEntryId;
-    const confirmation = deleteConfirmations.get(entryId);
-    if (confirmation && confirmation.parentElement) {
-      confirmation.parentElement.removeChild(confirmation);
+  }
+
+  function removeFloatingElement(element) {
+    if (element && element.parentElement) {
+      element.parentElement.removeChild(element);
     }
-    deleteConfirmations.delete(entryId);
-    confirmDeleteEntryId = null;
-    const trigger = deleteButtons.get(entryId);
-    if (trigger) {
-      trigger.setAttribute("aria-expanded", "false");
-      if (returnFocus && typeof trigger.focus === "function") {
-        trigger.focus();
-      }
+  }
+
+  function closeAccountAction(returnFocus = true) {
+    if (!activeAccountEntryId && !accountContextMenu && !deleteConfirmation) return;
+    removeFloatingElement(accountContextMenu);
+    removeFloatingElement(deleteConfirmation);
+    accountContextMenu = null;
+    deleteConfirmation = null;
+    activeAccountEntryId = null;
+    if (returnFocus) focusAccountActionTarget();
+    accountActionFocusTarget = null;
+  }
+
+  function isWithin(element, candidate) {
+    let current = candidate;
+    while (current) {
+      if (current === element) return true;
+      current = current.parentElement;
     }
+    return false;
+  }
+
+  function contextFocusTarget(item, eventTarget, fallback) {
+    let current = eventTarget;
+    while (current && current !== item) {
+      if (current.tagName === "BUTTON" && typeof current.focus === "function") return current;
+      current = current.parentElement;
+    }
+    const active = document.activeElement;
+    if (active && isWithin(item, active) && typeof active.focus === "function") return active;
+    return fallback;
   }
 
   function icon(name) {
@@ -211,7 +235,7 @@
     cancel.className = "confirm-cancel";
     cancel.textContent = "取消";
     cancel.addEventListener("click", () => {
-      closeDeleteConfirmation(true);
+      closeAccountAction(true);
     });
     const remove = document.createElement("button");
     remove.type = "button";
@@ -219,23 +243,14 @@
     remove.textContent = "删除";
     remove.addEventListener("click", () => {
       void runBusy(remove, async () => {
-        const trigger = deleteButtons.get(account.entryId);
         cancel.disabled = true;
-        if (trigger) {
-          trigger.disabled = true;
-          trigger.setAttribute("aria-busy", "true");
-        }
         try {
           const deleted = await deleteAccount(account.entryId);
           if (!deleted) return;
-          confirmDeleteEntryId = null;
+          closeAccountAction(false);
           await refresh();
         } finally {
           cancel.disabled = false;
-          if (trigger) {
-            trigger.disabled = false;
-            trigger.removeAttribute("aria-busy");
-          }
         }
       });
     });
@@ -243,10 +258,51 @@
     return confirm;
   }
 
+  function showDeleteConfirmation(account, item) {
+    removeFloatingElement(accountContextMenu);
+    accountContextMenu = null;
+    deleteConfirmation = renderDeleteConfirm(account);
+    item.appendChild(deleteConfirmation);
+    const cancel = deleteConfirmation.children[1];
+    if (cancel && typeof cancel.focus === "function") cancel.focus();
+  }
+
+  function renderAccountContextMenu(account, item) {
+    const menu = document.createElement("div");
+    menu.className = "account-context-menu";
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", "账户操作");
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "context-delete";
+    remove.setAttribute("role", "menuitem");
+    remove.setAttribute("aria-label", "删除账户");
+    remove.setAttribute("aria-haspopup", "dialog");
+    remove.textContent = "删除账户";
+    remove.addEventListener("click", (event) => {
+      if (typeof event.stopPropagation === "function") event.stopPropagation();
+      showDeleteConfirmation(account, item);
+    });
+    menu.appendChild(remove);
+    return menu;
+  }
+
+  function openAccountContextMenu(account, item, focusTarget) {
+    closeAccountAction(false);
+    activeAccountEntryId = account.entryId;
+    accountActionFocusTarget = focusTarget;
+    accountContextMenu = renderAccountContextMenu(account, item);
+    item.appendChild(accountContextMenu);
+    const firstItem = accountContextMenu.children[0];
+    if (firstItem && typeof firstItem.focus === "function") firstItem.focus();
+  }
+
   function renderAccountItem(account, origin) {
     const item = document.createElement("li");
     item.className = "account-card";
     item.setAttribute("data-entry-id", account.entryId);
+    item.setAttribute("role", "group");
+    item.setAttribute("aria-label", `${account.siteName || origin} 的账户；右键打开账户操作`);
     const fill = document.createElement("button");
     fill.type = "button";
     fill.className = "account-main";
@@ -262,7 +318,7 @@
     text.append(site, username);
     fill.appendChild(text);
     fill.addEventListener("click", () => {
-      if (confirmDeleteEntryId) closeDeleteConfirmation(false);
+      closeAccountAction(false);
       void runBusy(fill, () => fillAccount(account.entryId));
     });
 
@@ -270,12 +326,12 @@
     actions.className = "account-actions";
     const usernameCopy = iconButton({ label: "复制用户名", iconName: "user-round" });
     usernameCopy.addEventListener("click", () => {
-      if (confirmDeleteEntryId) closeDeleteConfirmation(false);
+      closeAccountAction(false);
       void runBusy(usernameCopy, () => copySecret(account.entryId, "username"));
     });
     const passwordCopy = iconButton({ label: "复制密码", iconName: "key-round" });
     passwordCopy.addEventListener("click", () => {
-      if (confirmDeleteEntryId) closeDeleteConfirmation(false);
+      closeAccountAction(false);
       void runBusy(passwordCopy, () => copySecret(account.entryId, "password"));
     });
     const hasMfa = account.hasMfa === true;
@@ -286,34 +342,27 @@
     });
     if (hasMfa) {
       mfaCopy.addEventListener("click", () => {
-        if (confirmDeleteEntryId) closeDeleteConfirmation(false);
+        closeAccountAction(false);
         void runBusy(mfaCopy, () => copySecret(account.entryId, "mfa"));
       });
     }
     actions.append(usernameCopy, passwordCopy, mfaCopy);
 
-    const remove = iconButton({
-      label: "删除账户",
-      iconName: "trash-2",
-      className: "delete-trigger",
+    item.addEventListener("contextmenu", (event) => {
+      if (typeof event.preventDefault === "function") event.preventDefault();
+      if (typeof event.stopPropagation === "function") event.stopPropagation();
+      openAccountContextMenu(account, item, contextFocusTarget(item, event.target, fill));
     });
-    remove.setAttribute("aria-haspopup", "dialog");
-    remove.setAttribute("aria-expanded", "false");
-    remove.addEventListener("click", () => {
-      if (confirmDeleteEntryId === account.entryId) {
-        closeDeleteConfirmation(true);
-        return;
-      }
-      if (confirmDeleteEntryId) closeDeleteConfirmation(false);
-      confirmDeleteEntryId = account.entryId;
-      remove.setAttribute("aria-expanded", "true");
-      const confirmation = renderDeleteConfirm(account);
-      deleteConfirmations.set(account.entryId, confirmation);
-      item.appendChild(confirmation);
+    item.addEventListener("keydown", (event) => {
+      const opensContextMenu = event.key === "ContextMenu"
+        || (event.key === "F10" && event.shiftKey === true);
+      if (!opensContextMenu) return;
+      if (typeof event.preventDefault === "function") event.preventDefault();
+      if (typeof event.stopPropagation === "function") event.stopPropagation();
+      openAccountContextMenu(account, item, contextFocusTarget(item, event.target, fill));
     });
-    deleteButtons.set(account.entryId, remove);
 
-    item.append(fill, actions, remove);
+    item.append(fill, actions);
     return item;
   }
 
@@ -322,9 +371,10 @@
     const originElement = document.getElementById("site-origin");
     const accountList = document.getElementById("account-list");
     clearChildren(accountList);
-    confirmDeleteEntryId = null;
-    deleteButtons = new Map();
-    deleteConfirmations = new Map();
+    activeAccountEntryId = null;
+    accountContextMenu = null;
+    deleteConfirmation = null;
+    accountActionFocusTarget = null;
     const origin = typeof tab.origin === "string" ? tab.origin : "";
     originElement.textContent = origin || "当前页面不是可填充的网站";
     const accounts = Array.isArray(tab.accounts) ? tab.accounts : [];
@@ -366,9 +416,16 @@
   });
 
   document.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape" || !confirmDeleteEntryId) return;
+    if (event.key !== "Escape" || (!activeAccountEntryId && !accountContextMenu && !deleteConfirmation)) return;
     if (typeof event.preventDefault === "function") event.preventDefault();
-    closeDeleteConfirmation(true);
+    closeAccountAction(true);
+  });
+
+  document.addEventListener("pointerdown", (event) => {
+    if (!activeAccountEntryId && !accountContextMenu && !deleteConfirmation) return;
+    const target = event && event.target;
+    if (isWithin(accountContextMenu, target) || isWithin(deleteConfirmation, target)) return;
+    closeAccountAction(true);
   });
 
   void refresh();

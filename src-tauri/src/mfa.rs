@@ -356,7 +356,25 @@ pub struct MfaManualImportRequest {
 #[serde(rename_all = "camelCase")]
 pub struct MfaImportCommitRequest {
     pub session_id: String,
+    pub name: String,
+    pub issuer: String,
+    pub account_name: String,
     pub icon_emoji: String,
+}
+
+struct NormalizedEntryMetadata {
+    name: String,
+    issuer: String,
+    account_name: String,
+    icon_emoji: String,
+}
+
+struct StoredEntryMetadata {
+    name: String,
+    issuer: String,
+    account_name: String,
+    icon_emoji: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1399,15 +1417,46 @@ impl MfaStore {
     #[cfg(test)]
     pub fn commit_import(&self, session_id: &str, icon_emoji: &str) -> AppResult<MfaEntrySummary> {
         let epoch = self.require_active_epoch()?;
-        self.commit_import_at(session_id, icon_emoji, epoch)
+        let request = {
+            let mut imports = lock_unpoisoned(&self.imports);
+            purge_expired_imports(&mut imports);
+            let pending = imports
+                .get(session_id)
+                .ok_or_else(|| AppError::not_found("导入预览已经过期，请重新识别。"))?;
+            MfaImportCommitRequest {
+                session_id: session_id.to_string(),
+                name: pending.entry.name.clone(),
+                issuer: pending.entry.issuer.clone(),
+                account_name: pending.entry.account_name.clone(),
+                icon_emoji: icon_emoji.to_string(),
+            }
+        };
+        self.commit_import_at(request, epoch)
+    }
+
+    #[cfg(test)]
+    pub fn commit_import_request(
+        &self,
+        request: MfaImportCommitRequest,
+    ) -> AppResult<MfaEntrySummary> {
+        let epoch = self.require_active_epoch()?;
+        self.commit_import_at(request, epoch)
     }
 
     fn commit_import_at(
         &self,
-        session_id: &str,
-        icon_emoji: &str,
+        request: MfaImportCommitRequest,
         epoch: u64,
     ) -> AppResult<MfaEntrySummary> {
+        if request.session_id.is_empty() {
+            return Err(AppError::invalid("导入预览标识不能为空。"));
+        }
+        let metadata = normalize_import_metadata(
+            &request.name,
+            &request.issuer,
+            &request.account_name,
+            &request.icon_emoji,
+        )?;
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
         self.validate_epoch(epoch)?;
         let mut runtime = lock_unpoisoned(&self.runtime);
@@ -1429,15 +1478,14 @@ impl MfaStore {
         let mut imports = lock_unpoisoned(&self.imports);
         purge_expired_imports(&mut imports);
         let pending = imports
-            .remove(session_id)
+            .remove(&request.session_id)
             .ok_or_else(|| AppError::not_found("导入预览已经过期，请重新识别。"))?;
         let PendingImport {
             mut entry,
             expires_at,
         } = pending;
-        let original_icon = entry.icon_emoji.clone();
-        let original_updated_at = entry.updated_at.clone();
-        entry.icon_emoji = normalize_icon(icon_emoji);
+        let original_metadata = stored_entry_metadata(&entry);
+        apply_entry_metadata(&mut entry, metadata);
         entry.updated_at = now_iso();
         let summary = summary(&entry);
         vault.payload.entries.push(entry);
@@ -1447,9 +1495,8 @@ impl MfaStore {
                 .entries
                 .pop()
                 .expect("the pending MFA entry was appended immediately before save");
-            entry.icon_emoji = original_icon;
-            entry.updated_at = original_updated_at;
-            imports.insert(session_id.to_string(), PendingImport { entry, expires_at });
+            restore_entry_metadata(&mut entry, original_metadata);
+            imports.insert(request.session_id, PendingImport { entry, expires_at });
             return Err(error);
         }
         Ok(summary)
@@ -1478,10 +1525,18 @@ impl MfaStore {
             )));
         }
         let mut requested_ids = HashSet::with_capacity(requests.len());
-        for request in &requests {
-            if request.session_id.is_empty() || !requested_ids.insert(request.session_id.as_str()) {
+        let mut normalized_requests = Vec::with_capacity(requests.len());
+        for request in requests {
+            if request.session_id.is_empty() || !requested_ids.insert(request.session_id.clone()) {
                 return Err(AppError::invalid("批量导入包含空白或重复的预览标识。"));
             }
+            let metadata = normalize_import_metadata(
+                &request.name,
+                &request.issuer,
+                &request.account_name,
+                &request.icon_emoji,
+            )?;
+            normalized_requests.push((request.session_id, metadata));
         }
 
         let _lifecycle = lock_unpoisoned(&self.lifecycle_lock);
@@ -1497,7 +1552,7 @@ impl MfaStore {
             .entries
             .len()
             .checked_add(vault.payload.trash.len())
-            .and_then(|count| count.checked_add(requests.len()))
+            .and_then(|count| count.checked_add(normalized_requests.len()))
             .is_none_or(|count| count > MAX_VAULT_ENTRIES)
         {
             return Err(AppError::new(
@@ -1508,21 +1563,21 @@ impl MfaStore {
 
         let mut imports = lock_unpoisoned(&self.imports);
         purge_expired_imports(&mut imports);
-        if requests
+        if normalized_requests
             .iter()
-            .any(|request| !imports.contains_key(&request.session_id))
+            .any(|(session_id, _)| !imports.contains_key(session_id))
         {
             return Err(AppError::not_found(
                 "一个或多个导入预览已经过期，请重新识别。",
             ));
         }
 
-        let mut removed = Vec::with_capacity(requests.len());
-        for request in &requests {
+        let mut removed = Vec::with_capacity(normalized_requests.len());
+        for (session_id, _) in &normalized_requests {
             let pending = imports
-                .remove(&request.session_id)
+                .remove(session_id)
                 .expect("all pending MFA import sessions were checked above");
-            removed.push((request.session_id.clone(), pending));
+            removed.push((session_id.clone(), pending));
         }
 
         let restore_metadata = removed
@@ -1531,14 +1586,13 @@ impl MfaStore {
                 (
                     session_id.clone(),
                     pending.expires_at,
-                    pending.entry.icon_emoji.clone(),
-                    pending.entry.updated_at.clone(),
+                    stored_entry_metadata(&pending.entry),
                 )
             })
             .collect::<Vec<_>>();
 
-        for ((_, pending), request) in removed.iter_mut().zip(&requests) {
-            pending.entry.icon_emoji = normalize_icon(&request.icon_emoji);
+        for ((_, pending), (_, metadata)) in removed.iter_mut().zip(normalized_requests) {
+            apply_entry_metadata(&mut pending.entry, metadata);
             pending.entry.updated_at = now_iso();
         }
         let summaries = removed
@@ -1553,11 +1607,10 @@ impl MfaStore {
 
         if let Err(error) = self.save_vault(vault) {
             let rolled_back = vault.payload.entries.split_off(original_entry_count);
-            for ((session_id, expires_at, original_icon, original_updated_at), mut entry) in
+            for ((session_id, expires_at, original_metadata), mut entry) in
                 restore_metadata.into_iter().zip(rolled_back)
             {
-                entry.icon_emoji = original_icon;
-                entry.updated_at = original_updated_at;
+                restore_entry_metadata(&mut entry, original_metadata);
                 imports.insert(session_id, PendingImport { entry, expires_at });
             }
             return Err(error);
@@ -1589,19 +1642,12 @@ impl MfaStore {
         self.validate_epoch(epoch)?;
         // Validate every field before touching the unlocked in-memory entry so
         // an invalid later field cannot leave an earlier field half-updated.
-        let issuer = normalize_label_text(&request.issuer, 256, "发行方")?;
-        let account_name = normalize_label_text(&request.account_name, 256, "账户")?;
-        let mut name = normalize_label_text(&request.name, 120, "账户名称")?;
-        if name.is_empty() {
-            name = if !issuer.is_empty() {
-                issuer.clone()
-            } else if !account_name.is_empty() {
-                account_name.clone()
-            } else {
-                "未命名账户".to_string()
-            };
-        }
-        let icon_emoji = normalize_icon(&request.icon_emoji);
+        let metadata = normalize_entry_metadata(
+            &request.name,
+            &request.issuer,
+            &request.account_name,
+            &request.icon_emoji,
+        )?;
         let mut runtime = lock_unpoisoned(&self.runtime);
         self.ensure_unlocked_at(&mut runtime, epoch)?;
         let vault = runtime.vault.as_mut().ok_or_else(generic_vault_error)?;
@@ -1622,10 +1668,7 @@ impl MfaStore {
             )
         };
         let entry = &mut vault.payload.entries[index];
-        entry.name = name;
-        entry.issuer = issuer;
-        entry.account_name = account_name;
-        entry.icon_emoji = icon_emoji;
+        apply_entry_metadata(entry, metadata);
         entry.updated_at = now_iso();
         let result = summary(entry);
         if let Err(error) = self.save_vault(vault) {
@@ -3335,6 +3378,75 @@ fn normalize_label_text(value: &str, max_chars: usize, field: &str) -> AppResult
     Ok(value.to_string())
 }
 
+fn normalize_entry_metadata(
+    name: &str,
+    issuer: &str,
+    account_name: &str,
+    icon_emoji: &str,
+) -> AppResult<NormalizedEntryMetadata> {
+    let issuer = normalize_label_text(issuer, 256, "发行方")?;
+    let account_name = normalize_label_text(account_name, 256, "账户")?;
+    let mut name = normalize_label_text(name, 120, "账户名称")?;
+    if name.is_empty() {
+        name = if !issuer.is_empty() {
+            issuer.clone()
+        } else if !account_name.is_empty() {
+            account_name.clone()
+        } else {
+            "未命名账户".to_string()
+        };
+    }
+    Ok(NormalizedEntryMetadata {
+        name,
+        issuer,
+        account_name,
+        icon_emoji: normalize_icon(icon_emoji),
+    })
+}
+
+fn normalize_import_metadata(
+    name: &str,
+    issuer: &str,
+    account_name: &str,
+    icon_emoji: &str,
+) -> AppResult<NormalizedEntryMetadata> {
+    let name = normalize_label_text(name, 120, "账户名称")?;
+    if name.is_empty() {
+        return Err(AppError::invalid("账户名称不能为空。"));
+    }
+    Ok(NormalizedEntryMetadata {
+        name,
+        issuer: normalize_label_text(issuer, 256, "发行方")?,
+        account_name: normalize_label_text(account_name, 256, "账户")?,
+        icon_emoji: normalize_icon(icon_emoji),
+    })
+}
+
+fn stored_entry_metadata(entry: &StoredEntry) -> StoredEntryMetadata {
+    StoredEntryMetadata {
+        name: entry.name.clone(),
+        issuer: entry.issuer.clone(),
+        account_name: entry.account_name.clone(),
+        icon_emoji: entry.icon_emoji.clone(),
+        updated_at: entry.updated_at.clone(),
+    }
+}
+
+fn apply_entry_metadata(entry: &mut StoredEntry, metadata: NormalizedEntryMetadata) {
+    entry.name = metadata.name;
+    entry.issuer = metadata.issuer;
+    entry.account_name = metadata.account_name;
+    entry.icon_emoji = metadata.icon_emoji;
+}
+
+fn restore_entry_metadata(entry: &mut StoredEntry, metadata: StoredEntryMetadata) {
+    entry.name = metadata.name;
+    entry.issuer = metadata.issuer;
+    entry.account_name = metadata.account_name;
+    entry.icon_emoji = metadata.icon_emoji;
+    entry.updated_at = metadata.updated_at;
+}
+
 fn normalize_icon(value: &str) -> String {
     let value = value.trim();
     if value.is_empty() || value.chars().count() > 8 || value.chars().any(char::is_control) {
@@ -4391,14 +4503,12 @@ pub async fn scan_mfa_screen_qr(
 pub async fn commit_mfa_import(
     app: AppHandle,
     window: WebviewWindow,
-    session_id: String,
-    icon_emoji: String,
+    request: MfaImportCommitRequest,
 ) -> AppResult<MfaEntrySummary> {
     ensure_mfa_window(&window)?;
     let epoch = app.state::<MfaStore>().require_active_epoch()?;
     tauri::async_runtime::spawn_blocking(move || {
-        app.state::<MfaStore>()
-            .commit_import_at(&session_id, &icon_emoji, epoch)
+        app.state::<MfaStore>().commit_import_at(request, epoch)
     })
     .await
     .map_err(|_| AppError::new("mfa_task_error", "保存 MFA 账户任务异常结束。"))?
@@ -4830,6 +4940,17 @@ mod tests {
         );
         let preview = store.preview_uri(&uri).unwrap().remove(0);
         store.commit_import(&preview.session_id, "🌸").unwrap()
+    }
+
+    #[cfg(windows)]
+    fn import_commit(preview: &MfaImportPreview, icon_emoji: &str) -> MfaImportCommitRequest {
+        MfaImportCommitRequest {
+            session_id: preview.session_id.clone(),
+            name: preview.name.clone(),
+            issuer: preview.issuer.clone(),
+            account_name: preview.account_name.clone(),
+            icon_emoji: icon_emoji.to_string(),
+        }
     }
 
     #[cfg(windows)]
@@ -5770,6 +5891,54 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn single_import_applies_editable_metadata_without_changing_totp_parameters() {
+        let (_root, store) = test_store();
+        let preview = store
+            .preview_uri(
+                "otpauth://totp/Original%3Aalice%40example.com?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=Original&algorithm=SHA512&digits=8&period=45",
+            )
+            .unwrap()
+            .remove(0);
+        let mut request = import_commit(&preview, "🌸");
+        request.name = "  工作账户  ".to_string();
+        request.issuer = "  Example Cloud  ".to_string();
+        request.account_name = "  person@example.com  ".to_string();
+
+        let saved = store.commit_import_request(request).unwrap();
+
+        assert_eq!(saved.name, "工作账户");
+        assert_eq!(saved.issuer, "Example Cloud");
+        assert_eq!(saved.account_name, "person@example.com");
+        assert_eq!(saved.icon_emoji, "🌸");
+        assert_eq!(saved.algorithm, MfaAlgorithm::Sha512);
+        assert_eq!(saved.digits, 8);
+        assert_eq!(saved.period, 45);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_import_metadata_does_not_consume_the_pending_session() {
+        let (_root, store) = test_store();
+        let preview = store
+            .preview_uri("otpauth://totp/PetalDesk%3Aretry?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=PetalDesk")
+            .unwrap()
+            .remove(0);
+        let mut invalid = import_commit(&preview, "🌸");
+        invalid.name = "   ".to_string();
+
+        let error = store.commit_import_request(invalid).unwrap_err();
+
+        assert_eq!(error.code, "invalid_input");
+        assert_eq!(error.message, "账户名称不能为空。");
+        assert!(lock_unpoisoned(&store.imports).contains_key(&preview.session_id));
+        let saved = store
+            .commit_import_request(import_commit(&preview, "🌸"))
+            .unwrap();
+        assert_eq!(saved.account_name, "retry");
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn batch_import_commits_all_accounts_with_one_vault_update() {
         let (_root, store) = test_store();
         let input = [
@@ -5782,10 +5951,7 @@ mod tests {
         let requests = result
             .previews
             .iter()
-            .map(|preview| MfaImportCommitRequest {
-                session_id: preview.session_id.clone(),
-                icon_emoji: preview.icon_emoji.clone().unwrap(),
-            })
+            .map(|preview| import_commit(preview, preview.icon_emoji.as_deref().unwrap()))
             .collect();
 
         let saved = store.commit_imports(requests).unwrap();
@@ -5805,18 +5971,19 @@ mod tests {
                  otpauth://totp/PetalDesk%3Avalid-two?secret=JBSWY3DPEHPK3PXP&issuer=PetalDesk",
             )
             .unwrap();
-        let valid_request = MfaImportCommitRequest {
-            session_id: result.previews[0].session_id.clone(),
-            icon_emoji: "🌸".to_string(),
-        };
+        let valid_request = import_commit(&result.previews[0], "🌸");
+        let mut invalid_metadata_request = import_commit(&result.previews[1], "🔐");
+        invalid_metadata_request.name = "   ".to_string();
+        let invalid_metadata_error = store
+            .commit_imports(vec![valid_request.clone(), invalid_metadata_request])
+            .unwrap_err();
+        assert_eq!(invalid_metadata_error.code, "invalid_input");
+        assert_eq!(lock_unpoisoned(&store.imports).len(), 2);
+
+        let mut missing_request = import_commit(&result.previews[1], "🔐");
+        missing_request.session_id = "missing-session".to_string();
         let error = store
-            .commit_imports(vec![
-                valid_request,
-                MfaImportCommitRequest {
-                    session_id: "missing-session".to_string(),
-                    icon_emoji: "🔐".to_string(),
-                },
-            ])
+            .commit_imports(vec![valid_request, missing_request])
             .unwrap_err();
 
         assert_eq!(error.code, "not_found");
@@ -5839,6 +6006,9 @@ mod tests {
             let mut imports = lock_unpoisoned(&store.imports);
             for (index, preview) in result.previews.iter().enumerate() {
                 let pending = imports.get_mut(&preview.session_id).unwrap();
+                pending.entry.name = format!("original-name-{index}");
+                pending.entry.issuer = format!("original-issuer-{index}");
+                pending.entry.account_name = format!("original-account-{index}");
                 pending.entry.icon_emoji = format!("original-{index}");
                 pending.entry.updated_at = format!("2026-01-0{}T00:00:00.000Z", index + 1);
             }
@@ -5852,6 +6022,9 @@ mod tests {
                     let pending = imports.get(&preview.session_id).unwrap();
                     (
                         preview.session_id.clone(),
+                        pending.entry.name.clone(),
+                        pending.entry.issuer.clone(),
+                        pending.entry.account_name.clone(),
                         pending.entry.icon_emoji.clone(),
                         pending.entry.updated_at.clone(),
                         pending.expires_at,
@@ -5863,9 +6036,12 @@ mod tests {
             .previews
             .iter()
             .enumerate()
-            .map(|(index, preview)| MfaImportCommitRequest {
-                session_id: preview.session_id.clone(),
-                icon_emoji: ["⭐", "☁️"][index].to_string(),
+            .map(|(index, preview)| {
+                let mut request = import_commit(preview, ["⭐", "☁️"][index]);
+                request.name = format!("edited-name-{index}");
+                request.issuer = format!("edited-issuer-{index}");
+                request.account_name = format!("edited-account-{index}");
+                request
             })
             .collect::<Vec<_>>();
         atomic_write(&store.vault_path, b"externally-replaced-vault").unwrap();
@@ -5877,8 +6053,13 @@ mod tests {
         {
             let imports = lock_unpoisoned(&store.imports);
             assert_eq!(imports.len(), 2);
-            for (session_id, icon, updated_at, expires_at) in &original_sessions {
+            for (session_id, name, issuer, account_name, icon, updated_at, expires_at) in
+                &original_sessions
+            {
                 let pending = imports.get(session_id).unwrap();
+                assert_eq!(&pending.entry.name, name);
+                assert_eq!(&pending.entry.issuer, issuer);
+                assert_eq!(&pending.entry.account_name, account_name);
                 assert_eq!(&pending.entry.icon_emoji, icon);
                 assert_eq!(&pending.entry.updated_at, updated_at);
                 assert_eq!(&pending.expires_at, expires_at);
@@ -5892,7 +6073,13 @@ mod tests {
         atomic_write(&store.vault_path, &original_vault).unwrap();
         let saved = store.commit_imports(requests).unwrap();
         assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0].name, "edited-name-0");
+        assert_eq!(saved[0].issuer, "edited-issuer-0");
+        assert_eq!(saved[0].account_name, "edited-account-0");
         assert_eq!(saved[0].icon_emoji, "⭐");
+        assert_eq!(saved[1].name, "edited-name-1");
+        assert_eq!(saved[1].issuer, "edited-issuer-1");
+        assert_eq!(saved[1].account_name, "edited-account-1");
         assert_eq!(saved[1].icon_emoji, "☁️");
         assert_eq!(store.list_entries().unwrap().len(), 2);
     }
@@ -5945,10 +6132,7 @@ mod tests {
         let requests = result
             .previews
             .iter()
-            .map(|preview| MfaImportCommitRequest {
-                session_id: preview.session_id.clone(),
-                icon_emoji: preview.icon_emoji.clone().unwrap(),
-            })
+            .map(|preview| import_commit(preview, preview.icon_emoji.as_deref().unwrap()))
             .collect::<Vec<_>>();
         {
             let mut runtime = lock_unpoisoned(&store.runtime);

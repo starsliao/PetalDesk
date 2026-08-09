@@ -141,6 +141,15 @@ describe("desktop password command contract", () => {
     expect(backendInvoke).toHaveBeenCalledWith("list_password_mfa_candidates", undefined);
   });
 
+  it("copies linked MFA through the password command without returning a code", async () => {
+    (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
+    backendInvoke.mockResolvedValueOnce(undefined);
+
+    await expect(passwordApi.copyMfa("entry-1")).resolves.toBeUndefined();
+
+    expect(backendInvoke).toHaveBeenCalledWith("copy_password_mfa_code", { entryId: "entry-1" });
+  });
+
   it("normalizes the shared recovery flag from desktop status payloads", async () => {
     (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
     backendInvoke.mockResolvedValueOnce({

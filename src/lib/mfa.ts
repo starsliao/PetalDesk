@@ -85,6 +85,9 @@ export interface MfaUriPreviewResult {
 
 export interface MfaImportCommit {
   sessionId: string;
+  name: string;
+  issuer: string;
+  accountName: string;
   iconEmoji: string;
 }
 
@@ -117,7 +120,7 @@ export interface MfaApi {
   previewUri(uri: string): Promise<MfaImportPreview[]>;
   previewUris(uris: string): Promise<MfaUriPreviewResult>;
   previewManual(request: MfaManualImportRequest): Promise<MfaImportPreview[]>;
-  commitImport(sessionId: string, iconEmoji: string): Promise<MfaEntrySummary>;
+  commitImport(request: MfaImportCommit): Promise<MfaEntrySummary>;
   commitImports(imports: MfaImportCommit[]): Promise<MfaEntrySummary[]>;
   cancelImport(sessionId: string): Promise<void>;
   update(request: MfaEntryUpdateRequest): Promise<MfaEntrySummary>;
@@ -339,18 +342,21 @@ export function createBrowserMfaApi(): MfaApi {
     if (new Set(imports.map((item) => item.sessionId)).size !== imports.length) {
       throw new Error("导入列表包含重复账户。");
     }
+    if (imports.some((item) => !item.name.trim())) {
+      throw new Error("账户名称不能为空。");
+    }
     const selected = imports.map((item) => {
       const preview = previews.get(item.sessionId);
       if (!preview) throw new Error("导入预览已经过期，请重新识别。");
-      return { preview, iconEmoji: item.iconEmoji };
+      return { preview, request: item };
     });
     const timestamp = nowIso();
-    const saved = selected.map(({ preview, iconEmoji }) => ({
+    const saved = selected.map(({ preview, request }) => ({
       id: crypto.randomUUID(),
-      name: preview.name,
-      issuer: preview.issuer,
-      accountName: preview.accountName,
-      iconEmoji: iconEmoji || preview.iconEmoji || "🔐",
+      name: request.name.trim(),
+      issuer: request.issuer.trim(),
+      accountName: request.accountName.trim(),
+      iconEmoji: request.iconEmoji || preview.iconEmoji || "🔐",
       pinned: false,
       algorithm: preview.algorithm,
       digits: preview.digits,
@@ -422,8 +428,8 @@ export function createBrowserMfaApi(): MfaApi {
         period: request.period,
       }));
     },
-    async commitImport(sessionId, iconEmoji) {
-      return commitPreviewBatch([{ sessionId, iconEmoji }])[0];
+    async commitImport(request) {
+      return commitPreviewBatch([request])[0];
     },
     async commitImports(imports) {
       return commitPreviewBatch(imports);
@@ -566,9 +572,9 @@ export const mfaApi: MfaApi = {
     return previewList(await command<MfaImportPreview | MfaImportPreview[]>("preview_mfa_manual", { request }));
   },
 
-  async commitImport(sessionId, iconEmoji) {
-    if (!isDesktopRuntime()) return browserApi.commitImport(sessionId, iconEmoji);
-    return command<MfaEntrySummary>("commit_mfa_import", { sessionId, iconEmoji });
+  async commitImport(request) {
+    if (!isDesktopRuntime()) return browserApi.commitImport(request);
+    return command<MfaEntrySummary>("commit_mfa_import", { request });
   },
 
   async commitImports(imports) {

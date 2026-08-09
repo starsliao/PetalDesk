@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "飞花 - PetalDesk 浏览器增强",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "飞花 Firefox 浏览器增强，支持长截图、用户触发的密码填充、登录保存提示与关联 TOTP 填充。",
   "homepage_url": "https://starsliao.github.io/PetalDesk/",
   "icons": {
@@ -52,7 +52,7 @@
   "browser_specific_settings": {
     "gecko": {
       "id": "petaldesk-capture@petaldesk.app",
-      "strict_min_version": "140.0",
+      "strict_min_version": "142.0",
       "data_collection_permissions": {
         "required": ["websiteActivity", "authenticationInfo"]
       }

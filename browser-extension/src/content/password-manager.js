@@ -898,8 +898,6 @@
     }
     let password = String(payload.password || "");
     let username = payload.username == null ? activeOffer.username : String(payload.username);
-    const directFill = activeOffer.direct === true;
-    let fillNotice = "";
     try {
       if (!password || password.length > 4_096) throw new Error("The password is invalid");
       const fields = templates.identifyLoginFields(root.document, {
@@ -928,11 +926,6 @@
         fillInputValue(fields.passwordField, password);
         filledPassword = true;
       }
-      if (directFill) {
-        fillNotice = username
-          ? `已填充 ${username}，未自动提交。`
-          : "已填充密码，未自动提交。";
-      }
       return {
         filledPassword,
         filledUsername,
@@ -948,7 +941,6 @@
       if (Object.prototype.hasOwnProperty.call(payload, "username")) payload.username = "";
       clearActiveOffer();
       removeOverlay();
-      if (fillNotice) showFillNotice(fillNotice);
     }
   }
 
@@ -1082,14 +1074,6 @@
     const timer = setTimeout(() => {
       if (overlay === notice) removeOverlay();
     }, 3_000);
-    if (timer && typeof timer.unref === "function") timer.unref();
-  }
-
-  function showFillNotice(message) {
-    const notice = createOverlay("飞花密码管理器", message, []);
-    const timer = setTimeout(() => {
-      if (overlay === notice) removeOverlay();
-    }, 2_000);
     if (timer && typeof timer.unref === "function") timer.unref();
   }
 

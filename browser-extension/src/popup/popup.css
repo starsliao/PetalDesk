@@ -114,8 +114,7 @@ button.primary {
   position: relative;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 106px;
-  grid-template-rows: 34px 40px;
-  min-height: 74px;
+  min-height: 64px;
   width: 100%;
   border: 1px solid #c6d0d9;
   border-radius: 6px;
@@ -124,7 +123,7 @@ button.primary {
 
 button.account-main {
   grid-column: 1;
-  grid-row: 1 / 3;
+  grid-row: 1;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -176,13 +175,13 @@ button.account-main .username {
 
 .account-actions {
   grid-column: 2;
-  grid-row: 2;
+  grid-row: 1;
   display: grid;
   grid-template-columns: repeat(3, 30px);
   gap: 4px;
-  align-self: end;
+  align-self: center;
   justify-self: end;
-  padding: 0 7px 7px 0;
+  padding: 0 7px 0 0;
 }
 
 button.icon-button {
@@ -231,43 +230,45 @@ button.icon-button:hover:not(:disabled) {
   mask-image: url("../assets/icons/lucide/shield-check.svg");
 }
 
-.lucide-trash-2 {
-  -webkit-mask-image: url("../assets/icons/lucide/trash-2.svg");
-  mask-image: url("../assets/icons/lucide/trash-2.svg");
-}
-
-button.delete-trigger {
-  grid-column: 2;
-  grid-row: 1;
-  align-self: start;
-  justify-self: end;
-  margin: 4px 7px 0 0;
-  color: #657481;
-  background: transparent;
-  border-color: transparent;
-}
-
-button.delete-trigger:hover:not(:disabled),
-button.delete-trigger:focus-visible {
-  color: #b00020;
-  background: #fff0f2;
-  border-color: #e4a4af;
-}
-
+.account-context-menu,
 .delete-confirm {
   position: absolute;
   z-index: 10;
-  top: 36px;
+  top: 7px;
   right: 7px;
+  border: 1px solid #c6d0d9;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 5px 14px rgb(23 32 42 / 18%);
+}
+
+.account-context-menu {
+  width: 132px;
+  padding: 5px;
+}
+
+.account-context-menu button {
+  width: 100%;
+  padding: 6px 9px;
+  color: #b00020;
+  border-color: transparent;
+  background: transparent;
+  text-align: left;
+}
+
+.account-context-menu button:hover:not(:disabled),
+.account-context-menu button:focus-visible {
+  color: #fff;
+  border-color: #b00020;
+  background: #b00020;
+}
+
+.delete-confirm {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 6px;
   width: 166px;
   padding: 8px;
-  border: 1px solid #c6d0d9;
-  border-radius: 6px;
-  background: #fff;
-  box-shadow: 0 5px 14px rgb(23 32 42 / 18%);
 }
 
 .delete-confirm .confirm-label {

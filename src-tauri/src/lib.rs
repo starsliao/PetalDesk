@@ -794,10 +794,10 @@ pub fn run() {
                     tauri::async_runtime::spawn_blocking(move || {
                         password_app
                             .state::<PasswordBrowserService>()
-                            .suspend_capture();
-                        password_app
-                            .state::<PasswordStore>()
-                            .clear_deactivated_state(closing_epoch);
+                            .finish_password_window_close(
+                                &password_app.state::<PasswordStore>(),
+                                closing_epoch,
+                            );
                     });
                 }
             }
@@ -878,6 +878,7 @@ pub fn run() {
             passwords::reveal_password,
             passwords::copy_password_username,
             passwords::copy_password_secret,
+            passwords::copy_password_mfa_code,
             passwords::generate_password,
             passwords::set_password_capture_enabled,
             passwords::evaluate_password_capture,

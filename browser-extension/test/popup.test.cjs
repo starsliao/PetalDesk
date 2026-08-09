@@ -77,12 +77,25 @@ function loadPopup({ tab, onMessage } = {}) {
       document.activeElement = this;
     }
 
+    dispatch(type, options = {}) {
+      let prevented = false;
+      let stopped = false;
+      const event = {
+        ...options,
+        currentTarget: this,
+        target: options.target || this,
+        type,
+        preventDefault() { prevented = true; },
+        stopPropagation() { stopped = true; },
+      };
+      for (const listener of this.listeners.get(type) || []) listener(event);
+      return { prevented, stopped };
+    }
+
     click() {
       if (this.disabled) return;
       this.focus();
-      for (const listener of this.listeners.get("click") || []) {
-        listener({ currentTarget: this, target: this, type: "click" });
-      }
+      this.dispatch("click");
     }
   }
 
@@ -134,7 +147,7 @@ function loadPopup({ tab, onMessage } = {}) {
       }
       if (message.type === "petaldesk.popup.getState") {
         return Promise.resolve({
-          diagnostics: { captureEnabled: true, extensionVersion: "0.8.0" },
+          diagnostics: { captureEnabled: true, extensionVersion: "0.8.1" },
           tab: currentTab,
         });
       }
@@ -194,8 +207,26 @@ function loadPopup({ tab, onMessage } = {}) {
     elements,
     sentMessages,
     buttonInCard,
+    card(index) {
+      const card = accountList.children[index];
+      assert.ok(card, `account card ${index} should exist`);
+      return card;
+    },
+    contextMenus() {
+      return descendants(accountList, (element) => hasClass(element, "account-context-menu"));
+    },
     dialogs() {
       return descendants(accountList, (element) => hasClass(element, "delete-confirm"));
+    },
+    dispatchContextMenu(cardIndex, target = null) {
+      const card = accountList.children[cardIndex];
+      assert.ok(card, `account card ${cardIndex} should exist`);
+      return card.dispatch("contextmenu", { target: target || card });
+    },
+    dispatchContextKey(cardIndex, key, { shiftKey = false, target = null } = {}) {
+      const card = accountList.children[cardIndex];
+      assert.ok(card, `account card ${cardIndex} should exist`);
+      return card.dispatch("keydown", { key, shiftKey, target: target || card });
     },
     dispatchEscape() {
       let prevented = false;
@@ -206,6 +237,11 @@ function loadPopup({ tab, onMessage } = {}) {
         });
       }
       return prevented;
+    },
+    dispatchDocumentPointerDown(target = null) {
+      for (const listener of documentListeners.get("pointerdown") || []) {
+        listener({ target });
+      }
     },
     iconButtons(cardIndex) {
       const card = accountList.children[cardIndex];
@@ -225,7 +261,7 @@ function flush() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-test("account cards use four Lucide actions without an ellipsis or nested buttons", async () => {
+test("account cards keep three copy actions and no delete icon or nested buttons", async () => {
   const harness = loadPopup();
   await flush();
 
@@ -233,18 +269,20 @@ test("account cards use four Lucide actions without an ellipsis or nested button
   assert.equal(harness.nestedButtons().length, 0);
   assert.deepEqual(
     harness.iconButtons(0).map((button) => button.getAttribute("aria-label")),
-    ["复制用户名", "复制密码", "未关联 MFA", "删除账户"],
+    ["复制用户名", "复制密码", "未关联 MFA"],
   );
   assert.deepEqual(
     harness.iconButtons(1).map((button) => button.getAttribute("aria-label")),
-    ["复制用户名", "复制密码", "复制 MFA 验证码", "删除账户"],
+    ["复制用户名", "复制密码", "复制 MFA 验证码"],
   );
   assert.equal(harness.buttonInCard(0, "未关联 MFA").disabled, true);
   assert.equal(harness.buttonInCard(0, "未关联 MFA").getAttribute("title"), "未关联 MFA");
 
   const source = fs.readFileSync(path.join(__dirname, "..", "src", "popup", "popup.js"), "utf8");
   assert.equal(source.includes("⋯"), false);
-  assert.equal(source.includes("account-menu"), false);
+  assert.match(source, /account-context-menu/);
+  assert.equal(source.includes("delete-trigger"), false);
+  assert.equal(source.includes("trash-2"), false);
   assert.equal(source.includes("复制账号"), false);
 });
 
@@ -303,15 +341,59 @@ test("the account body remains the only fill action", async () => {
     type: "petaldesk.popup.fill",
     entryId: "entry-b",
   });
-  assert.equal(harness.status(), "填充请求已发送，请查看页面。");
+  assert.equal(harness.status(), "选择要填充的账户：");
 });
 
-test("deleting requires a second click, cancel restores focus, and success refreshes", async () => {
+test("right-click and keyboard context-menu gestures never trigger filling", async () => {
   const harness = loadPopup();
   await flush();
 
+  const fill = harness.buttonInCard(0, "填充 Example 的账户");
+  fill.focus();
+  const enter = harness.dispatchContextKey(0, "Enter", { target: fill });
+  const space = harness.dispatchContextKey(0, " ", { target: fill });
+  assert.equal(enter.prevented, false);
+  assert.equal(space.prevented, false);
+  assert.equal(harness.contextMenus().length, 0);
+
+  harness.dispatchContextMenu(0, fill);
+  assert.equal(harness.contextMenus().length, 1);
+  assert.equal(
+    harness.sentMessages.some((message) => message.type === "petaldesk.popup.fill"),
+    false,
+  );
+  harness.dispatchEscape();
+
+  const keyboard = harness.dispatchContextKey(0, "ContextMenu", { target: fill });
+  assert.equal(keyboard.prevented, true);
+  assert.equal(keyboard.stopped, true);
+  assert.equal(harness.contextMenus().length, 1);
+  assert.equal(
+    harness.sentMessages.some((message) => message.type === "petaldesk.popup.fill"),
+    false,
+  );
+});
+
+test("right-click deletion opens a menu, then requires confirmation and refreshes", async () => {
+  const harness = loadPopup();
+  await flush();
+
+  const fill = harness.buttonInCard(0, "填充 Example 的账户");
+  fill.focus();
+  const context = harness.dispatchContextMenu(0, fill);
+  assert.equal(context.prevented, true);
+  assert.equal(context.stopped, true);
+  assert.equal(harness.contextMenus().length, 1);
+  assert.equal(harness.dialogs().length, 0);
+  assert.equal(harness.document.activeElement.getAttribute("aria-label"), "删除账户");
+  assert.equal(
+    harness.sentMessages.some((message) => message.type === "petaldesk.popup.deleteEntry"),
+    false,
+  );
+
   harness.buttonInCard(0, "删除账户").click();
   assert.equal(harness.dialogs().length, 1);
+  assert.equal(harness.contextMenus().length, 0);
   assert.equal(
     harness.sentMessages.some((message) => message.type === "petaldesk.popup.deleteEntry"),
     false,
@@ -319,12 +401,13 @@ test("deleting requires a second click, cancel restores focus, and success refre
 
   harness.buttonInCard(0, "取消").click();
   assert.equal(harness.dialogs().length, 0);
-  assert.equal(harness.document.activeElement, harness.buttonInCard(0, "删除账户"));
+  assert.equal(harness.document.activeElement, fill);
   assert.equal(
     harness.sentMessages.some((message) => message.type === "petaldesk.popup.deleteEntry"),
     false,
   );
 
+  harness.dispatchContextMenu(0, fill);
   harness.buttonInCard(0, "删除账户").click();
   harness.buttonInCard(0, "删除").click();
   await flush();
@@ -351,6 +434,7 @@ test("the popup refreshes only after the desktop delete acknowledgement", async 
   });
   await flush();
 
+  harness.dispatchContextMenu(0);
   harness.buttonInCard(0, "删除账户").click();
   harness.buttonInCard(0, "删除").click();
   await flush();
@@ -374,31 +458,69 @@ test("the popup refreshes only after the desktop delete acknowledgement", async 
   assert.equal(harness.accountList.children.length, 1);
 });
 
-test("Escape closes delete confirmation and restores the delete trigger focus", async () => {
+test("Escape closes the context menu or confirmation and restores the invoking focus", async () => {
   const harness = loadPopup();
   await flush();
 
+  const fill = harness.buttonInCard(1, "填充 Example 的账户");
+  fill.focus();
+  harness.dispatchContextMenu(1, fill);
+  assert.equal(harness.contextMenus().length, 1);
+  assert.equal(harness.dispatchEscape(), true);
+  assert.equal(harness.contextMenus().length, 0);
+  assert.equal(harness.document.activeElement, fill);
+
+  harness.dispatchContextKey(1, "F10", { shiftKey: true, target: fill });
+  assert.equal(harness.contextMenus().length, 1);
   harness.buttonInCard(1, "删除账户").click();
   assert.equal(harness.dialogs().length, 1);
   assert.equal(harness.dispatchEscape(), true);
   assert.equal(harness.dialogs().length, 0);
-  assert.equal(harness.document.activeElement, harness.buttonInCard(1, "删除账户"));
+  assert.equal(harness.document.activeElement, fill);
   assert.equal(
     harness.sentMessages.some((message) => message.type === "petaldesk.popup.deleteEntry"),
     false,
   );
 });
 
-test("opening another account confirmation closes the previous one", async () => {
+test("opening another account context menu closes the previous one", async () => {
   const harness = loadPopup();
   await flush();
 
-  harness.buttonInCard(0, "删除账户").click();
+  const fill = harness.buttonInCard(1, "填充 Example 的账户");
+  harness.dispatchContextMenu(0);
+  harness.dispatchContextMenu(1, fill);
+  assert.equal(harness.contextMenus().length, 1);
+  assert.equal(harness.dialogs().length, 0);
+  assert.equal(harness.accountList.children[0].children.some((child) => child.className === "account-context-menu"), false);
+  assert.equal(harness.accountList.children[1].children.some((child) => child.className === "account-context-menu"), true);
   harness.buttonInCard(1, "删除账户").click();
+  harness.buttonInCard(1, "取消").click();
+  assert.equal(harness.document.activeElement, fill);
+});
+
+test("clicking outside the account action closes its menu or confirmation", async () => {
+  const harness = loadPopup();
+  await flush();
+
+  const fill = harness.buttonInCard(0, "填充 Example 的账户");
+  harness.dispatchContextMenu(0, fill);
+  harness.dispatchDocumentPointerDown(harness.elements.get("site-status"));
+  assert.equal(harness.contextMenus().length, 0);
+  assert.equal(harness.document.activeElement, fill);
+
+  harness.dispatchContextMenu(0, fill);
+  const deleteAction = harness.buttonInCard(0, "删除账户");
+  harness.dispatchDocumentPointerDown(deleteAction);
+  deleteAction.click();
   assert.equal(harness.dialogs().length, 1);
-  assert.equal(harness.accountList.children[0].children.some((child) => child.className === "delete-confirm"), false);
-  assert.equal(harness.accountList.children[1].children.some((child) => child.className === "delete-confirm"), true);
-  assert.equal(harness.document.activeElement, harness.buttonInCard(1, "删除账户"));
+  harness.dispatchDocumentPointerDown(harness.elements.get("site-status"));
+  assert.equal(harness.dialogs().length, 0);
+  assert.equal(harness.document.activeElement, fill);
+  assert.equal(
+    harness.sentMessages.some((message) => message.type === "petaldesk.popup.deleteEntry"),
+    false,
+  );
 });
 
 test("copy actions expose a disabled busy state until the request completes", async () => {
@@ -412,10 +534,11 @@ test("copy actions expose a disabled busy state until the request completes", as
   });
   await flush();
 
-  harness.buttonInCard(0, "删除账户").click();
+  harness.dispatchContextMenu(0);
   const copy = harness.buttonInCard(0, "复制密码");
   copy.click();
   await Promise.resolve();
+  assert.equal(harness.contextMenus().length, 0);
   assert.equal(harness.dialogs().length, 0);
   assert.equal(copy.disabled, true);
   assert.equal(copy.getAttribute("aria-busy"), "true");
@@ -445,16 +568,19 @@ test("an MFA copy error stays in popup status and does not disable password fill
   harness.buttonInCard(1, "填充 Example 的账户").click();
   await flush();
   assert.equal(harness.sentMessages.at(-1).type, "petaldesk.popup.fill");
-  assert.equal(harness.status(), "填充请求已发送，请查看页面。");
+  assert.equal(harness.status(), "选择要填充的账户：");
 });
 
-test("popup CSS fixes card geometry and keeps confirmation out of document flow", () => {
+test("popup CSS removes the delete slot and keeps context actions out of document flow", () => {
   const css = fs.readFileSync(path.join(__dirname, "..", "src", "popup", "popup.css"), "utf8");
   assert.match(css, /width:\s*360px/);
   assert.match(css, /grid-template-columns:\s*minmax\(0,\s*1fr\)\s+106px/);
+  assert.match(css, /min-height:\s*64px/);
+  assert.match(css, /\.account-context-menu\s*,\s*\.delete-confirm\s*\{[^}]*position:\s*absolute/s);
   assert.match(css, /\.delete-confirm\s*\{[^}]*position:\s*absolute/s);
-  assert.equal(css.includes("menu-trigger"), false);
-  assert.equal(css.includes("account-menu"), false);
+  assert.equal(css.includes("grid-template-rows"), false);
+  assert.equal(css.includes("delete-trigger"), false);
+  assert.equal(css.includes("lucide-trash-2"), false);
 });
 
 test("the four locally packaged Lucide sources retain their package license marker", () => {

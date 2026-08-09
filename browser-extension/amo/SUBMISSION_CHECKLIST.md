@@ -4,9 +4,9 @@
 - [ ] Product owner reviews `PRIVACY.md` and publishes the approved text at a stable HTTPS URL.
 - [ ] Replace the remaining `<PUBLISHER_NAME>` and `<SUPPORT_EMAIL>` fields during submission.
 - [ ] Confirm the extension and desktop app use one release version.
-- [ ] Confirm the desktop app, both extension manifests, both package manifests, and the release tag all use `0.8.0` / `v0.8.0`.
+- [ ] Confirm the desktop app, both extension manifests, both package manifests, and the release tag all use `0.8.1` / `v0.8.1`.
 - [ ] Run `npm test`, `npm run build`, and `npm run package:firefox`.
-- [ ] Confirm `web-ext lint` has no errors. The known Android-only warning is acceptable because v1 is Firefox Desktop only.
+- [ ] Confirm `web-ext lint` has no errors or minimum-version compatibility warnings. The Firefox manifest requires Firefox 142 or newer.
 - [ ] Upload `dist/artifacts/PetalDesk_Firefox_AMO-upload_<version>.zip` as **On this site / Listed** in AMO Developer Hub.
 - [ ] If AMO requests source, upload `dist/artifacts/PetalDesk_Firefox_AMO-source_<version>.zip` and paste the build steps from `REVIEWER_NOTES.md`.
 - [ ] Complete the AMO data categories with required `websiteActivity` and `authenticationInfo` exactly as declared by the manifest.

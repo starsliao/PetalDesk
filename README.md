@@ -2,7 +2,7 @@
 
 > 把想法留在桌面，把文件留在自己手里。
 
-[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows x64](https://github.com/starsliao/PetalDesk/releases/download/v0.8.0/PetalDesk_0.8.0_x64-setup.exe) · [下载 macOS Universal](https://github.com/starsliao/PetalDesk/releases/download/v0.8.0/PetalDesk_0.8.0_universal.dmg)
+[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows x64](https://github.com/starsliao/PetalDesk/releases/download/v0.8.1/PetalDesk_0.8.1_x64-setup.exe) · [下载 macOS Universal](https://github.com/starsliao/PetalDesk/releases/download/v0.8.1/PetalDesk_0.8.1_universal.dmg)
 
 飞花 - PetalDesk 是一款面向 Windows 10/11 与 macOS 12+ 的本地便签与效率工具。它启动快、界面安静，支持 Markdown 即时排版、纯文本、图片、搜索、回收站，以及截图、任务规划和本地 MFA 验证器等随时可以唤起的小工具。没有账号、没有云端依赖，内容保留在你的本地数据目录中。
 
@@ -32,7 +32,9 @@
 | --- | --- |
 | <img src="website/assets/screenshots/password-manager-tool.png" alt="飞花 - PetalDesk 密码管理器" width="500" /> | <img src="website/assets/screenshots/mfa-tool.png" alt="飞花 - PetalDesk MFA 验证器" width="260" /> |
 
-### 0.8.0 平台支持
+### 0.8.1 平台支持
+
+`0.8.1` 优化了密码与 MFA 的日常使用：Firefox 填充账号密码后保持静默且仍绝不主动提交；账户卡片移除占位删除图标，改为右键打开删除菜单并二次确认。普通关闭密码管理器不再关闭 Firefox 后台登录检测，只有原生通道断开、保险库被主动锁定或不可用等安全状态才会暂停保存提示；普通关闭 MFA 窗口也不会再被误判为显式锁定。MFA 扫码、图片或链接识别后可以编辑账户名称、发行方、账户名或邮箱和图标，算法、位数与周期保持只读。桌面密码管理器把显示密码按钮放在密码旁，按住显示、松开隐藏，并统一提供复制用户名、复制密码和复制 MFA 图标；未关联 MFA 时按钮置灰。
 
 `0.8.0` 把密码管理器与本地 TOTP 验证器联动起来：一个密码账户可关联一个 MFA 账户；飞花填入账号密码，或用户手动输入与唯一已保存账户完全一致时，会启动最长 5 分钟的二次验证 journey。唯一可信的 6/7/8 位 TOTP 字段可自动填入，模糊或多个字段会先显示“一键填充”，跨 origin 页面只接受首次明确确认并记住的精确 HTTPS origin；飞花始终不点击登录按钮、不发送 Enter，也不主动提交表单。Firefox 弹窗账户列表改为固定卡片，直接提供复制用户名、复制密码、复制 MFA 和右上角二次确认删除；MFA 验证码由桌面端直接写入系统剪贴板，并在失效时自动清除。关于页继续在当前版本旁显示正式安装包的真实打包时间。
 
@@ -97,15 +99,15 @@ MFA 与密码管理器同样可以随整个数据目录迁移。首次启用任�
 
 ### 升级与兼容
 
-Windows 上的 `0.5.2` 是自动更新桥接版本；已安装该版本或更高版本的用户可直接在飞花内更新到 `0.8.0`，无需重新运行本地安装流程。macOS 的 `0.5.0` 是首个公开版本，`0.8.0` 可以直接覆盖升级，但当前仍使用手动下载安装。首次启动时会自动识别旧的 `飞花/.feihua` 存储布局、旧便签元数据和旧甘特图数组格式，转换到当前 `.petaldesk/` 结构；便签正文 `note.md` 不会被改写，甘特图转换前会保留迁移备份。密码保险库 v1 会透明读取；首次成功写入 v2 前保留已认证备份，原有加密 AAD 不变。同机升级不需要输入全局恢复密码；恢复密码由 MFA 与密码管理器全局共用，用于跨设备恢复两个保险库，以及主动导出单个 MFA 账户。旧数据损坏或格式版本过新时，飞花会保留原文件并阻止静默覆盖。
+Windows 上的 `0.5.2` 是自动更新桥接版本；已安装该版本或更高版本的用户可直接在飞花内更新到 `0.8.1`，无需重新运行本地安装流程。macOS 的 `0.5.0` 是首个公开版本，`0.8.1` 可以直接覆盖升级，但当前仍使用手动下载安装。首次启动时会自动识别旧的 `飞花/.feihua` 存储布局、旧便签元数据和旧甘特图数组格式，转换到当前 `.petaldesk/` 结构；便签正文 `note.md` 不会被改写，甘特图转换前会保留迁移备份。密码保险库 v1 会透明读取；首次成功写入 v2 前保留已认证备份，原有加密 AAD 不变。同机升级不需要输入全局恢复密码；恢复密码由 MFA 与密码管理器全局共用，用于跨设备恢复两个保险库，以及主动导出单个 MFA 账户。旧数据损坏或格式版本过新时，飞花会保留原文件并阻止静默覆盖。
 
 ## 安装与运行
 
-Windows 新用户可下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.8.0/PetalDesk_0.8.0_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。`0.5.2` 起默认开启自动检查与后台下载；“关于飞花 - PetalDesk”中可以查看当前版本及安装包打包时间、手动检查或关闭自动更新，下载完成后仍由用户选择何时重启安装。
+Windows 新用户可下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.8.1/PetalDesk_0.8.1_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。`0.5.2` 起默认开启自动检查与后台下载；“关于飞花 - PetalDesk”中可以查看当前版本及安装包打包时间、手动检查或关闭自动更新，下载完成后仍由用户选择何时重启安装。
 
 没有 WebView2 或下载权限时，安装器会明确提示失败原因，不会静默留下无法启动的程序。未签名构建可能显示“未知发布者”，这是 Windows 对代码签名的正常提示。
 
-macOS 用户下载 [Universal DMG](https://github.com/starsliao/PetalDesk/releases/download/v0.8.0/PetalDesk_0.8.0_universal.dmg)，将应用拖入“应用程序”即可。同一个 DMG 同时包含 Intel（x86_64）和 Apple Silicon（arm64）代码，不需要按芯片下载不同安装包。普通截图首次使用时，请在“系统设置 > 隐私与安全性 > 屏幕录制”中允许 PetalDesk；未签名、未公证的测试构建可能被 Gatekeeper 阻止，正式发布方式见 [`docs/publishing.md`](docs/publishing.md)。
+macOS 用户下载 [Universal DMG](https://github.com/starsliao/PetalDesk/releases/download/v0.8.1/PetalDesk_0.8.1_universal.dmg)，将应用拖入“应用程序”即可。同一个 DMG 同时包含 Intel（x86_64）和 Apple Silicon（arm64）代码，不需要按芯片下载不同安装包。普通截图首次使用时，请在“系统设置 > 隐私与安全性 > 屏幕录制”中允许 PetalDesk；未签名、未公证的测试构建可能被 Gatekeeper 阻止，正式发布方式见 [`docs/publishing.md`](docs/publishing.md)。
 
 Windows 安装包已经包含长截图和密码管理器所需的 Native Messaging Host。首版密码自动填充与登录检测只由 Firefox 扩展提供；安装器不会静默安装扩展，用户需从 [Firefox 扩展安装页](https://starsliao.github.io/PetalDesk/firefox.html) 进入 AMO 并确认安装。不安装扩展仍可在密码管理器中打开站点、复制凭据并使用 Windows 通用长截图；安装后无需任何额外操作，浏览器长页面会在自动滚动模式下自动获得更稳定的滚动定位和拼接效果。macOS 版本不安装 Native Messaging Host，也不提供密码管理器、长截图或浏览器增强模式。
 

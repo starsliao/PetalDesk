@@ -74,7 +74,13 @@ describe("browser MFA demonstration", () => {
       digits: 6,
       period: 30,
     });
-    const saved = await api.commitImport(previews[0].sessionId, "🛡️");
+    const saved = await api.commitImport({
+      sessionId: previews[0].sessionId,
+      name: previews[0].name,
+      issuer: previews[0].issuer,
+      accountName: previews[0].accountName,
+      iconEmoji: "🛡️",
+    });
     const entries = await api.list();
     const revealed = await api.reveal(saved.id);
 

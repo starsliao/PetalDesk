@@ -173,6 +173,8 @@ export interface PasswordApi {
   reveal(id: string): Promise<PasswordRevealResult>;
   copyUsername(id: string): Promise<void>;
   copyPassword(id: string): Promise<void>;
+  /** Copies the linked TOTP directly from the desktop vault; no code is returned to the UI. */
+  copyMfa(id: string): Promise<void>;
   generatePassword(options: PasswordGeneratorOptions): Promise<string>;
   startFill(id: string): Promise<PasswordFillTicket>;
   cancelFill(sessionId: string): Promise<void>;
@@ -614,6 +616,14 @@ export function createBrowserPasswordApi(): PasswordApi {
       if (!entries.some((entry) => entry.id === id)) throw new Error("没有找到这个密码账户。");
       if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(secrets[id] || "Demo-Password-2026!");
     },
+    async copyMfa(id) {
+      const entry = entries.find((item) => item.id === id);
+      if (!entry) throw new Error("没有找到这个密码账户。");
+      if (!entry.mfaLink || !mfaCandidates.some((candidate) => candidate.id === entry.mfaLink?.entryId)) {
+        throw new Error("此账户未关联可用的 MFA。");
+      }
+      throw new Error("浏览器预览不包含真实 MFA 验证码，请在桌面客户端使用。");
+    },
     async generatePassword(options) {
       return generatePassword(options);
     },
@@ -708,6 +718,10 @@ export const passwordApi: PasswordApi = {
   async copyPassword(id) {
     if (!isDesktopRuntime()) return browserApi.copyPassword(id);
     await command<void>("copy_password_secret", { entryId: id });
+  },
+  async copyMfa(id) {
+    if (!isDesktopRuntime()) return browserApi.copyMfa(id);
+    await command<void>("copy_password_mfa_code", { entryId: id });
   },
   async generatePassword(options) {
     if (!isDesktopRuntime()) return browserApi.generatePassword(options);

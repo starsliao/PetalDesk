@@ -13,6 +13,7 @@
     KeyRound,
     Keyboard,
     LoaderCircle,
+    Lock,
     Pencil,
     Pin,
     PinOff,
@@ -40,6 +41,7 @@
     type MfaEntrySummary,
     type MfaEntryExport,
     type MfaTrashEntrySummary,
+    type MfaImportCommit,
     type MfaImportPreview,
     type MfaRevealResult,
     type MfaStatus,
@@ -107,6 +109,7 @@
   let recoveryPasswordConfirm = $state("");
   let recoveryError = $state("");
   let recoveryBusy = $state(false);
+  let lockBusy = $state(false);
   let recoveryDialog = $state<HTMLElement | null>(null);
   let currentRecoveryPasswordInput = $state<HTMLInputElement | null>(null);
   let recoveryPasswordInput = $state<HTMLInputElement | null>(null);
@@ -179,6 +182,9 @@
   let pinBusy = $derived(Object.keys(pinningIds).length > 0);
 
   let selectedPreview = $derived(previews.find((preview) => preview.sessionId === selectedSessionId) ?? null);
+  let invalidPreviewNameCount = $derived(bulkUriImport
+    ? previews.filter((preview) => !preview.name.trim()).length
+    : selectedPreview && !selectedPreview.name.trim() ? 1 : 0);
   let previewWarnings = $derived(bulkUriImport
     ? previews.flatMap((preview) => preview.warnings.map((warning) => `${preview.name}：${warning}`))
     : selectedPreview?.warnings ?? []);
@@ -214,6 +220,27 @@
 
   function setImportEmoji(value: string): void {
     importEmoji = selectedEmoji(value);
+  }
+
+  function updatePreview(
+    sessionId: string,
+    patch: Partial<Pick<MfaImportPreview, "name" | "issuer" | "accountName" | "iconEmoji">>,
+  ): void {
+    previews = previews.map((preview) => preview.sessionId === sessionId ? { ...preview, ...patch } : preview);
+  }
+
+  function setPreviewEmoji(sessionId: string, value: string): void {
+    updatePreview(sessionId, { iconEmoji: selectedEmoji(value) });
+  }
+
+  function previewCommit(preview: MfaImportPreview): MfaImportCommit {
+    return {
+      sessionId: preview.sessionId,
+      name: preview.name,
+      issuer: preview.issuer,
+      accountName: preview.accountName,
+      iconEmoji: selectedEmoji(preview.iconEmoji || "🔐"),
+    };
   }
 
   function setEditEmoji(value: string): void {
@@ -1162,16 +1189,17 @@
 
   async function commitImport(): Promise<void> {
     if (importBusy || previews.length === 0 || (!bulkUriImport && !selectedPreview)) return;
+    if (invalidPreviewNameCount > 0) {
+      importError = bulkUriImport ? "请为每个待导入账户填写账户名称。" : "账户名称不能为空。";
+      return;
+    }
     importBusy = true;
     error = "";
     importError = "";
     try {
       const savedEntries = bulkUriImport
-        ? await api.commitImports(previews.map((preview) => ({
-          sessionId: preview.sessionId,
-          iconEmoji: selectedEmoji(preview.iconEmoji || "🔐"),
-        })))
-        : [await api.commitImport(selectedPreview!.sessionId, selectedEmoji(importEmoji))];
+        ? await api.commitImports(previews.map(previewCommit))
+        : [await api.commitImport(previewCommit(selectedPreview!))];
       if (savedEntries.length === 0) throw new Error("后端未返回已导入的账户。");
       entries = [...entries, ...savedEntries];
       if (!bulkUriImport) {
@@ -1207,11 +1235,6 @@
   }
 
   async function closeWindow(): Promise<void> {
-    try {
-      await api.lock();
-    } catch {
-      // Closing must remain possible even when the backend is already shutting down.
-    }
     revealed = {};
     resetSensitiveInputs();
     clearRecoveryInputs();
@@ -1227,6 +1250,28 @@
       }
     } catch {
       // Browser preview has no native window.
+    }
+  }
+
+  async function lockVault(): Promise<void> {
+    if (lockBusy) return;
+    lockBusy = true;
+    error = "";
+    try {
+      await api.lock();
+      revealed = {};
+      resetSensitiveInputs();
+      clearRecoveryInputs();
+      clearExportState();
+      contextMenu = null;
+      addOpen = false;
+      editing = null;
+      trashOpen = false;
+      await refreshList();
+    } catch (reason) {
+      error = reasonMessage(reason, "锁定 MFA 保险库失败。");
+    } finally {
+      lockBusy = false;
     }
   }
 
@@ -1295,18 +1340,12 @@
       now = lastWallClock;
       if (!document.hidden) void refreshVisibleCodes(true);
     };
-    const beforeUnload = (): void => {
-      revealed = {};
-      void api.lock();
-    };
-
     void refreshList();
     tick();
     window.addEventListener("focus", resync);
     window.addEventListener("blur", handleWindowBlur);
     window.addEventListener("pointerdown", handleGlobalPointerDown);
     window.addEventListener("keydown", handleGlobalKeydown);
-    window.addEventListener("beforeunload", beforeUnload);
     document.addEventListener("visibilitychange", resync);
 
     if (api.isDesktop()) {
@@ -1326,13 +1365,11 @@
       window.removeEventListener("blur", handleWindowBlur);
       window.removeEventListener("pointerdown", handleGlobalPointerDown);
       window.removeEventListener("keydown", handleGlobalKeydown);
-      window.removeEventListener("beforeunload", beforeUnload);
       document.removeEventListener("visibilitychange", resync);
       revealed = {};
       resetSensitiveInputs();
       clearRecoveryInputs();
       clearExportState();
-      void api.lock();
     };
   });
 </script>
@@ -1373,6 +1410,9 @@
       {#if status?.recoveryState === "ready" && status.protection !== "browser-demo"}
         <button type="button" aria-label="修改全局恢复密码" title="修改全局恢复密码" onclick={openRecoveryPasswordChange}>
           <KeyRound size={18} aria-hidden="true" />
+        </button>
+        <button type="button" aria-label="锁定保险库" title="锁定保险库" disabled={lockBusy} onclick={() => void lockVault()}>
+          <Lock size={18} aria-hidden="true" />
         </button>
       {/if}
       <button
@@ -1634,6 +1674,7 @@
   {#if recoveryDialogMode}
     {@const isUnlocking = recoveryDialogMode === "unlock"}
     {@const isChanging = recoveryDialogMode === "change"}
+    {@const isManualUnlock = isUnlocking && status?.available === true && status.locked}
     <div class="modal-backdrop recovery-backdrop" role="presentation">
       <div
         bind:this={recoveryDialog}
@@ -1647,8 +1688,8 @@
         <form novalidate onsubmit={(event) => { event.preventDefault(); void submitRecoveryPassword(); }}>
           <header class="modal-header">
             <div>
-              <h2 id="mfa-recovery-title">{isUnlocking ? "使用恢复密码迁移" : isChanging ? "修改全局恢复密码" : "设置全局恢复密码"}</h2>
-              <p>{isUnlocking ? "验证成功后，这台电脑将恢复本机免密解锁。" : "这是密码管理器和 MFA 验证器全局共用的恢复密码。"}</p>
+              <h2 id="mfa-recovery-title">{isManualUnlock ? "解锁 MFA 保险库" : isUnlocking ? "使用恢复密码迁移" : isChanging ? "修改全局恢复密码" : "设置全局恢复密码"}</h2>
+              <p>{isManualUnlock ? "输入全局恢复密码后，浏览器中的 MFA 复制和自动填充将恢复可用。" : isUnlocking ? "验证成功后，这台电脑将恢复本机免密解锁。" : "这是密码管理器和 MFA 验证器全局共用的恢复密码。"}</p>
             </div>
             <button
               type="button"
@@ -1661,9 +1702,11 @@
             <div class="recovery-intro">
               <div class="recovery-icon"><KeyRound size={24} aria-hidden="true" /></div>
               <div class="recovery-copy">
-                <strong>{isUnlocking ? "解锁从其他电脑迁移来的 MFA 数据" : isChanging ? "修改后，两项工具同时使用新密码" : "用于迁移或恢复飞花的加密保险库"}</strong>
+                <strong>{isManualUnlock ? "保险库已由你主动锁定" : isUnlocking ? "解锁从其他电脑迁移来的 MFA 数据" : isChanging ? "修改后，两项工具同时使用新密码" : "用于迁移或恢复飞花的加密保险库"}</strong>
                 <p>
-                  {#if isUnlocking}
+                  {#if isManualUnlock}
+                    输入当前全局恢复密码即可解锁；此操作不会修改任何 MFA 账户。
+                  {:else if isUnlocking}
                     输入原电脑设置的恢复密码。解锁后，飞花会为当前系统用户建立新的本机保护。
                   {:else if isChanging}
                     原密码用于验证身份，修改成功后旧密码失效。更换电脑、重装系统、切换系统用户或本机安全保护不可用时，需要用新密码迁移或恢复加密保险库；导出 MFA 账户时也会用它验证身份。
@@ -1732,7 +1775,7 @@
             <button class="secondary-button" type="button" disabled={recoveryBusy} onclick={cancelRecoveryDialog}>{isChanging ? "取消" : "关闭"}</button>
             <button class="primary-button" type="submit" disabled={recoveryBusy}>
               {#if recoveryBusy}<LoaderCircle class="spinner" size={15} aria-hidden="true" />{:else}<KeyRound size={15} aria-hidden="true" />{/if}
-              {isUnlocking ? "解锁并迁移" : isChanging ? "保存新密码" : "设置恢复密码"}
+              {isManualUnlock ? "解锁" : isUnlocking ? "解锁并迁移" : isChanging ? "保存新密码" : "设置恢复密码"}
             </button>
           </div>
         </form>
@@ -1968,19 +2011,27 @@
               <div class="import-operation-error" role="alert"><AlertTriangle size={15} aria-hidden="true" /><span>{importError}</span></div>
             {/if}
             <div class="preview-heading">
-              <div><strong>确认识别结果</strong><span>{bulkUriImport ? `将一次导入 ${previews.length} 个账户，每项已分配独立图标` : previews.length > 1 ? `识别到 ${previews.length} 个标准账户，请选择一个` : "密钥不会显示在预览中"}</span></div>
+              <div><strong>确认识别结果</strong><span>{bulkUriImport ? `将一次导入 ${previews.length} 个账户；点击账户可逐项修改信息` : previews.length > 1 ? `识别到 ${previews.length} 个标准账户，请选择并确认信息` : "可修改显示信息；密钥不会显示在预览中"}</span></div>
               <button class="text-button" type="button" disabled={importBusy} onclick={() => void discardPreviews()}>重新识别</button>
             </div>
             {#if bulkUriImport}
-              <div class="preview-list" role="list" aria-label="将导入的账户">
+              <ul class="preview-list" aria-label="将导入的账户">
                 {#each previews as preview (preview.sessionId)}
-                  <div class="preview-card bulk-preview-card" role="listitem">
-                    <span class="preview-icon">{preview.iconEmoji || "🔐"}</span>
-                    <span class="preview-main"><strong>{preview.name}</strong><span>{metadata(preview)}</span><small>{preview.algorithm.toUpperCase()} · {preview.digits} 位 · {preview.period} 秒</small></span>
-                    <Check size={17} aria-label="将导入" />
-                  </div>
+                  <li>
+                    <button
+                      type="button"
+                      class:selected={selectedSessionId === preview.sessionId}
+                      class="preview-card bulk-preview-card"
+                      aria-label={`编辑 ${preview.name || "未命名账户"} 的识别信息`}
+                      onclick={() => (selectedSessionId = preview.sessionId)}
+                    >
+                      <span class="preview-icon">{preview.iconEmoji || "🔐"}</span>
+                      <span class="preview-main"><strong>{preview.name}</strong><span>{metadata(preview)}</span><small>{preview.algorithm.toUpperCase()} · {preview.digits} 位 · {preview.period} 秒</small></span>
+                      {#if selectedSessionId === preview.sessionId}<Pencil size={16} aria-label="正在编辑" />{:else}<Check size={17} aria-label="将导入" />{/if}
+                    </button>
+                  </li>
                 {/each}
-              </div>
+              </ul>
             {:else}
               <div class="preview-list" role="radiogroup" aria-label="选择导入账户">
                 {#each previews as preview (preview.sessionId)}
@@ -1992,6 +2043,65 @@
                   </label>
                 {/each}
               </div>
+            {/if}
+            {#if selectedPreview}
+              <section class="preview-editor" aria-label="编辑识别信息">
+                <div class="preview-editor-heading">
+                  <div><strong>编辑识别信息</strong><span>只修改显示信息，不会改变二维码中的验证码参数</span></div>
+                  <span class="preview-editor-icon" aria-hidden="true">{selectedPreview.iconEmoji || "🔐"}</span>
+                </div>
+                <div class="preview-editor-grid">
+                  <label class="field">
+                    <span>账户名称</span>
+                    <input
+                      aria-label="识别结果账户名称"
+                      autocomplete="off"
+                      maxlength="120"
+                      value={selectedPreview.name}
+                      disabled={importBusy}
+                      aria-invalid={!selectedPreview.name.trim()}
+                      oninput={(event) => updatePreview(selectedPreview.sessionId, { name: (event.currentTarget as HTMLInputElement).value })}
+                    />
+                    {#if !selectedPreview.name.trim()}<small class="field-error" role="alert">账户名称不能为空</small>{/if}
+                  </label>
+                  <label class="field">
+                    <span>发行方</span>
+                    <input
+                      aria-label="识别结果发行方"
+                      autocomplete="off"
+                      maxlength="256"
+                      value={selectedPreview.issuer}
+                      disabled={importBusy}
+                      oninput={(event) => updatePreview(selectedPreview.sessionId, { issuer: (event.currentTarget as HTMLInputElement).value })}
+                    />
+                  </label>
+                  <label class="field full-field">
+                    <span>账户名或邮箱</span>
+                    <input
+                      aria-label="识别结果账户名或邮箱"
+                      autocomplete="off"
+                      maxlength="256"
+                      value={selectedPreview.accountName}
+                      disabled={importBusy}
+                      oninput={(event) => updatePreview(selectedPreview.sessionId, { accountName: (event.currentTarget as HTMLInputElement).value })}
+                    />
+                  </label>
+                </div>
+                <div class="emoji-section preview-emoji-section">
+                  <span>选择图标</span>
+                  {#each emojiGroups as group}
+                    <div class="emoji-group"><small>{group.label}</small><div class="emoji-row">
+                      {#each group.values as emoji}<button type="button" disabled={importBusy} class:selected={selectedPreview.iconEmoji === emoji} aria-label={`识别结果使用 ${emoji} 图标`} onclick={() => setPreviewEmoji(selectedPreview.sessionId, emoji)}>{emoji}</button>{/each}
+                    </div></div>
+                  {/each}
+                  <label class="custom-emoji wide"><span>自定义 Emoji</span><input value={selectedPreview.iconEmoji || "🔐"} maxlength="8" disabled={importBusy} aria-label="识别结果自定义 Emoji" oninput={(event) => setPreviewEmoji(selectedPreview.sessionId, (event.currentTarget as HTMLInputElement).value)} /></label>
+                </div>
+                <dl class="preview-readonly" aria-label="二维码验证码参数">
+                  <div><dt>算法</dt><dd>{selectedPreview.algorithm.toUpperCase()}</dd></div>
+                  <div><dt>位数</dt><dd>{selectedPreview.digits} 位</dd></div>
+                  <div><dt>周期</dt><dd>{selectedPreview.period} 秒</dd></div>
+                </dl>
+              </section>
             {/if}
             {#if uriPreviewErrors.length}
               <div class="uri-preview-errors compact" role="alert" aria-label="链接识别错误">
@@ -2005,20 +2115,9 @@
                 <ul>{#each previewWarnings as warning}<li>{warning}</li>{/each}</ul>
               </div>
             {/if}
-            {#if !bulkUriImport}
-              <div class="emoji-section">
-                <span>选择图标</span>
-                {#each emojiGroups as group}
-                  <div class="emoji-group"><small>{group.label}</small><div class="emoji-row">
-                    {#each group.values as emoji}<button type="button" class:selected={importEmoji === emoji} aria-label={`使用 ${emoji} 图标`} onclick={() => setImportEmoji(emoji)}>{emoji}</button>{/each}
-                  </div></div>
-                {/each}
-                <label class="custom-emoji wide"><span>自定义 Emoji</span><input value={importEmoji} maxlength="8" aria-label="自定义 Emoji" oninput={(event) => setImportEmoji((event.currentTarget as HTMLInputElement).value)} /></label>
-              </div>
-            {/if}
             <div class="modal-actions">
               <button class="secondary-button" type="button" disabled={importBusy} onclick={() => void closeAdd()}>取消</button>
-              <button class="primary-button" type="button" disabled={importBusy || (bulkUriImport ? previews.length === 0 : !selectedPreview)} onclick={() => void commitImport()}>
+              <button class="primary-button" type="button" disabled={importBusy || invalidPreviewNameCount > 0 || (bulkUriImport ? previews.length === 0 : !selectedPreview)} onclick={() => void commitImport()}>
                 {#if importBusy}<LoaderCircle class="spinner" size={15} aria-hidden="true" />{:else}<Check size={15} aria-hidden="true" />{/if}
                 {bulkUriImport ? `添加 ${previews.length} 个账户并复制首个验证码` : "添加并复制验证码"}
               </button>
@@ -2195,7 +2294,9 @@
   .field input, .field select { height: 34px; padding: 0 9px; }
   .field textarea { min-height: 96px; padding: 8px 9px; resize: vertical; line-height: 1.45; }
   .field input:focus, .field textarea:focus, .field select:focus, .custom-emoji input:focus { border-color: #7352b9; box-shadow: inset 0 -2px #7352b9; }
+  .field input[aria-invalid="true"] { border-color: #c75a50; box-shadow: inset 0 -2px #c75a50; }
   .field small { color: #7b7580; line-height: 1.45; }
+  .field small.field-error { color: #a62b20; }
   .recovery-content { display: grid; padding: 17px; gap: 13px; overflow: auto; }
   .recovery-intro { display: grid; padding: 12px; grid-template-columns: 42px minmax(0, 1fr); align-items: start; gap: 11px; color: #463752; background: #f2edf8; border: 1px solid #d9cce9; border-radius: 7px; }
   .recovery-icon { display: grid; width: 40px; height: 40px; place-items: center; color: #65439d; background: #fff; border: 1px solid #ded2eb; border-radius: 50%; }
@@ -2279,11 +2380,13 @@
   .preview-heading span { color: #7b7580; font-size: 10.5px; }
   .text-button { padding: 5px 8px; color: #5c3e88; font-size: 11px; background: transparent; border: 0; border-radius: 4px; cursor: pointer; }
   .text-button:hover { background: #eee7f7; }
-  .preview-list { display: grid; max-height: 190px; gap: 6px; overflow: auto; }
-  .preview-card { display: grid; min-height: 64px; padding: 8px 10px; grid-template-columns: auto 38px minmax(0, 1fr) 20px; align-items: center; gap: 9px; background: #fff; border: 1px solid #d8d5da; border-radius: 7px; cursor: pointer; }
-  .preview-card.bulk-preview-card { grid-template-columns: 38px minmax(0, 1fr) 20px; cursor: default; }
+  .preview-list { display: grid; max-height: 164px; padding: 0; margin: 0; gap: 6px; overflow: auto; list-style: none; }
+  .preview-list > li { min-width: 0; }
+  .preview-card { display: grid; width: 100%; min-height: 64px; padding: 8px 10px; grid-template-columns: auto 38px minmax(0, 1fr) 20px; align-items: center; gap: 9px; color: inherit; font: inherit; text-align: left; background: #fff; border: 1px solid #d8d5da; border-radius: 7px; cursor: pointer; }
+  .preview-card.bulk-preview-card { grid-template-columns: 38px minmax(0, 1fr) 20px; }
   .bulk-preview-card > :global(svg) { color: #5d3c91; }
   .preview-card.selected { background: #f8f4fc; border-color: #9d81c1; box-shadow: 0 0 0 1px rgb(112 73 170 / 10%); }
+  .preview-card:focus-visible { border-color: #8f72bc; outline: 2px solid rgb(104 69 173 / 22%); outline-offset: 1px; }
   .preview-card input { accent-color: #6845ad; }
   .preview-icon { display: grid; width: 36px; height: 36px; place-items: center; font-size: 20px; background: #eee9f4; border-radius: 50%; }
   .preview-main { display: grid; min-width: 0; gap: 1px; }
@@ -2291,6 +2394,18 @@
   .preview-main strong { color: #302c34; font-size: 12.5px; }
   .preview-main span { color: #767079; font-size: 10.5px; }
   .preview-main small { color: #918b94; font-size: 9.5px; }
+  .preview-editor { display: grid; padding: 11px; margin-top: 10px; gap: 10px; background: #f7f4fa; border: 1px solid #d9d0e3; border-radius: 7px; }
+  .preview-editor-heading { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 10px; }
+  .preview-editor-heading > div { display: grid; min-width: 0; gap: 2px; }
+  .preview-editor-heading strong { color: #41354c; font-size: 11.5px; }
+  .preview-editor-heading span { color: #7c7185; font-size: 9.5px; line-height: 1.4; }
+  .preview-editor-icon { display: grid; width: 32px; height: 32px; flex: 0 0 auto; place-items: center; font-size: 18px !important; background: #fff; border: 1px solid #ddd3e7; border-radius: 50%; }
+  .preview-editor-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+  .preview-emoji-section { padding: 9px; margin-top: 0; }
+  .preview-readonly { display: grid; padding: 7px 9px; margin: 0; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; color: #746c7a; font-size: 9.5px; background: #fff; border: 1px solid #e1dce5; border-radius: 6px; }
+  .preview-readonly > div { display: flex; min-width: 0; align-items: center; justify-content: center; gap: 4px; }
+  .preview-readonly dt, .preview-readonly dd { margin: 0; }
+  .preview-readonly dd { color: #4f4657; font-weight: 650; }
   .preview-warnings { display: flex; padding: 8px 10px; margin-top: 9px; gap: 7px; color: #76520b; font-size: 10.5px; line-height: 1.45; background: #fff8df; border: 1px solid #ead69a; border-radius: 6px; }
   .preview-warnings :global(svg) { flex: 0 0 auto; margin-top: 1px; }
   .preview-warnings ul { padding: 0 0 0 15px; margin: 0; }
@@ -2326,6 +2441,7 @@
     .modal-backdrop { padding: 7px; }
     .method-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .manual-grid { grid-template-columns: 1fr; }
+    .preview-editor-grid { grid-template-columns: 1fr; }
     .full-field { grid-column: auto; }
   }
   @media (max-height: 520px) {
