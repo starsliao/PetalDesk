@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="安装飞花 - PetalDesk Chrome 与 Edge 浏览器增强" />
+    <meta name="theme-color" content="#f7f7f5" />
+    <link rel="icon" href="./assets/app-icon.svg" type="image/svg+xml" />
+    <title>Chrome / Edge 浏览器增强 | 飞花 - PetalDesk</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #242426;
+        --muted: #5f5f63;
+        --line: #e4e4df;
+        --line-strong: #d4d4cd;
+        --paper: #f7f7f5;
+        --white: #ffffff;
+        --blue: #0875c9;
+        --blue-hover: #0066ae;
+        --green-bg: #e9f6ed;
+        --green-line: #b8ddc2;
+        --green-ink: #245a32;
+        font-family: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", -apple-system, "Segoe UI", Arial, sans-serif;
+        font-synthesis: none;
+      }
+
+      * { box-sizing: border-box; }
+      body { margin: 0; min-width: 320px; color: var(--ink); background: var(--paper); line-height: 1.65; letter-spacing: 0; -webkit-font-smoothing: antialiased; }
+      a { color: inherit; text-underline-offset: 3px; }
+      :focus-visible { outline: 3px solid #e7b900; outline-offset: 3px; }
+      header { border-bottom: 1px solid rgba(36, 36, 38, 0.09); background: var(--paper); }
+      nav, .inner, footer { width: min(calc(100% - 40px), 920px); margin-inline: auto; }
+      nav { display: flex; align-items: center; justify-content: space-between; min-height: 68px; gap: 20px; }
+      .brand { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; font-size: 18px; font-weight: 800; }
+      .brand img { width: 34px; height: 34px; border-radius: 8px; }
+      .back { padding: 8px 12px; color: var(--muted); font-size: 14px; font-weight: 650; text-decoration: none; }
+      .back:hover { color: var(--ink); }
+      .intro { padding-block: 62px 54px; background: var(--white); border-bottom: 1px solid var(--line); }
+      h1 { margin: 0; max-width: 760px; font-size: 48px; font-weight: 850; line-height: 1.14; letter-spacing: 0; }
+      .lead { max-width: 720px; margin: 18px 0 28px; color: var(--muted); font-size: 18px; }
+      .actions { display: flex; flex-wrap: wrap; gap: 12px; }
+      .primary, .secondary { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 10px 20px; border: 1px solid transparent; border-radius: 8px; font-size: 15px; font-weight: 700; line-height: 1.2; text-decoration: none; }
+      .primary { color: var(--white); background: var(--blue); }
+      .primary:hover { background: var(--blue-hover); }
+      .secondary { color: var(--ink); background: var(--white); border-color: var(--line-strong); }
+      .status { padding-block: 18px; background: var(--green-bg); border-bottom: 1px solid var(--green-line); }
+      .status p { margin: 0; color: var(--green-ink); font-size: 14px; }
+      main { padding-block: 42px 68px; }
+      section { padding-block: 28px; border-bottom: 1px solid var(--line); }
+      section:first-child { padding-top: 0; }
+      section:last-child { border-bottom: 0; }
+      h2 { margin: 0 0 12px; font-size: 21px; font-weight: 800; letter-spacing: 0; }
+      p { margin: 0 0 12px; }
+      section p:last-child, section ul:last-child, section ol:last-child { margin-bottom: 0; }
+      ol, ul { margin: 8px 0 0; padding-left: 24px; }
+      li + li { margin-top: 8px; }
+      code { padding: 1px 5px; border-radius: 4px; background: #eeeeea; overflow-wrap: anywhere; }
+      .warning { padding: 14px 16px; border-left: 4px solid #c79400; background: #fff7d6; }
+      footer { padding-block: 26px 42px; color: var(--muted); font-size: 14px; }
+      footer a { color: var(--blue); }
+      @media (max-width: 560px) {
+        nav, .inner, footer { width: min(calc(100% - 28px), 920px); }
+        .intro { padding-block: 44px 40px; }
+        h1 { font-size: 36px; }
+        .actions a { width: 100%; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <nav aria-label="主导航">
+        <a class="brand" href="./index.html"><img src="./assets/app-icon.svg" alt="" />飞花 - PetalDesk</a>
+        <a class="back" href="./index.html">返回产品网站</a>
+      </nav>
+    </header>
+
+    <div class="intro">
+      <div class="inner">
+        <h1>飞花 Chrome / Edge 浏览器增强</h1>
+        <p class="lead">Chrome 与 Edge 共用 Chromium 版扩展，并与 Firefox 版使用相同的工具栏弹窗、站点账户操作、登录保存提示、受控密码与 TOTP 填充，以及网页长截图增强。</p>
+        <div class="actions">
+          <a class="primary" href="https://github.com/starsliao/PetalDesk/releases/download/v0.8.5/PetalDesk_Chrome_unpacked_0.8.5.zip">下载 Chromium 扩展 ZIP</a>
+          <a class="secondary" href="https://github.com/starsliao/PetalDesk/releases/latest">下载飞花桌面端</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="status">
+      <div class="inner">
+        <p>当前通过 GitHub 提供开发者模式 ZIP，尚未声称在 Chrome Web Store 上架。固定扩展 ID：<code>eclmlkbklcpcaijloflmohfpeldcbjkp</code>。</p>
+      </div>
+    </div>
+
+    <main class="inner">
+      <section>
+        <h2>安装条件</h2>
+        <ul>
+          <li>Windows 10/11 x64 上安装飞花 - PetalDesk 0.8.5 或更高版本。</li>
+          <li>Google Chrome 109 或 Microsoft Edge 109，或更高版本。</li>
+          <li>扩展目录需要长期保留；移动或删除目录后浏览器无法继续加载。</li>
+        </ul>
+      </section>
+
+      <section id="edge-install">
+        <h2>安装步骤</h2>
+        <ol>
+          <li>先安装或升级飞花桌面端。安装器会为固定扩展 ID 注册本机 Native Messaging Host。</li>
+          <li>下载 <code>PetalDesk_Chrome_unpacked_0.8.5.zip</code>，解压到不会移动的本地目录。</li>
+          <li>Chrome 用户打开 <code>chrome://extensions</code>；Edge 用户打开 <code>edge://extensions</code>。然后开启页面中的“开发者模式”。</li>
+          <li>点击“加载已解压的扩展程序”，选择直接包含 <code>manifest.json</code> 的目录。</li>
+          <li>保持飞花运行，点击工具栏中的飞花图标检查 Native Host 和桌面密码通道状态。</li>
+        </ol>
+        <p class="warning">Chrome 或 Edge 可能持续显示开发者模式提示，这是从 GitHub 加载未上架扩展的正常行为。请只使用本项目 Release 中的 ZIP。</p>
+      </section>
+
+      <section>
+        <h2>工具栏功能</h2>
+        <ul>
+          <li>查看扩展安装、Native Host、桌面密码通道和登录检测状态。</li>
+          <li>为当前站点显示账户角标和账户卡片，点击卡片填充，分别复制用户名、密码或关联 MFA。</li>
+          <li>通过右键菜单和二次确认删除账户。</li>
+          <li>单独开关登录检测，或在自动重连失败后手动重连。</li>
+          <li>打开飞花主界面、密码管理器、MFA 验证器或新建独立便签。</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>HTTP 与安全边界</h2>
+        <p>登录检测覆盖 HTTP 和 HTTPS，因此在 HTTP 站点提交新账号或修改密码后也会提示保存或更新。HTTP 会在保存时明确提示明文传输风险，用户接受后仅为该精确 origin 允许后续填充。</p>
+        <p>扩展只填写字段，绝不点击登录按钮、发送 Enter 或主动提交表单。TOTP 仍只用于受信任的 HTTPS 登录流程。凭据不会写入 Chrome 或 Edge storage、扩展日志或截图文件通信目录，也不会上传到飞花服务器。</p>
+      </section>
+    </main>
+
+    <footer>
+      <a href="./privacy.html">浏览器增强隐私政策</a> · <a href="./firefox.html">Firefox 扩展</a> · <a href="https://github.com/starsliao/PetalDesk/issues">问题反馈</a>
+    </footer>
+  </body>
+</html>

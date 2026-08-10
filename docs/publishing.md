@@ -6,20 +6,21 @@
 
 <https://starsliao.github.io/PetalDesk/>
 
-## 0.8.4 平台范围
+## 0.8.5 平台范围
 
-Windows 10/11 x64 与 macOS 12+ 共享便签、甘特图、计时器、提醒、系统通知、MFA 和普通截图能力。Windows `0.8.4` 修复远程桌面断开或重连后托盘线程可能同步等待 Explorer、导致飞花整体无响应的问题；点击、双击和悬停改用本地光标锚点，显示器、设备或设置变化只重置本地状态，任务栏重建时按需重新注册图标，全程不运行嵌套消息循环。Windows `0.8.3` 修复开机启动注册表权限并把设置错误固定显示在对话框顶部，托盘入口改为“打开主界面”，便签操作合并到带新建项和列表的二级菜单；关于页安全渲染更新内容中的 Markdown。Firefox 扩展把密码账户与本地 TOTP 关联：密码填入或唯一账户完全匹配后，可自动或经用户确认填入受信任的 6/7/8 位 TOTP 字段，且绝不主动提交表单；账号密码填入成功后保持静默，工具栏账户卡片可分别复制用户名、密码和 MFA，并通过右键菜单二次确认删除。扩展状态默认折叠，四个状态点分别概览安装权限、Native Host、桌面密码通道和登录检测；登录检测主动关闭时使用黑色，异常或未知状态使用红色。登录检测默认开启且可在扩展弹窗中主动开关；异常断线立即快速重连 3 次，全部失败后才显示手动重连。待保存/更新提示跨同一标签页页面变化保留至用户明确处理，弹窗另提供同一行的主界面、密码、MFA 和便签四个入口。复制关联 MFA 后会显示真实剩余有效秒数，验证码到期不再因此自动清空系统剪贴板；主动锁定 MFA 或退出飞花时仍会清理未被替换的验证码。普通关闭密码管理器或 MFA 窗口不会错误关闭登录检测或显式锁定 MFA；MFA 导入预览可编辑显示信息，桌面密码管理器提供按住显示密码及统一的三项复制按钮。Chrome/Edge 的密码能力延期。Windows 继续提供密码管理器、长截图、自动滚动和 Native Messaging Host。macOS 使用 Keychain 提供 MFA 本机免密解锁，并支持普通区域截图，但当前不提供密码管理器、长截图、浏览器联动、Native Messaging 注册或自动更新。
+Windows 10/11 x64 与 macOS 12+ 共享便签、甘特图、计时器、提醒、系统通知、MFA 和普通截图能力。`0.8.5` 新增 Google Chrome 浏览器增强，功能和工具栏弹窗与 Firefox 保持一致，包括长截图协作、站点账户角标、连接诊断、登录检测、账户填充与复制、关联 TOTP、删除确认及四个飞花快捷入口。登录检测现在覆盖所有 HTTP 与 HTTPS 登录页，新的 HTTP 站点也会提示保存或更新；接受 HTTP 保存时仍显示明文风险并按精确 origin 记录允许，TOTP 继续只用于受信任的 HTTPS 流程。Windows 安装器为固定 ID `eclmlkbklcpcaijloflmohfpeldcbjkp` 同时注册 Chrome 与 Edge Native Messaging Host。Chrome ZIP 只作为 GitHub 开发者模式分发，不代表已经在 Chrome Web Store 上架。macOS 当前仍不提供密码管理器、长截图、浏览器联动、Native Messaging 注册或自动更新。
 
 macOS Release 是一个 Universal DMG，内部同时包含 `x86_64-apple-darwin` 与 `aarch64-apple-darwin`，所以 Intel 和 Apple Silicon 不需要两个安装包。当前发布资产为：
 
-- `PetalDesk_0.8.4_x64-setup.exe`
-- `PetalDesk_0.8.4_x64-setup.exe.sig`
+- `PetalDesk_0.8.5_x64-setup.exe`
+- `PetalDesk_0.8.5_x64-setup.exe.sig`
 - `latest.json`
-- `PetalDesk_0.8.4_universal.dmg`
-- `PetalDesk_Firefox_AMO-upload_0.8.4.zip`
-- `PetalDesk_Firefox_AMO-source_0.8.4.zip`
+- `PetalDesk_0.8.5_universal.dmg`
+- `PetalDesk_Firefox_AMO-upload_0.8.5.zip`
+- `PetalDesk_Firefox_AMO-source_0.8.5.zip`
+- `PetalDesk_Chrome_unpacked_0.8.5.zip`
 
-Windows `0.5.2` 及后续版本可以通过客户端自动更新到 `0.8.4`，无需先在本机手工打包或安装。macOS 的 `0.5.0` 是首个公开版本，`0.8.4` 可以直接覆盖升级。MFA 保险库继续兼容已有 DPAPI/Keychain 包装；Windows 密码保险库 v1 会透明迁移到保留旧 AAD 的 v2，并在首次成功写入前创建备份。
+Windows `0.5.2` 及后续版本可以通过客户端自动更新到 `0.8.5`，无需先在本机手工打包或安装。macOS 的 `0.5.0` 是首个公开版本，`0.8.5` 可以直接覆盖升级。MFA 保险库继续兼容已有 DPAPI/Keychain 包装；Windows 密码保险库 v1 会透明迁移到保留旧 AAD 的 v2，并在首次成功写入前创建备份。
 
 ## 本地构建
 
@@ -53,7 +54,7 @@ macOS 上构建；Windows 主机不能直接产出可发布的 DMG。
 推送与项目版本一致的 `v*` 标签后，[`.github/workflows/release.yml`](../.github/workflows/release.yml) 会完成以下工作：
 
 1. 在 Ubuntu Runner 校验 `package.json`、Cargo、Tauri 和浏览器扩展版本是否与标签一致。
-2. 在 Windows Runner 构建现有 NSIS 安装包和 Firefox 发布资产。
+2. 在 Windows Runner 构建现有 NSIS 安装包，以及 Firefox 和 Chrome 发布资产。
 3. 在 GitHub 托管的 macOS 15 Runner 安装 Intel、Apple Silicon 两个 Rust target，并通过 `universal-apple-darwin` 生成一个 Universal DMG。
 4. 两个平台构建成功后，由独立发布任务一次性创建或更新同一个 GitHub Release，避免 Windows 与 macOS 任务竞争创建 Release。
 
@@ -81,16 +82,17 @@ macOS 普通截图首次运行依赖“系统设置 > 隐私与安全性 > 屏�
 
 ## Windows 浏览器增强发布
 
-Windows 包始终包含并注册 Firefox Native Messaging Host。构建 Chromium 增强时设置 `PETALDESK_CHROME_EXTENSION_ID` 和/或 `PETALDESK_EDGE_EXTENSION_ID`；GitHub 标签工作流从同名 repository secrets 读取 32 位商店扩展 ID。缺少某个 ID 只跳过对应 Chromium 浏览器的注册。
+Windows 包始终包含并注册 Native Messaging Host。Chrome 与 Edge 使用同一个清单公钥和固定扩展 ID `eclmlkbklcpcaijloflmohfpeldcbjkp`；安装器构建会从清单公钥重新推导 ID，任何不一致都会阻止发布。
 
-安装器不会安装浏览器扩展本身。公开 Firefox 版本还应发布 AMO 签名的 `browser-extension/dist/firefox` 构建；稳定 Gecko ID 已与 Host allowlist 对齐。Chrome 与 Edge 共用 Chromium 扩展构建，Firefox 使用独立 manifest 与签名 XPI。以上流程只适用于 Windows，macOS DMG 不包含或注册 Native Messaging Host。
+安装器不会安装浏览器扩展本身。公开 Firefox 版本还应发布 AMO 签名的 `browser-extension/dist/firefox` 构建；稳定 Gecko ID 已与 Host allowlist 对齐。Chrome 与 Edge 共用 Chromium 扩展构建，GitHub Release 中的 `PetalDesk_Chrome_unpacked_<version>.zip` 需要解压后通过 Chrome 开发者模式加载，不能作为 Chrome Web Store 上架证明。以上流程只适用于 Windows，macOS DMG 不包含或注册 Native Messaging Host。
 
 公开页面使用以下稳定地址，客户端和审核材料不写死尚未确认的 AMO slug：
 
 - Firefox 扩展安装页：<https://starsliao.github.io/PetalDesk/firefox.html>
+- Chrome 扩展安装页：<https://starsliao.github.io/PetalDesk/chrome.html>
 - 浏览器增强隐私政策：<https://starsliao.github.io/PetalDesk/privacy.html>
 
-AMO 公开提交前应先把包含这两个页面的 `main` 分支推送并等待 Pages 部署成功，再创建 `v0.8.4` 标签和提交 AMO，避免审核材料引用尚未上线的页面。
+AMO 公开提交前应先把包含这些页面的 `main` 分支推送并等待 Pages 部署成功，再创建 `v0.8.5` 标签和提交 AMO，避免审核材料引用尚未上线的页面。
 
 本地生成带版本号的 AMO 上传包：
 
@@ -98,8 +100,14 @@ AMO 公开提交前应先把包含这两个页面的 `main` 分支推送并等�
 npm --prefix browser-extension run package:firefox
 ```
 
-标签工作流总会附加明确标识的未签名 AMO 上传 ZIP 和审核源码 ZIP，但不会自动提交 AMO。首版应等 GitHub Release、Windows 安装包、隐私页和安装页全部公开后，再由产品所有者在 AMO Developer Hub 手工上传，避免桌面发布失败时提前占用不可重复的扩展版本号。未签名 ZIP 仅用于 AMO 上传，不能作为可直接安装的 Firefox 扩展对外提供。后续若增加 API 自动提交，应放在桌面 Release 成功后的独立工作流中，并单独处理 AMO 已存在同版本的幂等情况。
+同时生成 Firefox 两个归档与 Chrome 开发者模式 ZIP：
+
+```powershell
+npm --prefix browser-extension run package:extensions
+```
+
+标签工作流固定发布 Windows EXE、签名、Universal DMG、两个 Firefox 归档、Chrome 开发者模式 ZIP 和 `latest.json`，合计恰好 7 个资产。流程不会自动提交 AMO 或 Chrome Web Store。未签名 AMO ZIP 仅用于商店上传，不能作为可直接安装的 Firefox 扩展对外提供。
 
 当前版本页面：
 
-<https://github.com/starsliao/PetalDesk/releases/tag/v0.8.4>
+<https://github.com/starsliao/PetalDesk/releases/tag/v0.8.5>

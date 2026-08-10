@@ -59,11 +59,11 @@
     <main>
       <h1>浏览器增强隐私政策</h1>
       <p class="lead">飞花浏览器增强只与同一台 Windows 电脑上的飞花桌面应用通信，不运营云端账号，也不把浏览数据或凭据上传到飞花服务器。</p>
-      <p class="updated">最后更新：2026 年 8 月 10 日</p>
+      <p class="updated">最后更新：2026 年 8 月 11 日</p>
 
       <section>
         <h2>适用范围</h2>
-        <p>本政策适用于 Firefox 上的“飞花 - PetalDesk 浏览器增强”。它为飞花桌面应用提供长截图、由用户点选账户触发的密码填充、用户提交登录时的保存或更新提示，以及与本地 TOTP 的受控联动。</p>
+        <p>本政策适用于 Firefox、Chrome 与 Edge 上的“飞花 - PetalDesk 浏览器增强”。各版本使用相同的本地数据处理和安全边界，为飞花桌面应用提供长截图、由用户点选账户触发的密码填充、用户提交登录时的保存或更新提示，以及与本地 TOTP 的受控联动。</p>
       </section>
 
       <section>
@@ -79,7 +79,7 @@
       <section>
         <h2>使用方式</h2>
         <ul>
-          <li>长截图数据通过 Firefox Native Messaging 发送给本机飞花进程，用于完成用户主动发起的截图。</li>
+          <li>长截图数据通过浏览器 Native Messaging 发送给本机飞花进程，用于完成用户主动发起的截图。</li>
           <li>用户在飞花或工具栏弹窗中选择账户后，扩展先向目标页面发送不含密码的填充请求；目标 frame 的身份和字段可用性校验通过后，桌面应用才提供一次性凭据。扩展只填写字段，绝不自动提交表单。</li>
           <li>连接的密码保险库可用时，登录检测默认开启，用户也可在扩展弹窗中单独关闭。用户提交登录后，扩展把候选交给本机加密保险库判断是否完全相同、需要新增或需要更新。</li>
           <li>飞花填入已关联账户的密码，或手动登录与唯一已保存账户完全一致时，会为该标签页建立最长 5 分钟的二次验证 journey。唯一可信的 TOTP 字段可自动填入；模糊字段先询问用户，跨 origin 页面首次确认精确 HTTPS origin。飞花不点击按钮、不发送 Enter，也不主动提交表单。</li>
@@ -90,7 +90,7 @@
 
       <section>
         <h2>存储与保留</h2>
-        <p>扩展不会把密码、MFA ID、TOTP 或登录候选写入 Firefox storage、磁盘、日志、诊断或旧的截图文件通信目录。尚未进入保存提示的含密码候选最多在扩展内存中保留 30 秒；提交给本机飞花后，扩展立即清空密码，只保留恢复提示所需的非秘密元数据。桌面端把待确认候选仅保留在当前进程内存中，直到用户保存、更新、忽略或关闭，或标签页关闭、用户关闭登录检测、锁库、断连。两步登录中的纯用户名阶段最多保留 2 分钟；二次验证 journey 最长 5 分钟，每个字段 challenge 最长 30 秒且只能消费一次。</p>
+        <p>扩展不会把密码、MFA ID、TOTP 或登录候选写入 Firefox/Chrome/Edge storage、磁盘、日志、诊断或旧的截图文件通信目录。尚未进入保存提示的含密码候选最多在扩展内存中保留 30 秒；提交给本机飞花后，扩展立即清空密码，只保留恢复提示所需的非秘密元数据。桌面端把待确认候选仅保留在当前进程内存中，直到用户保存、更新、忽略或关闭，或标签页关闭、用户关闭登录检测、锁库、断连。两步登录中的纯用户名阶段最多保留 2 分钟；二次验证 journey 最长 5 分钟，每个字段 challenge 最长 30 秒且只能消费一次。</p>
         <p>用户选择保存的凭据由飞花桌面应用写入本地 XChaCha20-Poly1305 加密保险库，保留与删除由用户在飞花中控制。</p>
       </section>
 
@@ -101,7 +101,7 @@
           <li>密码操作绑定单次会话、标签页、文档、顶层 origin 和经过校验的目标 frame。跨源委派默认拒绝；当前唯一明确允许的是 <code>mail.163.com</code> 到其 <code>dl.reg.163.com</code> 登录 frame 的单向委派。</li>
           <li>每次填充都需要用户先明确选择账户，且扩展不会自动提交。</li>
           <li>TOTP challenge 绑定连接、flow、标签页、顶层 HTTPS origin、frame 和文档；跨 origin 首次需确认精确站点，跨 origin OTP iframe 一律拒绝。</li>
-          <li>HTTPS 为默认要求；HTTP 必须在飞花中逐 origin 明确允许并持续显示风险提示。</li>
+          <li>HTTP 与 HTTPS 登录提交都会触发保存或更新判断；HTTP 在接受保存时显示明文风险，并只为该精确 origin 允许后续填充。TOTP 仍要求 HTTPS。</li>
         </ul>
       </section>
 
@@ -114,7 +114,7 @@
       <div class="english" lang="en">
         <section>
           <h2>PetalDesk Browser Companion Privacy Notice</h2>
-          <p>Last updated: August 10, 2026</p>
+          <p>Last updated: August 11, 2026</p>
           <p>PetalDesk Browser Companion communicates only with the PetalDesk desktop application on the same Windows computer. It has no PetalDesk cloud account and does not upload browsing data or credentials to a PetalDesk server.</p>
         </section>
 
@@ -126,13 +126,13 @@
 
         <section>
           <h2>Storage, sharing, and retention</h2>
-          <p>Credentials, MFA identifiers, TOTP codes, and login candidates are not written to Firefox storage, disk, logs, diagnostics, or the legacy screenshot file bridge. A pre-prompt candidate containing a password remains in extension memory for no more than 30 seconds. After it is handed to the local PetalDesk process, the extension clears the password and keeps only non-secret metadata needed to restore the prompt after navigation. The desktop keeps the pending candidate only in process memory until the user saves, updates, ignores, or closes it, or until the tab closes, login detection is disabled, the vault is locked, or the local connection ends. A username-only stage may remain for up to two minutes. A second-factor journey lasts at most five minutes and each bound field challenge lasts at most 30 seconds and is single-use.</p>
+          <p>Credentials, MFA identifiers, TOTP codes, and login candidates are not written to Firefox, Chrome, or Edge storage, disk, logs, diagnostics, or the legacy screenshot file bridge. A pre-prompt candidate containing a password remains in extension memory for no more than 30 seconds. After it is handed to the local PetalDesk process, the extension clears the password and keeps only non-secret metadata needed to restore the prompt after navigation. The desktop keeps the pending candidate only in process memory until the user saves, updates, ignores, or closes it, or until the tab closes, login detection is disabled, the vault is locked, or the local connection ends. A username-only stage may remain for up to two minutes. A second-factor journey lasts at most five minutes and each bound field challenge lasts at most 30 seconds and is single-use.</p>
           <p>The extension does not sell, rent, or remotely transmit personal information. Native Messaging transfers data only to the registered PetalDesk executable under the same Windows user account.</p>
         </section>
 
         <section>
           <h2>Controls and contact</h2>
-          <p>Password operations are bound to one session, tab, document, top-level origin, and validated target frame. Cross-origin password delegation is denied by default; the only current explicit mapping is from <code>mail.163.com</code> to its <code>dl.reg.163.com</code> login frame. TOTP is bound to a separate single-use challenge and exact HTTPS origin; cross-origin OTP frames are rejected. The extension never submits a form or bypasses MFA. Recovery codes, CAPTCHA, passkeys, SMS or email codes, security keys, CVV, postal codes, and coupons are excluded.</p>
+          <p>Password operations are bound to one session, tab, document, top-level origin, and validated target frame. Cross-origin password delegation is denied by default; the only current explicit mapping is from <code>mail.163.com</code> to its <code>dl.reg.163.com</code> login frame. HTTP and HTTPS submissions both produce save or update decisions; accepting an HTTP save shows a plaintext warning and enables later filling only for that exact origin. TOTP is bound to a separate single-use challenge and exact HTTPS origin; cross-origin OTP frames are rejected. The extension never submits a form or bypasses MFA. Recovery codes, CAPTCHA, passkeys, SMS or email codes, security keys, CVV, postal codes, and coupons are excluded.</p>
           <p>The authentication-information permission is required at install time. Users may decline it during installation (the extension cannot run without it), lock the password vault, delete accounts, or uninstall the extension. Questions can be filed through <a href="https://github.com/starsliao/PetalDesk/issues">PetalDesk GitHub Issues</a>.</p>
         </section>
       </div>

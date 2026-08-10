@@ -21,7 +21,7 @@ describe("launch-at-login settings", () => {
       ]);
     const appInfo = vi.spyOn(notesApi, "appInfo").mockResolvedValue({
       workspacePath: "E:/notes",
-      version: "0.8.4",
+      version: "0.8.5",
       defaultEditorMode: "typora",
       trayShortcutSettings: {
         doubleClick: "firstNote",

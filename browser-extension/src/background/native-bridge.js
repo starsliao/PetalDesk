@@ -28,12 +28,7 @@
   let reconnectAttempt = 0;
   let recoveryMode = null;
   let connectionState = "connecting";
-  let secretConnected = api.browserFamily !== "firefox";
-  let passwordChannelDisconnected = false;
-  const activeSessions = new Map();
-  let defaultSessionKey = null;
-  const passwordBridge = api.browserFamily === "firefox"
-    && root.PetalDeskPasswordBridge
+  const passwordBridge = root.PetalDeskPasswordBridge
     ? root.PetalDeskPasswordBridge.createPasswordBridge({
       api,
       postToNative,
@@ -41,6 +36,10 @@
       requestNativeReconnect,
     })
     : null;
+  let secretConnected = !passwordBridge;
+  let passwordChannelDisconnected = false;
+  const activeSessions = new Map();
+  let defaultSessionKey = null;
 
   function errorMessage(error) {
     return error instanceof Error ? error.message : String(error || "Unknown error");
@@ -344,7 +343,7 @@
           ...(passwordBridge ? Array.from(passwordBridge.capabilities) : []),
         ],
       });
-      if (readyPosted && nativePort === port && api.browserFamily !== "firefox") {
+      if (readyPosted && nativePort === port && !passwordBridge) {
         markConnectionHealthy();
       }
       return readyPosted && nativePort === port;
@@ -480,7 +479,7 @@
     }
     connectionState = "connecting";
     reconnectAttempt = 0;
-    secretConnected = api.browserFamily !== "firefox";
+    secretConnected = !passwordBridge;
     if (!openNativePort("initial")) beginFastReconnect();
   }
 

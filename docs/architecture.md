@@ -30,7 +30,7 @@ PetalDesk 面向读取频繁、写入较少的桌面使用场景，不为第三�
 
 便签、甘特图、计时器、提醒和系统通知在 Windows 与 macOS 共享同一业务层。普通截图也同时支持两个平台：Windows 使用现有 Win32 捕获链路，macOS 使用系统屏幕捕获并依赖“屏幕录制”权限；编辑、复制、保存和贴图沿用共享流程。
 
-Windows 继续保留长截图、自动滚动、浏览器扩展和 Native Messaging Host，并在 `0.6.0` 增加密码管理器。截图控制仍使用原有文件桥接；用户名、密码和登录候选只经过带当前用户 ACL、随机进程令牌和短时会话绑定的 Windows named pipe，不进入文件队列。首版密码自动填充只在 Firefox 启用，且页面确认后仅填写字段、不自动提交。macOS 当前版本不打包或注册 Native Messaging Host，也不提供密码管理器、长截图和浏览器联动。
+Windows 继续保留长截图、自动滚动、浏览器扩展和 Native Messaging Host，并在 `0.6.0` 增加密码管理器。截图控制仍使用原有文件桥接；用户名、密码和登录候选只经过带当前用户 ACL、随机进程令牌和短时会话绑定的 Windows named pipe，不进入文件队列。密码填充、登录保存提示和关联 TOTP 由 Firefox、Chrome 与 Edge 共享同一套扩展协议，页面确认后只填写字段、不自动提交。macOS 当前版本不打包或注册 Native Messaging Host，也不提供密码管理器、长截图和浏览器联动。
 
 macOS Release 使用 `universal-apple-darwin` 目标，把 `x86_64-apple-darwin` 与 `aarch64-apple-darwin` 合并为一个 Universal 应用和 DMG。Intel 与 Apple Silicon 用户下载同一个文件即可。
 

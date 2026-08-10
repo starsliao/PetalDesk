@@ -28,12 +28,85 @@ const SECOND_FACTOR_MIN_VALIDITY_SECONDS: u64 = 5;
 const BADGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_BADGE_ACCOUNTS: usize = 16;
 const STATUS_DIAGNOSTIC_LIMIT: usize = 20;
+const PASSWORD_BROWSER_PRIORITY: [BrowserFamily; 3] = [
+    BrowserFamily::Chrome,
+    BrowserFamily::Firefox,
+    BrowserFamily::Edge,
+];
 /// The native host rewrites its session heartbeat every 2s; anything older is
 /// treated as a dead stdio layer.
 const STDIO_SESSION_MAX_AGE: Duration = Duration::from_secs(6);
 #[cfg(windows)]
 const FIREFOX_AMO_URL: &str = "https://starsliao.github.io/PetalDesk/firefox.html";
+#[cfg(windows)]
+const CHROMIUM_EXTENSION_URL: &str = "https://starsliao.github.io/PetalDesk/chrome.html";
+#[cfg(windows)]
+const EDGE_EXTENSION_URL: &str = "https://starsliao.github.io/PetalDesk/chrome.html#edge-install";
 static EVENT_DISPATCHER_STARTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasswordConnectionSelectionError {
+    Missing(Option<BrowserFamily>),
+    Ambiguous(BrowserFamily),
+}
+
+fn browser_display_name(browser: BrowserFamily) -> &'static str {
+    match browser {
+        BrowserFamily::Chrome => "Chrome",
+        BrowserFamily::Firefox => "Firefox",
+        BrowserFamily::Edge => "Edge",
+    }
+}
+
+#[cfg(windows)]
+fn browser_install_url(browser: BrowserFamily) -> &'static str {
+    match browser {
+        BrowserFamily::Firefox => FIREFOX_AMO_URL,
+        BrowserFamily::Chrome => CHROMIUM_EXTENSION_URL,
+        BrowserFamily::Edge => EDGE_EXTENSION_URL,
+    }
+}
+
+fn preferred_password_browser(
+    requested: Option<BrowserFamily>,
+    mut is_connected: impl FnMut(BrowserFamily) -> bool,
+) -> BrowserFamily {
+    requested.unwrap_or_else(|| {
+        PASSWORD_BROWSER_PRIORITY
+            .into_iter()
+            .find(|browser| is_connected(*browser))
+            .unwrap_or(BrowserFamily::Chrome)
+    })
+}
+
+fn select_password_connection(
+    requested: Option<BrowserFamily>,
+    mut connection_ids: impl FnMut(BrowserFamily) -> Vec<String>,
+) -> Result<(BrowserFamily, String), PasswordConnectionSelectionError> {
+    let select = |browser: BrowserFamily, connections: Vec<String>| match connections.as_slice() {
+        [] => Ok(None),
+        [connection_id] => Ok(Some((browser, connection_id.clone()))),
+        _ => Err(PasswordConnectionSelectionError::Ambiguous(browser)),
+    };
+
+    if let Some(browser) = requested {
+        return select(browser, connection_ids(browser))?
+            .ok_or(PasswordConnectionSelectionError::Missing(Some(browser)));
+    }
+    for browser in PASSWORD_BROWSER_PRIORITY {
+        if let Some(selected) = select(browser, connection_ids(browser))? {
+            return Ok(selected);
+        }
+    }
+    Err(PasswordConnectionSelectionError::Missing(None))
+}
+
+fn supports_password_browser(browser: BrowserFamily) -> bool {
+    matches!(
+        browser,
+        BrowserFamily::Chrome | BrowserFamily::Firefox | BrowserFamily::Edge
+    )
+}
 
 #[derive(Clone)]
 struct FillSession {
@@ -233,11 +306,16 @@ impl PasswordBrowserService {
         }
     }
 
-    fn status(&self) -> PasswordBrowserStatus {
+    fn status(&self, requested_browser: Option<BrowserFamily>) -> PasswordBrowserStatus {
+        let browser = preferred_password_browser(requested_browser, |candidate| {
+            self.bridge.is_connected(candidate)
+        });
+        #[cfg(windows)]
+        let browser_name = browser_display_name(browser);
         #[cfg(not(windows))]
         {
             return PasswordBrowserStatus {
-                browser: "firefox",
+                browser: browser.as_str(),
                 connection: "unsupported",
                 extension_installed: false,
                 native_host_installed: false,
@@ -259,14 +337,14 @@ impl PasswordBrowserService {
         // The stdio layer health comes from the native host's session
         // heartbeat file; the pipe layer from this process's secret bridge.
         #[cfg(windows)]
-        let bridge_session = latest_firefox_bridge_session();
+        let bridge_session = latest_bridge_session(browser);
         #[cfg(windows)]
         let stdio_connected = bridge_session.as_ref().is_some_and(|session| {
             unix_time_ms().saturating_sub(session.last_seen_unix_ms)
                 <= STDIO_SESSION_MAX_AGE.as_millis()
         });
         #[cfg(windows)]
-        let connection_id = self.bridge.latest_connection_id(BrowserFamily::Firefox);
+        let connection_id = self.bridge.latest_connection_id(browser);
         #[cfg(windows)]
         let had_connection = connection_id.is_some();
         #[cfg(windows)]
@@ -282,7 +360,7 @@ impl PasswordBrowserService {
         let (extension_status, status_error) = match extension_status_result {
             Some(Ok(status)) => (Some(status), None),
             Some(Err(error)) => {
-                eprintln!("读取 Firefox 密码扩展状态失败: {error}");
+                eprintln!("读取 {browser_name} 密码扩展状态失败: {error}");
                 (None, Some(error))
             }
             None => (None, None),
@@ -290,7 +368,7 @@ impl PasswordBrowserService {
         // A failed send may retire a half-open connection, so check this after
         // the request instead of preserving a stale pre-request snapshot.
         #[cfg(windows)]
-        let connected = self.bridge.is_connected(BrowserFamily::Firefox);
+        let connected = self.bridge.is_connected(browser);
         #[cfg(windows)]
         let authentication_consent = extension_status
             .as_ref()
@@ -320,7 +398,7 @@ impl PasswordBrowserService {
         let known_extension = had_connection || connected;
         #[cfg(windows)]
         PasswordBrowserStatus {
-            browser: "firefox",
+            browser: browser.as_str(),
             connection: if connected {
                 "connected"
             } else {
@@ -329,7 +407,7 @@ impl PasswordBrowserService {
             extension_installed: known_extension,
             native_host_installed: known_extension,
             extension_version: bridge_session.and_then(|session| session.extension_version),
-            install_url: (!known_extension).then(|| FIREFOX_AMO_URL.to_string()),
+            install_url: (!known_extension).then(|| browser_install_url(browser).to_string()),
             capture_permission: match (authentication_consent, known_extension, unsupported) {
                 (_, _, true) => "unavailable",
                 (Some(true), _, _) => "granted",
@@ -347,22 +425,35 @@ impl PasswordBrowserService {
             diagnostics: self.bridge.diag_snapshot(STATUS_DIAGNOSTIC_LIMIT),
             last_request_outcome: self.bridge.last_request_outcome(),
             message: if unsupported {
-                Some("当前 Firefox 扩展不支持密码功能，请更新扩展。".to_string())
+                Some(format!(
+                    "当前 {browser_name} 扩展不支持密码功能，请更新扩展。"
+                ))
             } else if status_error.is_some() {
-                Some("Firefox 密码通道通信异常；请稍后重试，必要时重启飞花或 Firefox。".to_string())
+                Some(format!(
+                    "{browser_name} 密码通道通信异常；请稍后重试，必要时重启飞花或 {browser_name}。"
+                ))
             } else if !connected {
-                Some("Firefox 扩展或本机通信组件尚未连接；仍可复制账号和密码。".to_string())
+                Some(format!(
+                    "{browser_name} 扩展或本机通信组件尚未连接；仍可复制账号和密码。"
+                ))
             } else if authentication_consent == Some(false) {
-                Some("Firefox 扩展的密码权限状态异常；请更新或重新安装扩展。".to_string())
+                Some(format!(
+                    "{browser_name} 扩展的密码权限状态异常；请更新或重新安装扩展。"
+                ))
             } else {
                 None
             },
         }
     }
 
-    fn start_fill(&self, app: &AppHandle, entry_id: &str) -> AppResult<PasswordFillTicket> {
+    fn start_fill(
+        &self,
+        app: &AppHandle,
+        entry_id: &str,
+        requested_browser: Option<BrowserFamily>,
+    ) -> AppResult<PasswordFillTicket> {
         let data = app.state::<PasswordStore>().browser_fill_data(entry_id)?;
-        let connection_id = self.single_firefox_connection()?;
+        let (browser, connection_id) = self.single_browser_connection(requested_browser)?;
         let session_id = Uuid::new_v4().to_string();
         let expires_at = Instant::now() + FILL_TTL;
         lock_unpoisoned(&self.fills).insert(
@@ -398,7 +489,7 @@ impl PasswordBrowserService {
         Ok(PasswordFillTicket {
             session_id,
             entry_id: entry_id.to_string(),
-            browser: "firefox",
+            browser: browser.as_str(),
             origin: data.origin.clone(),
             expires_at: unix_time_ms().saturating_add(FILL_TTL.as_millis()),
         })
@@ -424,9 +515,10 @@ impl PasswordBrowserService {
         &self,
         app: &AppHandle,
         entry_id: &str,
+        requested_browser: Option<BrowserFamily>,
     ) -> AppResult<PasswordTemplateRecordingTicket> {
         let data = app.state::<PasswordStore>().browser_fill_data(entry_id)?;
-        let connection_id = self.single_firefox_connection()?;
+        let (browser, connection_id) = self.single_browser_connection(requested_browser)?;
         let session_id = Uuid::new_v4().to_string();
         let expires_at = Instant::now() + TEMPLATE_RECORDING_TTL;
         let session = TemplateRecordingSession {
@@ -471,7 +563,10 @@ impl PasswordBrowserService {
             lock_unpoisoned(&self.recordings).remove(&session_id);
             return Err(browser_error(
                 "password_template_recording_binding",
-                "Firefox 返回了不匹配的模板录制会话。",
+                format!(
+                    "{} 返回了不匹配的模板录制会话。",
+                    browser_display_name(browser)
+                ),
             ));
         }
         let tab_id = response.get("tabId").and_then(Value::as_i64);
@@ -480,7 +575,10 @@ impl PasswordBrowserService {
             lock_unpoisoned(&self.recordings).remove(&session_id);
             return Err(browser_error(
                 "password_template_recording_binding",
-                "模板只能绑定 Firefox 的有效标签页和顶层文档。",
+                format!(
+                    "模板只能绑定 {} 的有效标签页和顶层文档。",
+                    browser_display_name(browser)
+                ),
             ));
         }
         let mut recordings = lock_unpoisoned(&self.recordings);
@@ -552,7 +650,7 @@ impl PasswordBrowserService {
     }
 
     /// Completes a normal password-manager window close without revoking the
-    /// independent Firefox background lease. Security-driven shutdown paths
+    /// independent browser-extension background lease. Security-driven shutdown paths
     /// (explicit vault lock, remote-session protection, or an unusable vault)
     /// must call `suspend_capture` themselves before clearing the UI session.
     pub(crate) fn finish_password_window_close(&self, store: &PasswordStore, closing_epoch: u64) {
@@ -612,19 +710,31 @@ impl PasswordBrowserService {
         }
     }
 
-    fn single_firefox_connection(&self) -> AppResult<String> {
-        let connections = self.bridge.connection_ids(BrowserFamily::Firefox);
-        match connections.as_slice() {
-            [] => Err(browser_error(
+    fn single_browser_connection(
+        &self,
+        requested_browser: Option<BrowserFamily>,
+    ) -> AppResult<(BrowserFamily, String)> {
+        select_password_connection(requested_browser, |browser| {
+            self.bridge.connection_ids(browser)
+        })
+        .map_err(|error| match error {
+            PasswordConnectionSelectionError::Missing(Some(browser)) => browser_error(
                 "password_extension_missing",
-                "Firefox 扩展尚未连接。",
-            )),
-            [connection_id] => Ok(connection_id.clone()),
-            _ => Err(browser_error(
+                format!("{} 扩展尚未连接。", browser_display_name(browser)),
+            ),
+            PasswordConnectionSelectionError::Missing(None) => browser_error(
+                "password_extension_missing",
+                "Chrome、Firefox 或 Edge 扩展尚未连接。",
+            ),
+            PasswordConnectionSelectionError::Ambiguous(browser) => browser_error(
                 "password_extension_ambiguous",
-                "检测到多个 Firefox 扩展配置，请只保留一个 Firefox 配置后重试。",
-            )),
-        }
+                format!(
+                    "检测到多个 {} 扩展配置，请只保留一个 {} 配置后重试。",
+                    browser_display_name(browser),
+                    browser_display_name(browser)
+                ),
+            ),
+        })
     }
 
     pub(crate) fn sync_capture_from_store(&self, store: &PasswordStore) {
@@ -670,7 +780,10 @@ impl PasswordBrowserService {
     }
 
     fn broadcast_capture_state(&self, desired: CaptureSyncState) {
-        let connection_ids = self.bridge.connection_ids(BrowserFamily::Firefox);
+        let connection_ids = PASSWORD_BROWSER_PRIORITY
+            .into_iter()
+            .flat_map(|browser| self.bridge.connection_ids(browser))
+            .collect::<Vec<_>>();
         if connection_ids.is_empty() {
             return;
         }
@@ -685,6 +798,7 @@ impl PasswordBrowserService {
                     "enabled": desired.enabled,
                     "desiredEnabled": desired.desired_enabled,
                     "available": desired.available,
+                    "allowInsecureHttp": true,
                     "insecureOrigins": desired.insecure_origins.clone(),
                 }),
                 Duration::from_secs(2),
@@ -699,7 +813,7 @@ impl PasswordBrowserService {
     }
 
     fn handle_event(&self, app: &AppHandle, event: BrowserSecretEvent) {
-        if event.browser != BrowserFamily::Firefox {
+        if !supports_password_browser(event.browser) {
             return;
         }
         self.prune(app);
@@ -712,11 +826,10 @@ impl PasswordBrowserService {
                 self.sync_capture_from_store(&store);
             }
             "connectionClosed" => {
-                self.clear_connection_state(app, &event.connection_id);
-                if self
-                    .bridge
-                    .connection_ids(BrowserFamily::Firefox)
-                    .is_empty()
+                self.clear_connection_state(app, &event.connection_id, event.browser);
+                if PASSWORD_BROWSER_PRIORITY
+                    .into_iter()
+                    .all(|browser| !self.bridge.is_connected(browser))
                 {
                     app.state::<PasswordStore>().deactivate_browser_session();
                 }
@@ -902,7 +1015,7 @@ impl PasswordBrowserService {
         );
     }
 
-    fn clear_connection_state(&self, app: &AppHandle, connection_id: &str) {
+    fn clear_connection_state(&self, app: &AppHandle, connection_id: &str, browser: BrowserFamily) {
         let removed_recordings = self.clear_connection_state_data(connection_id);
         for (session_id, session) in removed_recordings {
             emit_template_recording_status(
@@ -910,7 +1023,10 @@ impl PasswordBrowserService {
                 template_recording_ticket(
                     &session_id,
                     &session,
-                    Some("Firefox 连接已断开，模板录制已取消。".to_string()),
+                    Some(format!(
+                        "{} 连接已断开，模板录制已取消。",
+                        browser_display_name(browser)
+                    )),
                 ),
                 TemplateRecordingState::Failed,
             );
@@ -1161,7 +1277,7 @@ impl PasswordBrowserService {
                 "origin": session.origin,
                 "tabId": session.tab_id,
                 "frameId": frame_id,
-                // Firefox assigns a distinct document id to an iframe. Keep
+                // Browsers assign a distinct document id to an iframe. Keep
                 // the top-level id in the session, but route credentials with
                 // the id of the confirming frame.
                 "documentId": confirmation_document_id,
@@ -2843,7 +2959,10 @@ impl PasswordBrowserService {
                 template_recording_ticket(
                     session_id,
                     &failed,
-                    Some("Firefox 返回了不匹配的模板录制页面。".to_string()),
+                    Some(format!(
+                        "{} 返回了不匹配的模板录制页面。",
+                        browser_display_name(event.browser)
+                    )),
                 ),
                 TemplateRecordingState::Failed,
             );
@@ -2893,7 +3012,9 @@ impl PasswordBrowserService {
                 .get("error")
                 .and_then(Value::as_str)
                 .map(|value| value.chars().take(512).collect())
-                .unwrap_or_else(|| "Firefox 未能完成模板录制。".to_string());
+                .unwrap_or_else(|| {
+                    format!("{} 未能完成模板录制。", browser_display_name(event.browser))
+                });
             emit_template_recording_status(
                 app,
                 template_recording_ticket(session_id, &session, Some(message)),
@@ -3113,21 +3234,21 @@ fn badge_accounts(store: &PasswordStore, origin: &str) -> (bool, Vec<PasswordCap
     }
 }
 
-/// Newest native-host session file for Firefox. The host rewrites the
+/// Newest native-host session file for one browser. The host rewrites the
 /// heartbeat every couple of seconds and deletes the file on exit, so its
 /// freshness describes the stdio layer's health.
 #[cfg(windows)]
-struct FirefoxBridgeSession {
+struct BrowserBridgeSession {
     extension_version: Option<String>,
     last_seen_unix_ms: u128,
 }
 
 #[cfg(windows)]
-fn latest_firefox_bridge_session() -> Option<FirefoxBridgeSession> {
+fn latest_bridge_session(browser: BrowserFamily) -> Option<BrowserBridgeSession> {
     let sessions = crate::browser_secret_bridge::bridge_root()
         .ok()?
         .join("sessions");
-    let mut latest: Option<FirefoxBridgeSession> = None;
+    let mut latest: Option<BrowserBridgeSession> = None;
     for entry in std::fs::read_dir(sessions).ok()?.flatten() {
         let path = entry.path();
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
@@ -3139,13 +3260,13 @@ fn latest_firefox_bridge_session() -> Option<FirefoxBridgeSession> {
         let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
             continue;
         };
-        if value.get("browser").and_then(Value::as_str) != Some(BrowserFamily::Firefox.as_str()) {
+        if value.get("browser").and_then(Value::as_str) != Some(browser.as_str()) {
             continue;
         }
         let Some(last_seen_unix_ms) = value.get("lastSeenUnixMs").and_then(Value::as_u64) else {
             continue;
         };
-        let session = FirefoxBridgeSession {
+        let session = BrowserBridgeSession {
             extension_version: value
                 .get("extensionVersion")
                 .and_then(Value::as_str)
@@ -3394,7 +3515,7 @@ fn fill_confirmation_matches(session: &FillSession, payload: &Value) -> bool {
     let document_matches = if frame_id == 0 {
         session.document_id.as_deref() == Some(document_id)
     } else if frame_id > 0 {
-        // A trusted iframe has its own Firefox document id. The session's
+        // A trusted iframe has its own browser document id. The session's
         // top-level id remains the navigation binding; frame origin/id checks
         // below ensure the confirmation still belongs to this tab session.
         session.frame_id == Some(0) || session.frame_id == Some(frame_id)
@@ -3512,10 +3633,11 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub async fn get_password_browser_status(
     app: AppHandle,
     window: WebviewWindow,
+    browser: Option<BrowserFamily>,
 ) -> AppResult<PasswordBrowserStatus> {
     ensure_password_window(&window)?;
-    crate::commands::run_background("读取 Firefox 扩展状态", move || {
-        Ok(app.state::<PasswordBrowserService>().status())
+    crate::commands::run_background("读取浏览器扩展状态", move || {
+        Ok(app.state::<PasswordBrowserService>().status(browser))
     })
     .await
 }
@@ -3525,11 +3647,12 @@ pub async fn start_password_fill(
     app: AppHandle,
     window: WebviewWindow,
     entry_id: String,
+    browser: Option<BrowserFamily>,
 ) -> AppResult<PasswordFillTicket> {
     ensure_password_window(&window)?;
     tauri::async_runtime::spawn_blocking(move || {
         app.state::<PasswordBrowserService>()
-            .start_fill(&app, &entry_id)
+            .start_fill(&app, &entry_id, browser)
     })
     .await
     .map_err(|error| {
@@ -3565,11 +3688,12 @@ pub async fn start_password_template_recording(
     app: AppHandle,
     window: WebviewWindow,
     entry_id: String,
+    browser: Option<BrowserFamily>,
 ) -> AppResult<PasswordTemplateRecordingTicket> {
     ensure_password_window(&window)?;
     tauri::async_runtime::spawn_blocking(move || {
         app.state::<PasswordBrowserService>()
-            .start_template_recording(&app, &entry_id)
+            .start_template_recording(&app, &entry_id, browser)
     })
     .await
     .map_err(|error| {
@@ -3869,6 +3993,71 @@ mod tests {
         binding.document_id = "document-a".to_string();
         binding.frame_id = 0;
         assert!(!second_factor_challenge_matches(&challenge, &binding));
+    }
+
+    #[test]
+    fn password_browser_selection_prefers_chrome_and_honors_explicit_choice() {
+        assert_eq!(browser_install_url(BrowserFamily::Firefox), FIREFOX_AMO_URL);
+        assert_eq!(
+            browser_install_url(BrowserFamily::Chrome),
+            CHROMIUM_EXTENSION_URL
+        );
+        assert_eq!(browser_install_url(BrowserFamily::Edge), EDGE_EXTENSION_URL);
+
+        assert_eq!(
+            preferred_password_browser(None, |_| false),
+            BrowserFamily::Chrome
+        );
+        assert_eq!(
+            preferred_password_browser(None, |browser| {
+                matches!(browser, BrowserFamily::Firefox | BrowserFamily::Edge)
+            }),
+            BrowserFamily::Firefox
+        );
+        assert_eq!(
+            preferred_password_browser(Some(BrowserFamily::Edge), |_| false),
+            BrowserFamily::Edge
+        );
+
+        let selected = select_password_connection(None, |browser| match browser {
+            BrowserFamily::Chrome => vec!["chrome-a".to_string()],
+            BrowserFamily::Firefox => vec!["firefox-a".to_string()],
+            BrowserFamily::Edge => vec!["edge-a".to_string()],
+        })
+        .unwrap();
+        assert_eq!(selected, (BrowserFamily::Chrome, "chrome-a".to_string()));
+
+        let selected = select_password_connection(Some(BrowserFamily::Edge), |browser| {
+            (browser == BrowserFamily::Edge)
+                .then(|| vec!["edge-a".to_string()])
+                .unwrap_or_default()
+        })
+        .unwrap();
+        assert_eq!(selected, (BrowserFamily::Edge, "edge-a".to_string()));
+
+        assert_eq!(
+            select_password_connection(None, |browser| {
+                (browser == BrowserFamily::Chrome)
+                    .then(|| vec!["chrome-a".to_string(), "chrome-b".to_string()])
+                    .unwrap_or_default()
+            }),
+            Err(PasswordConnectionSelectionError::Ambiguous(
+                BrowserFamily::Chrome
+            ))
+        );
+    }
+
+    #[test]
+    fn password_event_filter_accepts_chrome_firefox_and_edge() {
+        for browser in PASSWORD_BROWSER_PRIORITY {
+            let event = secret_event_for_browser(
+                browser,
+                "connection-a",
+                "captureCandidate",
+                Value::Object(Default::default()),
+            );
+            assert!(supports_password_browser(event.browser));
+        }
     }
 
     #[test]
@@ -4376,9 +4565,18 @@ mod tests {
     }
 
     fn secret_event(connection_id: &str, event: &str, payload: Value) -> BrowserSecretEvent {
+        secret_event_for_browser(BrowserFamily::Firefox, connection_id, event, payload)
+    }
+
+    fn secret_event_for_browser(
+        browser: BrowserFamily,
+        connection_id: &str,
+        event: &str,
+        payload: Value,
+    ) -> BrowserSecretEvent {
         BrowserSecretEvent {
             connection_id: connection_id.to_string(),
-            browser: BrowserFamily::Firefox,
+            browser,
             event: event.to_string(),
             payload,
         }
@@ -4855,6 +5053,67 @@ mod tests {
     }
 
     #[test]
+    fn chrome_http_capture_prompts_and_persists_insecure_origin() {
+        let (_root, store) = test_store();
+        let (service, recorded) = connected_service("connection-a");
+        let candidate = secret_event_for_browser(
+            BrowserFamily::Chrome,
+            "connection-a",
+            "captureCandidate",
+            serde_json::json!({
+                "candidateId": "candidate-http-chrome",
+                "origin": "http://intranet.example",
+                "promptOrigin": "http://intranet.example",
+                "username": "alice",
+                "password": "one",
+                "tabId": 7,
+                "frameId": 0,
+                "documentId": "document-http",
+            }),
+        );
+        assert!(supports_password_browser(candidate.browser));
+
+        service.handle_capture_candidate(&store, &candidate);
+
+        let matches = recorded.requests_for("password.captureMatch");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["payload"]["action"], "new");
+        {
+            let captures = lock_unpoisoned(&service.captures);
+            let capture = captures.get("candidate-http-chrome").unwrap();
+            assert_eq!(capture.origin, "http://intranet.example");
+            assert!(capture.allow_insecure_http);
+        }
+
+        let saved = service.save_decision_from_event(
+            &store,
+            &secret_event_for_browser(
+                BrowserFamily::Chrome,
+                "connection-a",
+                "saveDecision",
+                serde_json::json!({
+                    "candidateId": "candidate-http-chrome",
+                    "action": "new",
+                    "origin": "http://intranet.example",
+                    "promptOrigin": "http://intranet.example",
+                    "tabId": 7,
+                    "frameId": 0,
+                    "documentId": "document-http",
+                }),
+            ),
+        );
+        let Some((entry_id, action)) = saved else {
+            panic!("a Chrome HTTP capture must be saved");
+        };
+        assert_eq!(action, "new");
+        let epoch = store.require_active_epoch().unwrap();
+        let created = store.browser_fill_data_at(&entry_id, epoch).unwrap();
+        assert_eq!(created.origin, "http://intranet.example");
+        assert!(created.allow_insecure_http);
+        assert_eq!(recorded.requests_for("password.saveResult").len(), 1);
+    }
+
+    #[test]
     fn capture_survives_document_navigation_and_saves_with_the_original_binding() {
         let (_root, store) = test_store();
         let (service, recorded) = connected_service("connection-a");
@@ -5237,6 +5496,8 @@ mod tests {
         let syncs = recorded.requests_for("password.setCaptureEnabled");
         assert_eq!(syncs.len(), 1);
         assert_eq!(syncs[0]["payload"]["enabled"], true);
+        assert_eq!(syncs[0]["payload"]["allowInsecureHttp"], true);
+        assert!(syncs[0]["payload"]["insecureOrigins"].is_array());
 
         service.clear_connection_state_data("connection-a");
         service.sync_capture_from_store(&store);
@@ -5580,7 +5841,8 @@ mod tests {
                 "available": false,
             }),
         );
-        let status = service.status();
+        let status = service.status(None);
+        assert_eq!(status.browser, "firefox");
         assert_eq!(status.capture_permission, "unknown");
         assert_eq!(status.capture_enabled, Some(false));
         assert_eq!(status.capture_desired_enabled, Some(true));
@@ -5605,9 +5867,15 @@ mod tests {
                 "available": true,
             }),
         );
-        assert_eq!(service.status().capture_permission, "granted");
+        assert_eq!(
+            service
+                .status(Some(BrowserFamily::Firefox))
+                .capture_permission,
+            "granted"
+        );
 
-        let status = disconnected.status();
+        let status = disconnected.status(None);
+        assert_eq!(status.browser, "chrome");
         assert_eq!(status.capture_permission, "unavailable");
         assert!(!status.pipe_connected);
     }

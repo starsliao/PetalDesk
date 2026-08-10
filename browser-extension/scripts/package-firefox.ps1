@@ -2,7 +2,8 @@
 param(
     [switch]$Sign,
     [ValidateSet('Listed', 'Unlisted')]
-    [string]$Channel
+    [string]$Channel,
+    [switch]$SkipTestAndBuild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,8 +32,10 @@ function Invoke-CheckedCommand {
 
 Push-Location $extensionRoot
 try {
-    Invoke-CheckedCommand -Command 'npm.cmd' -Arguments @('test')
-    Invoke-CheckedCommand -Command 'npm.cmd' -Arguments @('run', 'build')
+    if (-not $SkipTestAndBuild) {
+        Invoke-CheckedCommand -Command 'npm.cmd' -Arguments @('test')
+        Invoke-CheckedCommand -Command 'npm.cmd' -Arguments @('run', 'build')
+    }
     Invoke-CheckedCommand -Command 'npx.cmd' -Arguments @(
         '--yes', $webExtPackage,
         'lint',

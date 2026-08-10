@@ -14,6 +14,9 @@ $releaseExe = Join-Path $releaseDir "petaldesk.exe"
 $nativeHostBinaryName = "petaldesk-browser-host.exe"
 $nativeHostReleaseExe = Join-Path $releaseDir $nativeHostBinaryName
 $nativeHostRegistrationScript = Join-Path $projectRoot "browser-extension\native-host\windows\Register-PetalDeskNativeHost.ps1"
+$chromiumManifestPath = Join-Path $projectRoot "browser-extension\manifest\chromium.json"
+$chromiumIdentityGuard = Join-Path $projectRoot "browser-extension\scripts\Test-ChromiumExtensionIdentity.ps1"
+$expectedChromiumExtensionId = "eclmlkbklcpcaijloflmohfpeldcbjkp"
 $nsisDir = Join-Path $releaseDir "nsis\x64"
 $installerScript = Join-Path $nsisDir "installer.nsi"
 $nsisOutput = Join-Path $nsisDir "nsis-output.exe"
@@ -72,18 +75,22 @@ function Invoke-CheckedCommand {
     }
 }
 
-function Get-OptionalChromiumExtensionId {
+function Get-ChromiumExtensionId {
     param(
-        [Parameter(Mandatory = $true)][string]$EnvironmentVariable
+        [Parameter(Mandatory = $true)][string]$EnvironmentVariable,
+        [Parameter(Mandatory = $true)][string]$ExpectedExtensionId
     )
 
     $value = [Environment]::GetEnvironmentVariable($EnvironmentVariable, "Process")
     if ([string]::IsNullOrWhiteSpace($value)) {
-        return $null
+        return $ExpectedExtensionId
     }
     $value = $value.Trim()
     if ($value -notmatch '^[a-p]{32}$') {
         throw "$EnvironmentVariable 必须是 32 位小写 a-p 字符的 Chromium 扩展 ID。"
+    }
+    if ($value -cne $ExpectedExtensionId) {
+        throw "$EnvironmentVariable 配置为 '$value'，但当前 Chromium 清单固定 ID 为 '$ExpectedExtensionId'。"
     }
     return $value
 }
@@ -435,6 +442,12 @@ if (-not (Test-Path -LiteralPath $storagePathHooks)) {
 if (-not (Test-Path -LiteralPath $nativeHostRegistrationScript)) {
     throw "没有找到 Native Messaging 注册脚本：$nativeHostRegistrationScript"
 }
+if (-not (Test-Path -LiteralPath $chromiumManifestPath -PathType Leaf)) {
+    throw "没有找到 Chromium 扩展清单：$chromiumManifestPath"
+}
+if (-not (Test-Path -LiteralPath $chromiumIdentityGuard -PathType Leaf)) {
+    throw "没有找到 Chromium 扩展身份校验脚本：$chromiumIdentityGuard"
+}
 
 $storageHooksText = [System.IO.File]::ReadAllText(
     $storagePathHooks,
@@ -455,8 +468,15 @@ if ($persistCallCount -ne 1) {
     throw "NSIS_HOOK_POSTINSTALL 必须且只能调用一次 PetalDeskPersistStoragePath。"
 }
 
-$chromeExtensionId = Get-OptionalChromiumExtensionId -EnvironmentVariable "PETALDESK_CHROME_EXTENSION_ID"
-$edgeExtensionId = Get-OptionalChromiumExtensionId -EnvironmentVariable "PETALDESK_EDGE_EXTENSION_ID"
+& $chromiumIdentityGuard `
+    -ManifestPath $chromiumManifestPath `
+    -ExpectedExtensionId $expectedChromiumExtensionId | Out-Null
+$chromeExtensionId = Get-ChromiumExtensionId `
+    -EnvironmentVariable "PETALDESK_CHROME_EXTENSION_ID" `
+    -ExpectedExtensionId $expectedChromiumExtensionId
+$edgeExtensionId = Get-ChromiumExtensionId `
+    -EnvironmentVariable "PETALDESK_EDGE_EXTENSION_ID" `
+    -ExpectedExtensionId $expectedChromiumExtensionId
 
 $configText = [System.IO.File]::ReadAllText($configPath, [System.Text.Encoding]::UTF8)
 $config = $configText | ConvertFrom-Json
@@ -484,12 +504,7 @@ foreach ($resource in $expectedBundleResources.GetEnumerator()) {
     }
 }
 
-if ($null -eq $chromeExtensionId) {
-    Write-Host "未设置 PETALDESK_CHROME_EXTENSION_ID；安装包将跳过 Chrome Native Messaging 注册。"
-}
-if ($null -eq $edgeExtensionId) {
-    Write-Host "未设置 PETALDESK_EDGE_EXTENSION_ID；安装包将跳过 Edge Native Messaging 注册。"
-}
+Write-Host "Chrome/Edge Native Messaging 固定扩展 ID：$expectedChromiumExtensionId"
 
 # A clean checkout does not have frontendDist yet. Build the Tauri app first so
 # generate_context! can resolve ../build when Cargo compiles the Native Host.

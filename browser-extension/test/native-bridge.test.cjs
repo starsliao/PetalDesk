@@ -18,7 +18,9 @@ function eventTarget() {
   };
 }
 
-function loadBridge(family = "chrome", { timerCapMs = null } = {}) {
+function loadBridge(family = "chrome", options = {}) {
+  const { timerCapMs = null } = options;
+  const passwordFeatures = options.passwordFeatures ?? family === "firefox";
   const postedMessages = [];
   const ports = [];
   const runtimeStartup = eventTarget();
@@ -61,7 +63,7 @@ function loadBridge(family = "chrome", { timerCapMs = null } = {}) {
       return createPort();
     },
     getManifest() {
-      return { version: "0.8.4" };
+      return { version: "0.8.5" };
     },
   };
   const callbackTabs = {
@@ -105,12 +107,12 @@ function loadBridge(family = "chrome", { timerCapMs = null } = {}) {
   let manualReconnect = null;
   const nativeStates = [];
   const connectionStates = [];
-  if (family === "firefox") {
+  if (passwordFeatures) {
     context.PetalDeskPasswordBridge = {
       createPasswordBridge(options) {
         manualReconnect = options.requestNativeReconnect;
         return {
-          capabilities: [],
+          capabilities: ["password.getStatus"],
           disconnect() {
             passwordDisconnects += 1;
           },
@@ -375,6 +377,25 @@ test("Chrome and Edge mark replacement native ports healthy without Firefox secr
     assert.equal(bridge.ports.length, 2);
     assert.equal(bridge.postedMessages.filter((message) => message.type === "extension.ready").length, 2);
   }
+});
+
+test("Chrome password features use the same secret-channel lifecycle as Firefox", async () => {
+  const bridge = loadBridge("chrome", { passwordFeatures: true });
+  const ready = bridge.postedMessages[0];
+  assert.equal(ready.browser, "chrome");
+  assert.ok(ready.capabilities.includes("password.getStatus"));
+  assert.equal(bridge.connectionStates().at(-1).secretConnected, false);
+
+  await sendNativeRequest(bridge, {
+    protocolVersion: 1,
+    type: "extension.event",
+    event: "secretConnected",
+    payload: {},
+  });
+
+  assert.equal(bridge.secretConnects(), 1);
+  assert.equal(bridge.connectionStates().at(-1).state, "connected");
+  assert.equal(bridge.connectionStates().at(-1).secretConnected, true);
 });
 
 test("capture commands stay bound to the tab and frame selected by prepare", async () => {

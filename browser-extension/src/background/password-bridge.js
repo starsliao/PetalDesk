@@ -104,8 +104,13 @@
   }
 
   function createPasswordBridge({ api, postToNative, protocolVersion, requestNativeReconnect }) {
-    if (!api || api.browserFamily !== "firefox") {
-      throw new Error("The password bridge is only available in Firefox v1");
+    if (
+      !api
+      || !api.runtime
+      || !api.runtime.onMessage
+      || typeof api.runtime.onMessage.addListener !== "function"
+    ) {
+      throw new Error("The password bridge requires WebExtension runtime messaging");
     }
     const sessions = new Map();
     const candidates = new Map();
@@ -525,18 +530,12 @@
     function capturePromptSurfaceAllowed(record, binding) {
       if (!record || !binding || binding.frameId !== 0) return false;
       if (binding.origin.startsWith("https://")) return true;
-      // HTTP capture is opt-in and may be shown on the exact document that
-      // produced it. Do not replay a retained in-page prompt into a later
-      // HTTP navigation, where the old candidate would be an unrelated page
-      // overlay. The desktop candidate remains pending until a safe HTTPS
-      // document announces itself.
+      // HTTP prompts may follow a same-origin redirect, but never cross into a
+      // different plaintext origin where even secret-free account metadata
+      // would belong to another site.
       return Boolean(
         binding.origin.startsWith("http://")
-        && captureInsecureOrigins.has(binding.origin)
         && binding.origin === record.origin
-        && record.topDocumentId
-        && binding.documentId
-        && record.topDocumentId === binding.documentId,
       );
     }
 
@@ -915,7 +914,7 @@
       }
       const tab = await api.createTab({ active: true, url: url.href });
       if (!tab || !Number.isInteger(tab.id)) {
-        throw bridgeError("PASSWORD_TARGET_INVALID", "Firefox did not create a login tab");
+        throw bridgeError("PASSWORD_TARGET_INVALID", "The browser did not create a login tab");
       }
       const session = {
         allowInsecureHttp,
@@ -1181,7 +1180,7 @@
       }
       const tab = await api.createTab({ active: true, url: url.href });
       if (!tab || !Number.isInteger(tab.id)) {
-        throw bridgeError("PASSWORD_TARGET_INVALID", "Firefox did not create a template recording tab");
+        throw bridgeError("PASSWORD_TARGET_INVALID", "The browser did not create a template recording tab");
       }
       const recording = {
         allowInsecureHttp,
@@ -1247,8 +1246,7 @@
         } catch (_error) {
           return;
         }
-        const allowed = origin.startsWith("https://") || captureInsecureOrigins.has(origin);
-        const command = captureEnabled && allowed ? "captureEnable" : "captureDisable";
+        const command = captureEnabled ? "captureEnable" : "captureDisable";
         // No frameId: every frame of the tab toggles its own login detection,
         // so explicitly trusted login frames can report credentials too.
         await api.sendTabMessage(
@@ -2098,10 +2096,7 @@
         const frameTopOrigin = await topLevelOrigin(binding, sender);
         const trustedFrame = Boolean(frameTopOrigin)
           && templates.frameOriginAllowed(frameTopOrigin, binding.origin);
-        const frameCaptureAllowed = trustedFrame && (
-          binding.origin.startsWith("https://")
-          || captureInsecureOrigins.has(binding.origin)
-        );
+        const frameCaptureAllowed = trustedFrame;
         const secondFactorArm = await secondFactorArmForBinding(binding, sender);
         const capturePrompt = pendingCapturePromptForBinding(binding, frameTopOrigin);
         return {
@@ -2246,12 +2241,10 @@
           tabId: binding.tabId,
         });
       }
-      const originCaptureAllowed = binding.origin.startsWith("https://")
-        || captureInsecureOrigins.has(binding.origin);
       const secondFactorArm = await secondFactorArmForBinding(binding, sender);
       const capturePrompt = pendingCapturePromptForBinding(binding, binding.origin);
       return {
-        captureEnabled: Boolean(captureEnabled && originCaptureAllowed),
+        captureEnabled,
         capturePrompt,
         insecureOrigins: Array.from(captureInsecureOrigins),
         secondFactorArm,
@@ -2554,9 +2547,6 @@
       if (binding.frameId > 0 && !templates.frameOriginAllowed(origin, binding.origin)) {
         throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The username-stage frame is cross-site");
       }
-      if (origin.startsWith("http://") && !captureInsecureOrigins.has(origin)) {
-        throw bridgeError("PASSWORD_INSECURE_ORIGIN", "HTTP login detection was not enabled for this origin");
-      }
       let username = String(message.username == null ? "" : message.username);
       if (!username || username.length > 1_024) {
         username = "";
@@ -2612,12 +2602,6 @@
       } else if (!templates.frameOriginAllowed(origin, frameOrigin)) {
         // A cross-site iframe must never attach credentials to the top site.
         throw bridgeError("PASSWORD_ORIGIN_MISMATCH", "The login candidate came from a cross-site frame");
-      }
-      if (origin.startsWith("http://") && !captureInsecureOrigins.has(origin)) {
-        throw bridgeError("PASSWORD_INSECURE_ORIGIN", "HTTP login detection was not enabled for this origin");
-      }
-      if (frameOrigin.startsWith("http://") && !captureInsecureOrigins.has(frameOrigin)) {
-        throw bridgeError("PASSWORD_INSECURE_ORIGIN", "HTTP login detection was not enabled for this frame");
       }
       const existingPrompt = Array.from(candidates.values()).find((record) => (
         record.tabId === binding.tabId

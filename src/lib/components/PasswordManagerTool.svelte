@@ -30,6 +30,7 @@
     passwordApi,
     secondsUntilPasswordHidden,
     type PasswordApi,
+    type PasswordBrowser,
     type PasswordBrowserDiagEntry,
     type PasswordBrowserStatus,
     type PasswordEntryInput,
@@ -51,12 +52,14 @@
   type EditorMode = "add" | "edit";
   type RecoveryMode = "setup" | "reuse" | "unlock" | "change";
   const BROWSER_STATUS_POLL_MS = 10_000;
+  const PASSWORD_BROWSERS: PasswordBrowser[] = ["chrome", "firefox", "edge"];
 
   let { api = passwordApi }: Props = $props();
 
   let entries = $state<PasswordEntrySummary[]>([]);
   let status = $state<PasswordStatus | null>(null);
   let browser = $state<PasswordBrowserStatus | null>(null);
+  let selectedBrowser = $state<PasswordBrowser>("chrome");
   let loading = $state(true);
   let error = $state("");
   let toast = $state("");
@@ -79,7 +82,7 @@
   let lockBusy = $state(false);
   let revealTimers = new Map<string, number>();
   let browserStatusTimer: number | null = null;
-  let browserStatusRefreshInFlight: Promise<void> | null = null;
+  let browserStatusRefreshInFlight: { browser: PasswordBrowser; request: Promise<void> } | null = null;
   let templateExpiryTimer: number | null = null;
   let unlistenEntriesChanged: (() => void) | undefined;
   let unlistenTemplateRecording: (() => void) | undefined;
@@ -544,11 +547,11 @@
       try {
         await notesApi.openExternalLink(entry.loginUrl);
         error = communicationFailed
-          ? "Firefox 扩展通信异常，暂时无法确认密码权限；站点已直接打开。"
-          : "当前 Firefox 扩展不支持密码填充，请更新扩展；站点已直接打开。";
+          ? `${browserName()} 扩展通信异常，暂时无法确认密码权限；站点已直接打开。`
+          : `当前 ${browserName()} 扩展不支持密码填充，请更新扩展；站点已直接打开。`;
       } catch (reason) {
         error = reasonMessage(reason, communicationFailed
-          ? "Firefox 扩展通信异常，且无法打开站点。"
+          ? `${browserName()} 扩展通信异常，且无法打开站点。`
           : "当前扩展不支持密码填充，且无法打开站点。");
       } finally {
         fillBusy = setBusy(fillBusy, entry.id, false);
@@ -567,13 +570,14 @@
       }
       return;
     }
+    const targetBrowser = selectedBrowser;
     try {
-      await api.startFill(entry.id);
+      await api.startFill(entry.id, targetBrowser);
       error = "";
-      showToast(`已在 Firefox 中打开“${entry.siteName}”，请在页面确认填充`);
+      showToast(`已在 ${browserName(targetBrowser)} 中打开“${entry.siteName}”，请在页面确认填充`);
     } catch (reason) {
       await refreshBrowserStatus().catch(() => undefined);
-      error = reasonMessage(reason, "无法连接 Firefox 扩展。你仍可以手动打开网址并复制凭据。");
+      error = reasonMessage(reason, `无法连接 ${browserName(targetBrowser)} 扩展。你仍可以手动打开网址并复制凭据。`);
       try {
         await notesApi.openExternalLink(entry.loginUrl);
       } catch {
@@ -757,27 +761,44 @@
     }
   }
 
+  function browserName(target: PasswordBrowser = selectedBrowser): string {
+    return target === "chrome" ? "Chrome" : target === "firefox" ? "Firefox" : "Edge";
+  }
+
   function refreshBrowserStatus(announceGrant = false): Promise<void> {
-    if (browserStatusRefreshInFlight) return browserStatusRefreshInFlight;
+    const target = selectedBrowser;
+    if (browserStatusRefreshInFlight?.browser === target) return browserStatusRefreshInFlight.request;
     const request = (async () => {
       const previousPermission = browser?.capturePermission;
-      const next = await api.getBrowserStatus();
+      const next = await api.getBrowserStatus(target);
+      if (selectedBrowser !== target) return;
       browser = next;
       if (next.capturePermission === "granted" && announceGrant && previousPermission && previousPermission !== "granted") {
         error = "";
-        showToast(status?.captureEnabled ? "Firefox 已授权，登录信息检测已开启" : "Firefox 密码填充已授权");
+        showToast(status?.captureEnabled ? `${browserName(target)} 已授权，登录信息检测已开启` : `${browserName(target)} 密码填充已授权`);
       }
     })();
-    browserStatusRefreshInFlight = request;
+    browserStatusRefreshInFlight = { browser: target, request };
     void request.then(
       () => {
-        if (browserStatusRefreshInFlight === request) browserStatusRefreshInFlight = null;
+        if (browserStatusRefreshInFlight?.request === request) browserStatusRefreshInFlight = null;
       },
       () => {
-        if (browserStatusRefreshInFlight === request) browserStatusRefreshInFlight = null;
+        if (browserStatusRefreshInFlight?.request === request) browserStatusRefreshInFlight = null;
       },
     );
     return request;
+  }
+
+  async function initializeBrowserStatus(): Promise<void> {
+    const statuses = await Promise.all(PASSWORD_BROWSERS.map((target) => api.getBrowserStatus(target)));
+    const connected = statuses.find((candidate) => candidate.connection === "connected");
+    selectedBrowser = connected?.browser ?? "chrome";
+    browser = statuses.find((candidate) => candidate.browser === selectedBrowser) ?? null;
+  }
+
+  async function selectBrowser(): Promise<void> {
+    await refreshBrowserStatus();
   }
 
   function scheduleBrowserStatusRefresh(): void {
@@ -809,12 +830,13 @@
     }
   }
 
-  async function refresh(): Promise<void> {
+  async function refresh(detectBrowser = false): Promise<void> {
     try {
       const nextStatus = await api.getStatus();
       status = nextStatus;
       syncRequiredRecovery(nextStatus);
-      await refreshBrowserStatus();
+      if (detectBrowser) await initializeBrowserStatus();
+      else await refreshBrowserStatus();
       if (!nextStatus.available || nextStatus.locked || nextStatus.recoveryState !== "ready") {
         entries = [];
         mfaCandidates = [];
@@ -841,16 +863,17 @@
     try {
       await notesApi.openExternalLink(url);
     } catch (reason) {
-      error = reasonMessage(reason, "无法打开 Firefox 扩展安装页面。");
+      error = reasonMessage(reason, `无法打开 ${browserName()} 扩展安装页面。`);
     }
   }
 
   async function startTemplateRecording(entry: PasswordEntrySummary): Promise<void> {
     if (browser?.connection !== "connected" || browser.capturePermission !== "granted" || templateRecording || templateBusy[entry.id]) return;
     templateBusy = setBusy(templateBusy, entry.id, true);
+    const targetBrowser = selectedBrowser;
     try {
-      setTemplateRecording(await api.startTemplateRecording(entry.id));
-      showToast(`已在 Firefox 中打开“${entry.siteName}”的模板录制`);
+      setTemplateRecording(await api.startTemplateRecording(entry.id, targetBrowser));
+      showToast(`已在 ${browserName(targetBrowser)} 中打开“${entry.siteName}”的模板录制`);
       error = "";
     } catch (reason) {
       error = reasonMessage(reason, "无法开始录制站点模板。");
@@ -900,14 +923,14 @@
 
   function browserLabel(connection: PasswordBrowserStatus["connection"]): string {
     return connection === "connected"
-      ? "Firefox 已连接"
+      ? `${browserName()} 已连接`
       : connection === "extension-missing"
         ? "未安装扩展"
         : connection === "native-host-missing"
           ? "未注册本机桥接"
           : connection === "unsupported"
-            ? "Firefox 不可用"
-            : "Firefox 未连接";
+            ? `${browserName()} 不可用`
+            : `${browserName()} 未连接`;
   }
 
   function formatDiagTime(atUnixMs: number): string {
@@ -950,7 +973,7 @@
     window.addEventListener("resize", hideTooltip);
     window.addEventListener("blur", hideTooltip);
     window.addEventListener("blur", clearAllReveals);
-    void refresh();
+    void refresh(true);
     if (api.isDesktop()) {
       scheduleBrowserStatusRefresh();
       void import("@tauri-apps/api/event")
@@ -1039,9 +1062,17 @@
       </div>
     </div>
     <div class="header-actions">
-      <span class:connected={browser?.connection === "connected"} class="browser-status" title={browser?.message ?? "Firefox 扩展状态"}>
+      <label class="browser-selector">
+        <span class="sr-only">选择浏览器</span>
+        <select aria-label="选择浏览器" bind:value={selectedBrowser} onchange={() => void selectBrowser()}>
+          {#each PASSWORD_BROWSERS as target}
+            <option value={target}>{browserName(target)}</option>
+          {/each}
+        </select>
+      </label>
+      <span class:connected={browser?.connection === "connected"} class="browser-status" title={browser?.message ?? `${browserName()} 扩展状态`}>
         <span class="status-dot" aria-hidden="true"></span>
-        {browser ? browserLabel(browser.connection) : "Firefox 状态读取中"}
+        {browser ? browserLabel(browser.connection) : `${browserName()} 状态读取中`}
       </span>
       {#if status?.recoveryState === "ready" && status.protection !== "browser-demo"}
         <button class="icon-button" type="button" data-tooltip="修改全局恢复密码" data-tooltip-placement="bottom" aria-label="修改全局恢复密码" onclick={() => openRecovery("change")}>
@@ -1062,7 +1093,7 @@
       <div class="banner-icon" aria-hidden="true"><ShieldCheck size={17} /></div>
       <div class="banner-copy">
         <strong>{browserLabel(browser.connection)}</strong>
-        <span>{browser.message ?? "安装 Firefox 扩展后可使用打开并填充；未安装时仍可复制凭据。"}</span>
+        <span>{browser.message ?? `安装 ${browserName()} 扩展后可使用打开并填充；未安装时仍可复制凭据。`}</span>
       </div>
       {#if browser.installUrl}
         <button type="button" class="secondary-button" onclick={() => void openInstallPage()}><ExternalLink size={14} aria-hidden="true" />安装扩展</button>
@@ -1093,11 +1124,11 @@
     <div class="consent-banner permission-banner" role="alert">
       <div class="banner-icon" aria-hidden="true"><AlertTriangle size={17} /></div>
       <div class="banner-copy">
-        <strong>Firefox 扩展通信异常</strong>
+        <strong>{browserName()} 扩展通信异常</strong>
         {#if !browser?.stdioConnected}
-          <span>未检测到 Firefox 扩展连接，请确认扩展已安装并启用。</span>
+          <span>未检测到 {browserName()} 扩展连接，请确认扩展已安装并启用。</span>
         {:else if !browser?.pipeConnected}
-          <span>Firefox 扩展已连接，桌面密码通道未建立，正在自动重试。</span>
+          <span>{browserName()} 扩展已连接，桌面密码通道未建立，正在自动重试。</span>
         {:else}
           <span>暂时无法读取密码权限状态；登录信息检测暂未运行，飞花会自动重试。</span>
         {/if}
@@ -1108,7 +1139,7 @@
       <div class="banner-icon" aria-hidden="true"><AlertTriangle size={17} /></div>
       <div class="banner-copy">
         <strong>当前扩展不支持密码权限</strong>
-        <span>请更新 Firefox 扩展；登录信息检测暂未运行。</span>
+        <span>请更新 {browserName()} 扩展；登录信息检测暂未运行。</span>
       </div>
     </div>
   {/if}
@@ -1148,7 +1179,7 @@
         <summary>连接诊断</summary>
         <dl class="diagnostics-grid">
           <div><dt>密码权限</dt><dd>{capturePermissionLabel(browser.capturePermission)}</dd></div>
-          <div><dt>Firefox 扩展连接</dt><dd>{browser.stdioConnected ? "已连接" : "未连接"}</dd></div>
+          <div><dt>{browserName()} 扩展连接</dt><dd>{browser.stdioConnected ? "已连接" : "未连接"}</dd></div>
           <div><dt>桌面密码通道</dt><dd>{browser.pipeConnected ? "已建立" : "未建立"}</dd></div>
           <div><dt>最近请求结果</dt><dd>{browser.lastRequestOutcome ? lastRequestLabel(browser.lastRequestOutcome) : "暂无"}</dd></div>
           <div><dt>扩展版本</dt><dd>{browser.extensionVersion ?? "未知"}</dd></div>
@@ -1159,7 +1190,7 @@
     {/if}
 
     {#if filteredEntries.length === 0}
-      <section class="empty-state"><KeyRound size={30} aria-hidden="true" /><h2>{searchText ? "没有匹配的账户" : "还没有保存账户"}</h2><p>{searchText ? "换一个站点名称、origin 或用户名试试。" : "添加第一个站点账户，之后可以从 Firefox 中确认填充。"}</p>{#if !searchText}<button type="button" class="secondary-button" onclick={resetEditor}><Plus size={14} aria-hidden="true" />添加账户</button>{/if}</section>
+      <section class="empty-state"><KeyRound size={30} aria-hidden="true" /><h2>{searchText ? "没有匹配的账户" : "还没有保存账户"}</h2><p>{searchText ? "换一个站点名称、origin 或用户名试试。" : `添加第一个站点账户，之后可以从 ${browserName()} 中确认填充。`}</p>{#if !searchText}<button type="button" class="secondary-button" onclick={resetEditor}><Plus size={14} aria-hidden="true" />添加账户</button>{/if}</section>
     {:else}
       <section class="entry-list" aria-label="密码账户列表">
         {#each filteredEntries as entry (entry.id)}
@@ -1203,7 +1234,7 @@
               <button type="button" class="icon-button" data-tooltip="复制用户名" aria-label={`复制 ${entry.siteName} 用户名`} disabled={copyBusy?.[entry.id] === "username"} onclick={() => void copyUsername(entry)}><UserRound size={15} aria-hidden="true" /></button>
               <button type="button" class="icon-button" data-tooltip="复制密码" aria-label={`复制 ${entry.siteName} 密码`} disabled={copyBusy?.[entry.id] === "password"} onclick={() => void copyPassword(entry)}><KeyRound size={15} aria-hidden="true" /></button>
               <button type="button" class="icon-button" data-tooltip={entry.mfaLink ? "复制 MFA 验证码" : "未关联 MFA"} title={entry.mfaLink ? undefined : "未关联 MFA"} aria-label={`复制 ${entry.siteName} MFA 验证码`} disabled={!entry.mfaLink || copyBusy?.[entry.id] === "mfa"} onclick={() => void copyMfa(entry)}><ShieldCheck size={15} aria-hidden="true" /></button>
-              <button type="button" class="icon-button" data-tooltip={!canFill ? "连接 Firefox 后录制模板" : fillPermission !== "granted" ? "Firefox 密码通道就绪后可录制" : "录制站点模板"} aria-label={`录制 ${entry.siteName} 模板`} disabled={!canFill || fillPermission !== "granted" || Boolean(templateRecording) || Boolean(templateBusy[entry.id])} onclick={() => void startTemplateRecording(entry)}><ScanSearch size={15} aria-hidden="true" /></button>
+              <button type="button" class="icon-button" data-tooltip={!canFill ? `连接 ${browserName()} 后录制模板` : fillPermission !== "granted" ? `${browserName()} 密码通道就绪后可录制` : "录制站点模板"} aria-label={`录制 ${entry.siteName} 模板`} disabled={!canFill || fillPermission !== "granted" || Boolean(templateRecording) || Boolean(templateBusy[entry.id])} onclick={() => void startTemplateRecording(entry)}><ScanSearch size={15} aria-hidden="true" /></button>
               <button type="button" class="icon-button" data-tooltip="编辑" aria-label={`编辑 ${entry.siteName}`} onclick={() => editEntry(entry)}><Pencil size={15} aria-hidden="true" /></button>
               <button type="button" class="icon-button danger-icon" data-tooltip="删除" aria-label={`删除 ${entry.siteName}`} onclick={() => (pendingDelete = entry)}><Trash2 size={15} aria-hidden="true" /></button>
             </div>
@@ -1362,6 +1393,7 @@
   h1 { font-size: 16px; font-weight: 650; }
   .title-block p { margin-top: 2px; color: var(--app-muted); font-size: 11px; }
   .header-actions { min-width: 0; gap: 8px; }
+  .browser-selector select { height: 26px; max-width: 88px; padding: 2px 20px 2px 7px; color: var(--app-fg); font: inherit; font-size: 11px; border: 1px solid var(--app-border); border-radius: 4px; background: var(--app-surface); }
   .browser-status { display: inline-flex; max-width: 180px; padding: 4px 7px; align-items: center; gap: 6px; overflow: hidden; color: var(--app-muted); font-size: 11px; white-space: nowrap; text-overflow: ellipsis; border: 1px solid var(--app-border); border-radius: 4px; }
   .browser-status.connected { color: #247b4b; border-color: #a8d5b7; background: #f0faf3; }
   .status-dot { width: 6px; height: 6px; flex: 0 0 6px; background: #9b9b9b; border-radius: 50%; }

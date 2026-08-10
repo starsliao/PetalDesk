@@ -2,7 +2,7 @@
 
 > 把想法留在桌面，把文件留在自己手里。
 
-[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows x64](https://github.com/starsliao/PetalDesk/releases/download/v0.8.4/PetalDesk_0.8.4_x64-setup.exe) · [下载 macOS Universal](https://github.com/starsliao/PetalDesk/releases/download/v0.8.4/PetalDesk_0.8.4_universal.dmg)
+[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows x64](https://github.com/starsliao/PetalDesk/releases/download/v0.8.5/PetalDesk_0.8.5_x64-setup.exe) · [下载 macOS Universal](https://github.com/starsliao/PetalDesk/releases/download/v0.8.5/PetalDesk_0.8.5_universal.dmg)
 
 飞花 - PetalDesk 是一款面向 Windows 10/11 与 macOS 12+ 的本地便签与效率工具。它启动快、界面安静，支持 Markdown 即时排版、纯文本、图片、搜索、回收站，以及截图、任务规划和本地 MFA 验证器等随时可以唤起的小工具。没有账号、没有云端依赖，内容保留在你的本地数据目录中。
 
@@ -32,6 +32,10 @@
 | --- | --- |
 | <img src="website/assets/screenshots/password-manager-tool.png" alt="飞花 - PetalDesk 密码管理器" width="500" /> | <img src="website/assets/screenshots/mfa-tool.png" alt="飞花 - PetalDesk MFA 验证器" width="260" /> |
 
+### 0.8.5 平台支持
+
+`0.8.5` 为 Google Chrome 提供与 Firefox 一致的浏览器增强：同一套工具栏弹窗、站点账户角标、连接诊断、登录检测开关、账户填充与复制、关联 TOTP、账户删除和四个飞花快捷入口。Windows 安装器会为固定扩展 ID `eclmlkbklcpcaijloflmohfpeldcbjkp` 注册 Chrome 与 Edge Native Messaging Host；GitHub Release 同时提供需解压后通过开发者模式加载的 Chrome 扩展 ZIP。登录检测现在覆盖所有 HTTP 与 HTTPS 登录页，因此新的 HTTP 站点也会提示保存或更新密码；HTTP 填充仍需要用户在保存时确认明文传输风险，TOTP 仍只允许受信任的 HTTPS 流程。
+
 ### 0.8.4 平台支持
 
 `0.8.4` 修复 Windows 远程桌面断开或重连后飞花可能整体无响应的问题。托盘事件处理不再同步等待 Explorer 返回图标矩形，而是使用本地光标锚点处理点击、双击和悬停；显示器、设备或系统设置变化时只重置本地状态，任务栏重建时按需重新注册图标，整个过程不运行嵌套消息循环。发布流程同时校验实际使用本地修复版 `tray-icon`，并检查最终 Windows EXE 未重新引入该阻塞 API。数据格式、浏览器权限和密码/MFA 安全边界均未改变。
@@ -50,7 +54,7 @@
 | --- | --- | --- |
 | 便签、甘特图、计时器、提醒 | 支持 | 支持 |
 | MFA 本机免密保护 | Windows DPAPI | macOS Keychain |
-| 密码管理器 | 支持；Firefox 扩展提供账户角标、卡片式快捷复制、点击账户直接填充、登录信息检测与关联 TOTP 填充 | 当前版本暂不支持 |
+| 密码管理器 | 支持；Firefox 与 Chrome 扩展提供账户角标、卡片式快捷复制、点击账户直接填充、登录信息检测与关联 TOTP 填充 | 当前版本暂不支持 |
 | 普通区域截图、标注、复制、保存、贴图 | 支持 | 支持；首次使用需授予“屏幕录制”权限 |
 | 长截图、浏览器增强 / Native Messaging | 支持 | 当前版本暂不支持 |
 | 安装包 | Windows x64 联网安装 EXE | 一个 Universal DMG，同时支持 Intel 与 Apple Silicon |
@@ -59,7 +63,7 @@
 - 提醒：一次、间隔、日/周/月/年周期，到点发送系统通知。
 - 任务甘特图：任务排序、进度筛选、时间条拖动、小时级时间轴缩放。
 - MFA 验证器：支持标准 `TOTP`、屏幕二维码扫描、图片/链接/手动导入，也支持一行一个链接批量导入并为批量账户随机搭配图标。验证码默认隐藏、双击安全复制，账户可拖动排序或通过右键置顶/取消置顶。单项可从右键菜单安全导出，经恢复密码验证后提供 Base32 密钥、完整 `otpauth://` 链接和二维码；删除项保留在 MFA 加密回收站中，可恢复，永久删除或清空前均需二次确认。
-- 密码管理器：使用独立的 XChaCha20-Poly1305 保险库保存多个站点账户，共享 MFA 恢复密码并由 Windows DPAPI 日常解锁。Firefox 扩展角标会显示当前站点已保存的账户数量，点击图标可查看连接诊断、登录检测开关、卡片式账户列表以及四个飞花快捷入口；账户可直接填充，或分别复制用户名、密码与已关联的 MFA 验证码。登录信息检测默认开启，用户提交登录后立即提示保存新账户；用户名或密码与已存账户不一致时，可选择保存为新账户或更新任一既有账户。提示会跨同一标签页的页面变化继续保留，直到用户明确处理。密码账户可关联本地 TOTP；在受信任的登录 journey 内，扩展只填入唯一可信字段，模糊字段需用户确认，并且绝不主动提交。密码窗口关闭时这些能力仍可用；用户可单独关闭登录检测，手动锁库则立即停止所有秘密操作。秘密只在当前用户的本机内存通道中按需处理，不写入浏览器存储、诊断日志或截图文件队列。
+- 密码管理器：使用独立的 XChaCha20-Poly1305 保险库保存多个站点账户，共享 MFA 恢复密码并由 Windows DPAPI 日常解锁。Firefox 与 Chrome 扩展角标会显示当前站点已保存的账户数量，点击图标可查看连接诊断、登录检测开关、卡片式账户列表以及四个飞花快捷入口；账户可直接填充，或分别复制用户名、密码与已关联的 MFA 验证码。登录信息检测默认开启，用户提交 HTTP 或 HTTPS 登录后都会立即提示保存新账户；用户名或密码与已存账户不一致时，可选择保存为新账户或更新任一既有账户。HTTP 保存会明确提示明文传输风险，后续填充仍按精确 origin 授权。提示会跨同一标签页的页面变化继续保留，直到用户明确处理。密码账户可关联本地 TOTP；在受信任的 HTTPS 登录 journey 内，扩展只填入唯一可信字段，模糊字段需用户确认，并且绝不主动提交。密码窗口关闭时这些能力仍可用；用户可单独关闭登录检测，手动锁库则立即停止所有秘密操作。秘密只在当前用户的本机内存通道中按需处理，不写入浏览器存储、诊断日志或截图文件队列。
 - 截图：默认 `F1`，在飞花窗口内外都可直接唤起；Windows 与 macOS 均支持单显示器手动框选、标注、马赛克、模糊、复制、保存和置顶贴图，选区内双击即可复制，选区外右键直接取消。
 - Windows 长截图：默认由用户在原窗口中手动滚动并实时拼接，支持暂停、重试、回退和完整标注；自动滚动作为高级模式保留。**安装浏览器扩展后不需要对扩展做任何操作**：飞花里的长截图操作完全不变，当目标是 Chrome、Edge 或 Firefox 长页面并使用自动滚动模式时，飞花会自动启用浏览器增强引擎，滚动定位与拼接更稳定；扩展本身没有、也不需要任何长截图操作入口。macOS 当前版本不提供长截图和浏览器联动。
 
@@ -105,24 +109,24 @@ MFA 与密码管理器同样可以随整个数据目录迁移。首次启用任�
 
 ### 升级与兼容
 
-Windows 上的 `0.5.2` 是自动更新桥接版本；已安装该版本或更高版本的用户可直接在飞花内更新到 `0.8.4`，无需重新运行本地安装流程。macOS 的 `0.5.0` 是首个公开版本，`0.8.4` 可以直接覆盖升级，但当前仍使用手动下载安装。首次启动时会自动识别旧的 `飞花/.feihua` 存储布局、旧便签元数据和旧甘特图数组格式，转换到当前 `.petaldesk/` 结构；便签正文 `note.md` 不会被改写，甘特图转换前会保留迁移备份。密码保险库 v1 会透明读取；首次成功写入 v2 前保留已认证备份，原有加密 AAD 不变。同机升级不需要输入全局恢复密码；恢复密码由 MFA 与密码管理器全局共用，用于跨设备恢复两个保险库，以及主动导出单个 MFA 账户。旧数据损坏或格式版本过新时，飞花会保留原文件并阻止静默覆盖。
+Windows 上的 `0.5.2` 是自动更新桥接版本；已安装该版本或更高版本的用户可直接在飞花内更新到 `0.8.5`，无需重新运行本地安装流程。macOS 的 `0.5.0` 是首个公开版本，`0.8.5` 可以直接覆盖升级，但当前仍使用手动下载安装。首次启动时会自动识别旧的 `飞花/.feihua` 存储布局、旧便签元数据和旧甘特图数组格式，转换到当前 `.petaldesk/` 结构；便签正文 `note.md` 不会被改写，甘特图转换前会保留迁移备份。密码保险库 v1 会透明读取；首次成功写入 v2 前保留已认证备份，原有加密 AAD 不变。同机升级不需要输入全局恢复密码；恢复密码由 MFA 与密码管理器全局共用，用于跨设备恢复两个保险库，以及主动导出单个 MFA 账户。旧数据损坏或格式版本过新时，飞花会保留原文件并阻止静默覆盖。
 
 ## 安装与运行
 
-Windows 新用户可下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.8.4/PetalDesk_0.8.4_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。`0.5.2` 起默认开启自动检查与后台下载；“关于飞花 - PetalDesk”中可以查看当前版本及安装包打包时间、手动检查或关闭自动更新，下载完成后仍由用户选择何时重启安装。
+Windows 新用户可下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.8.5/PetalDesk_0.8.5_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。`0.5.2` 起默认开启自动检查与后台下载；“关于飞花 - PetalDesk”中可以查看当前版本及安装包打包时间、手动检查或关闭自动更新，下载完成后仍由用户选择何时重启安装。
 
 没有 WebView2 或下载权限时，安装器会明确提示失败原因，不会静默留下无法启动的程序。未签名构建可能显示“未知发布者”，这是 Windows 对代码签名的正常提示。
 
-macOS 用户下载 [Universal DMG](https://github.com/starsliao/PetalDesk/releases/download/v0.8.4/PetalDesk_0.8.4_universal.dmg)，将应用拖入“应用程序”即可。同一个 DMG 同时包含 Intel（x86_64）和 Apple Silicon（arm64）代码，不需要按芯片下载不同安装包。普通截图首次使用时，请在“系统设置 > 隐私与安全性 > 屏幕录制”中允许 PetalDesk；未签名、未公证的测试构建可能被 Gatekeeper 阻止，正式发布方式见 [`docs/publishing.md`](docs/publishing.md)。
+macOS 用户下载 [Universal DMG](https://github.com/starsliao/PetalDesk/releases/download/v0.8.5/PetalDesk_0.8.5_universal.dmg)，将应用拖入“应用程序”即可。同一个 DMG 同时包含 Intel（x86_64）和 Apple Silicon（arm64）代码，不需要按芯片下载不同安装包。普通截图首次使用时，请在“系统设置 > 隐私与安全性 > 屏幕录制”中允许 PetalDesk；未签名、未公证的测试构建可能被 Gatekeeper 阻止，正式发布方式见 [`docs/publishing.md`](docs/publishing.md)。
 
-Windows 安装包已经包含长截图和密码管理器所需的 Native Messaging Host。首版密码自动填充与登录检测只由 Firefox 扩展提供；安装器不会静默安装扩展，用户需从 [Firefox 扩展安装页](https://starsliao.github.io/PetalDesk/firefox.html) 进入 AMO 并确认安装。不安装扩展仍可在密码管理器中打开站点、复制凭据并使用 Windows 通用长截图；安装后无需任何额外操作，浏览器长页面会在自动滚动模式下自动获得更稳定的滚动定位和拼接效果。macOS 版本不安装 Native Messaging Host，也不提供密码管理器、长截图或浏览器增强模式。
+Windows 安装包已经包含长截图和密码管理器所需的 Native Messaging Host，并为同一个固定 Chromium 扩展 ID 注册 Chrome 与 Edge。安装器不会静默安装浏览器扩展：Firefox 用户从 [Firefox 扩展安装页](https://starsliao.github.io/PetalDesk/firefox.html) 进入 AMO，Chrome 用户按 [Chrome 扩展安装页](https://starsliao.github.io/PetalDesk/chrome.html) 下载 ZIP、解压并通过开发者模式加载。不安装扩展仍可在密码管理器中打开站点、复制凭据并使用 Windows 通用长截图。macOS 版本不安装 Native Messaging Host，也不提供密码管理器、长截图或浏览器增强模式。
 
 ## 技术栈
 
 - Rust stable + Tauri 2：文件、窗口、托盘、截图、剪贴板、通知和本地 IPC。
 - Svelte 5 + TypeScript：主界面、便签和小工具。
 - CodeMirror 6：Markdown/纯文本编辑、中文输入法、撤回与重做。
-- Firefox 扩展：在 Windows 上提供长截图协作，以及站点账户数角标、连接诊断与账户弹窗、用户点选账户后触发的密码填充和登录信息检测；Chrome、Edge 首版继续只用于长截图。
+- Firefox / Chromium MV3 扩展：在 Windows 上提供长截图协作，以及站点账户数角标、连接诊断与账户弹窗、用户点选账户后触发的密码填充、登录信息检测与本地 TOTP 联动。
 - 系统 WebView：Windows 使用 WebView2，macOS 使用 WKWebView，避免 Electron 自带 Chromium 的体积。
 
 ## 开发

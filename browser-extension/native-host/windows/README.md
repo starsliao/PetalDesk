@@ -10,31 +10,34 @@ shape. Chromium uses `allowed_origins`; Firefox uses `allowed_extensions` and
 the stable Gecko ID `petaldesk-capture@petaldesk.app`.
 
 `pnpm package:windows` builds `petaldesk-browser-host.exe` first and includes it
-at the root of the installation directory for 飞花 - PetalDesk. The installer always writes and
-registers the Firefox manifest. Release builds can register the store versions
-of Chrome and Edge by setting either or both environment variables:
+at the root of the installation directory for 飞花 - PetalDesk. The installer
+registers Firefox plus Chrome and Edge. Both Chromium registrations use the
+manifest-key-derived ID `eclmlkbklcpcaijloflmohfpeldcbjkp`.
+
+Optional environment overrides are accepted only when they equal that fixed ID:
 
 ```powershell
-$env:PETALDESK_CHROME_EXTENSION_ID = '<32-character-store-id>'
-$env:PETALDESK_EDGE_EXTENSION_ID = '<32-character-store-id>'
+$env:PETALDESK_CHROME_EXTENSION_ID = 'eclmlkbklcpcaijloflmohfpeldcbjkp'
+$env:PETALDESK_EDGE_EXTENSION_ID = 'eclmlkbklcpcaijloflmohfpeldcbjkp'
 pnpm package:windows
 ```
 
-Missing Chromium IDs are intentionally non-fatal: the corresponding browser
-registration is omitted. A supplied ID with an invalid format fails the build.
-The uninstaller removes all three browser registration keys and the Native
-Messaging manifest files owned by 飞花 - PetalDesk.
+The build derives the ID from `manifest/chromium.json` and fails if its public
+key, an override, or the expected ID disagree. The uninstaller removes all
+three browser registration keys and the Native Messaging manifest files owned
+by 飞花 - PetalDesk.
 
 For a development or installer integration test, run:
 
 ```powershell
 .\Register-PetalDeskNativeHost.ps1 `
   -HostExecutable 'C:\Program Files\PetalDesk\petaldesk-browser-host.exe' `
-  -ChromeExtensionId '<32-character unpacked-or-store-id>' `
-  -EdgeExtensionId '<32-character unpacked-or-store-id>'
+  -ChromeExtensionId 'eclmlkbklcpcaijloflmohfpeldcbjkp' `
+  -EdgeExtensionId 'eclmlkbklcpcaijloflmohfpeldcbjkp'
 ```
 
-Both Chromium ID parameters are optional. Omitting them registers Firefox only.
+Both Chromium ID parameters default to the fixed ID, so omitting them registers
+the same unpacked extension for Chrome and Edge.
 
 Use `-WhatIf` to inspect all writes. Registration is per-user under these keys:
 
@@ -48,6 +51,6 @@ Remove the per-user registrations with:
 .\Unregister-PetalDeskNativeHost.ps1
 ```
 
-Chrome and Edge extension IDs must be replaced with the actual unpacked or
-store-assigned IDs. Firefox production use still requires an AMO-signed build;
-these templates do not perform signing or store publication.
+Firefox production use still requires an AMO-signed build. The GitHub Chrome
+ZIP is an unpacked developer-mode build; these templates do not perform signing
+or store publication.

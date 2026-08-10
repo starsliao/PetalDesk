@@ -32,7 +32,7 @@
 - TOTP 联动只在飞花填入密码，或用户输入与唯一已保存账户完全一致时启动；恢复码、短信或邮件验证码、CAPTCHA、Passkey、安全密钥、CVV、邮编和优惠码不会被填入。
 - MFA 密钥始终留在桌面加密保险库中。自动填入所需的当前验证码只在本机内存通道中短暂使用；工具栏复制 MFA 时验证码不经过扩展。
 - 保存提示建立前，仍含密码的登录候选只会在扩展内存中短暂保留；交给本机飞花后，扩展立即清空密码，只保留恢复提示所需的不含密码元数据。桌面端仅在进程内存中保留待处理候选，直到用户处理、真实标签页关闭、主动关闭检测、锁库或本地连接结束；页面导航本身不会取消提示，也不会写入浏览器存储。
-- HTTP 站点默认拒绝密码功能，必须在飞花中逐站点明确允许并持续显示风险提示。
+- HTTP 登录提交同样会触发保存或更新提示；接受保存时会明确显示明文风险，并只为该精确 origin 允许后续填充。
 
 密码保险库位于用户自己的 Windows 设备上，由飞花桌面应用加密保存。扩展不能独立读取保险库。
 
@@ -42,11 +42,11 @@
 - 备选分类：Other
 - 标签：password manager, productivity, screenshot, local-first, PetalDesk
 
-## 0.8.4 更新说明
+## 0.8.5 更新说明
 
-- Windows 桌面伴侣修复远程桌面断开或重连后可能整体无响应的问题；托盘事件不再同步等待 Explorer 返回图标矩形。
-- 本次没有改变扩展协议、页面交互或 Firefox 权限；`nativeMessaging`、`tabs`、`<all_urls>`、`websiteActivity` 和 `authenticationInfo` 的用途保持不变。
-- 密码与 TOTP 仍只通过本机 Native Messaging 通道短暂传递，填充绝不主动提交表单，保险库和系统剪贴板行为不变。
+- 修复新的 HTTP 登录站点提交后不提示保存或更新的问题；保存时仍明确显示明文传输风险。
+- Chrome 版现在与 Firefox 版共用相同的弹窗、填充、保存、账户操作和关联 TOTP 实现；Firefox 权限与数据处理边界保持不变。
+- 密码与 TOTP 仍只通过本机 Native Messaging 通道短暂传递，填充绝不主动提交表单。
 
 ## 提交前待补信息
 
@@ -55,5 +55,5 @@
 - 支持页面：https://github.com/starsliao/PetalDesk/issues
 - 项目主页：https://starsliao.github.io/PetalDesk/
 - 隐私政策公开 URL：https://starsliao.github.io/PetalDesk/privacy.html
-- Windows 安装包公开 URL：https://github.com/starsliao/PetalDesk/releases/download/v0.8.4/PetalDesk_0.8.4_x64-setup.exe
+- Windows 安装包公开 URL：https://github.com/starsliao/PetalDesk/releases/download/v0.8.5/PetalDesk_0.8.5_x64-setup.exe
 - 许可证：MIT

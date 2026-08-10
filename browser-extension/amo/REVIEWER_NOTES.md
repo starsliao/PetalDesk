@@ -2,7 +2,7 @@
 
 ## Dependency
 
-The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.8.4/PetalDesk_0.8.4_x64-setup.exe.
+The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.8.5/PetalDesk_0.8.5_x64-setup.exe.
 
 The extension ID is fixed as `petaldesk-capture@petaldesk.app`, and the Native Messaging host name is `com.petaldesk.capture`.
 
@@ -56,7 +56,7 @@ Use a reviewer-controlled HTTPS login page with an ordinary username/password st
 4. In the toolbar popup, click the linked MFA icon. PetalDesk writes the code directly to the system clipboard; the popup shows only a success message with the remaining validity in seconds. TOTP expiry alone does not clear the copied value; it remains until replaced, or until an explicit MFA lock or PetalDesk shutdown clears the unchanged value. An unlinked account keeps the same disabled icon position.
 5. Lock the MFA vault manually and repeat either path. TOTP filling/copying is refused without affecting ordinary username/password filling.
 
-## PetalDesk 0.8.4 desktop companion checks
+## PetalDesk 0.8.5 desktop companion checks
 
 1. Close the MFA tool normally, then copy a linked MFA code from the extension or password manager. The code is copied without a recovery-password prompt. Use the dedicated **Lock vault** action and repeat: the copy is rejected until the user unlocks it.
 2. Import a QR code, image, or `otpauth://` URI. In the confirmation view, edit the account name, issuer, account identifier, and icon. Algorithm, digits, and period remain read-only, and the secret is never displayed.
@@ -80,7 +80,7 @@ The fixture never transmits form data and logs no credentials.
 node .\amo\reviewer-fixture\server.mjs
 ```
 
-Open `http://127.0.0.1:43127/login`. Because this is intentionally HTTP, PetalDesk must explicitly allow this exact origin for the test entry. Suggested dummy values are `reviewer@example.invalid` and `review-only-password`.
+Open `http://127.0.0.1:43127/login`. Submitting new dummy credentials must offer to save them even before the origin is allowlisted. Accepting the save displays the HTTP warning and records permission only for this exact origin. Suggested dummy values are `reviewer@example.invalid` and `review-only-password`.
 
 Submitting the fixture removes the login form and changes the URL in the same page without contacting an external service. The save/update prompt is triggered by the user's submission rather than a later success heuristic.
 

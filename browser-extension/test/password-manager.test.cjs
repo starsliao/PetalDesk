@@ -410,6 +410,84 @@ test("a submitted password form requests promotion in the same message", async (
   await harness.command("captureDisable", {});
 });
 
+test("HTTP pages capture submitted logins without a saved-origin allowlist", async () => {
+  const harness = loadManager({ frame: { href: "http://intranet.test/login" } });
+  const enabled = await harness.command("captureEnable", {
+    insecureOrigins: [],
+    topLevelOrigin: "http://intranet.test",
+  });
+  assert.equal(enabled.ok, true);
+  assert.equal(enabled.result.enabled, true);
+  harness.inputs.username.value = "alice";
+  harness.inputs.password.value = "http-secret";
+  harness.documentListeners.get("submit")({ target: harness.document });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const submitted = harness.backgroundMessages.find((message) => (
+    message.type === "petaldesk.password.capture-submitted"
+  ));
+  assert.ok(submitted);
+  assert.equal(submitted.candidate.origin, "http://intranet.test");
+  assert.equal(submitted.candidate.password, "http-secret");
+  assert.equal(submitted.candidate.promote, true);
+
+  const matched = await harness.command("captureMatch", {
+    action: "new",
+    candidateId: submitted.candidate.candidateId,
+    confidence: "high",
+    origin: "http://intranet.test",
+    username: "alice",
+  });
+  assert.equal(matched.ok, true);
+  assert.match(harness.overlayMessage(), /HTTP 明文连接/);
+  await harness.command("captureDisable", {});
+});
+
+test("HTTP fill and template recording still require allowInsecureHttp", async () => {
+  const harness = loadManager({ frame: { href: "http://intranet.test/login" } });
+  const ignored = await harness.command("fillOffer", {
+    direct: true,
+    entryId: "http-entry",
+    offerId: "http-offer-denied",
+    origin: "http://intranet.test",
+    sessionId: "http-fill-denied",
+    username: "alice",
+  });
+  assert.equal(ignored.ok, true);
+  assert.equal(ignored.result.ignored, true);
+
+  const allowed = await harness.command("fillOffer", {
+    allowInsecureHttp: true,
+    direct: true,
+    entryId: "http-entry",
+    offerId: "http-offer",
+    origin: "http://intranet.test",
+    sessionId: "http-fill",
+    username: "alice",
+  });
+  assert.equal(allowed.ok, true);
+  assert.equal(allowed.result.state, "confirmed");
+  await harness.command("fillCancel", {
+    offerId: "http-offer",
+    origin: "http://intranet.test",
+    sessionId: "http-fill",
+  });
+
+  const deniedRecording = await harness.command("templateRecordStart", {
+    origin: "http://intranet.test",
+    sessionId: "http-recording-denied",
+  });
+  assert.equal(deniedRecording.ok, false);
+  const allowedRecording = await harness.command("templateRecordStart", {
+    allowInsecureHttp: true,
+    origin: "http://intranet.test",
+    sessionId: "http-recording",
+  });
+  assert.equal(allowedRecording.ok, true);
+  assert.equal(allowedRecording.result.state, "recording");
+  await harness.command("templateRecordCancel", { sessionId: "http-recording" });
+});
+
 test("ambiguous login fields fail closed before credentials are written", async () => {
   const harness = loadManager({ ambiguous: true });
   await harness.command("fillOffer", {

@@ -3,9 +3,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$HostExecutable,
 
-    [string]$ChromeExtensionId = '',
+    [string]$ChromeExtensionId = 'eclmlkbklcpcaijloflmohfpeldcbjkp',
 
-    [string]$EdgeExtensionId = '',
+    [string]$EdgeExtensionId = 'eclmlkbklcpcaijloflmohfpeldcbjkp',
 
     [string]$ManifestDirectory = (Join-Path $env:LOCALAPPDATA 'PetalDesk\NativeMessaging')
 )

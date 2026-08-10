@@ -14,14 +14,17 @@ From this directory:
 ```powershell
 npm test
 npm run build
+npm run package:extensions
 npm run package:firefox
 ```
 
 The build creates two unpacked extensions:
 
-- `dist/chromium`: Chrome and Edge Manifest V3 extension.
-- `dist/firefox`: Firefox Manifest V3 extension with long capture and password
-  features, using the stable Gecko ID `petaldesk-capture@petaldesk.app`.
+- `dist/chromium`: Chrome and Edge Manifest V3 extension with the same popup,
+  long-capture, password, and linked TOTP features as Firefox. Its manifest key
+  fixes the unpacked extension ID as `eclmlkbklcpcaijloflmohfpeldcbjkp`.
+- `dist/firefox`: Firefox Manifest V3 extension using the stable Gecko ID
+  `petaldesk-capture@petaldesk.app`.
 
 `npm run package:firefox` validates the Firefox build and creates a versioned
 `dist/artifacts/PetalDesk_Firefox_AMO-upload_*.zip`. This ZIP is for a public AMO
@@ -39,7 +42,9 @@ explicit channel. After setting `AMO_JWT_ISSUER` and
 Unlisted signing downloads an XPI under `dist/signed`. Listed API submission may
 not return an XPI until Mozilla makes it available. Without `-Sign`, packaging
 never requires AMO credentials or performs an external submission. Chrome/Edge
-password publication remains a later release step.
+packaging creates `dist/artifacts/PetalDesk_Chrome_unpacked_*.zip`. The archive
+must be extracted and loaded through Chromium developer mode; its presence in a
+GitHub Release does not mean it is listed in the Chrome Web Store.
 
 The Firefox manifest declares required `websiteActivity` for scroll geometry
 and required `authenticationInfo` for usernames, passwords, and short-lived
@@ -97,7 +102,7 @@ Native host templates and Windows registration instructions are under
 
 ## Password protocol
 
-Firefox advertises `password-fill`, `password-capture`, and
+Firefox and Chrome advertise `password-fill`, `password-capture`, and
 `second-factor-fill-v1` plus these commands:
 
 - `password.open`
@@ -224,6 +229,6 @@ and native connection state are tracked independently. An unexpected disconnect
 never rewrites an enabled user preference or presents it as manually switched
 off. Reconnection starts immediately and makes three fast attempts with delays
 of 0 ms, 350 ms, and 900 ms; each attempt allows up to 2.5 seconds for the
-Firefox password-channel handshake. The popup shows a manual reconnect button
+browser password-channel handshake. The popup shows a manual reconnect button
 only after all three attempts fail, while the background continues a low-rate
 recovery attempt every 30 seconds. A manual reconnect restarts the fast cycle.

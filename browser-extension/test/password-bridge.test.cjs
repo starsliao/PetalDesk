@@ -14,7 +14,7 @@ function eventTarget() {
   };
 }
 
-function loadBridge({ longTimerDelayMs = null } = {}) {
+function loadBridge({ browserFamily = "firefox", longTimerDelayMs = null } = {}) {
   const events = [];
   const nativeReconnects = [];
   const runtimeMessages = eventTarget();
@@ -43,8 +43,8 @@ function loadBridge({ longTimerDelayMs = null } = {}) {
     return handle;
   }
   const api = {
-    browserFamily: "firefox",
-    extensionVersion: "0.8.4",
+    browserFamily,
+    extensionVersion: "0.8.5",
     action: {
       async setBadgeText(value) {
         actionUpdates.badgeTexts.push(JSON.parse(JSON.stringify(value)));
@@ -184,6 +184,13 @@ function loadBridge({ longTimerDelayMs = null } = {}) {
     timeoutDelays,
   };
 }
+
+test("the password bridge can be created for Chrome", async () => {
+  const harness = loadBridge({ browserFamily: "chrome" });
+  assert.equal(harness.api.browserFamily, "chrome");
+  assert.equal(harness.bridge.supportsCommand("password.open"), true);
+  assert.equal(harness.bridge.capabilities.includes("password-capture"), true);
+});
 
 test("the consent probe is a no-op now that authentication access is granted at install", async () => {
   const harness = loadBridge();
@@ -1287,7 +1294,7 @@ test("popup state reports diagnostics recorded at the command boundary", async (
   await harness.bridge.route({ command: "password.getStatus", payload: {} });
   let state = await harness.sendPopup({ type: "petaldesk.popup.getState" });
   assert.equal(state.diagnostics.nativeConnected, true);
-  assert.equal(state.diagnostics.extensionVersion, "0.8.4");
+  assert.equal(state.diagnostics.extensionVersion, "0.8.5");
   assert.equal(state.diagnostics.lastCommandOk, true);
   assert.equal(state.diagnostics.lastCommandErrorCode, null);
   assert.equal(typeof state.diagnostics.lastCommandAt, "number");
@@ -2232,6 +2239,68 @@ test("a retained prompt waits for the top document instead of replaying into a s
   harness.tabRemovals.listeners[0](112);
 });
 
+test("an HTTP save prompt follows only the same exact origin across navigation", async () => {
+  const harness = loadBridge();
+  await harness.bridge.route({ command: "password.setCaptureEnabled", payload: { enabled: true } });
+  const originalSender = {
+    documentId: "http-login-document",
+    frameId: 0,
+    tab: { id: 113, url: "http://intranet.test/login" },
+    url: "http://intranet.test/login",
+  };
+  harness.tabs.set(113, originalSender.tab);
+  await harness.sendContent({
+    type: "petaldesk.password.tab-ready",
+    origin: "http://intranet.test",
+  }, originalSender);
+  await harness.sendContent({
+    type: "petaldesk.password.capture-submitted",
+    candidate: {
+      candidateId: "http-navigation-candidate",
+      confidence: "high",
+      origin: "http://intranet.test",
+      password: "http-navigation-secret",
+      promote: true,
+      username: "alice",
+    },
+  }, originalSender);
+  await harness.bridge.route({
+    command: "password.captureMatch",
+    payload: { action: "new", candidateId: "http-navigation-candidate" },
+  });
+  await harness.sendContent({ type: "petaldesk.password.page-closed" }, originalSender);
+
+  const otherOriginSender = {
+    documentId: "other-http-document",
+    frameId: 0,
+    tab: { id: 113, url: "http://other.test/home" },
+    url: "http://other.test/home",
+  };
+  harness.tabs.set(113, otherOriginSender.tab);
+  const otherReady = await harness.sendContent({
+    type: "petaldesk.password.tab-ready",
+    origin: "http://other.test",
+  }, otherOriginSender);
+  assert.equal(otherReady.capturePrompt, null);
+
+  const sameOriginSender = {
+    documentId: "http-redirect-document",
+    frameId: 0,
+    tab: { id: 113, url: "http://intranet.test/home" },
+    url: "http://intranet.test/home",
+  };
+  harness.tabs.set(113, sameOriginSender.tab);
+  const sameReady = await harness.sendContent({
+    type: "petaldesk.password.tab-ready",
+    origin: "http://intranet.test",
+  }, sameOriginSender);
+  assert.equal(sameReady.capturePrompt.candidateId, "http-navigation-candidate");
+  assert.equal(sameReady.capturePrompt.origin, "http://intranet.test");
+  assert.equal(sameReady.capturePrompt.username, "alice");
+  assert.equal(JSON.stringify(sameReady.capturePrompt).includes("http-navigation-secret"), false);
+  harness.tabRemovals.listeners[0](113);
+});
+
 test("a retained prompt is not replayed into an HTTP navigation", async () => {
   const harness = loadBridge();
   await harness.bridge.route({ command: "password.setCaptureEnabled", payload: { enabled: true } });
@@ -2863,7 +2932,7 @@ test("template recording opens an exact-origin tab and returns a constrained tem
   assert.equal(status.pendingTemplateRecordings, 0);
 });
 
-test("HTTP origins require an explicit allowlist for opening and capture", async () => {
+test("HTTP fill and template recording keep their explicit per-entry opt-in", async () => {
   const harness = loadBridge();
   await assert.rejects(
     harness.bridge.route({
@@ -2883,6 +2952,90 @@ test("HTTP origins require an explicit allowlist for opening and capture", async
     },
   });
   assert.equal(opened.origin, "http://intranet.test");
+
+  await assert.rejects(
+    harness.bridge.route({
+      command: "password.startTemplateRecording",
+      payload: {
+        entryId: "entry",
+        origin: "http://intranet.test",
+        sessionId: "http-recording-denied",
+        url: "http://intranet.test/login",
+      },
+    }),
+    /HTTP.*opt-in/i,
+  );
+  const recording = await harness.bridge.route({
+    command: "password.startTemplateRecording",
+    payload: {
+      allowInsecureHttp: true,
+      entryId: "entry",
+      origin: "http://intranet.test",
+      sessionId: "http-recording",
+      url: "http://intranet.test/login",
+    },
+  });
+  assert.equal(recording.origin, "http://intranet.test");
+  await harness.bridge.route({
+    command: "password.cancelTemplateRecording",
+    payload: { sessionId: "http-recording" },
+  });
+});
+
+test("HTTP login capture is enabled without a saved-origin allowlist", async () => {
+  const harness = loadBridge();
+  const tab = { id: 87, url: "http://intranet.test/login" };
+  harness.tabs.set(tab.id, tab);
+  await harness.bridge.route({
+    command: "password.setCaptureEnabled",
+    payload: { enabled: true, insecureOrigins: [] },
+  });
+  const broadcast = harness.tabMessages.at(-1);
+  assert.equal(broadcast.message.command, "captureEnable");
+  assert.deepEqual(broadcast.message.payload.insecureOrigins, []);
+
+  const sender = {
+    documentId: "http-capture-document",
+    frameId: 0,
+    tab,
+    url: tab.url,
+  };
+  const ready = await harness.sendContent({
+    type: "petaldesk.password.tab-ready",
+    hasPassword: true,
+    hasUsername: true,
+    origin: "http://intranet.test",
+  }, sender);
+  assert.equal(ready.captureEnabled, true);
+
+  const usernameStage = await harness.sendContent({
+    type: "petaldesk.password.capture-username-stage",
+    origin: "http://intranet.test",
+    username: "alice",
+  }, sender);
+  assert.equal(usernameStage.accepted, true);
+  const submitted = await harness.sendContent({
+    type: "petaldesk.password.capture-submitted",
+    candidate: {
+      candidateId: "http-candidate",
+      confidence: "high",
+      frameOrigin: "http://intranet.test",
+      origin: "http://intranet.test",
+      password: "http-secret",
+      promote: true,
+      username: "",
+    },
+  }, sender);
+  assert.equal(submitted.accepted, true);
+  assert.equal(submitted.promoted, true);
+  const nativeCandidate = harness.events.find((event) => (
+    event.event === "captureCandidate" && event.payload.candidateId === "http-candidate"
+  ));
+  assert.ok(nativeCandidate);
+  assert.equal(nativeCandidate.payload.origin, "http://intranet.test");
+  assert.equal(nativeCandidate.payload.username, "alice");
+  assert.equal(nativeCandidate.payload.password, "http-secret");
+  harness.tabRemovals.listeners[0](tab.id);
 });
 
 test("a trusted iframe confirms the broadcast offer and receives the secret alone", async () => {

@@ -225,7 +225,7 @@ describe("desktop password command contract", () => {
       })
       .mockResolvedValueOnce(undefined);
 
-    await expect(passwordApi.startTemplateRecording("entry-1")).resolves.toEqual({
+    await expect(passwordApi.startTemplateRecording("entry-1", "edge")).resolves.toEqual({
       sessionId: "recording-1",
       entryId: "entry-1",
       origin: "https://example.com",
@@ -234,7 +234,7 @@ describe("desktop password command contract", () => {
     });
     await passwordApi.cancelTemplateRecording("recording-1");
 
-    expect(backendInvoke).toHaveBeenNthCalledWith(1, "start_password_template_recording", { entryId: "entry-1" });
+    expect(backendInvoke).toHaveBeenNthCalledWith(1, "start_password_template_recording", { entryId: "entry-1", browser: "edge" });
     expect(backendInvoke).toHaveBeenNthCalledWith(2, "cancel_password_template_recording", { sessionId: "recording-1" });
   });
 
@@ -243,21 +243,21 @@ describe("desktop password command contract", () => {
     backendInvoke.mockResolvedValue({
       sessionId: "fill-1",
       entryId: "entry-1",
-      browser: "firefox",
+      browser: "chrome",
       origin: "https://example.com",
       expiresAt: 1_800_000_000_000,
     });
 
-    const ticket = await passwordApi.startFill("entry-1");
+    const ticket = await passwordApi.startFill("entry-1", "chrome");
     expect(ticket).toEqual({
       sessionId: "fill-1",
       entryId: "entry-1",
-      browser: "firefox",
+      browser: "chrome",
       origin: "https://example.com",
       expiresAt: 1_800_000_000_000,
     });
     expect(ticket).not.toHaveProperty("actionRequired");
-    expect(backendInvoke).toHaveBeenCalledWith("start_password_fill", { entryId: "entry-1" });
+    expect(backendInvoke).toHaveBeenCalledWith("start_password_fill", { entryId: "entry-1", browser: "chrome" });
   });
 
   it("keeps the backend error code and routing fields on command failures", async () => {
@@ -270,7 +270,7 @@ describe("desktop password command contract", () => {
       connectionId: "connection-a",
     });
 
-    const failure = await passwordApi.startFill("entry-1").catch((error: unknown) => error);
+    const failure = await passwordApi.startFill("entry-1", "firefox").catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(Error);
     expect((failure as Error).message).toBe("Firefox 扩展尚未连接。");
     expect(failure).toMatchObject({
@@ -281,20 +281,22 @@ describe("desktop password command contract", () => {
     });
   });
 
-  it("provides the Firefox install page when a disconnected backend omits it", async () => {
+  it("provides the selected browser install page when a disconnected backend omits it", async () => {
     (window as TauriTestWindow).__TAURI_INTERNALS__ = {};
     backendInvoke.mockResolvedValue({
-      browser: "firefox",
+      browser: "edge",
       connection: "disconnected",
       extensionInstalled: false,
       nativeHostInstalled: true,
       installUrl: null,
     });
 
-    await expect(passwordApi.getBrowserStatus()).resolves.toMatchObject({
+    await expect(passwordApi.getBrowserStatus("edge")).resolves.toMatchObject({
+      browser: "edge",
       connection: "disconnected",
-      installUrl: "https://starsliao.github.io/PetalDesk/firefox.html",
+      installUrl: "https://starsliao.github.io/PetalDesk/chrome.html",
     });
+    expect(backendInvoke).toHaveBeenCalledWith("get_password_browser_status", { browser: "edge" });
   });
 
   it("normalizes a connected browser with no permission result as unknown", async () => {

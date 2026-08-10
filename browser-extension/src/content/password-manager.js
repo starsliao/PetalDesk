@@ -1332,7 +1332,6 @@
       return false;
     }
     if (!templates.frameOriginAllowed(topLevelOrigin, origin)) return false;
-    if (origin.startsWith("http://") && !captureAllowedHttpOrigins.has(origin)) return false;
     captureEnabled = true;
     if (!captureListenerInstalled) {
       root.document.addEventListener("submit", onSubmit, true);

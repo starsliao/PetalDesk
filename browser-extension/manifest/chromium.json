@@ -1,9 +1,18 @@
 {
   "manifest_version": 3,
-  "name": "飞花 - PetalDesk 长截图",
-  "version": "0.8.4",
-  "description": "飞花 - PetalDesk 浏览器长截图增强，支持 Chrome、Edge 和 Firefox。",
+  "name": "飞花 - PetalDesk 浏览器增强",
+  "version": "0.8.5",
+  "description": "飞花 Chrome 浏览器增强，支持长截图、用户触发的密码填充、登录保存提示与关联 TOTP 填充。",
+  "homepage_url": "https://starsliao.github.io/PetalDesk/chrome.html",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzbbR7V5hi9DI4P68SJrq1j/jRYN1CcY4Rf6i47AK7RetRyFyjO/dQQ2/bFcwGihFk/trV7zlyTb9udw0/7nyzeJ5Yrwea70Asd0oA0Tp45eWQF8bWN5cH5ebSI0jjGDEjx3YrBYCv0j/FiSqyLRHG+BDpViZWVTVSD3vAy18GcedD7fJO/0EpOO/gHMZ4QjIntWz2rp6fKkkBQkQhYGNs0s5ylrDhymOI5r5B4coZK+VLvSAOp5onDsu2JyyUnNttpSkbAzg9UCb5o96s1K4jzWGuq+s+frtnxOs4OuuJSA32aUSeKkT8QVswAX0Z4tkvKM5U7+1cuxFPaHwmhp9XQIDAQAB",
   "minimum_chrome_version": "109",
+  "icons": {
+    "16": "assets/icons/petaldesk-16.png",
+    "32": "assets/icons/petaldesk-32.png",
+    "48": "assets/icons/petaldesk-48.png",
+    "96": "assets/icons/petaldesk-96.png",
+    "128": "assets/icons/petaldesk-128.png"
+  },
   "permissions": [
     "nativeMessaging",
     "tabs"
@@ -14,6 +23,14 @@
   "background": {
     "service_worker": "background/chromium-entry.js"
   },
+  "action": {
+    "default_title": "飞花密码管理",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "assets/icons/petaldesk-16.png",
+      "32": "assets/icons/petaldesk-32.png"
+    }
+  },
   "content_scripts": [
     {
       "matches": [
@@ -21,7 +38,9 @@
       ],
       "js": [
         "shared/scroll-core.js",
-        "content/capture-session.js"
+        "shared/password-templates.js",
+        "content/capture-session.js",
+        "content/password-manager.js"
       ],
       "run_at": "document_idle",
       "all_frames": true

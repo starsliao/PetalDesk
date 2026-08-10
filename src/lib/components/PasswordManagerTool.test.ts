@@ -1,7 +1,14 @@
 import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/svelte";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { notesApi } from "../bridge";
-import { createBrowserPasswordApi, type PasswordApi, type PasswordBrowserStatus, type PasswordStatus } from "../passwords";
+import {
+  createBrowserPasswordApi,
+  type PasswordApi,
+  type PasswordBrowserStatus,
+  type PasswordFillTicket,
+  type PasswordStatus,
+  type PasswordTemplateRecordingTicket,
+} from "../passwords";
 import PasswordManagerTool from "./PasswordManagerTool.svelte";
 
 const eventHarness = vi.hoisted(() => {
@@ -248,7 +255,7 @@ describe("PasswordManagerTool", () => {
 
     await fireEvent.click(view.getAllByRole("button", { name: "打开并填充 Google Workspace" })[0]);
 
-    await waitFor(() => expect(startFill).toHaveBeenCalledWith("browser-demo-google-work"));
+    await waitFor(() => expect(startFill).toHaveBeenCalledWith("browser-demo-google-work", "firefox"));
     expect(startFill).toHaveBeenCalledTimes(1);
     expect(await view.findByText(/已在 Firefox 中打开/)).toBeInTheDocument();
     expect(view.queryByText(/等待授权|授权后填充/)).not.toBeInTheDocument();
@@ -402,20 +409,22 @@ describe("PasswordManagerTool", () => {
   it("polls browser status ten seconds after completion without overlapping requests", async () => {
     vi.useFakeTimers();
     const base = createBrowserPasswordApi();
-    const connected = {
+    const connected: PasswordBrowserStatus = {
       browser: "firefox" as const,
       connection: "connected" as const,
       extensionInstalled: true,
       nativeHostInstalled: true,
       capturePermission: "granted" as const,
     };
-    let resolvePending: ((value: typeof connected) => void) | undefined;
-    const getBrowserStatus = vi.fn()
-      .mockResolvedValueOnce(connected)
-      .mockImplementationOnce(() => new Promise<typeof connected>((resolve) => {
-        resolvePending = resolve;
-      }))
-      .mockResolvedValue(connected);
+    let resolvePending: ((value: PasswordBrowserStatus) => void) | undefined;
+    const getBrowserStatus = vi.fn((browser: "chrome" | "firefox" | "edge") => {
+      if (getBrowserStatus.mock.calls.length === 4) {
+        return new Promise<PasswordBrowserStatus>((resolve) => {
+          resolvePending = resolve;
+        });
+      }
+      return Promise.resolve({ ...connected, browser });
+    });
     const api: PasswordApi = {
       ...base,
       isDesktop: () => true,
@@ -423,19 +432,115 @@ describe("PasswordManagerTool", () => {
     };
     render(PasswordManagerTool, { api });
     await vi.advanceTimersByTimeAsync(0);
-    expect(getBrowserStatus).toHaveBeenCalledTimes(1);
+    expect(getBrowserStatus).toHaveBeenCalledTimes(3);
 
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(getBrowserStatus).toHaveBeenCalledTimes(2);
+    expect(getBrowserStatus).toHaveBeenCalledTimes(4);
     await vi.advanceTimersByTimeAsync(30_000);
-    expect(getBrowserStatus).toHaveBeenCalledTimes(2);
+    expect(getBrowserStatus).toHaveBeenCalledTimes(4);
 
-    resolvePending?.(connected);
+    resolvePending?.({ ...connected, browser: "chrome" });
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(9_999);
-    expect(getBrowserStatus).toHaveBeenCalledTimes(2);
+    expect(getBrowserStatus).toHaveBeenCalledTimes(4);
     await vi.advanceTimersByTimeAsync(1);
-    expect(getBrowserStatus).toHaveBeenCalledTimes(3);
+    expect(getBrowserStatus).toHaveBeenCalledTimes(5);
+  });
+
+  it("queries all browsers, prefers connected Chrome, and routes selected Edge status and fill", async () => {
+    const base = createBrowserPasswordApi();
+    const statuses: Record<"chrome" | "firefox" | "edge", PasswordBrowserStatus> = {
+      chrome: { browser: "chrome", connection: "connected", extensionInstalled: true, nativeHostInstalled: true, capturePermission: "granted" },
+      firefox: { browser: "firefox", connection: "connected", extensionInstalled: true, nativeHostInstalled: true, capturePermission: "granted" },
+      edge: { browser: "edge", connection: "connected", extensionInstalled: true, nativeHostInstalled: true, capturePermission: "granted" },
+    };
+    const getBrowserStatus = vi.fn((target: "chrome" | "firefox" | "edge" = "chrome") => Promise.resolve(statuses[target]));
+    const startFill = vi.fn().mockResolvedValue({
+      sessionId: "fill-edge",
+      entryId: "browser-demo-google-work",
+      browser: "edge",
+      origin: "https://accounts.google.com",
+      expiresAt: Date.now() + 60_000,
+    });
+    const startTemplateRecording = vi.fn().mockResolvedValue({
+      sessionId: "recording-edge",
+      entryId: "browser-demo-google-work",
+      origin: "https://accounts.google.com",
+      state: "recording",
+      expiresAt: Date.now() + 60_000,
+    });
+    const api: PasswordApi = { ...base, getBrowserStatus, startFill, startTemplateRecording };
+    const view = render(PasswordManagerTool, { api });
+
+    expect(await view.findByText("Chrome 已连接")).toBeInTheDocument();
+    expect(getBrowserStatus.mock.calls.slice(0, 3)).toEqual([["chrome"], ["firefox"], ["edge"]]);
+    const selector = view.getByRole("combobox", { name: "选择浏览器" }) as HTMLSelectElement;
+    expect(selector.value).toBe("chrome");
+
+    await fireEvent.change(selector, { target: { value: "edge" } });
+    expect(await view.findByText("Edge 已连接")).toBeInTheDocument();
+    await waitFor(() => expect(getBrowserStatus).toHaveBeenLastCalledWith("edge"));
+    await fireEvent.click(view.getAllByRole("button", { name: "打开并填充 Google Workspace" })[0]);
+    await waitFor(() => expect(startFill).toHaveBeenCalledWith("browser-demo-google-work", "edge"));
+    await fireEvent.click(view.getAllByRole("button", { name: "录制 Google Workspace 模板" })[0]);
+    await waitFor(() => expect(startTemplateRecording).toHaveBeenCalledWith("browser-demo-google-work", "edge"));
+  });
+
+  it("keeps fill and template feedback bound to the browser that started each request", async () => {
+    const base = createBrowserPasswordApi();
+    const connected = (browser: "chrome" | "firefox" | "edge"): PasswordBrowserStatus => ({
+      browser,
+      connection: "connected",
+      extensionInstalled: true,
+      nativeHostInstalled: true,
+      capturePermission: "granted",
+    });
+    let resolveFill: ((ticket: PasswordFillTicket) => void) | undefined;
+    let resolveRecording: ((ticket: PasswordTemplateRecordingTicket) => void) | undefined;
+    const startFill = vi.fn(() => new Promise<PasswordFillTicket>((resolve) => {
+      resolveFill = resolve;
+    }));
+    const startTemplateRecording = vi.fn(() => new Promise<PasswordTemplateRecordingTicket>((resolve) => {
+      resolveRecording = resolve;
+    }));
+    const api: PasswordApi = {
+      ...base,
+      getBrowserStatus: vi.fn((browser = "chrome") => Promise.resolve(connected(browser))),
+      startFill,
+      startTemplateRecording,
+    };
+    const view = render(PasswordManagerTool, { api });
+    await view.findByText("Chrome 已连接");
+    await view.findByText("demo@example.com");
+    const selector = view.getByRole("combobox", { name: "选择浏览器" });
+
+    await fireEvent.change(selector, { target: { value: "edge" } });
+    await view.findByText("Edge 已连接");
+    await fireEvent.click(view.getAllByRole("button", { name: "打开并填充 Google Workspace" })[0]);
+    await waitFor(() => expect(startFill).toHaveBeenCalledWith("browser-demo-google-work", "edge"));
+    await fireEvent.change(selector, { target: { value: "chrome" } });
+    resolveFill?.({
+      sessionId: "fill-edge",
+      entryId: "browser-demo-google-work",
+      browser: "edge",
+      origin: "https://accounts.google.com",
+      expiresAt: Date.now() + 60_000,
+    });
+    expect(await view.findByText("已在 Edge 中打开“Google Workspace”，请在页面确认填充")).toBeInTheDocument();
+
+    await fireEvent.change(selector, { target: { value: "edge" } });
+    await view.findByText("Edge 已连接");
+    await fireEvent.click(view.getAllByRole("button", { name: "录制 Google Workspace 模板" })[0]);
+    await waitFor(() => expect(startTemplateRecording).toHaveBeenCalledWith("browser-demo-google-work", "edge"));
+    await fireEvent.change(selector, { target: { value: "chrome" } });
+    resolveRecording?.({
+      sessionId: "recording-edge",
+      entryId: "browser-demo-google-work",
+      origin: "https://accounts.google.com",
+      state: "recording",
+      expiresAt: Date.now() + 60_000,
+    });
+    expect(await view.findByText("已在 Edge 中打开“Google Workspace”的模板录制")).toBeInTheDocument();
   });
 
   it("starts and cancels template recording when Firefox is connected", async () => {
@@ -467,7 +572,7 @@ describe("PasswordManagerTool", () => {
     await view.findByText("demo@example.com");
 
     await fireEvent.click(view.getAllByRole("button", { name: "录制 Google Workspace 模板" })[0]);
-    await waitFor(() => expect(startTemplateRecording).toHaveBeenCalledWith("browser-demo-google-work"));
+    await waitFor(() => expect(startTemplateRecording).toHaveBeenCalledWith("browser-demo-google-work", "firefox"));
     expect(await view.findByText("正在录制站点模板")).toBeInTheDocument();
 
     await fireEvent.click(view.getByRole("button", { name: "取消录制" }));

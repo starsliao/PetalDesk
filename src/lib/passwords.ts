@@ -10,11 +10,19 @@ export type PasswordProtection =
   | "browser-demo"
   | "unavailable";
 
-export type PasswordBrowser = "firefox";
+export type PasswordBrowser = "chrome" | "firefox" | "edge";
 export type PasswordBrowserConnection = "connected" | "extension-missing" | "native-host-missing" | "unsupported" | "disconnected";
 export type PasswordBrowserCapturePermission = "granted" | "unavailable" | "unknown";
 
+export const CHROME_EXTENSION_INSTALL_URL = "https://starsliao.github.io/PetalDesk/chrome.html";
 export const FIREFOX_EXTENSION_INSTALL_URL = "https://starsliao.github.io/PetalDesk/firefox.html";
+export const EDGE_EXTENSION_INSTALL_URL = CHROME_EXTENSION_INSTALL_URL;
+
+const PASSWORD_BROWSER_INSTALL_URLS: Record<PasswordBrowser, string> = {
+  chrome: CHROME_EXTENSION_INSTALL_URL,
+  firefox: FIREFOX_EXTENSION_INSTALL_URL,
+  edge: EDGE_EXTENSION_INSTALL_URL,
+};
 
 /** Non-secret diagnostic entry reported by the desktop bridge layers. */
 export interface PasswordBrowserDiagEntry {
@@ -170,7 +178,7 @@ export interface PasswordGeneratorOptions {
 export interface PasswordApi {
   isDesktop(): boolean;
   getStatus(): Promise<PasswordStatus>;
-  getBrowserStatus(): Promise<PasswordBrowserStatus>;
+  getBrowserStatus(browser?: PasswordBrowser): Promise<PasswordBrowserStatus>;
   list(): Promise<PasswordEntrySummary[]>;
   listMfaCandidates(): Promise<PasswordMfaCandidate[]>;
   create(request: PasswordEntryInput): Promise<PasswordEntrySummary>;
@@ -182,9 +190,9 @@ export interface PasswordApi {
   /** Copies the linked TOTP directly from the desktop vault; no code is returned to the UI. */
   copyMfa(id: string): Promise<void>;
   generatePassword(options: PasswordGeneratorOptions): Promise<string>;
-  startFill(id: string): Promise<PasswordFillTicket>;
+  startFill(id: string, browser: PasswordBrowser): Promise<PasswordFillTicket>;
   cancelFill(sessionId: string): Promise<void>;
-  startTemplateRecording(id: string): Promise<PasswordTemplateRecordingTicket>;
+  startTemplateRecording(id: string, browser: PasswordBrowser): Promise<PasswordTemplateRecordingTicket>;
   cancelTemplateRecording(sessionId: string): Promise<void>;
   setCaptureEnabled(enabled: boolean): Promise<PasswordStatus>;
   evaluateCapture(candidate: PasswordCaptureCandidate): Promise<PasswordCaptureDecision>;
@@ -354,7 +362,15 @@ function normalizeDiagEntry(value: unknown): PasswordBrowserDiagEntry | null {
   };
 }
 
-function normalizeBrowser(value: Partial<PasswordBrowserStatus> & Record<string, unknown>): PasswordBrowserStatus {
+function normalizePasswordBrowser(value: unknown, fallback: PasswordBrowser): PasswordBrowser {
+  return value === "chrome" || value === "firefox" || value === "edge" ? value : fallback;
+}
+
+function normalizeBrowser(
+  value: Partial<PasswordBrowserStatus> & Record<string, unknown>,
+  fallbackBrowser: PasswordBrowser = "chrome",
+): PasswordBrowserStatus {
+  const browser = normalizePasswordBrowser(value.browser, fallbackBrowser);
   const connection = String(value.connection ?? value.status ?? "disconnected") as PasswordBrowserConnection;
   const allowed: PasswordBrowserConnection[] = ["connected", "extension-missing", "native-host-missing", "unsupported", "disconnected"];
   const normalizedConnection = allowed.includes(connection) ? connection : "disconnected";
@@ -372,7 +388,7 @@ function normalizeBrowser(value: Partial<PasswordBrowserStatus> & Record<string,
   const captureDesiredEnabled = value.captureDesiredEnabled ?? value.capture_desired_enabled;
   const captureAvailable = value.captureAvailable ?? value.capture_available;
   return {
-    browser: "firefox",
+    browser,
     connection: normalizedConnection,
     extensionInstalled: Boolean(value.extensionInstalled ?? value.extension_installed ?? false),
     nativeHostInstalled: Boolean(value.nativeHostInstalled ?? value.native_host_installed ?? false),
@@ -380,7 +396,7 @@ function normalizeBrowser(value: Partial<PasswordBrowserStatus> & Record<string,
     installUrl: value.installUrl == null
       ? normalizedConnection === "connected" || normalizedConnection === "unsupported"
         ? null
-        : FIREFOX_EXTENSION_INSTALL_URL
+        : PASSWORD_BROWSER_INSTALL_URLS[browser]
       : String(value.installUrl),
     ...(normalizedCapturePermission ? { capturePermission: normalizedCapturePermission } : {}),
     authenticationConsent: Boolean(value.authenticationConsent ?? value.authentication_consent ?? false),
@@ -400,7 +416,7 @@ function normalizeFillTicket(value: Partial<PasswordFillTicket> & Record<string,
   return {
     sessionId: String(value.sessionId ?? value.session_id ?? ""),
     entryId: String(value.entryId ?? value.entry_id ?? ""),
-    browser: "firefox",
+    browser: normalizePasswordBrowser(value.browser, "chrome"),
     origin: String(value.origin ?? ""),
     expiresAt: (value.expiresAt ?? value.expires_at ?? 0) as number | string,
   };
@@ -478,15 +494,15 @@ export function generatePassword(options: PasswordGeneratorOptions): string {
   return result.join("");
 }
 
-function demoBrowserStatus(): PasswordBrowserStatus {
+function demoBrowserStatus(browser: PasswordBrowser = "chrome"): PasswordBrowserStatus {
   return {
-    browser: "firefox",
+    browser,
     connection: "extension-missing",
     extensionInstalled: false,
     nativeHostInstalled: false,
-    installUrl: FIREFOX_EXTENSION_INSTALL_URL,
+    installUrl: PASSWORD_BROWSER_INSTALL_URLS[browser],
     capturePermission: "unavailable",
-    message: "浏览器预览不会连接真实 Firefox 扩展。",
+    message: `浏览器预览不会连接真实 ${browser === "chrome" ? "Chrome" : browser === "firefox" ? "Firefox" : "Edge"} 扩展。`,
   };
 }
 
@@ -563,8 +579,8 @@ export function createBrowserPasswordApi(): PasswordApi {
         message: "浏览器预览使用模拟账户，数据只保存在当前页面内。",
       } satisfies PasswordStatus;
     },
-    async getBrowserStatus() {
-      return demoBrowserStatus();
+    async getBrowserStatus(browser = "chrome") {
+      return demoBrowserStatus(browser);
     },
     async list() {
       return structuredClone(entries);
@@ -639,14 +655,14 @@ export function createBrowserPasswordApi(): PasswordApi {
     async generatePassword(options) {
       return generatePassword(options);
     },
-    async startFill(id) {
+    async startFill(id, browser) {
       const entry = entries.find((item) => item.id === id);
       if (!entry) throw new Error("没有找到这个密码账户。");
-      throw new Error("浏览器预览没有连接 Firefox 扩展，请在桌面客户端安装并启用扩展。");
+      throw new Error(`浏览器预览没有连接 ${browser === "chrome" ? "Chrome" : browser === "firefox" ? "Firefox" : "Edge"} 扩展，请在桌面客户端安装并启用扩展。`);
     },
     async cancelFill() {},
-    async startTemplateRecording() {
-      throw new Error("浏览器预览没有连接 Firefox 扩展，无法录制站点模板。");
+    async startTemplateRecording(_id, browser) {
+      throw new Error(`浏览器预览没有连接 ${browser === "chrome" ? "Chrome" : browser === "firefox" ? "Firefox" : "Edge"} 扩展，无法录制站点模板。`);
     },
     async cancelTemplateRecording() {},
     async setCaptureEnabled(enabled) {
@@ -672,24 +688,27 @@ export const passwordApi: PasswordApi = {
     const status = await command<PasswordStatus & Record<string, unknown>>("get_password_status");
     return normalizeStatus(status);
   },
-  async getBrowserStatus() {
-    if (!isDesktopRuntime()) return browserApi.getBrowserStatus();
+  async getBrowserStatus(browser = "chrome") {
+    if (!isDesktopRuntime()) return browserApi.getBrowserStatus(browser);
     try {
-      return normalizeBrowser(await command<PasswordBrowserStatus & Record<string, unknown>>("get_password_browser_status"));
+      return normalizeBrowser(
+        await command<PasswordBrowserStatus & Record<string, unknown>>("get_password_browser_status", { browser }),
+        browser,
+      );
     } catch (reason) {
       const detail = reason instanceof Error && reason.message
         && reason.message !== "密码管理器操作失败，请稍后重试。" ? reason.message : "";
       const code = (reason as PasswordCommandError | null)?.code;
       return {
-        browser: "firefox",
+        browser,
         connection: "disconnected",
         extensionInstalled: false,
         nativeHostInstalled: false,
         capturePermission: "unknown",
         ...(code ? { errorCode: code } : {}),
         message: detail
-          ? `Firefox 扩展通信异常，无法读取密码权限状态（${detail}）。`
-          : "Firefox 扩展通信异常，无法读取密码权限状态。",
+          ? `${browser === "chrome" ? "Chrome" : browser === "firefox" ? "Firefox" : "Edge"} 扩展通信异常，无法读取密码权限状态（${detail}）。`
+          : `${browser === "chrome" ? "Chrome" : browser === "firefox" ? "Firefox" : "Edge"} 扩展通信异常，无法读取密码权限状态。`,
       };
     }
   },
@@ -740,22 +759,22 @@ export const passwordApi: PasswordApi = {
     const result = await command<{ password: string } | string>("generate_password", { options });
     return typeof result === "string" ? result : result.password;
   },
-  async startFill(id) {
-    if (!isDesktopRuntime()) return browserApi.startFill(id);
+  async startFill(id, browser) {
+    if (!isDesktopRuntime()) return browserApi.startFill(id, browser);
     return normalizeFillTicket(await command<Partial<PasswordFillTicket> & Record<string, unknown>>(
       "start_password_fill",
-      { entryId: id },
+      { entryId: id, browser },
     ));
   },
   async cancelFill(sessionId) {
     if (!isDesktopRuntime()) return browserApi.cancelFill(sessionId);
     await command<void>("cancel_password_fill", { sessionId });
   },
-  async startTemplateRecording(id) {
-    if (!isDesktopRuntime()) return browserApi.startTemplateRecording(id);
+  async startTemplateRecording(id, browser) {
+    if (!isDesktopRuntime()) return browserApi.startTemplateRecording(id, browser);
     const ticket = await command<Partial<PasswordTemplateRecordingTicket> & Record<string, unknown>>(
       "start_password_template_recording",
-      { entryId: id },
+      { entryId: id, browser },
     );
     return normalizeTemplateRecordingTicket(ticket);
   },

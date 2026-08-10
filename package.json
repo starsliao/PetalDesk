@@ -1,6 +1,6 @@
 {
   "name": "petaldesk",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "description": "飞花 - PetalDesk: local Markdown notes and desktop tools",
   "type": "module",
   "scripts": {

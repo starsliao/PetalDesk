@@ -45,7 +45,7 @@ The extension does not sell, rent, share, or remotely transmit personal informat
 - Binding to a single session, tab, document, top-level origin, and validated login frame. Cross-origin delegation is deny-by-default; the only current audited mapping is from `mail.163.com` to its `dl.reg.163.com` login frame.
 - An explicit account choice before password filling; linked TOTP is limited to the resulting trusted journey, with no automatic submission.
 - Second-factor binding to one connection, flow, tab, top-level origin, frame, document, and one-time field challenge. Cross-origin TOTP is HTTPS-only and requires the exact origin to be confirmed; cross-origin OTP iframes are rejected.
-- HTTPS by default; HTTP requires a separate per-site warning and opt-in.
+- HTTP and HTTPS submissions can both create save/update decisions. Accepting an HTTP save requires a separate plaintext-transport warning and enables later filling only for that exact origin; TOTP remains HTTPS-only.
 - Short expiration for pre-prompt secret requests; an actionable save prompt is lifecycle-bound to the user decision, tab, detection setting, vault, and local connection.
 
 No security control can make an already compromised device or website safe. Users should keep Firefox, Windows, and PetalDesk updated.

@@ -32,7 +32,7 @@ Security properties:
 - TOTP linking starts only after PetalDesk fills the password, or after a manual login exactly matches one unique saved account. Recovery codes, SMS or email codes, CAPTCHA, passkeys, security keys, CVV, postal codes, and coupons are excluded.
 - MFA secrets remain in the encrypted desktop vault. A current code used for automatic filling exists only briefly in the local in-memory channel; a toolbar MFA copy never passes through the extension.
 - Before a save prompt is established, a password-bearing candidate is short-lived in extension memory. After it is handed to local PetalDesk, the extension clears the password and retains only non-secret prompt metadata; the desktop keeps the pending candidate only in process memory until the user acts, the tab closes, detection is disabled, the vault locks, or the local connection ends. Nothing is written to browser storage.
-- HTTP password use is blocked by default and requires an explicit per-origin opt-in in PetalDesk.
+- HTTP login submissions also produce save or update prompts. Accepting a save displays a plaintext-transport warning and allows later filling only for that exact origin.
 
 The password vault remains encrypted on the user's Windows device. The extension cannot read it independently.
 
@@ -42,11 +42,11 @@ The password vault remains encrypted on the user's Windows device. The extension
 - Alternative category: Other
 - Tags: password manager, productivity, screenshot, local-first, PetalDesk
 
-## 0.8.4 release notes
+## 0.8.5 release notes
 
-- The Windows desktop companion fixes a possible application freeze after a Remote Desktop disconnect or reconnect. Tray events no longer synchronously wait for Explorer to return the notification-icon rectangle.
-- This release does not change the extension protocol, page interactions, or Firefox permissions. The purposes of `nativeMessaging`, `tabs`, `<all_urls>`, `websiteActivity`, and `authenticationInfo` remain unchanged.
-- Passwords and TOTP values still travel only transiently over the local Native Messaging channel, filling never submits forms, and vault and clipboard behavior is unchanged.
+- Fixes missing save or update prompts after submissions on new HTTP login sites. Saving still displays the plaintext-transport warning.
+- Chrome now shares the same popup, filling, saving, account actions, and linked TOTP implementation; Firefox permissions and data-handling boundaries are unchanged.
+- Passwords and TOTP values still travel only transiently over the local Native Messaging channel, and filling never submits forms.
 
 ## Required owner details before submission
 
@@ -55,5 +55,5 @@ The password vault remains encrypted on the user's Windows device. The extension
 - Support page: https://github.com/starsliao/PetalDesk/issues
 - Homepage: https://starsliao.github.io/PetalDesk/
 - Public privacy-policy URL: https://starsliao.github.io/PetalDesk/privacy.html
-- Public Windows installer URL: https://github.com/starsliao/PetalDesk/releases/download/v0.8.4/PetalDesk_0.8.4_x64-setup.exe
+- Public Windows installer URL: https://github.com/starsliao/PetalDesk/releases/download/v0.8.5/PetalDesk_0.8.5_x64-setup.exe
 - License: MIT

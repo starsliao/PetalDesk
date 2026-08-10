@@ -14,7 +14,7 @@ Required to create the exact login tab requested by PetalDesk and bind a fill se
 
 ### `<all_urls>` host access
 
-Long screenshots and password forms can occur on user-selected sites, so the content scripts need access to ordinary HTTP and HTTPS pages. Password operations still enforce exact scheme, host, and port matching. Browser-restricted pages fail closed. HTTP password operations require a separate per-origin opt-in.
+Long screenshots and password forms can occur on user-selected sites, so the content scripts need access to ordinary HTTP and HTTPS pages. Password operations still enforce exact scheme, host, and port matching. Browser-restricted pages fail closed. HTTP submissions may create save/update prompts, while accepting a save and later filling require the separate per-origin plaintext warning and opt-in.
 
 ### `action`
 

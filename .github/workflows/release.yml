@@ -68,6 +68,13 @@ jobs:
           }
           Write-Host "All release versions match $tag."
 
+      - name: Validate stable Chromium extension identity
+        shell: pwsh
+        run: |
+          & "./browser-extension/scripts/Test-ChromiumExtensionIdentity.ps1" `
+            -ManifestPath "browser-extension/manifest/chromium.json" `
+            -ExpectedExtensionId "eclmlkbklcpcaijloflmohfpeldcbjkp"
+
       - name: Test updater manifest tooling
         shell: pwsh
         run: '& "./scripts/test-windows-updater-manifest.ps1"'
@@ -109,8 +116,6 @@ jobs:
         shell: pwsh
         env:
           PETALDESK_BUILD_TIMESTAMP: ${{ needs.validate.outputs.build_timestamp }}
-          PETALDESK_CHROME_EXTENSION_ID: ${{ secrets.PETALDESK_CHROME_EXTENSION_ID }}
-          PETALDESK_EDGE_EXTENSION_ID: ${{ secrets.PETALDESK_EDGE_EXTENSION_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
@@ -123,12 +128,12 @@ jobs:
         shell: pwsh
         run: '& "./scripts/test-tray-icon-windows-patch.ps1" -SkipCargoTest -BinaryPath "src-tauri/target/release/petaldesk.exe"'
 
-      - name: Build Firefox extension package
+      - name: Build browser extension packages
         shell: pwsh
         run: |
-          & ".\browser-extension\scripts\package-firefox.ps1"
+          & ".\browser-extension\scripts\package-extensions.ps1"
           if ($LASTEXITCODE -ne 0) {
-            throw "Firefox extension packaging failed with exit code $LASTEXITCODE."
+            throw "Browser extension packaging failed with exit code $LASTEXITCODE."
           }
 
       - name: Collect Windows release assets
@@ -160,13 +165,11 @@ jobs:
           }
           Copy-Item -LiteralPath $firefoxSourceArchives[0].FullName -Destination $assetsDirectory.FullName
 
-          $signedFirefoxPackages = @(Get-ChildItem -Path "browser-extension/dist/signed" -Filter "PetalDesk_Firefox_*-signed.xpi" -File -ErrorAction SilentlyContinue)
-          if ($signedFirefoxPackages.Count -gt 1) {
-            throw "Expected at most one signed Firefox XPI, found $($signedFirefoxPackages.Count)."
+          $chromeArchives = @(Get-ChildItem -Path "browser-extension/dist/artifacts" -Filter "PetalDesk_Chrome_unpacked_*.zip" -File)
+          if ($chromeArchives.Count -ne 1) {
+            throw "Expected one Chrome unpacked archive, found $($chromeArchives.Count)."
           }
-          if ($signedFirefoxPackages.Count -eq 1) {
-            Copy-Item -LiteralPath $signedFirefoxPackages[0].FullName -Destination $assetsDirectory.FullName
-          }
+          Copy-Item -LiteralPath $chromeArchives[0].FullName -Destination $assetsDirectory.FullName
 
       - name: Upload Windows release assets
         uses: actions/upload-artifact@v4
@@ -313,6 +316,11 @@ jobs:
             gh release create "$tag" --verify-tag --draft --title "飞花 - PetalDesk $version" --notes-file "$notes_path"
           fi
 
+          mapfile -t existing_assets < <(gh release view "$tag" --json assets --jq '.assets[].name')
+          for asset in "${existing_assets[@]}"; do
+            gh release delete-asset "$tag" "$asset" --yes
+          done
+
           cp "$notes_path" release-notes.md
 
       - name: Generate and validate Windows updater manifest
@@ -355,6 +363,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ github.ref_name }}"
+          version="${tag#v}"
           shopt -s nullglob
 
           windows_installers=(release-assets/PetalDesk_*_x64-setup.exe)
@@ -362,16 +371,35 @@ jobs:
           macos_images=(release-assets/PetalDesk_*_universal.dmg)
           firefox_archives=(release-assets/PetalDesk_Firefox_AMO-upload_*.zip)
           firefox_source_archives=(release-assets/PetalDesk_Firefox_AMO-source_*.zip)
+          chrome_archives=(release-assets/PetalDesk_Chrome_unpacked_*.zip)
           if [[ "${#windows_installers[@]}" -ne 1 || "${#windows_signatures[@]}" -ne 1 ]]; then
             echo "Expected exactly one signed Windows updater payload." >&2
             exit 1
           fi
-          if [[ "${#macos_images[@]}" -ne 1 || "${#firefox_archives[@]}" -ne 1 || "${#firefox_source_archives[@]}" -ne 1 ]]; then
-            echo "Expected exactly one macOS DMG, one Firefox upload archive and one Firefox source archive." >&2
+          if [[ "${#macos_images[@]}" -ne 1 || "${#firefox_archives[@]}" -ne 1 || "${#firefox_source_archives[@]}" -ne 1 || "${#chrome_archives[@]}" -ne 1 ]]; then
+            echo "Expected exactly one macOS DMG, one Firefox upload archive, one Firefox source archive and one Chrome unpacked archive." >&2
             exit 1
           fi
           if [[ ! -s release-assets/latest.json ]]; then
             echo "Missing Windows updater manifest: release-assets/latest.json" >&2
+            exit 1
+          fi
+
+          expected_asset_names=(
+            "PetalDesk_${version}_x64-setup.exe"
+            "PetalDesk_${version}_x64-setup.exe.sig"
+            "PetalDesk_${version}_universal.dmg"
+            "PetalDesk_Firefox_AMO-upload_${version}.zip"
+            "PetalDesk_Firefox_AMO-source_${version}.zip"
+            "PetalDesk_Chrome_unpacked_${version}.zip"
+            "latest.json"
+          )
+          mapfile -t expected_asset_names < <(printf '%s\n' "${expected_asset_names[@]}" | sort)
+          mapfile -t actual_asset_names < <(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [[ "$(printf '%s\n' "${actual_asset_names[@]}")" != "$(printf '%s\n' "${expected_asset_names[@]}")" ]]; then
+            echo "Release assets do not match the required seven-file whitelist." >&2
+            printf 'Expected:\n%s\n' "${expected_asset_names[*]}" >&2
+            printf 'Actual:\n%s\n' "${actual_asset_names[*]}" >&2
             exit 1
           fi
 
@@ -386,9 +414,13 @@ jobs:
     needs: publish
     runs-on: ubuntu-latest
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
       - name: Verify public updater assets
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -398,7 +430,28 @@ jobs:
           macos_name="PetalDesk_${version}_universal.dmg"
           firefox_upload_name="PetalDesk_Firefox_AMO-upload_${version}.zip"
           firefox_source_name="PetalDesk_Firefox_AMO-source_${version}.zip"
+          chrome_name="PetalDesk_Chrome_unpacked_${version}.zip"
           latest_url="https://github.com/${GH_REPO}/releases/latest/download/latest.json"
+
+          expected_asset_names=(
+            "$installer_name"
+            "${installer_name}.sig"
+            "$macos_name"
+            "$firefox_upload_name"
+            "$firefox_source_name"
+            "$chrome_name"
+            latest.json
+          )
+          mapfile -t expected_asset_names < <(printf '%s\n' "${expected_asset_names[@]}" | sort)
+          mapfile -t public_asset_names < <(
+            gh api "repos/${GH_REPO}/releases/tags/${tag}" --jq '.assets[].name' | sort
+          )
+          if [[ "$(printf '%s\n' "${public_asset_names[@]}")" != "$(printf '%s\n' "${expected_asset_names[@]}")" ]]; then
+            echo "Published release does not contain exactly the required seven assets." >&2
+            printf 'Expected:\n%s\n' "${expected_asset_names[*]}" >&2
+            printf 'Published:\n%s\n' "${public_asset_names[*]}" >&2
+            exit 1
+          fi
 
           expected_url="https://github.com/${GH_REPO}/releases/download/${tag}/${installer_name}"
           for attempt in {1..24}; do
@@ -427,7 +480,16 @@ jobs:
             "$macos_name" \
             "$firefox_upload_name" \
             "$firefox_source_name" \
+            "$chrome_name" \
             latest.json; do
             curl --fail --silent --show-error --location --head --retry 12 --retry-delay 5 --retry-all-errors \
               "https://github.com/${GH_REPO}/releases/download/${tag}/${asset}" >/dev/null
           done
+
+          curl --fail --silent --show-error --location --retry 12 --retry-delay 5 --retry-all-errors \
+            "https://github.com/${GH_REPO}/releases/download/${tag}/${chrome_name}" \
+            --output "$chrome_name"
+          pwsh -NoProfile -File browser-extension/scripts/Test-ChromiumExtensionPackage.ps1 \
+            -ArchivePath "$chrome_name" \
+            -Version "$version" \
+            -ExpectedExtensionId eclmlkbklcpcaijloflmohfpeldcbjkp
