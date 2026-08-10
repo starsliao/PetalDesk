@@ -42,12 +42,11 @@ The password vault remains encrypted on the user's Windows device. The extension
 - Alternative category: Other
 - Tags: password manager, productivity, screenshot, local-first, PetalDesk
 
-## 0.8.3 release notes
+## 0.8.4 release notes
 
-- Extension status is collapsed by default in the toolbar popup. Four summary dots cover install permission, Native Host, the desktop password channel, and login detection; green means healthy, red means unavailable or abnormal, and black is reserved for login detection explicitly turned off by the user.
-- Main, Password, MFA, and Notes launchers now share one row while the account list and detailed login-detection controls remain available on demand.
-- Copying a linked MFA code reports its actual remaining validity. Expiry alone no longer clears the system clipboard; an explicit MFA lock or PetalDesk shutdown still clears an unchanged code. The code, MFA ID, and secret never return to the extension.
-- No Firefox permission was added. Filling still never submits forms, and an unexpected login-detection disconnect still starts three immediate reconnect attempts.
+- The Windows desktop companion fixes a possible application freeze after a Remote Desktop disconnect or reconnect. Tray events no longer synchronously wait for Explorer to return the notification-icon rectangle.
+- This release does not change the extension protocol, page interactions, or Firefox permissions. The purposes of `nativeMessaging`, `tabs`, `<all_urls>`, `websiteActivity`, and `authenticationInfo` remain unchanged.
+- Passwords and TOTP values still travel only transiently over the local Native Messaging channel, filling never submits forms, and vault and clipboard behavior is unchanged.
 
 ## Required owner details before submission
 
@@ -56,5 +55,5 @@ The password vault remains encrypted on the user's Windows device. The extension
 - Support page: https://github.com/starsliao/PetalDesk/issues
 - Homepage: https://starsliao.github.io/PetalDesk/
 - Public privacy-policy URL: https://starsliao.github.io/PetalDesk/privacy.html
-- Public Windows installer URL: https://github.com/starsliao/PetalDesk/releases/download/v0.8.3/PetalDesk_0.8.3_x64-setup.exe
+- Public Windows installer URL: https://github.com/starsliao/PetalDesk/releases/download/v0.8.4/PetalDesk_0.8.4_x64-setup.exe
 - License: MIT

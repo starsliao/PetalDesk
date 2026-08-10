@@ -1,6 +1,6 @@
 [package]
 name = "petaldesk"
-version = "0.8.3"
+version = "0.8.4"
 description = "飞花 - PetalDesk local Markdown notes and desktop tools"
 authors = ["飞花 - PetalDesk contributors"]
 edition = "2021"
@@ -119,3 +119,11 @@ panic = "unwind"
 
 [profile.release.package.rustfft]
 opt-level = 3
+
+# tray-icon's Windows event handler normally calls Shell_NotifyIconGetRect
+# synchronously for every mouse notification. Explorer can stop servicing that
+# call during an RDP session transition, which blocks Tauri's UI thread. Keep
+# the Windows-only non-blocking patch local until upstream ships an equivalent
+# fix.
+[patch.crates-io]
+tray-icon = { path = "vendor/tray-icon" }

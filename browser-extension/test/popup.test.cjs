@@ -21,7 +21,7 @@ function loadPopup({ tab, diagnostics, onMessage } = {}) {
       captureAvailable: true,
       captureDesiredEnabled: true,
       captureEnabled: true,
-      extensionVersion: "0.8.3",
+      extensionVersion: "0.8.4",
       nativeConnected: true,
       secretConnected: true,
       loginDetection: {
@@ -375,7 +375,7 @@ function loginDiagnostics(overrides = {}) {
     captureAvailable: loginDetection.available,
     captureDesiredEnabled: loginDetection.desiredEnabled,
     captureEnabled: loginDetection.enabled,
-    extensionVersion: "0.8.3",
+    extensionVersion: "0.8.4",
     nativeConnected: loginDetection.connectionState !== "disconnected",
     secretConnected: loginDetection.connectionState === "connected",
     ...overrides,

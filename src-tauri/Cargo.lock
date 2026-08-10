@@ -3500,7 +3500,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "petaldesk"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "arboard",
  "argon2",
@@ -5681,9 +5681,7 @@ dependencies = [
 
 [[package]]
 name = "tray-icon"
-version = "0.24.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65ba1e5f6b9ef9fd87e21b9c6f351554dbd717960089168fcfdef854686961dc"
+version = "0.24.2"
 dependencies = [
  "crossbeam-channel",
  "dirs",

@@ -59,6 +59,13 @@ jobs:
               throw "$($entry.Key) version '$($entry.Value)' does not match tag '$tag'."
             }
           }
+          $releaseNotes = "docs/release-notes-$expected.md"
+          if (-not (Test-Path -LiteralPath $releaseNotes -PathType Leaf)) {
+            throw "Release notes are missing: $releaseNotes"
+          }
+          if ((Get-Item -LiteralPath $releaseNotes).Length -eq 0) {
+            throw "Release notes are empty: $releaseNotes"
+          }
           Write-Host "All release versions match $tag."
 
       - name: Test updater manifest tooling
@@ -94,6 +101,10 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Test non-blocking Windows tray backend
+        shell: pwsh
+        run: '& "./scripts/test-tray-icon-windows-patch.ps1"'
+
       - name: Build signed Windows installer
         shell: pwsh
         env:
@@ -107,6 +118,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Windows installer build failed with exit code $LASTEXITCODE."
           }
+
+      - name: Verify PetalDesk tray imports
+        shell: pwsh
+        run: '& "./scripts/test-tray-icon-windows-patch.ps1" -SkipCargoTest -BinaryPath "src-tauri/target/release/petaldesk.exe"'
 
       - name: Build Firefox extension package
         shell: pwsh
@@ -280,6 +295,12 @@ jobs:
           set -euo pipefail
           tag="${{ github.ref_name }}"
           version="${tag#v}"
+          notes_path="docs/release-notes-${version}.md"
+
+          if [[ ! -s "$notes_path" ]]; then
+            echo "Release notes are missing or empty: $notes_path" >&2
+            exit 1
+          fi
 
           if gh release view "$tag" >/dev/null 2>&1; then
             is_draft="$(gh release view "$tag" --json isDraft --jq '.isDraft')"
@@ -287,11 +308,12 @@ jobs:
               echo "Release $tag is already published. Published releases are immutable; create a new version instead of replacing updater assets." >&2
               exit 1
             fi
+            gh release edit "$tag" --title "飞花 - PetalDesk $version" --notes-file "$notes_path"
           else
-            gh release create "$tag" --verify-tag --draft --title "飞花 - PetalDesk $version" --generate-notes
+            gh release create "$tag" --verify-tag --draft --title "飞花 - PetalDesk $version" --notes-file "$notes_path"
           fi
 
-          gh release view "$tag" --json body --jq '.body // ""' > release-notes.md
+          cp "$notes_path" release-notes.md
 
       - name: Generate and validate Windows updater manifest
         shell: pwsh

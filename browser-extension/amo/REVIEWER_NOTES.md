@@ -2,7 +2,7 @@
 
 ## Dependency
 
-The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.8.3/PetalDesk_0.8.3_x64-setup.exe.
+The extension is a companion for the PetalDesk Windows desktop application. Native Messaging functionality requires the public PetalDesk installer: https://github.com/starsliao/PetalDesk/releases/download/v0.8.4/PetalDesk_0.8.4_x64-setup.exe.
 
 The extension ID is fixed as `petaldesk-capture@petaldesk.app`, and the Native Messaging host name is `com.petaldesk.capture`.
 
@@ -56,12 +56,13 @@ Use a reviewer-controlled HTTPS login page with an ordinary username/password st
 4. In the toolbar popup, click the linked MFA icon. PetalDesk writes the code directly to the system clipboard; the popup shows only a success message with the remaining validity in seconds. TOTP expiry alone does not clear the copied value; it remains until replaced, or until an explicit MFA lock or PetalDesk shutdown clears the unchanged value. An unlinked account keeps the same disabled icon position.
 5. Lock the MFA vault manually and repeat either path. TOTP filling/copying is refused without affecting ordinary username/password filling.
 
-## PetalDesk 0.8.3 desktop companion checks
+## PetalDesk 0.8.4 desktop companion checks
 
 1. Close the MFA tool normally, then copy a linked MFA code from the extension or password manager. The code is copied without a recovery-password prompt. Use the dedicated **Lock vault** action and repeat: the copy is rejected until the user unlocks it.
 2. Import a QR code, image, or `otpauth://` URI. In the confirmation view, edit the account name, issuer, account identifier, and icon. Algorithm, digits, and period remain read-only, and the secret is never displayed.
 3. In the desktop password manager, hold the adjacent eye control to reveal a password and release it to hide. The username, password, and MFA copy controls use the same three icons as the extension; MFA is disabled when the password entry is not linked.
 4. In Settings, enable launch at login and then disable it again. Both operations complete without an access-denied error; any settings error appears at the top of the dialog. The tray menu uses **Open main window** and groups note creation plus the note list under one Notes submenu.
+5. On Windows, disconnect and reconnect a Remote Desktop session while PetalDesk remains in the tray. The tray menu and configured double-click actions remain responsive after reconnection.
 
 ## Login-detection test
 

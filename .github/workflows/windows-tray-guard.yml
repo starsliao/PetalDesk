@@ -1,0 +1,43 @@
+name: Windows Tray Guard
+
+on:
+  pull_request:
+    paths:
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - "src-tauri/vendor/tray-icon/**"
+      - "scripts/test-tray-icon-windows-patch.ps1"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/windows-tray-guard.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - "src-tauri/vendor/tray-icon/**"
+      - "scripts/test-tray-icon-windows-patch.ps1"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/windows-tray-guard.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tray-backend:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Test non-blocking Windows tray backend
+        shell: pwsh
+        run: '& "./scripts/test-tray-icon-windows-patch.ps1"'

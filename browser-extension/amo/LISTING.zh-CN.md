@@ -42,12 +42,11 @@
 - 备选分类：Other
 - 标签：password manager, productivity, screenshot, local-first, PetalDesk
 
-## 0.8.3 更新说明
+## 0.8.4 更新说明
 
-- 工具栏弹窗的扩展状态默认折叠，右侧四个状态点分别概览安装权限、Native Host、桌面密码通道和登录检测；正常为绿色，异常为红色，登录检测主动关闭为黑色。
-- 主界面、密码、MFA 和便签四个快捷入口改为同一行，账户列表和登录检测明细仍可按需展开使用。
-- 复制已关联的 MFA 后显示验证码真实剩余有效秒数；验证码到期不再因此自动清空系统剪贴板，主动锁定 MFA 或退出飞花时仍会清理未被替换的验证码。验证码、MFA ID 和密钥始终不会返回扩展。
-- 没有新增 Firefox 权限；填充仍绝不主动提交表单，登录检测异常断线仍会先自动快速重连 3 次。
+- Windows 桌面伴侣修复远程桌面断开或重连后可能整体无响应的问题；托盘事件不再同步等待 Explorer 返回图标矩形。
+- 本次没有改变扩展协议、页面交互或 Firefox 权限；`nativeMessaging`、`tabs`、`<all_urls>`、`websiteActivity` 和 `authenticationInfo` 的用途保持不变。
+- 密码与 TOTP 仍只通过本机 Native Messaging 通道短暂传递，填充绝不主动提交表单，保险库和系统剪贴板行为不变。
 
 ## 提交前待补信息
 
@@ -56,5 +55,5 @@
 - 支持页面：https://github.com/starsliao/PetalDesk/issues
 - 项目主页：https://starsliao.github.io/PetalDesk/
 - 隐私政策公开 URL：https://starsliao.github.io/PetalDesk/privacy.html
-- Windows 安装包公开 URL：https://github.com/starsliao/PetalDesk/releases/download/v0.8.3/PetalDesk_0.8.3_x64-setup.exe
+- Windows 安装包公开 URL：https://github.com/starsliao/PetalDesk/releases/download/v0.8.4/PetalDesk_0.8.4_x64-setup.exe
 - 许可证：MIT
