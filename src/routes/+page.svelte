@@ -36,6 +36,7 @@
   type GanttToolComponent = typeof import("$lib/components/GanttTool.svelte").default;
   type MfaToolComponent = typeof import("$lib/components/MfaTool.svelte").default;
   type PasswordManagerToolComponent = Component<Record<string, never>>;
+  type NetworkToolComponent = typeof import("$lib/components/NetworkTool.svelte").default;
   type ScreenshotToolComponent = typeof import("$lib/components/ScreenshotTool.svelte").default;
   type PinnedScreenshotComponent = typeof import("$lib/components/PinnedScreenshot.svelte").default;
 
@@ -109,6 +110,7 @@
   let GanttTool = $state<GanttToolComponent | null>(null);
   let MfaTool = $state<MfaToolComponent | null>(null);
   let PasswordManagerTool = $state<PasswordManagerToolComponent | null>(null);
+  let NetworkTool = $state<NetworkToolComponent | null>(null);
   let ScreenshotTool = $state<ScreenshotToolComponent | null>(null);
   let PinnedScreenshot = $state<PinnedScreenshotComponent | null>(null);
   let fatalError = $state("");
@@ -965,6 +967,10 @@
         void import("$lib/components/PasswordManagerTool.svelte").then((module) => {
           if (!disposed) PasswordManagerTool = module.default;
         });
+      } else if (toolName === "network") {
+        void import("$lib/components/NetworkTool.svelte").then((module) => {
+          if (!disposed) NetworkTool = module.default;
+        });
       }
       return () => {
         disposed = true;
@@ -1021,6 +1027,8 @@
               ? "MFA 验证器 - 飞花 - PetalDesk"
               : toolName === "passwords"
                 ? "密码管理器 - 飞花 - PetalDesk"
+              : toolName === "network"
+                ? "网络体检 - 飞花 - PetalDesk"
               : toolName === "screenshot"
                 ? longCaptureControlId
                   ? "长截图控制 - 飞花 - PetalDesk"
@@ -1109,6 +1117,16 @@
       </div>
     {/if}
   </main>
+{:else if toolName === "network"}
+  <main class="network-tool-window">
+    {#if NetworkTool}
+      <NetworkTool />
+    {:else}
+      <div class="tool-loading" aria-busy="true">
+        <LoaderCircle class="spinner" size={20} aria-hidden="true" />
+      </div>
+    {/if}
+  </main>
 {:else if !initialized}
   <main class="startup-state" aria-busy="true">
     <img src="/app-icon.svg" alt="" />
@@ -1162,6 +1180,7 @@
         onasset={importAsset}
         onchange={handleMarkdownChange}
         onopenlink={(url) => void openExternalLink(url)}
+        oncopy={() => showToast("已复制")}
         onerror={(detail) => (saveError = errorMessage(detail.error))}
       />
     </NoteShell>
@@ -1296,7 +1315,8 @@
   .reminder-tool-window,
   .gantt-tool-window,
   .mfa-tool-window,
-  .password-tool-window {
+  .password-tool-window,
+  .network-tool-window {
     width: 100vw;
     height: 100vh;
     min-width: 0;

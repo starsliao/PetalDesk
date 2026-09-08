@@ -1,5 +1,6 @@
 <script lang="ts">
   import {
+    Activity,
     Bell,
     ChartGantt,
     KeyRound,
@@ -251,6 +252,8 @@
                       <ShieldCheck size={15} aria-hidden="true" />
                     {:else if item.name === "passwords"}
                       <KeyRound size={15} aria-hidden="true" />
+                    {:else if item.name === "network"}
+                      <Activity size={15} aria-hidden="true" />
                     {:else}
                       <ScanLine size={15} aria-hidden="true" />
                     {/if}

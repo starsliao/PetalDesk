@@ -7,8 +7,11 @@ $ErrorActionPreference = "Stop"
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $expectedTrayVersion = "0.24.2"
+$expectedTaoVersion = "0.35.3"
 $rootManifest = Join-Path $repositoryRoot "src-tauri\Cargo.toml"
 $crateManifest = Join-Path $repositoryRoot "src-tauri\vendor\tray-icon\Cargo.toml"
+$taoManifest = Join-Path $repositoryRoot "src-tauri\vendor\tao\Cargo.toml"
+$taoEventLoop = Join-Path $repositoryRoot "src-tauri\vendor\tao\src\platform_impl\windows\event_loop.rs"
 $windowsBackendDirectory = Join-Path $repositoryRoot "src-tauri\vendor\tray-icon\src\platform_impl\windows"
 $releaseWorkflow = Join-Path $repositoryRoot ".github\workflows\release.yml"
 
@@ -17,6 +20,12 @@ if (-not (Test-Path -LiteralPath $rootManifest -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $crateManifest -PathType Leaf)) {
     throw "Vendored tray-icon manifest is missing: $crateManifest"
+}
+if (-not (Test-Path -LiteralPath $taoManifest -PathType Leaf)) {
+    throw "Vendored Tao manifest is missing: $taoManifest"
+}
+if (-not (Test-Path -LiteralPath $taoEventLoop -PathType Leaf)) {
+    throw "Vendored Tao Windows event loop is missing: $taoEventLoop"
 }
 if (-not (Test-Path -LiteralPath $windowsBackendDirectory -PathType Container)) {
     throw "Vendored tray-icon Windows backend is missing: $windowsBackendDirectory"
@@ -41,6 +50,21 @@ foreach ($sourceFile in $windowsSources) {
             throw "Forbidden blocking or nested-pump API '$symbol' is present in '$($sourceFile.FullName)'."
         }
     }
+}
+
+$taoSource = Get-Content -LiteralPath $taoEventLoop -Raw
+$taskbarHandlerMatch = [regex]::Match(
+    $taoSource,
+    '(?s)} else if msg == \*S_U_TASKBAR_RESTART \{(?<handler>.*?)\r?\n      \}'
+)
+if (-not $taskbarHandlerMatch.Success) {
+    throw "Tao TaskbarCreated handler was not found in '$taoEventLoop'."
+}
+$taskbarHandler = $taskbarHandlerMatch.Groups["handler"].Value
+$normalizedTaskbarHandler = [regex]::Replace($taskbarHandler, '\s+', ' ').Trim()
+$expectedTaskbarHandler = "let skip_taskbar = subclass_input.window_state.lock().skip_taskbar; let _ = set_skip_taskbar(window, skip_taskbar);"
+if (-not $normalizedTaskbarHandler.Equals($expectedTaskbarHandler, [System.StringComparison]::Ordinal)) {
+    throw "Tao TaskbarCreated handler no longer has the exact lock-free Explorer call sequence."
 }
 
 $releaseSource = Get-Content -LiteralPath $releaseWorkflow -Raw
@@ -72,10 +96,30 @@ if ($null -ne $trayPackages[0].source) {
     throw "The resolved tray-icon package unexpectedly has registry source '$($trayPackages[0].source)'."
 }
 
+$taoPackages = @($metadata.packages | Where-Object { $_.name -eq "tao" })
+if ($taoPackages.Count -ne 1) {
+    throw "Expected exactly one resolved Tao package, found $($taoPackages.Count)."
+}
+if ($taoPackages[0].version -ne $expectedTaoVersion) {
+    throw "Expected Tao $expectedTaoVersion, resolved $($taoPackages[0].version)."
+}
+$expectedTaoManifest = [System.IO.Path]::GetFullPath($taoManifest)
+$resolvedTaoManifest = [System.IO.Path]::GetFullPath($taoPackages[0].manifest_path)
+if (-not $resolvedTaoManifest.Equals($expectedTaoManifest, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Cargo resolved Tao from '$resolvedTaoManifest' instead of the patched fork '$expectedTaoManifest'."
+}
+if ($null -ne $taoPackages[0].source) {
+    throw "The resolved Tao package unexpectedly has registry source '$($taoPackages[0].source)'."
+}
+
 if (-not $SkipCargoTest) {
     & cargo test --manifest-path $crateManifest --lib
     if ($LASTEXITCODE -ne 0) {
         throw "Vendored tray-icon tests failed with exit code $LASTEXITCODE."
+    }
+    & cargo check --manifest-path $rootManifest --locked --all-targets
+    if ($LASTEXITCODE -ne 0) {
+        throw "PetalDesk/Tao integration check failed with exit code $LASTEXITCODE."
     }
 }
 
@@ -98,4 +142,4 @@ if (-not [string]::IsNullOrWhiteSpace($BinaryPath)) {
     }
 }
 
-Write-Host "Non-blocking Windows tray patch checks passed."
+Write-Host "Windows tray and taskbar deadlock patch checks passed."

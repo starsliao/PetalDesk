@@ -548,6 +548,50 @@ describe("MfaTool", () => {
     expect(rendered.getByLabelText("验证码已隐藏")).toBeInTheDocument();
   });
 
+  it("copies from the icon button next to the hidden code without revealing it", async () => {
+    const api = mockApi();
+    const rendered = render(MfaTool, { api });
+    await rendered.findByLabelText("GitHub，双击复制验证码");
+
+    // 点按钮之前先确认验证码确实是隐藏状态,否则这条断言就没有意义。
+    expect(rendered.getByLabelText("验证码已隐藏")).toBeInTheDocument();
+    await fireEvent.click(rendered.getByRole("button", { name: "复制“GitHub”的验证码" }));
+
+    await waitFor(() => expect(api.copy).toHaveBeenCalledWith(entry().id));
+    expect(api.reveal).not.toHaveBeenCalled();
+    expect(rendered.getByLabelText("验证码已隐藏")).toBeInTheDocument();
+  });
+
+  /// 按钮嵌在整卡双击复制的卡片里,不阻断冒泡的话一次点击会触发两次复制。
+  it("does not double-copy when the button click bubbles to the card", async () => {
+    const api = mockApi();
+    const rendered = render(MfaTool, { api });
+    await rendered.findByLabelText("GitHub，双击复制验证码");
+
+    const button = rendered.getByRole("button", { name: "复制“GitHub”的验证码" });
+    await fireEvent.click(button);
+    await fireEvent.doubleClick(button);
+
+    await waitFor(() => expect(api.copy).toHaveBeenCalled());
+    expect(api.copy).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables the copy button while a copy is in flight", async () => {
+    const api = mockApi();
+    let release: () => void = () => undefined;
+    // mockApi 的交叉类型让 copy 解析成 MfaApi 上的声明签名，取回 mock 视图才能改实现。
+    vi.mocked(api.copy).mockImplementation(() => new Promise<void>((resolve) => { release = () => resolve(); }));
+    const rendered = render(MfaTool, { api });
+    await rendered.findByLabelText("GitHub，双击复制验证码");
+
+    const button = rendered.getByRole("button", { name: "复制“GitHub”的验证码" });
+    await fireEvent.click(button);
+    await waitFor(() => expect(button).toBeDisabled());
+
+    release();
+    await waitFor(() => expect(button).toBeEnabled());
+  });
+
   it("reorders accounts from the dedicated drag handle without copying a code", async () => {
     const api = mockApi([
       entry(),

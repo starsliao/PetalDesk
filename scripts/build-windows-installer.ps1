@@ -1,6 +1,7 @@
 ﻿param(
     [switch]$SkipAppBuild,
-    [switch]$RequireUpdaterSignature
+    [switch]$RequireUpdaterSignature,
+    [switch]$SkipStorageCompatibilityProbe
 )
 
 $ErrorActionPreference = "Stop"
@@ -54,6 +55,10 @@ if ([string]::IsNullOrWhiteSpace($updaterPrivateKey)) {
     if ($RequireUpdaterSignature) {
         throw "发布构建缺少 TAURI_SIGNING_PRIVATE_KEY，无法生成 Windows 自动更新签名。"
     }
+}
+
+if ($RequireUpdaterSignature -and $SkipStorageCompatibilityProbe) {
+    throw "正式签名构建不能跳过 NSIS 数据存储兼容性检查。"
 }
 
 function Invoke-CheckedCommand {
@@ -979,7 +984,12 @@ Invoke-CheckedCommand -Command "cargo.exe" -Arguments @(
 if (-not (Test-Path -LiteralPath $makensis)) {
     throw "没有找到 Tauri 下载的 makensis：$makensis"
 }
-Test-LegacyWorkspaceResolver -MakensisPath $makensis -HooksPath $storagePathHooks
+if ($SkipStorageCompatibilityProbe) {
+    Write-Warning "仅本地构建：已显式跳过被安全软件拦截的 NSIS 数据存储兼容性探针。"
+}
+else {
+    Test-LegacyWorkspaceResolver -MakensisPath $makensis -HooksPath $storagePathHooks
+}
 $makensisArguments = @("/INPUTCHARSET", "UTF8", "/V2")
 if ($null -ne $chromeExtensionId) {
     $makensisArguments += "/DPETALDESK_CHROME_EXTENSION_ID=$chromeExtensionId"

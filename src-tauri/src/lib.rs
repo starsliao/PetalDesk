@@ -2,6 +2,7 @@ pub mod browser_bridge;
 pub mod browser_native_host;
 mod browser_secret_bridge;
 mod commands;
+mod diagnostics;
 mod error;
 mod gantt;
 mod launch_at_login;
@@ -9,6 +10,7 @@ mod long_screenshot;
 mod long_screenshot_input;
 mod mfa;
 mod models;
+mod network;
 mod password_browser;
 mod passwords;
 mod phase_match;
@@ -30,12 +32,10 @@ use crate::reminders::ReminderStore;
 use crate::screenshot::ScreenshotStore;
 use crate::storage::WorkspaceStore;
 use crate::timer::TimerStore;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{LazyLock, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, RunEvent, WindowEvent};
@@ -49,6 +49,7 @@ const OPEN_GANTT_MENU_ID: &str = "open-tool:gantt";
 const OPEN_MFA_MENU_ID: &str = "open-tool:mfa";
 const OPEN_PASSWORD_MENU_ID: &str = "open-tool:passwords";
 const OPEN_SCREENSHOT_MENU_ID: &str = "open-tool:screenshot";
+const OPEN_NETWORK_MENU_ID: &str = "open-tool:network";
 const ABOUT_MENU_ID: &str = "about";
 const MAX_TRAY_NOTE_TITLE_CHARS: usize = 80;
 const ACTIVATION_FALLBACK_DELAY: Duration = Duration::from_secs(2);
@@ -95,25 +96,6 @@ fn activation_fallback_is_current(
     in_flight.load(Ordering::Acquire) && generation.load(Ordering::Acquire) == expected_generation
 }
 
-pub(crate) fn trace_activation(message: &str) {
-    if std::env::var_os("PETALDESK_ACTIVATION_TRACE").is_none() {
-        return;
-    }
-    let Some(data_dir) = dirs::data_local_dir() else {
-        return;
-    };
-    let path = data_dir.join("PetalDesk").join("activation-trace.log");
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(
-            file,
-            "{:?} {:?} {}",
-            SystemTime::now(),
-            std::thread::current().id(),
-            message
-        );
-    }
-}
-
 fn tray_note_label(title: &str) -> String {
     let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
     let normalized = if normalized.is_empty() {
@@ -151,6 +133,7 @@ fn tool_from_tray_menu_id(menu_id: &str) -> Option<models::ToolName> {
         OPEN_MFA_MENU_ID => Some(models::ToolName::Mfa),
         OPEN_PASSWORD_MENU_ID => Some(models::ToolName::Passwords),
         OPEN_SCREENSHOT_MENU_ID => Some(models::ToolName::Screenshot),
+        OPEN_NETWORK_MENU_ID => Some(models::ToolName::Network),
         _ => None,
     }
 }
@@ -213,45 +196,35 @@ fn show_note_and_hide_main(app: &tauri::AppHandle, note_id: &str) -> bool {
 }
 
 fn show_last_note_or_main(app: &tauri::AppHandle) {
-    trace_activation("show_last:start");
     let store = app.state::<WorkspaceStore>();
     if let Ok(Some(note_id)) = store.last_or_recent_note_id() {
-        trace_activation(&format!("show_last:note:{note_id}"));
         if show_note_and_hide_main(app, &note_id) {
-            trace_activation("show_last:note_shown");
             return;
         }
     }
-    trace_activation("show_last:fallback_main");
     show_main_window(app);
-    trace_activation("show_last:end");
 }
 
 fn show_first_note_or_main(app: &tauri::AppHandle) {
-    trace_activation("show_first:start");
     let store = app.state::<WorkspaceStore>();
     if let Ok(Some(note_id)) = store.first_note_id() {
-        trace_activation(&format!("show_first:note:{note_id}"));
         if show_note_and_hide_main(app, &note_id) {
-            trace_activation("show_first:note_shown");
             return;
         }
     }
-    trace_activation("show_first:fallback_main");
     show_main_window(app);
-    trace_activation("show_first:end");
 }
 
 // Tray and single-instance callbacks run on Tauri's event-loop thread. A new
 // WebView must be built on a worker thread or its synchronous channel deadlocks.
 fn spawn_show_last_note_or_main(app: &tauri::AppHandle) {
-    trace_activation("activation:request");
+    diagnostics::record(diagnostics::DiagnosticEvent::ActivationRequested);
     let generation = next_activation_generation(&ACTIVATION_GENERATION);
     if ACTIVATION_IN_FLIGHT
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        trace_activation("activation:coalesced");
+        diagnostics::record(diagnostics::DiagnosticEvent::ActivationCoalesced);
         let app = app.clone();
         tauri::async_runtime::spawn_blocking(move || show_main_window(&app));
         return;
@@ -262,27 +235,27 @@ fn spawn_show_last_note_or_main(app: &tauri::AppHandle) {
         std::thread::sleep(ACTIVATION_FALLBACK_DELAY);
         if activation_fallback_is_current(&ACTIVATION_IN_FLIGHT, &ACTIVATION_GENERATION, generation)
         {
-            trace_activation("activation:fallback_main");
+            diagnostics::record(diagnostics::DiagnosticEvent::ActivationFallback);
             show_main_window(&fallback_app);
         }
     });
     let in_flight = ActivationInFlightGuard;
     tauri::async_runtime::spawn_blocking(move || {
         let _in_flight = in_flight;
-        trace_activation("activation:worker_start");
+        diagnostics::record(diagnostics::DiagnosticEvent::ActivationWorkerStarted);
         show_last_note_or_main(&app);
-        trace_activation("activation:worker_end");
+        diagnostics::record(diagnostics::DiagnosticEvent::ActivationWorkerFinished);
     });
 }
 
 fn spawn_show_first_note_or_main(app: &tauri::AppHandle) {
-    trace_activation("activation_first:request");
+    diagnostics::record(diagnostics::DiagnosticEvent::ActivationRequested);
     let generation = next_activation_generation(&ACTIVATION_GENERATION);
     if ACTIVATION_IN_FLIGHT
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        trace_activation("activation_first:coalesced");
+        diagnostics::record(diagnostics::DiagnosticEvent::ActivationCoalesced);
         let app = app.clone();
         tauri::async_runtime::spawn_blocking(move || show_main_window(&app));
         return;
@@ -293,16 +266,16 @@ fn spawn_show_first_note_or_main(app: &tauri::AppHandle) {
         std::thread::sleep(ACTIVATION_FALLBACK_DELAY);
         if activation_fallback_is_current(&ACTIVATION_IN_FLIGHT, &ACTIVATION_GENERATION, generation)
         {
-            trace_activation("activation_first:fallback_main");
+            diagnostics::record(diagnostics::DiagnosticEvent::ActivationFallback);
             show_main_window(&fallback_app);
         }
     });
     let in_flight = ActivationInFlightGuard;
     tauri::async_runtime::spawn_blocking(move || {
         let _in_flight = in_flight;
-        trace_activation("activation_first:worker_start");
+        diagnostics::record(diagnostics::DiagnosticEvent::ActivationWorkerStarted);
         show_first_note_or_main(&app);
-        trace_activation("activation_first:worker_end");
+        diagnostics::record(diagnostics::DiagnosticEvent::ActivationWorkerFinished);
     });
 }
 
@@ -333,6 +306,9 @@ fn spawn_open_tool(app: &tauri::AppHandle, tool: models::ToolName) {
             }
             models::ToolName::Passwords => commands::open_password_window(&app),
             models::ToolName::Screenshot => screenshot::start_capture_inner(&app).map(|_| ()),
+            models::ToolName::Network => {
+                commands::open_network_window_inner(&app, &app.state()).map(|_| ())
+            }
         };
         if let Err(error) = result {
             if error.code == commands::SENSITIVE_TOOL_REMOTE_SESSION_CODE {
@@ -379,13 +355,13 @@ fn spawn_tray_action(app: &tauri::AppHandle, action: models::TrayShortcutAction)
 fn spawn_primary_activation_action(app: &tauri::AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        trace_activation("single_instance:worker_start");
+        diagnostics::record(diagnostics::DiagnosticEvent::ActivationWorkerStarted);
         let action = app
             .state::<WorkspaceStore>()
             .tray_shortcut_settings()
             .double_click;
         spawn_tray_action(&app, action);
-        trace_activation("single_instance:worker_end");
+        diagnostics::record(diagnostics::DiagnosticEvent::ActivationWorkerFinished);
     });
 }
 
@@ -447,12 +423,14 @@ fn build_tray_menu(
         true,
         None::<&str>,
     )?;
+    let network = MenuItem::with_id(app, OPEN_NETWORK_MENU_ID, "网络体检", true, None::<&str>)?;
     tools.append(&timer)?;
     tools.append(&reminder)?;
     tools.append(&gantt)?;
     tools.append(&mfa)?;
     tools.append(&passwords)?;
     tools.append(&screenshot)?;
+    tools.append(&network)?;
     let about = MenuItem::with_id(app, ABOUT_MENU_ID, "关于", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     Ok(Menu::with_items(
@@ -515,10 +493,13 @@ fn tray_menu_signature(notes: &[models::NoteSummary], screenshot_shortcut: &str)
 }
 
 fn refresh_tray_menu_now(app: &tauri::AppHandle) {
+    let started = Instant::now();
+    diagnostics::record(diagnostics::DiagnosticEvent::TrayRefreshStarted);
     // Building the menu costs one synchronous UI-thread hop per item, plus one
     // deferred main-thread drop per item of the outgoing menu. Skipping
     // unchanged rebuilds keeps body-only autosaves off the UI thread entirely.
     let Ok(notes) = app.state::<WorkspaceStore>().list_notes() else {
+        diagnostics::record_warning(diagnostics::DiagnosticEvent::TrayRefreshFailed);
         return;
     };
     let shortcut = app.state::<ScreenshotStore>().settings().shortcut;
@@ -528,16 +509,23 @@ fn refresh_tray_menu_now(app: &tauri::AppHandle) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if current.as_deref() == Some(signature.as_str()) {
+            diagnostics::record_duration(
+                diagnostics::DiagnosticEvent::TrayRefreshSkipped,
+                started.elapsed(),
+            );
             return;
         }
     }
     let Ok(menu) = build_tray_menu(app, notes, &shortcut) else {
+        diagnostics::record_warning(diagnostics::DiagnosticEvent::TrayRefreshFailed);
         return;
     };
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        diagnostics::record_warning(diagnostics::DiagnosticEvent::TrayRefreshFailed);
         return;
     };
     if tray.set_menu(Some(menu)).is_err() {
+        diagnostics::record_warning(diagnostics::DiagnosticEvent::TrayRefreshFailed);
         return;
     }
     // Record only after the menu is actually installed, so a failed rebuild is
@@ -545,9 +533,16 @@ fn refresh_tray_menu_now(app: &tauri::AppHandle) {
     *TRAY_MENU_SIGNATURE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(signature);
+    diagnostics::record_duration(
+        diagnostics::DiagnosticEvent::TrayRefreshCompleted,
+        started.elapsed(),
+    );
 }
 
 fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let _phase = diagnostics::enter_main_phase(diagnostics::MainPhase::Setup);
+    diagnostics::record(diagnostics::DiagnosticEvent::SetupStarted);
+    diagnostics::start_main_loop_watchdog(app.handle().clone());
     let data_storage_path = app.state::<WorkspaceStore>().data_storage_path();
     recovery::recover_interrupted_shared_recovery(&data_storage_path)?;
     app.manage(MfaStore::load(&data_storage_path)?);
@@ -556,6 +551,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // accepted this process as primary. A secondary launch exits during plugin
     // setup and must never overwrite the primary process endpoint.
     app.manage(PasswordBrowserService::start());
+    diagnostics::record(diagnostics::DiagnosticEvent::BrowserServiceStarted);
     screenshot::setup(app)?;
     password_browser::start_event_dispatcher(app.handle().clone());
     let notes = app.state::<WorkspaceStore>().list_notes()?;
@@ -571,29 +567,43 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .menu(&menu)
         .show_menu_on_left_click(!cfg!(windows))
         .tooltip("飞花 - PetalDesk")
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => show_main_window(app),
-            "new-note" => spawn_create_note(app),
-            ABOUT_MENU_ID => {
-                show_main_window(app);
-                let _ = app.emit_to("main", "open_about_dialog", ());
-            }
-            "quit" => {
-                let app = app.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    app.state::<MfaStore>().lock();
-                    app.state::<PasswordStore>().lock();
-                    long_screenshot::shutdown(&app);
-                    app.exit(0);
-                });
-            }
-            id => {
-                if let Some(tool) = tool_from_tray_menu_id(id) {
-                    spawn_open_tool(app, tool);
-                    return;
+        .on_menu_event(|app, event| {
+            let _phase = diagnostics::enter_main_phase(diagnostics::MainPhase::TrayMenu);
+            diagnostics::mark_main_loop_progress();
+            match event.id.as_ref() {
+                "show" => {
+                    diagnostics::record(diagnostics::DiagnosticEvent::TrayMenuShow);
+                    show_main_window(app);
                 }
-                if let Some(note_id) = note_id_from_tray_menu_id(id) {
-                    spawn_show_note(app, note_id.to_string());
+                "new-note" => {
+                    diagnostics::record(diagnostics::DiagnosticEvent::TrayMenuNewNote);
+                    spawn_create_note(app);
+                }
+                ABOUT_MENU_ID => {
+                    diagnostics::record(diagnostics::DiagnosticEvent::TrayMenuAbout);
+                    show_main_window(app);
+                    let _ = app.emit_to("main", "open_about_dialog", ());
+                }
+                "quit" => {
+                    diagnostics::record(diagnostics::DiagnosticEvent::TrayMenuQuit);
+                    let app = app.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        app.state::<MfaStore>().lock();
+                        app.state::<PasswordStore>().lock();
+                        long_screenshot::shutdown(&app);
+                        app.exit(0);
+                    });
+                }
+                id => {
+                    if let Some(tool) = tool_from_tray_menu_id(id) {
+                        diagnostics::record(diagnostics::DiagnosticEvent::TrayMenuOpenTool);
+                        spawn_open_tool(app, tool);
+                        return;
+                    }
+                    if let Some(note_id) = note_id_from_tray_menu_id(id) {
+                        diagnostics::record(diagnostics::DiagnosticEvent::TrayMenuOpenNote);
+                        spawn_show_note(app, note_id.to_string());
+                    }
                 }
             }
         })
@@ -603,6 +613,9 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 ..
             } = event
             {
+                let _phase = diagnostics::enter_main_phase(diagnostics::MainPhase::TrayIcon);
+                diagnostics::mark_main_loop_progress();
+                diagnostics::record(diagnostics::DiagnosticEvent::TrayDoubleClick);
                 // Runs on the event-loop thread, so read the settings on a
                 // worker: blocking here stops the message pump and with it
                 // every tray click and single-instance handshake.
@@ -619,6 +632,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         tray = tray.icon(icon.clone());
     }
     tray.build(app)?;
+    diagnostics::record(diagnostics::DiagnosticEvent::TrayBuilt);
 
     if let Some(state) = app.state::<WorkspaceStore>().window_state("main") {
         if let Some(window) = app.get_webview_window("main") {
@@ -661,6 +675,7 @@ fn setup_tray(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     });
     reminders::start_scheduler(app.handle().clone());
     updater::start_scheduler(app.handle().clone());
+    diagnostics::record(diagnostics::DiagnosticEvent::SetupCompleted);
     Ok(())
 }
 
@@ -685,9 +700,8 @@ pub fn run() {
             // on the message pump while the relaunched process waits inside
             // SendMessageW. Tracing happens on the worker instead.
             |app, arguments, _cwd| {
-                if launch_at_login::args_contain_autostart(arguments.iter()) {
-                    trace_activation("single_instance:autostart_suppressed");
-                } else {
+                let _phase = diagnostics::enter_main_phase(diagnostics::MainPhase::SingleInstance);
+                if !launch_at_login::args_contain_autostart(arguments.iter()) {
                     spawn_primary_activation_action(app);
                 }
             },
@@ -713,13 +727,17 @@ pub fn run() {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
+                let _phase = diagnostics::enter_main_phase(diagnostics::MainPhase::PageLoad);
+                diagnostics::mark_main_loop_progress();
                 // `RunEvent::Ready` can arrive before WebView2 has finished
                 // initializing its first controller. Waiting for the hidden
                 // main page to finish loading avoids losing the configured
                 // activation target on fast, installed launches.
-                trace_activation("main_page:finished");
+                diagnostics::record(diagnostics::DiagnosticEvent::MainPageLoaded);
                 if autostart_launch {
-                    trace_activation("main_page:autostart_suppressed");
+                    diagnostics::record(
+                        diagnostics::DiagnosticEvent::ActivationAutostartSuppressed,
+                    );
                 } else {
                     spawn_primary_activation_action(webview.app_handle());
                 }
@@ -727,7 +745,10 @@ pub fn run() {
         })
         .setup(setup_tray)
         .on_window_event(|window, event| {
+            let _phase = diagnostics::enter_main_phase(diagnostics::MainPhase::WindowEvent);
+            diagnostics::mark_main_loop_progress();
             if let WindowEvent::CloseRequested { api, .. } = event {
+                diagnostics::record(diagnostics::DiagnosticEvent::WindowCloseRequested);
                 let app = window.app_handle().clone();
                 let label = window.label().to_string();
                 #[cfg(windows)]
@@ -746,7 +767,6 @@ pub fn run() {
                     api.prevent_close();
                     return;
                 }
-                trace_activation(&format!("window_close:{label}:requested"));
                 if let (Ok(position), Ok(size), Ok(scale), Ok(maximized)) = (
                     window.outer_position(),
                     window.inner_size(),
@@ -784,6 +804,7 @@ pub fn run() {
                     });
                 }
             } else if let WindowEvent::Destroyed = event {
+                diagnostics::record(diagnostics::DiagnosticEvent::WindowDestroyed);
                 let app = window.app_handle().clone();
                 let label = window.label().to_string();
                 #[cfg(windows)]
@@ -840,6 +861,7 @@ pub fn run() {
             commands::search_notes,
             commands::open_note_window,
             commands::open_tool_window,
+            network::collect_network_report,
             commands::close_note_window,
             commands::save_window_state,
             updater::get_update_settings,
@@ -940,47 +962,101 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("无法启动飞花 - PetalDesk 应用");
+    // The single-instance plugin exits secondary launches during `build`.
+    // Start the fixed-name logger only after that ownership check, otherwise a
+    // blocked secondary launch could corrupt or rotate the primary's evidence.
+    let _ = diagnostics::init();
+    diagnostics::record(diagnostics::DiagnosticEvent::PrimaryInstanceConfirmed);
+    diagnostics::record(diagnostics::DiagnosticEvent::StoresLoaded);
+    diagnostics::record(diagnostics::DiagnosticEvent::AppBuilt);
+    diagnostics::set_main_phase(diagnostics::MainPhase::Idle);
 
-    app.run(|app, event| match event {
-        RunEvent::Ready => {
-            trace_activation("run_event:ready");
-        }
-        RunEvent::ExitRequested { api, code, .. } => {
-            if code.is_none() {
-                #[cfg(not(target_os = "macos"))]
-                api.prevent_exit();
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = api;
+    app.run(|app, event| {
+        diagnostics::mark_main_loop_progress();
+        match event {
+            RunEvent::Ready => {
+                diagnostics::set_main_phase(diagnostics::MainPhase::Idle);
+                diagnostics::record(diagnostics::DiagnosticEvent::RunReady);
+            }
+            RunEvent::Resumed => {
+                diagnostics::record(diagnostics::DiagnosticEvent::RunResumed);
+            }
+            RunEvent::ExitRequested { api, code, .. } => {
+                let _phase = diagnostics::enter_main_phase(diagnostics::MainPhase::Exit);
+                diagnostics::record(diagnostics::DiagnosticEvent::ExitRequested);
+                if code.is_none() {
+                    #[cfg(not(target_os = "macos"))]
+                    api.prevent_exit();
+                    #[cfg(target_os = "macos")]
+                    {
+                        let _ = api;
+                        app.state::<MfaStore>().lock();
+                        app.state::<PasswordStore>().lock();
+                        long_screenshot::shutdown(app);
+                    }
+                } else {
                     app.state::<MfaStore>().lock();
                     app.state::<PasswordStore>().lock();
-                    long_screenshot::shutdown(app);
                 }
-            } else {
-                app.state::<MfaStore>().lock();
-                app.state::<PasswordStore>().lock();
+                // Explicit quit and restart paths finish long-capture cleanup on a
+                // worker thread before requesting process exit. Repeating that
+                // blocking cleanup here can stall Tauri's event loop while Windows
+                // is already tearing down the process.
             }
-            // Explicit quit and restart paths finish long-capture cleanup on a
-            // worker thread before requesting process exit. Repeating that
-            // blocking cleanup here can stall Tauri's event loop while Windows
-            // is already tearing down the process.
-        }
-        #[cfg(target_os = "macos")]
-        RunEvent::Reopen {
-            has_visible_windows,
-            ..
-        } => {
-            if !has_visible_windows {
-                show_main_window(app);
+            RunEvent::Exit => {
+                diagnostics::set_main_phase(diagnostics::MainPhase::Exit);
+                diagnostics::record_urgent(diagnostics::DiagnosticEvent::Exit);
             }
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } => {
+                if !has_visible_windows {
+                    show_main_window(app);
+                }
+            }
+            _ => {}
         }
-        _ => {}
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tauri 2 按窗口 label 授权窗口 API。工具窗口如果没进 capabilities 的
+    /// `windows` 白名单，页面照常渲染、自定义命令照常可用，但 `close()`、
+    /// `destroy()` 和标题栏拖动会被静默拒绝 —— 编译和其它单测都发现不了。
+    /// 每加一个工具窗口都必须同步这个白名单。
+    #[test]
+    fn every_tool_window_label_is_in_the_capability_scope() {
+        let capability: serde_json::Value = serde_json::from_str(include_str!(
+            "../capabilities/default.json"
+        ))
+        .expect("capabilities/default.json 必须是合法 JSON");
+        let scope: Vec<&str> = capability["windows"]
+            .as_array()
+            .expect("capabilities 必须声明 windows 数组")
+            .iter()
+            .map(|entry| entry.as_str().expect("窗口 label 必须是字符串"))
+            .collect();
+
+        for label in [
+            commands::TIMER_WINDOW_LABEL,
+            commands::REMINDER_WINDOW_LABEL,
+            commands::GANTT_WINDOW_LABEL,
+            commands::MFA_WINDOW_LABEL,
+            commands::PASSWORD_WINDOW_LABEL,
+            commands::NETWORK_WINDOW_LABEL,
+        ] {
+            assert!(
+                scope.contains(&label),
+                "工具窗口 `{label}` 不在 capabilities/default.json 的 windows 白名单里，\
+                 该窗口将无法关闭或拖动"
+            );
+        }
+    }
 
     #[test]
     fn activation_fallback_only_runs_for_the_current_in_flight_request() {

@@ -18,6 +18,7 @@ pub enum ToolName {
     Mfa,
     Passwords,
     Screenshot,
+    Network,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

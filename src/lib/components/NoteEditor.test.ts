@@ -109,6 +109,75 @@ describe("NoteEditor", () => {
     expect(clipboardWriteText).toHaveBeenCalledWith("丙丁");
   });
 
+  /// drawSelection() 会按行绘制矩形选区，跨行选择时把行尾空白一并染色。
+  /// 便签要求只高亮选中的文字，因此必须交给原生选区绘制。
+  it("leaves selection painting to the browser instead of drawing block rectangles", async () => {
+    let view: EditorView | undefined;
+    const { container } = render(NoteEditor, {
+      value: "第一行\n第二行\n第三行",
+      mode: "plain",
+      onready: (detail) => {
+        view = detail.view;
+      },
+    });
+
+    await waitFor(() => expect(view).toBeDefined());
+    // 跨行选中，正是会触发整行铺底的场景。
+    view!.dispatch({ selection: { anchor: 1, head: 9 } });
+    await waitFor(() => expect(view!.state.selection.main.empty).toBe(false));
+
+    expect(container.querySelector(".cm-selectionLayer")).toBeNull();
+    expect(container.querySelector(".cm-selectionBackground")).toBeNull();
+  });
+
+  it("reports a successful selection copy so the window can confirm it", async () => {
+    let view: EditorView | undefined;
+    const copied: string[] = [];
+    const { container } = render(NoteEditor, {
+      value: "复制提示",
+      mode: "plain",
+      oncopy: (detail: { text: string }) => copied.push(detail.text),
+      onready: (detail) => {
+        view = detail.view;
+      },
+    });
+
+    await waitFor(() => expect(view).toBeDefined());
+    view!.dispatch({ selection: { anchor: 0, head: 2 } });
+    await fireEvent.keyUp(container.querySelector<HTMLElement>(".cm-content")!, {
+      key: "ArrowRight",
+      shiftKey: true,
+    });
+
+    await waitFor(() => expect(copied).toEqual(["复制"]));
+  });
+
+  /// 写入剪贴板可能因权限被拒。那种情况下提示「已复制」会让用户以为复制到了。
+  it("stays silent when the clipboard write is rejected", async () => {
+    clipboardWriteText.mockRejectedValue(new Error("clipboard blocked"));
+    let view: EditorView | undefined;
+    const copied: string[] = [];
+    const { container } = render(NoteEditor, {
+      value: "复制失败",
+      mode: "plain",
+      oncopy: (detail: { text: string }) => copied.push(detail.text),
+      onready: (detail) => {
+        view = detail.view;
+      },
+    });
+
+    await waitFor(() => expect(view).toBeDefined());
+    view!.dispatch({ selection: { anchor: 0, head: 2 } });
+    await fireEvent.keyUp(container.querySelector<HTMLElement>(".cm-content")!, {
+      key: "ArrowRight",
+      shiftKey: true,
+    });
+
+    await waitFor(() => expect(clipboardWriteText).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(copied).toEqual([]);
+  });
+
   it("does not copy programmatic selection changes or formatting key releases", async () => {
     let view: EditorView | undefined;
     const { container } = render(NoteEditor, {

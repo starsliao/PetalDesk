@@ -1521,14 +1521,31 @@
                 {#if copyingIds[entry.id]}<span class="copying-label">正在复制…</span>{/if}
               </div>
               <span class="account-meta" title={metadata(entry)}>{metadata(entry)}</span>
-              <output
-                class:masked={!currentReveal}
-                class="otp-code"
-                aria-label={currentReveal ? `验证码 ${currentReveal.code}` : "验证码已隐藏"}
-                aria-live="polite"
-              >
-                {currentReveal ? formatOtpCode(currentReveal.code, entry.digits) : maskedOtpCode(entry.digits)}
-              </output>
+              <div class="otp-row">
+                <output
+                  class:masked={!currentReveal}
+                  class="otp-code"
+                  aria-label={currentReveal ? `验证码 ${currentReveal.code}` : "验证码已隐藏"}
+                  aria-live="polite"
+                >
+                  {currentReveal ? formatOtpCode(currentReveal.code, entry.digits) : maskedOtpCode(entry.digits)}
+                </output>
+                <button
+                  type="button"
+                  class="copy-code-button"
+                  aria-label={`复制“${entry.name}”的验证码`}
+                  title="复制验证码"
+                  disabled={Boolean(copyingIds[entry.id])}
+                  onclick={(event) => { event.stopPropagation(); void copyCode(entry); }}
+                  ondblclick={stopHandleClick}
+                >
+                  {#if copyingIds[entry.id]}
+                    <LoaderCircle class="spinner" size={15} aria-hidden="true" />
+                  {:else}
+                    <Copy size={15} aria-hidden="true" />
+                  {/if}
+                </button>
+              </div>
             </div>
             <button
               type="button"
@@ -2236,6 +2253,10 @@
   .account-meta { overflow: hidden; color: #79747f; font-size: 10.5px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
   .otp-code { margin-top: 2px; color: #362552; font-family: "Cascadia Mono", "Segoe UI Mono", Consolas, monospace; font-size: clamp(20px, 5.3vw, 27px); font-variant-numeric: tabular-nums; font-weight: 650; letter-spacing: .08em; line-height: 1.12; white-space: nowrap; }
   .otp-code.masked { color: #9a92a5; font-size: clamp(18px, 4.8vw, 24px); letter-spacing: .04em; }
+  .otp-row { display: flex; min-width: 0; align-items: center; gap: 7px; }
+  .copy-code-button { display: grid; width: 26px; height: 26px; padding: 0; flex: 0 0 auto; margin-top: 2px; place-items: center; color: #9084a6; background: transparent; border: 1px solid transparent; border-radius: 6px; cursor: pointer; transition: color 120ms ease, background 120ms ease, border-color 120ms ease; }
+  .copy-code-button:hover, .copy-code-button:focus-visible { color: #4e3377; background: #f3eff8; border-color: #dfd5eb; outline: 0; }
+  .copy-code-button:disabled { cursor: wait; opacity: .6; }
   .reveal-button { position: relative; display: grid; width: 38px; height: 38px; padding: 0; place-items: center; color: #69557f; background: #f3eff8; border: 1px solid #dfd5eb; border-radius: 50%; cursor: pointer; }
   .reveal-button:hover, .reveal-button:focus-visible { color: #4e3377; background: #eae2f5; outline: 0; box-shadow: 0 0 0 2px rgb(104 69 173 / 18%); }
   .reveal-button:disabled { opacity: .65; cursor: wait; }

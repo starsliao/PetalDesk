@@ -16,7 +16,6 @@
     dropCursor,
     EditorView,
     WidgetType,
-    drawSelection,
     keymap,
     placeholder as editorPlaceholder,
     type DecorationSet,
@@ -60,6 +59,8 @@
     onassetinsert?: (detail: AssetInsertDetail) => void;
     onerror?: (detail: EditorErrorDetail) => void;
     onready?: (detail: EditorReadyDetail) => void;
+    /// 选中文字自动复制成功后触发，供外层提示用户。复制失败不触发。
+    oncopy?: (detail: { text: string }) => void;
   }
 
   let {
@@ -75,6 +76,7 @@
     onassetinsert,
     onerror,
     onready,
+    oncopy,
   }: Props = $props();
 
   let editorHost: HTMLDivElement;
@@ -843,7 +845,11 @@
       if (composingText || view?.composing) return;
       if (!navigator.clipboard?.writeText) return;
       try {
-        void navigator.clipboard.writeText(selectedText).catch(() => undefined);
+        // 只有真正写入成功才提示，否则用户会以为复制到了而实际没有。
+        void navigator.clipboard
+          .writeText(selectedText)
+          .then(() => oncopy?.({ text: selectedText }))
+          .catch(() => undefined);
       } catch {
         // Clipboard permissions can change while editing; selection must remain usable.
       }
@@ -942,7 +948,10 @@
       doc: value,
       extensions: [
         dropCursor(),
-        drawSelection(),
+        // 不使用 drawSelection():它按行绘制矩形选区，跨行选择时会把行尾空白
+        // 一并染色，而且它注入的 `::selection { transparent }` 一旦被主题覆盖，
+        // 原生选区与绘制层会同时上色，叠出更深的色块。便签要的是「只高亮选中的
+        // 文字」，原生选区正好贴着字形，因此交给浏览器绘制。
         history({ minDepth: 200, newGroupDelay: 500 }),
         search({ top: true }),
         keymap.of([
@@ -998,7 +1007,7 @@
           ".cm-content": { padding: "14px 18px 48px", caretColor: "currentColor" },
           ".cm-line": { padding: "0" },
           ".cm-focused": { outline: "none" },
-          ".cm-selectionBackground, ::selection": { backgroundColor: "var(--note-selection, rgba(68, 63, 44, 0.2)) !important" },
+          "::selection": { backgroundColor: "var(--note-selection, rgba(68, 63, 44, 0.2))" },
           ".cm-panels": { backgroundColor: "var(--app-surface, rgba(255, 255, 255, 0.9))", color: "var(--app-fg, #25231d)" },
           ".cm-panels-top": { borderBottom: "1px solid rgba(60, 55, 35, 0.12)" },
           ".cm-search": { padding: "6px 10px" },

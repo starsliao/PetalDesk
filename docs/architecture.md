@@ -20,6 +20,8 @@
 
 源码仓库不包含真实便签、截图会话、计时记录或提醒数据。用户业务数据统一存放在所选目录的 `.petaldesk/` 下；Windows 的 `%LOCALAPPDATA%\PetalDesk` 或 macOS 的 `~/Library/Application Support/PetalDesk` 仅保留当前数据目录指针、可重建索引和调试日志。
 
+桌面诊断日志固定写入上述本机应用目录的 `logs/petaldesk-diagnostics.log`，不跟随用户选择的数据目录，避免同步盘或网络盘阻塞事件线程。日志只在单实例所有权确认后打开；一个独立写线程负责有界队列、JSONL 序列化与 1 MiB x 4 文件轮转。独立 watchdog 通过单个未决主线程探针检测事件循环停顿，Windows 等待链则交给唯一的隔离线程采集；查询超过 5 秒会留下超时记录，但不会停止后续 watchdog、恢复事件或进程资源采样。事件名和字段采用封闭的静态集合，不接收便签、路径、网址、账户、密码、MFA、剪贴板或浏览器消息内容。
+
 ## 本地优先存储
 
 PetalDesk 面向读取频繁、写入较少的桌面使用场景，不为第三方同步盘实现分布式锁、操作日志或 CRDT。数据按类型选择合适粒度：便签使用每条独立的 `note.md + meta.json + assets/`，甘特图使用版本化整体快照，MFA 与密码管理器分别使用独立的认证加密保险库。每个保险库拥有独立随机数据密钥，由恢复密码和平台本机保护分别包装；共享恢复密码协调器负责首次启用和轮换时保持两库一致。Windows 使用 DPAPI，macOS MFA 使用 Keychain，从而兼顾本机免密解锁，以及跨电脑、系统用户或平台迁移。
@@ -31,6 +33,8 @@ PetalDesk 面向读取频繁、写入较少的桌面使用场景，不为第三�
 便签、甘特图、计时器、提醒和系统通知在 Windows 与 macOS 共享同一业务层。普通截图也同时支持两个平台：Windows 使用现有 Win32 捕获链路，macOS 使用系统屏幕捕获并依赖“屏幕录制”权限；编辑、复制、保存和贴图沿用共享流程。
 
 Windows 继续保留长截图、自动滚动、浏览器扩展和 Native Messaging Host，并在 `0.6.0` 增加密码管理器。截图控制仍使用原有文件桥接；用户名、密码和登录候选只经过带当前用户 ACL、随机进程令牌和短时会话绑定的 Windows named pipe，不进入文件队列。密码填充、登录保存提示和关联 TOTP 由 Firefox、Chrome 与 Edge 共享同一套扩展协议，页面确认后只填写字段、不自动提交。macOS 当前版本不打包或注册 Native Messaging Host，也不提供密码管理器、长截图和浏览器联动。
+
+网络体检同样是 Windows 独有的小工具。采集走 `GetExtendedTcpTable`，而不是 netstat 子进程或 `Get-NetTCPConnection`：后两者在两万条连接的量级上分别需要数百毫秒到数秒，且 `Get-NetTCPConnection` 会直接超时返回空表 —— 恰恰是连接数异常、最需要体检的时候不可用。动态端口范围没有公开的 Win32 查询接口，只能调用一次 `netsh` 并按整数提取，失败时回退到系统默认范围。采集与聚合都在 `run_background` 的工作线程上完成，聚合后只把百余行的报表送过 IPC，不把原始连接表交给前端。聚合逻辑是与平台无关的纯函数，因此可以脱离 Windows API 单测；工具只读取连接元数据，不读取任何流量内容，也不写入诊断日志。
 
 macOS Release 使用 `universal-apple-darwin` 目标，把 `x86_64-apple-darwin` 与 `aarch64-apple-darwin` 合并为一个 Universal 应用和 DMG。Intel 与 Apple Silicon 用户下载同一个文件即可。
 

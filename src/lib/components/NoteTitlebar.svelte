@@ -1,6 +1,7 @@
 <script lang="ts">
   import { tick } from "svelte";
   import {
+    Activity,
     FilePenLine,
     FileText,
     KeyRound,
@@ -347,6 +348,8 @@
                   <ShieldCheck size={15} aria-hidden="true" />
                 {:else if item.name === "passwords"}
                   <KeyRound size={15} aria-hidden="true" />
+                {:else if item.name === "network"}
+                  <Activity size={15} aria-hidden="true" />
                 {:else}
                   <ScanLine size={15} aria-hidden="true" />
                 {/if}

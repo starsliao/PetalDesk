@@ -5,6 +5,7 @@ on:
     paths:
       - "src-tauri/Cargo.toml"
       - "src-tauri/Cargo.lock"
+      - "src-tauri/vendor/tao/**"
       - "src-tauri/vendor/tray-icon/**"
       - "scripts/test-tray-icon-windows-patch.ps1"
       - ".github/workflows/release.yml"
@@ -15,6 +16,7 @@ on:
     paths:
       - "src-tauri/Cargo.toml"
       - "src-tauri/Cargo.lock"
+      - "src-tauri/vendor/tao/**"
       - "src-tauri/vendor/tray-icon/**"
       - "scripts/test-tray-icon-windows-patch.ps1"
       - ".github/workflows/release.yml"
@@ -38,6 +40,6 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: Test non-blocking Windows tray backend
+      - name: Test Windows tray and taskbar deadlock guards
         shell: pwsh
         run: '& "./scripts/test-tray-icon-windows-patch.ps1"'

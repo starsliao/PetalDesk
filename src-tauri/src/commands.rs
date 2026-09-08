@@ -11,6 +11,7 @@ pub(crate) const REMINDER_WINDOW_LABEL: &str = "reminder";
 pub(crate) const GANTT_WINDOW_LABEL: &str = "gantt";
 pub(crate) const MFA_WINDOW_LABEL: &str = "mfa";
 pub(crate) const PASSWORD_WINDOW_LABEL: &str = "passwords";
+pub(crate) const NETWORK_WINDOW_LABEL: &str = "network";
 pub(crate) const SENSITIVE_TOOL_REMOTE_SESSION_CODE: &str =
     "remote_desktop_sensitive_window_unavailable";
 const SENSITIVE_TOOL_REMOTE_SESSION_MESSAGE: &str =
@@ -30,6 +31,7 @@ static REMINDER_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 static GANTT_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 static MFA_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 static PASSWORD_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
+static NETWORK_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 
 const SLOW_BACKGROUND_OPERATION: Duration = Duration::from_secs(2);
 
@@ -448,6 +450,7 @@ pub async fn open_tool_window(app: AppHandle, tool: ToolName) -> AppResult<Strin
         }
         ToolName::Screenshot => crate::screenshot::start_capture_inner(&app)
             .map(|_| crate::screenshot::CAPTURE_WINDOW_LABEL.to_string()),
+        ToolName::Network => open_network_window_inner(&app, &app.state()),
     })
     .await
 }
@@ -457,12 +460,12 @@ pub fn open_note_window_inner(
     store: &WorkspaceStore,
     note_id: &str,
 ) -> AppResult<String> {
-    crate::trace_activation(&format!("open_note:{note_id}:waiting_creation_lock"));
+    crate::diagnostics::record(crate::diagnostics::DiagnosticEvent::NoteWindowCreationRequested);
     let _creation_guard = lock_window_creation(&NOTE_WINDOW_CREATION_LOCK);
-    crate::trace_activation(&format!("open_note:{note_id}:creation_lock_acquired"));
+    crate::diagnostics::record(crate::diagnostics::DiagnosticEvent::NoteWindowCreationLockAcquired);
     let label = format!("note-{note_id}");
     if let Some(window) = app.get_webview_window(&label) {
-        crate::trace_activation(&format!("open_note:{note_id}:existing_window"));
+        crate::diagnostics::record(crate::diagnostics::DiagnosticEvent::NoteWindowExisting);
         window
             .show()
             .map_err(|error| AppError::new("window_error", format!("显示便签窗口失败: {error}")))?;
@@ -472,13 +475,13 @@ pub fn open_note_window_inner(
             let _ = window.set_always_on_top(snapshot.meta.pinned);
         }
         store.set_note_window_open(note_id, true)?;
-        crate::trace_activation(&format!("open_note:{note_id}:existing_window_shown"));
+        crate::diagnostics::record(crate::diagnostics::DiagnosticEvent::NoteWindowExistingShown);
         return Ok(label);
     }
 
-    crate::trace_activation(&format!("open_note:{note_id}:snapshot_start"));
+    crate::diagnostics::record(crate::diagnostics::DiagnosticEvent::NoteWindowSnapshotStarted);
     let snapshot = store.get_note(note_id)?;
-    crate::trace_activation(&format!("open_note:{note_id}:snapshot_end"));
+    crate::diagnostics::record(crate::diagnostics::DiagnosticEvent::NoteWindowSnapshotLoaded);
     let url = WebviewUrl::App(format!("?note={note_id}").into());
     let mut builder = WebviewWindowBuilder::new(app, &label, url)
         .title(format!("{} - 飞花 - PetalDesk", snapshot.meta.title))
@@ -494,14 +497,14 @@ pub fn open_note_window_inner(
             .inner_size(state.width, state.height)
             .maximized(state.maximized);
     }
-    crate::trace_activation(&format!("open_note:{note_id}:build_start"));
+    crate::diagnostics::record(crate::diagnostics::DiagnosticEvent::NoteWindowBuildStarted);
     let window = builder
         .build()
         .map_err(|error| AppError::new("window_error", format!("创建便签窗口失败: {error}")))?;
-    crate::trace_activation(&format!("open_note:{note_id}:build_end"));
+    crate::diagnostics::record(crate::diagnostics::DiagnosticEvent::NoteWindowBuilt);
     let _ = window.set_focus();
     store.set_note_window_open(note_id, true)?;
-    crate::trace_activation(&format!("open_note:{note_id}:state_saved"));
+    crate::diagnostics::record(crate::diagnostics::DiagnosticEvent::NoteWindowStateSaved);
     Ok(label)
 }
 
@@ -678,6 +681,40 @@ pub fn open_gantt_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppRe
         .map_err(|error| AppError::new("window_error", format!("创建任务甘特图失败: {error}")))?;
     let _ = window.set_focus();
     Ok(GANTT_WINDOW_LABEL.to_string())
+}
+
+pub fn open_network_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResult<String> {
+    let _creation_guard = lock_window_creation(&NETWORK_WINDOW_CREATION_LOCK);
+    if let Some(window) = app.get_webview_window(NETWORK_WINDOW_LABEL) {
+        window
+            .show()
+            .map_err(|error| AppError::new("window_error", format!("显示网络体检失败: {error}")))?;
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        return Ok(NETWORK_WINDOW_LABEL.to_string());
+    }
+
+    let url = WebviewUrl::App("?tool=network".into());
+    let mut builder = WebviewWindowBuilder::new(app, NETWORK_WINDOW_LABEL, url)
+        .title("网络体检 - 飞花 - PetalDesk")
+        .decorations(false)
+        .resizable(true)
+        .inner_size(920.0, 660.0)
+        .min_inner_size(640.0, 420.0)
+        .skip_taskbar(false);
+    if let Some(state) = store.window_state(NETWORK_WINDOW_LABEL) {
+        builder = builder
+            .position(state.x, state.y)
+            .inner_size(state.width, state.height)
+            .maximized(state.maximized);
+    } else {
+        builder = builder.center();
+    }
+    let window = builder
+        .build()
+        .map_err(|error| AppError::new("window_error", format!("创建网络体检失败: {error}")))?;
+    let _ = window.set_focus();
+    Ok(NETWORK_WINDOW_LABEL.to_string())
 }
 
 pub fn open_mfa_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResult<String> {

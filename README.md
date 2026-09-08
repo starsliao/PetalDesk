@@ -2,7 +2,7 @@
 
 > 把想法留在桌面，把文件留在自己手里。
 
-[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows x64](https://github.com/starsliao/PetalDesk/releases/download/v0.8.5/PetalDesk_0.8.5_x64-setup.exe) · [下载 macOS Universal](https://github.com/starsliao/PetalDesk/releases/download/v0.8.5/PetalDesk_0.8.5_universal.dmg)
+[产品网站](https://starsliao.github.io/PetalDesk/) · [GitHub](https://github.com/starsliao/PetalDesk) · [下载 Windows x64](https://github.com/starsliao/PetalDesk/releases/download/v0.8.8/PetalDesk_0.8.8_x64-setup.exe) · [下载 macOS Universal](https://github.com/starsliao/PetalDesk/releases/download/v0.8.8/PetalDesk_0.8.8_universal.dmg)
 
 飞花 - PetalDesk 是一款面向 Windows 10/11 与 macOS 12+ 的本地便签与效率工具。它启动快、界面安静，支持 Markdown 即时排版、纯文本、图片、搜索、回收站，以及截图、任务规划和本地 MFA 验证器等随时可以唤起的小工具。没有账号、没有云端依赖，内容保留在你的本地数据目录中。
 
@@ -31,6 +31,10 @@
 | 密码管理器 | MFA 验证器 |
 | --- | --- |
 | <img src="website/assets/screenshots/password-manager-tool.png" alt="飞花 - PetalDesk 密码管理器" width="500" /> | <img src="website/assets/screenshots/mfa-tool.png" alt="飞花 - PetalDesk MFA 验证器" width="260" /> |
+
+### 0.8.8 平台支持
+
+`0.8.8` 新增 Windows「网络体检」小工具，并把 `0.8.6`、`0.8.7` 两个未公开发布版本的改动一并带出。网络体检一键给出连接状态总览、临时端口占用比、按进程聚合和按目标端点聚合，并研判本地代理环路；`TIME_WAIT` 在 Windows 上属主 PID 为 0，按进程归因不到，因此额外把回环目标反查成监听方进程，几万条无主连接得以落到具体程序头上。MFA 验证器的隐藏验证码旁新增复制按钮。便签修复了跨行选中时选区变形、未选中空白处被染色的问题，选中自动复制成功后右下角会提示「已复制」。桌面进程新增结构化诊断日志与主事件循环停顿检测，并本地修补 `tray-icon` 与 `tao`，避免远程桌面会话切换时托盘假死。数据格式、密码与 MFA 安全边界均未改变。
 
 ### 0.8.5 平台支持
 
@@ -62,10 +66,11 @@
 - 计时器：透明电子管数字、暂停/重置记录、透明度、位置和大小记忆。
 - 提醒：一次、间隔、日/周/月/年周期，到点发送系统通知。
 - 任务甘特图：任务排序、进度筛选、时间条拖动、小时级时间轴缩放。
-- MFA 验证器：支持标准 `TOTP`、屏幕二维码扫描、图片/链接/手动导入，也支持一行一个链接批量导入并为批量账户随机搭配图标。验证码默认隐藏、双击安全复制，账户可拖动排序或通过右键置顶/取消置顶。单项可从右键菜单安全导出，经恢复密码验证后提供 Base32 密钥、完整 `otpauth://` 链接和二维码；删除项保留在 MFA 加密回收站中，可恢复，永久删除或清空前均需二次确认。
+- MFA 验证器：支持标准 `TOTP`、屏幕二维码扫描、图片/链接/手动导入，也支持一行一个链接批量导入并为批量账户随机搭配图标。验证码默认隐藏，可点击验证码旁的复制按钮直接复制，也可双击整张卡片复制；两种方式都不会显示验证码。账户可拖动排序或通过右键置顶/取消置顶。单项可从右键菜单安全导出，经恢复密码验证后提供 Base32 密钥、完整 `otpauth://` 链接和二维码；删除项保留在 MFA 加密回收站中，可恢复，永久删除或清空前均需二次确认。
 - 密码管理器：使用独立的 XChaCha20-Poly1305 保险库保存多个站点账户，共享 MFA 恢复密码并由 Windows DPAPI 日常解锁。Firefox 与 Chrome 扩展角标会显示当前站点已保存的账户数量，点击图标可查看连接诊断、登录检测开关、卡片式账户列表以及四个飞花快捷入口；账户可直接填充，或分别复制用户名、密码与已关联的 MFA 验证码。登录信息检测默认开启，用户提交 HTTP 或 HTTPS 登录后都会立即提示保存新账户；用户名或密码与已存账户不一致时，可选择保存为新账户或更新任一既有账户。HTTP 保存会明确提示明文传输风险，后续填充仍按精确 origin 授权。提示会跨同一标签页的页面变化继续保留，直到用户明确处理。密码账户可关联本地 TOTP；在受信任的 HTTPS 登录 journey 内，扩展只填入唯一可信字段，模糊字段需用户确认，并且绝不主动提交。密码窗口关闭时这些能力仍可用；用户可单独关闭登录检测，手动锁库则立即停止所有秘密操作。秘密只在当前用户的本机内存通道中按需处理，不写入浏览器存储、诊断日志或截图文件队列。
 - 截图：默认 `F1`，在飞花窗口内外都可直接唤起；Windows 与 macOS 均支持单显示器手动框选、标注、马赛克、模糊、复制、保存和置顶贴图，选区内双击即可复制，选区外右键直接取消。
 - Windows 长截图：默认由用户在原窗口中手动滚动并实时拼接，支持暂停、重试、回退和完整标注；自动滚动作为高级模式保留。**安装浏览器扩展后不需要对扩展做任何操作**：飞花里的长截图操作完全不变，当目标是 Chrome、Edge 或 Firefox 长页面并使用自动滚动模式时，飞花会自动启用浏览器增强引擎，滚动定位与拼接更稳定；扩展本身没有、也不需要任何长截图操作入口。macOS 当前版本不提供长截图和浏览器联动。
+- Windows 网络体检：点击查询即枚举本机全部 TCP 连接，给出状态总览、临时端口占用比、按进程聚合和按目标端点聚合。`TIME_WAIT` 在 Windows 上属主 PID 为 0，按进程永远归因不到，因此飞花额外把回环目标的端口反查成监听方进程 —— 几万条无主 `TIME_WAIT` 会直接落到具体程序头上。据此还会研判本地代理环路：当某个回环端点被大量打入、而它的属主进程自身出站又几乎全部回到本机时，说明流量在两个程序之间空转而不是真的发了出去，飞花会点名环路双方和上游调用者。只读取连接元数据，不读取任何流量内容。macOS 当前版本不提供。
 
 Windows 长截图的默认操作只有三步：按 `F1` 框选固定区域并点击工具栏中的长截图按钮；冻结画面切回原窗口后，选区外仍保留暗色遮罩，直接在选区内向下滚动；控制条帧数增长后，点击“完成”。无需再次点击选区，普通 Windows 窗口也不需要安装浏览器扩展。向上滚动只会回看已捕获内容，不会反向写入长图；重新向下越过已捕获末尾后会自动继续拼接。采集会跟随真实滚动连续取帧，并在停止滚动后补一张稳定帧；空闲等待不会自动结束。需要自动滚动时，从长截图按钮旁的小箭头选择自动模式，再点击选区内真正会滚动的正文区域。
 
@@ -107,17 +112,23 @@ PetalDesk/
 
 MFA 与密码管理器同样可以随整个数据目录迁移。首次启用任一保险库时需要设置全局恢复密码；另一个保险库首次启用时输入同一个密码完成绑定。保险库正文分别由随机密钥进行 XChaCha20-Poly1305 认证加密，各自的数据密钥由基于 Argon2id 的全局恢复密码包装，同时保留当前平台的本机免密包装：Windows 使用 DPAPI，macOS 使用 Keychain。复制目录到另一台电脑、另一个系统用户或另一平台后，输入一次恢复密码即可解锁，并为新环境绑定本机保护；已有的另一平台包装会继续保留。导出单项 MFA 密钥也必须重新验证恢复密码；恢复密码不会保存，保险库、加密回收站、备份和冲突副本都不会降级为明文。忘记恢复密码且原设备已不可用时，只能使用各服务提供的账户恢复码。
 
+### 故障诊断
+
+桌面进程默认把结构化诊断写入 Windows `%LOCALAPPDATA%\PetalDesk\logs\petaldesk-diagnostics.log` 或 macOS `~/Library/Application Support/PetalDesk/logs/petaldesk-diagnostics.log`。活动文件达到 1 MiB 后自动轮转并保留 3 份历史文件。日志记录版本、进程与会话信息、启动/窗口/托盘阶段、每分钟一次的句柄/线程/内存/CPU 趋势，以及主事件循环超过 15 秒未响应时的 Windows 等待链；写盘、资源采样和等待链查询均在独立系统线程执行，正常事件记录不会让 UI 线程等待日志 I/O，进程退出时最多等待 250 ms 确认最后一条记录已写入。
+
+诊断日志不会记录便签标题或正文、便签 ID、数据目录、网址、用户名、密码、MFA/TOTP 密钥、剪贴板内容、浏览器消息正文、Cookie 或令牌。发生假死时应先保留进程现场，并保留当前日志及 `.1.log`、`.2.log`、`.3.log` 文件，再决定是否结束进程。
+
 ### 升级与兼容
 
-Windows 上的 `0.5.2` 是自动更新桥接版本；已安装该版本或更高版本的用户可直接在飞花内更新到 `0.8.5`，无需重新运行本地安装流程。macOS 的 `0.5.0` 是首个公开版本，`0.8.5` 可以直接覆盖升级，但当前仍使用手动下载安装。首次启动时会自动识别旧的 `飞花/.feihua` 存储布局、旧便签元数据和旧甘特图数组格式，转换到当前 `.petaldesk/` 结构；便签正文 `note.md` 不会被改写，甘特图转换前会保留迁移备份。密码保险库 v1 会透明读取；首次成功写入 v2 前保留已认证备份，原有加密 AAD 不变。同机升级不需要输入全局恢复密码；恢复密码由 MFA 与密码管理器全局共用，用于跨设备恢复两个保险库，以及主动导出单个 MFA 账户。旧数据损坏或格式版本过新时，飞花会保留原文件并阻止静默覆盖。
+Windows 上的 `0.5.2` 是自动更新桥接版本；已安装该版本或更高版本的用户可直接在飞花内更新到 `0.8.8`，无需重新运行本地安装流程。macOS 的 `0.5.0` 是首个公开版本，`0.8.8` 可以直接覆盖升级，但当前仍使用手动下载安装。首次启动时会自动识别旧的 `飞花/.feihua` 存储布局、旧便签元数据和旧甘特图数组格式，转换到当前 `.petaldesk/` 结构；便签正文 `note.md` 不会被改写，甘特图转换前会保留迁移备份。密码保险库 v1 会透明读取；首次成功写入 v2 前保留已认证备份，原有加密 AAD 不变。同机升级不需要输入全局恢复密码；恢复密码由 MFA 与密码管理器全局共用，用于跨设备恢复两个保险库，以及主动导出单个 MFA 账户。旧数据损坏或格式版本过新时，飞花会保留原文件并阻止静默覆盖。
 
 ## 安装与运行
 
-Windows 新用户可下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.8.5/PetalDesk_0.8.5_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。`0.5.2` 起默认开启自动检查与后台下载；“关于飞花 - PetalDesk”中可以查看当前版本及安装包打包时间、手动检查或关闭自动更新，下载完成后仍由用户选择何时重启安装。
+Windows 新用户可下载 [Windows x64 安装包](https://github.com/starsliao/PetalDesk/releases/download/v0.8.8/PetalDesk_0.8.8_x64-setup.exe) 后按向导操作。安装器会检查 WebView2；缺少时从微软官方地址显示进度并下载、静默安装，然后继续安装飞花 - PetalDesk。联网安装包因此更小。`0.5.2` 起默认开启自动检查与后台下载；“关于飞花 - PetalDesk”中可以查看当前版本及安装包打包时间、手动检查或关闭自动更新，下载完成后仍由用户选择何时重启安装。
 
 没有 WebView2 或下载权限时，安装器会明确提示失败原因，不会静默留下无法启动的程序。未签名构建可能显示“未知发布者”，这是 Windows 对代码签名的正常提示。
 
-macOS 用户下载 [Universal DMG](https://github.com/starsliao/PetalDesk/releases/download/v0.8.5/PetalDesk_0.8.5_universal.dmg)，将应用拖入“应用程序”即可。同一个 DMG 同时包含 Intel（x86_64）和 Apple Silicon（arm64）代码，不需要按芯片下载不同安装包。普通截图首次使用时，请在“系统设置 > 隐私与安全性 > 屏幕录制”中允许 PetalDesk；未签名、未公证的测试构建可能被 Gatekeeper 阻止，正式发布方式见 [`docs/publishing.md`](docs/publishing.md)。
+macOS 用户下载 [Universal DMG](https://github.com/starsliao/PetalDesk/releases/download/v0.8.8/PetalDesk_0.8.8_universal.dmg)，将应用拖入“应用程序”即可。同一个 DMG 同时包含 Intel（x86_64）和 Apple Silicon（arm64）代码，不需要按芯片下载不同安装包。普通截图首次使用时，请在“系统设置 > 隐私与安全性 > 屏幕录制”中允许 PetalDesk；未签名、未公证的测试构建可能被 Gatekeeper 阻止，正式发布方式见 [`docs/publishing.md`](docs/publishing.md)。
 
 Windows 安装包已经包含长截图和密码管理器所需的 Native Messaging Host，并为同一个固定 Chromium 扩展 ID 注册 Chrome 与 Edge。安装器不会静默安装浏览器扩展：Firefox 用户从 [Firefox 扩展安装页](https://starsliao.github.io/PetalDesk/firefox.html) 进入 AMO，Chrome 用户按 [Chrome 扩展安装页](https://starsliao.github.io/PetalDesk/chrome.html) 下载 ZIP、解压并通过开发者模式加载。不安装扩展仍可在密码管理器中打开站点、复制凭据并使用 Windows 通用长截图。macOS 版本不安装 Native Messaging Host，也不提供密码管理器、长截图或浏览器增强模式。
 

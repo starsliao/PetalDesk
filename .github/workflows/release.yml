@@ -108,7 +108,7 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Test non-blocking Windows tray backend
+      - name: Test Windows tray and taskbar deadlock guards
         shell: pwsh
         run: '& "./scripts/test-tray-icon-windows-patch.ps1"'
 
@@ -124,7 +124,7 @@ jobs:
             throw "Windows installer build failed with exit code $LASTEXITCODE."
           }
 
-      - name: Verify PetalDesk tray imports
+      - name: Verify PetalDesk Windows Explorer guards
         shell: pwsh
         run: '& "./scripts/test-tray-icon-windows-patch.ps1" -SkipCargoTest -BinaryPath "src-tauri/target/release/petaldesk.exe"'
 
