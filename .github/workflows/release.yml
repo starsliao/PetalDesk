@@ -108,6 +108,12 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
+      # 托盘守卫会 cargo check 整个 petaldesk crate 来验证补丁版 tao 的集成，
+      # 而 generate_context! 要求 frontendDist(../build)已经存在。安装包构建
+      # 会自己产出它，但那一步在守卫之后，所以这里先单独构建一次前端。
+      - name: Build frontend for the tray guard integration check
+        run: pnpm build
+
       - name: Test Windows tray and taskbar deadlock guards
         shell: pwsh
         run: '& "./scripts/test-tray-icon-windows-patch.ps1"'

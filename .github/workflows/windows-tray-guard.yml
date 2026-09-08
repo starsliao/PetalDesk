@@ -32,6 +32,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -39,6 +50,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+
+      # 守卫脚本会 cargo check 整个 petaldesk crate，而 generate_context!
+      # 要求 frontendDist(../build)存在，因此这里必须先构建前端。
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend for the tray guard integration check
+        run: pnpm build
 
       - name: Test Windows tray and taskbar deadlock guards
         shell: pwsh
