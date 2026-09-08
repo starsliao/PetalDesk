@@ -19,6 +19,7 @@ pub enum ToolName {
     Passwords,
     Screenshot,
     Network,
+    NetCheck,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

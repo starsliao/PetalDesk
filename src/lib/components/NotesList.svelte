@@ -1,6 +1,7 @@
 <script lang="ts">
   import {
     Activity,
+    Radar,
     Bell,
     ChartGantt,
     KeyRound,
@@ -254,6 +255,8 @@
                       <KeyRound size={15} aria-hidden="true" />
                     {:else if item.name === "network"}
                       <Activity size={15} aria-hidden="true" />
+                    {:else if item.name === "netcheck"}
+                      <Radar size={15} aria-hidden="true" />
                     {:else}
                       <ScanLine size={15} aria-hidden="true" />
                     {/if}

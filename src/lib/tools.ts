@@ -6,6 +6,7 @@ export const TOOL_MENU_ITEMS = [
   { name: "passwords", label: "密码管理器" },
   { name: "screenshot", label: "截图" },
   { name: "network", label: "网络体检" },
+  { name: "netcheck", label: "网络检测" },
 ] as const;
 
 export type ToolName = (typeof TOOL_MENU_ITEMS)[number]["name"];

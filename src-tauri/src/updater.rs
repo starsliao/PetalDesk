@@ -889,7 +889,7 @@ fn window_requires_install_preparation(label: &str) -> bool {
         || label.starts_with("note-")
         || matches!(
             label,
-            "timer" | "reminder" | "gantt" | "mfa" | "network" | "screenshot-capture"
+            "timer" | "reminder" | "gantt" | "mfa" | "network" | "netcheck" | "screenshot-capture"
         )
         || label.starts_with("screenshot-long-")
 }

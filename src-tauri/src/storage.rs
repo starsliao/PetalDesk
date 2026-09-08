@@ -1020,6 +1020,7 @@ impl WorkspaceStore {
             "gantt" => (Self::GANTT_MIN_WIDTH, Self::GANTT_MIN_HEIGHT),
             "mfa" => (400.0, 360.0),
             "network" => (640.0, 420.0),
+            "netcheck" => (520.0, 420.0),
             _ => (240.0, 160.0),
         };
         let valid = state.x.is_finite()
@@ -2341,7 +2342,7 @@ pub(crate) fn validate_note_id(id: &str) -> AppResult<()> {
 fn validate_window_label(label: &str) -> AppResult<()> {
     if matches!(
         label,
-        "main" | "timer" | "reminder" | "gantt" | "mfa" | "network"
+        "main" | "timer" | "reminder" | "gantt" | "mfa" | "network" | "netcheck"
     ) {
         return Ok(());
     }

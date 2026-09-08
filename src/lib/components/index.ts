@@ -9,6 +9,7 @@ export { default as ReminderTool } from "./ReminderTool.svelte";
 export { default as TimerTool } from "./TimerTool.svelte";
 export { default as PasswordManagerTool } from "./PasswordManagerTool.svelte";
 export { default as NetworkTool } from "./NetworkTool.svelte";
+export { default as NetCheckTool } from "./NetCheckTool.svelte";
 export { default as TrashView } from "./TrashView.svelte";
 
 export {

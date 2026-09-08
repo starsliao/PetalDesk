@@ -12,6 +12,7 @@ pub(crate) const GANTT_WINDOW_LABEL: &str = "gantt";
 pub(crate) const MFA_WINDOW_LABEL: &str = "mfa";
 pub(crate) const PASSWORD_WINDOW_LABEL: &str = "passwords";
 pub(crate) const NETWORK_WINDOW_LABEL: &str = "network";
+pub(crate) const NETCHECK_WINDOW_LABEL: &str = "netcheck";
 pub(crate) const SENSITIVE_TOOL_REMOTE_SESSION_CODE: &str =
     "remote_desktop_sensitive_window_unavailable";
 const SENSITIVE_TOOL_REMOTE_SESSION_MESSAGE: &str =
@@ -32,6 +33,7 @@ static GANTT_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 static MFA_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 static PASSWORD_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 static NETWORK_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
+static NETCHECK_WINDOW_CREATION_LOCK: Mutex<()> = Mutex::new(());
 
 const SLOW_BACKGROUND_OPERATION: Duration = Duration::from_secs(2);
 
@@ -451,6 +453,7 @@ pub async fn open_tool_window(app: AppHandle, tool: ToolName) -> AppResult<Strin
         ToolName::Screenshot => crate::screenshot::start_capture_inner(&app)
             .map(|_| crate::screenshot::CAPTURE_WINDOW_LABEL.to_string()),
         ToolName::Network => open_network_window_inner(&app, &app.state()),
+        ToolName::NetCheck => open_netcheck_window_inner(&app, &app.state()),
     })
     .await
 }
@@ -715,6 +718,40 @@ pub fn open_network_window_inner(app: &AppHandle, store: &WorkspaceStore) -> App
         .map_err(|error| AppError::new("window_error", format!("创建网络体检失败: {error}")))?;
     let _ = window.set_focus();
     Ok(NETWORK_WINDOW_LABEL.to_string())
+}
+
+pub fn open_netcheck_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResult<String> {
+    let _creation_guard = lock_window_creation(&NETCHECK_WINDOW_CREATION_LOCK);
+    if let Some(window) = app.get_webview_window(NETCHECK_WINDOW_LABEL) {
+        window
+            .show()
+            .map_err(|error| AppError::new("window_error", format!("显示网络检测失败: {error}")))?;
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        return Ok(NETCHECK_WINDOW_LABEL.to_string());
+    }
+
+    let url = WebviewUrl::App("?tool=netcheck".into());
+    let mut builder = WebviewWindowBuilder::new(app, NETCHECK_WINDOW_LABEL, url)
+        .title("网络检测 - 飞花 - PetalDesk")
+        .decorations(false)
+        .resizable(true)
+        .inner_size(620.0, 620.0)
+        .min_inner_size(520.0, 420.0)
+        .skip_taskbar(false);
+    if let Some(state) = store.window_state(NETCHECK_WINDOW_LABEL) {
+        builder = builder
+            .position(state.x, state.y)
+            .inner_size(state.width, state.height)
+            .maximized(state.maximized);
+    } else {
+        builder = builder.center();
+    }
+    let window = builder
+        .build()
+        .map_err(|error| AppError::new("window_error", format!("创建网络检测失败: {error}")))?;
+    let _ = window.set_focus();
+    Ok(NETCHECK_WINDOW_LABEL.to_string())
 }
 
 pub fn open_mfa_window_inner(app: &AppHandle, store: &WorkspaceStore) -> AppResult<String> {

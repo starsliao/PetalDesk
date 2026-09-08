@@ -37,6 +37,7 @@
   type MfaToolComponent = typeof import("$lib/components/MfaTool.svelte").default;
   type PasswordManagerToolComponent = Component<Record<string, never>>;
   type NetworkToolComponent = typeof import("$lib/components/NetworkTool.svelte").default;
+  type NetCheckToolComponent = typeof import("$lib/components/NetCheckTool.svelte").default;
   type ScreenshotToolComponent = typeof import("$lib/components/ScreenshotTool.svelte").default;
   type PinnedScreenshotComponent = typeof import("$lib/components/PinnedScreenshot.svelte").default;
 
@@ -111,6 +112,7 @@
   let MfaTool = $state<MfaToolComponent | null>(null);
   let PasswordManagerTool = $state<PasswordManagerToolComponent | null>(null);
   let NetworkTool = $state<NetworkToolComponent | null>(null);
+  let NetCheckTool = $state<NetCheckToolComponent | null>(null);
   let ScreenshotTool = $state<ScreenshotToolComponent | null>(null);
   let PinnedScreenshot = $state<PinnedScreenshotComponent | null>(null);
   let fatalError = $state("");
@@ -971,6 +973,10 @@
         void import("$lib/components/NetworkTool.svelte").then((module) => {
           if (!disposed) NetworkTool = module.default;
         });
+      } else if (toolName === "netcheck") {
+        void import("$lib/components/NetCheckTool.svelte").then((module) => {
+          if (!disposed) NetCheckTool = module.default;
+        });
       }
       return () => {
         disposed = true;
@@ -1029,6 +1035,8 @@
                 ? "密码管理器 - 飞花 - PetalDesk"
               : toolName === "network"
                 ? "网络体检 - 飞花 - PetalDesk"
+              : toolName === "netcheck"
+                ? "网络检测 - 飞花 - PetalDesk"
               : toolName === "screenshot"
                 ? longCaptureControlId
                   ? "长截图控制 - 飞花 - PetalDesk"
@@ -1121,6 +1129,16 @@
   <main class="network-tool-window">
     {#if NetworkTool}
       <NetworkTool />
+    {:else}
+      <div class="tool-loading" aria-busy="true">
+        <LoaderCircle class="spinner" size={20} aria-hidden="true" />
+      </div>
+    {/if}
+  </main>
+{:else if toolName === "netcheck"}
+  <main class="netcheck-tool-window">
+    {#if NetCheckTool}
+      <NetCheckTool />
     {:else}
       <div class="tool-loading" aria-busy="true">
         <LoaderCircle class="spinner" size={20} aria-hidden="true" />
@@ -1316,7 +1334,8 @@
   .gantt-tool-window,
   .mfa-tool-window,
   .password-tool-window,
-  .network-tool-window {
+  .network-tool-window,
+  .netcheck-tool-window {
     width: 100vw;
     height: 100vh;
     min-width: 0;

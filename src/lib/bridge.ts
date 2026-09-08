@@ -753,6 +753,8 @@ export const notesApi = {
                 ? "popup,width=860,height=650"
                 : tool === "network"
                   ? "popup,width=920,height=660"
+                : tool === "netcheck"
+                  ? "popup,width=620,height=620"
               : `popup,width=${Math.max(640, screen.availWidth)},height=${Math.max(480, screen.availHeight)}`;
     window.open(url, `petaldesk-tool-${tool}`, dimensions);
   },

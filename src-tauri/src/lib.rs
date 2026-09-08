@@ -10,6 +10,7 @@ mod long_screenshot;
 mod long_screenshot_input;
 mod mfa;
 mod models;
+mod netcheck;
 mod network;
 mod password_browser;
 mod passwords;
@@ -50,6 +51,7 @@ const OPEN_MFA_MENU_ID: &str = "open-tool:mfa";
 const OPEN_PASSWORD_MENU_ID: &str = "open-tool:passwords";
 const OPEN_SCREENSHOT_MENU_ID: &str = "open-tool:screenshot";
 const OPEN_NETWORK_MENU_ID: &str = "open-tool:network";
+const OPEN_NETCHECK_MENU_ID: &str = "open-tool:netcheck";
 const ABOUT_MENU_ID: &str = "about";
 const MAX_TRAY_NOTE_TITLE_CHARS: usize = 80;
 const ACTIVATION_FALLBACK_DELAY: Duration = Duration::from_secs(2);
@@ -134,6 +136,7 @@ fn tool_from_tray_menu_id(menu_id: &str) -> Option<models::ToolName> {
         OPEN_PASSWORD_MENU_ID => Some(models::ToolName::Passwords),
         OPEN_SCREENSHOT_MENU_ID => Some(models::ToolName::Screenshot),
         OPEN_NETWORK_MENU_ID => Some(models::ToolName::Network),
+        OPEN_NETCHECK_MENU_ID => Some(models::ToolName::NetCheck),
         _ => None,
     }
 }
@@ -309,6 +312,9 @@ fn spawn_open_tool(app: &tauri::AppHandle, tool: models::ToolName) {
             models::ToolName::Network => {
                 commands::open_network_window_inner(&app, &app.state()).map(|_| ())
             }
+            models::ToolName::NetCheck => {
+                commands::open_netcheck_window_inner(&app, &app.state()).map(|_| ())
+            }
         };
         if let Err(error) = result {
             if error.code == commands::SENSITIVE_TOOL_REMOTE_SESSION_CODE {
@@ -424,6 +430,7 @@ fn build_tray_menu(
         None::<&str>,
     )?;
     let network = MenuItem::with_id(app, OPEN_NETWORK_MENU_ID, "网络体检", true, None::<&str>)?;
+    let netcheck = MenuItem::with_id(app, OPEN_NETCHECK_MENU_ID, "网络检测", true, None::<&str>)?;
     tools.append(&timer)?;
     tools.append(&reminder)?;
     tools.append(&gantt)?;
@@ -431,6 +438,7 @@ fn build_tray_menu(
     tools.append(&passwords)?;
     tools.append(&screenshot)?;
     tools.append(&network)?;
+    tools.append(&netcheck)?;
     let about = MenuItem::with_id(app, ABOUT_MENU_ID, "关于", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     Ok(Menu::with_items(
@@ -862,6 +870,7 @@ pub fn run() {
             commands::open_note_window,
             commands::open_tool_window,
             network::collect_network_report,
+            netcheck::run_network_check,
             commands::close_note_window,
             commands::save_window_state,
             updater::get_update_settings,
@@ -1049,6 +1058,7 @@ mod tests {
             commands::MFA_WINDOW_LABEL,
             commands::PASSWORD_WINDOW_LABEL,
             commands::NETWORK_WINDOW_LABEL,
+            commands::NETCHECK_WINDOW_LABEL,
         ] {
             assert!(
                 scope.contains(&label),
